@@ -17370,7 +17370,7 @@ def create_sessions_router(
                             await _forward_session_change_to_runner(
                                 session_id,
                                 _server_runner_router,
-                                {"type": "interrupt"},
+                                {"type": "interrupt", "origin": "system"},
                             )
                             verdict_body = {
                                 "result": "POLICY_ACTION_DENY",
@@ -17502,7 +17502,7 @@ def create_sessions_router(
             await _forward_session_change_to_runner(
                 session_id,
                 _server_runner_router,
-                {"type": "interrupt"},
+                {"type": "interrupt", "origin": "system"},
             )
         body = codex_request.build_response(result)
         return Response(
@@ -17604,7 +17604,7 @@ def create_sessions_router(
             await _forward_session_change_to_runner(
                 session_id,
                 _server_runner_router,
-                {"type": "interrupt"},
+                {"type": "interrupt", "origin": "system"},
             )
         return Response(
             content=result.model_dump_json(),
@@ -17719,7 +17719,7 @@ def create_sessions_router(
             await _forward_session_change_to_runner(
                 session_id,
                 _server_runner_router,
-                {"type": "interrupt"},
+                {"type": "interrupt", "origin": "system"},
             )
         return Response(
             content=json.dumps(result.model_dump(exclude_none=True)),
@@ -17827,7 +17827,7 @@ def create_sessions_router(
             await _forward_session_change_to_runner(
                 session_id,
                 _server_runner_router,
-                {"type": "interrupt"},
+                {"type": "interrupt", "origin": "system"},
             )
         return Response(
             content=json.dumps(result.model_dump(exclude_none=True)),

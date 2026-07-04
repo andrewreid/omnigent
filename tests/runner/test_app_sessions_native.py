@@ -267,7 +267,7 @@ class _FakeProcessManager:
         return True
 
     async def release(self, conversation_id: str) -> None:
-        """Record a release and remove the session."""
+        """Record a release."""
         self.released.append(conversation_id)
         self._sessions.discard(conversation_id)
 
