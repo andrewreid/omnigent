@@ -10,8 +10,9 @@ review is a sub-agent that returns a structured report, not a transcript
 anyone needs to read through.
 
 ## Procedure
-1. Get the task's diff — `sys_os_shell("gh pr diff <pr>")` (or
-   `git -C .worktrees/<task_id> diff main...HEAD`).
+1. Get the task's diff. Per `review-before-pr`, review runs BEFORE a PR exists,
+   so take the branch diff: `git -C .worktrees/<task_id> diff main...HEAD`. Use
+   `gh pr diff <pr>` only for a pre-existing PR you did not just create.
 2. Run the deterministic gates first — tests / lint / typecheck via
    `sys_os_shell`. If red, re-dispatch the implementer to drive it green first;
    don't involve the reviewer yet.
@@ -45,9 +46,12 @@ anyone needs to read through.
    `purpose: "implement"`, so the worker keeps its worktree/branch context and
    updates its existing PR. A new title would spawn a fresh worker with no
    memory of the task. Then loop to step 1.
-6. When gates are green AND there are zero blocking issues, the PR passes
-   review — mark it ready in the registry (with its PR URL) and leave it for
-   the human to merge. polly does NOT merge it.
+6. When gates are green AND there are zero blocking issues, the diff passes
+   review. Now (and only now) tell the SAME implementer to open the PR on its
+   reviewed branch (per `review-before-pr` — the PR is opened on the reviewed
+   product, and only the implementer opens PRs). Then mark it ready in the
+   registry (with its PR URL) and leave it for the human to merge. polly does
+   NOT merge it.
 7. If the contract can't be satisfied after a few loops, stop and escalate to
    the user with specifics.
 
