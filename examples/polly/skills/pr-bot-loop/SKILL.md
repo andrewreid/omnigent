@@ -28,6 +28,9 @@ human can resolve the threads. polly runs this loop; polly never merges.
    Note the **commit the bot reviewed** (`Reviewed commit: <sha>` in the body):
    it is often a PRE-fix commit, so some findings may already be resolved by a
    later commit — reconcile against the current head before acting.
+   Also read the bot's **reaction emoji** FIRST (see "The bot's reaction emoji"
+   below): it is the quickest state signal and gates whether a nudge is even
+   allowed — do not skip it and jump to re-requesting review.
 3. **Disposition EACH finding** (badges: P1 > P2 > P3). Exactly one of:
    - **fix** — a real defect. Bundle it into a cohesive fix task (see step 5).
    - **pushback** — wrong or out-of-context. Reply with concrete rationale
@@ -48,16 +51,49 @@ human can resolve the threads. polly runs this loop; polly never merges.
    pushes. Then re-request review with a NEW top-level comment containing
    exactly `@codex review` (`gh pr comment <n> --body "@codex review"`), and
    re-arm the timer (step 1). Loop.
-   - If the bot hasn't posted anything yet on a sweep, nudge once with
-     `@codex review` and reset the timer rather than assuming clean.
-6. **Clean bill → stop.** A PR is merge-clean only when BOTH hold: (a) the
-   latest sweep surfaces no new P1/P2, AND (b) there are ZERO UNRESOLVED bot
+   - Before ANY nudge, read the bot's reaction (see "The bot's reaction emoji"
+     below). Re-request `@codex review` ONLY when there is NO reaction AND no
+     review of the current head after the lag window. NEVER re-request while a
+     👀 (`eyes`) reaction is present, or before a review of the current
+     head SHA has had its ~10 min — a second `@codex review` on an in-progress
+     review spawns a duplicate and confuses the run. When unsure, re-arm the
+     timer and wait; do not nudge.
+6. **Clean bill → stop.** A 👍 (`+1`) reaction on the CURRENT head SHA is the
+   bot's explicit "no issues" verdict (a positive outcome, not silence) — the
+   fast clean-bill signal; the "Codex Review: Didn't find any major issues"
+   comment says the same thing more slowly. A PR is merge-clean only when BOTH
+   hold: (a) the latest review/reaction on the CURRENT head shows no new P1/P2,
+   AND (b) there are ZERO UNRESOLVED bot
    review threads (verify via GraphQL, not REST — replying to a thread does
    NOT resolve it, and `isOutdated` does NOT mean resolved). RESOLVE every
    handled thread (fixed / accepted-pushback / superseded-outdated) so the
    human sees a clean PR; only leave a thread open if it is a real unaddressed
    finding you are still working. Then mark ready in the registry and **disarm
    any timers** (`sys_timer_cancel`). Leave the merge to the human.
+
+## The bot's reaction emoji = its state signal (read it BEFORE nudging)
+The Codex bot signals review state by REACTING to the PR, faster and more
+reliably than any comment it posts. Read the reaction FIRST on every sweep — it
+is what distinguishes "not picked up" from "reviewing" from "done, clean", and
+is the single best guard against a redundant `@codex review`:
+- **no reaction** — not picked up yet. Only here MAY a single nudge apply, and
+  only after the ~10 min lag.
+- **👀 `eyes`** — acknowledged, review IN PROGRESS. Do NOT nudge, do NOT
+  re-request. Re-arm a normal timer and wait; the verdict is coming.
+- **👍 `+1`** — reviewed, NO issues = clean bill (a positive verdict).
+  Confirm zero unresolved prior threads, then disarm.
+
+Read it (reactions sit on the PR issue itself, and separately on the `@codex
+review` comment):
+```
+gh api repos/<owner>/<repo>/issues/<n>/reactions --jq '.[] | {content, user:.user.login}'
+```
+A reaction is bound to the HEAD SHA the bot reviewed. After you push a fix the
+prior 👍 is STALE — expect a fresh 👀→👍 cycle on the new commit; never read an
+old thumbs-up as covering a newer head. If the reaction and a review comment
+disagree, trust whichever is tied to the current head SHA. This reaction-state
+check is why most sweeps need NO nudge at all — an 👀 means "keep waiting",
+not "poke again".
 
 ## Finding & resolving threads (GraphQL, not REST)
 REST (`gh api repos/<o>/<r>/pulls/<n>/comments`) is fine for reading a
@@ -157,6 +193,17 @@ last pushed. When one merged:
 - Stacked PRs: merge bottom-up and delete each head branch after merge so
   GitHub auto-retargets the child — but the merge can happen out of order, so
   the lifecycle/orphan check above is what actually protects you, not the order.
+- **SQUASH-merged parent → REBASE the child, do NOT just retarget.** When a
+  parent PR is SQUASH-merged, its branch is deleted and its commits enter the
+  base as ONE new squash commit — the child's COPIES of those commits are NOT in
+  the base. Auto-retarget (or a manual base change) to the new base then makes
+  the child's diff DOUBLE-show the parent's changes, and the child's old base
+  ref may be gone (a pending PR-open/retarget fails with "Base ref must be a
+  branch"). Fix: rebase the child `--onto <new-base> <old-parent-tip>` (replay
+  ONLY the child's own commits), or fresh-branch off the new base + cherry-pick
+  just the child's commits. Force-push is often blocked, so a fresh
+  non-destructive branch is usually cleanest. VERIFY `git diff <new-base>...HEAD
+  --stat` shows ONLY the child's own files before repointing the PR base.
 
 ## Notes
 - The bot reviews a specific commit; a comment can target a line/commit that a
