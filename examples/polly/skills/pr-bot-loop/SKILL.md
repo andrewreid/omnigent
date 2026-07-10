@@ -19,20 +19,23 @@ After an implementer opens/updates a PR, a review bot (`chatgpt-codex-connector`
    - **already-fixed** — closed by a later commit; reply naming the sha and what closed it.
 4. **Reply IN-THREAD, never top-level.** `add_reply_to_pull_request_comment(owner, repo, pullNumber, commentId=<id>, body=...)` — `commentId` is the numeric review-comment id from step 2; the reply threads under the bot's comment so the human resolves in place. A top-level comment orphans it. Reply to every finding, pushbacks and already-fixed included.
 5. **Push fixes as ONE cohesive pass, not per-bug.** Cluster fix-worthy findings by theme; send to the SAME implementer conversation (reuse `agent`+`title`, `purpose:"implement"`) so it keeps its worktree/branch/PR. Re-run gates yourself (tsc/lint/build) after it pushes, then re-request review — a NEW top-level comment of exactly `@codex review` (`gh pr comment <n> --body "@codex review"`) — and re-arm the timer. Loop.
-   - Nudge discipline: re-request ONLY when there's NO reaction AND no review of the current head past the lag window. NEVER re-request while a 👀 (`eyes`) is present or before the current head's ~10 min elapses — a second `@codex review` on an in-progress review duplicates/confuses it. Unsure → re-arm and wait.
+   - Nudge discipline: re-request ONLY in the true not-picked-up state — no body reaction AND no inline findings AND the ~10 min lag elapsed (see "The bot's reaction emoji" for disambiguating a CLEARED reaction, which means issues were posted, from a never-engaged one). NEVER re-request while a 👀 (`eyes`) is present, when inline findings already exist for the current head, or before the current head's ~10 min elapses — a second `@codex review` on an in-progress review duplicates/confuses it. Unsure → re-arm and wait.
 6. **Clean bill → stop.** Merge-clean requires BOTH: (a) the latest review/reaction on the CURRENT head shows no new P1/P2 (a 👍 `+1` on the current head is the bot's explicit "no issues" verdict — see below), AND (b) ZERO UNRESOLVED bot threads (verify via GraphQL, not REST — a reply does NOT resolve, and `isOutdated` ≠ resolved). RESOLVE every handled thread (fixed / accepted-pushback / superseded) so the human sees a clean PR; leave open only a real finding you're still working. Mark ready in the registry, **disarm timers** (`sys_timer_cancel`), leave the merge to the human.
 
 ## The bot's reaction emoji = its state signal (read BEFORE nudging)
-The bot signals state by REACTING to the PR — faster and more reliable than any comment. Read it first every sweep; it distinguishes "not picked up" / "reviewing" / "done clean" and is the best guard against a redundant `@codex review`:
-- **no reaction** — not picked up. Only here may a single nudge apply, and only after the ~10 min lag.
-- **👀 `eyes`** — review IN PROGRESS. Do NOT nudge; re-arm a normal timer and wait.
-- **👍 `+1`** — reviewed, no issues = clean bill (a positive verdict). Confirm zero unresolved prior threads, then disarm.
+The bot's PRIMARY signal is the reaction on the MAIN PR body — faster and more reliable than its comments. Read it first every sweep; the reaction MOVES between states (it is NOT monotonic):
+- **👀 `eyes` on the PR body** — picked up, review IN PROGRESS: the initial state on a fresh PR, and again after every `@codex review`. Do NOT nudge; re-arm a normal timer and wait.
+- **👍 `+1` on the PR body** — reviewed the CURRENT head, NO issues = clean bill. On the FIRST clean pass this comes with NO comment (don't wait for one); on a re-review clean pass it ALSO posts an inline "no major issues" comment. Confirm zero unresolved prior threads, then disarm.
+- **NO reaction on the PR body — AMBIGUOUS; disambiguate by inline findings.** When the bot reviews and FINDS issues it posts inline review comments and CLEARS the body reaction — so a bare "no reaction" means one of two OPPOSITE things:
+  - inline review comments exist for the current head → **reviewed, issues found** → service the findings (this is NOT a nudge situation).
+  - no inline findings and the bot has never engaged (brand-new PR) → **not picked up yet** → the ONLY nudge-eligible state, and only after the ~10 min lag.
 
-Read it (reactions sit on the PR issue, and separately on the `@codex review` comment):
+A `@codex review` ping puts 👀 on THAT comment AND flips the PR-body reaction back to 👀 — so after a nudge, watch the BODY reaction cycle 👀 → (👍 clean | cleared-with-inline-findings). Read both surfaces:
 ```
-gh api repos/<owner>/<repo>/issues/<n>/reactions --jq '.[] | {content, user:.user.login}'
+gh api repos/<owner>/<repo>/issues/<n>/reactions --jq '.[] | {content, user:.user.login}'   # PR body
+gh api repos/<owner>/<repo>/issues/comments/<comment-id>/reactions                           # a specific @codex review comment
 ```
-A reaction binds to the head SHA reviewed: after you push a fix the prior 👍 is STALE — expect a fresh 👀→👍 on the new commit, and never read an old thumbs-up as covering a newer head. If a reaction and a comment disagree, trust whichever ties to the current head. Most sweeps need NO nudge — 👀 means "keep waiting", not "poke again".
+Every reaction binds to the head SHA the bot reviewed: after you push a fix the prior 👍 is STALE — expect a fresh 👀 → (👍 | cleared) on the new commit; never read an old thumbs-up as covering a newer head. Bottom line: NEVER nudge on a bare "no reaction" without first checking for inline findings — a cleared reaction almost always means issues are already posted, not that the bot is idle.
 
 ## Finding & resolving threads (GraphQL, not REST)
 REST (`gh api repos/<o>/<r>/pulls/<n>/comments`) reads a finding's body and posts a reply, but can't report resolution state — a PR looks "handled" while 30 threads sit UNRESOLVED. Use GraphQL to scan and resolve.
