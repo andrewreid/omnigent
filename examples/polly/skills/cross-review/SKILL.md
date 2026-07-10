@@ -9,6 +9,13 @@ The implementer never signs off on its own work — a different model does, and
 review is a sub-agent that returns a structured report, not a transcript
 anyone needs to read through.
 
+Default review is *confirmatory* — the reviewer gets the diff + contract and
+answers "does this fix do what it claims?". That is enough for isolated, low-state
+changes and NOT enough for stateful, combinatorial surfaces, where it is the single
+biggest time-sink polly hits: the states the contract never listed get discovered
+reactively, one external-bot round at a time, in the slow post-PR loop. Match the
+review DEPTH to the surface (see below).
+
 ## Procedure
 1. Get the task's diff. Per `review-before-pr`, review runs BEFORE a PR exists,
    so take the branch diff: `git -C .worktrees/<task_id> diff main...HEAD`. Use
@@ -54,6 +61,41 @@ anyone needs to read through.
    NOT merge it.
 7. If the contract can't be satisfied after a few loops, stop and escalate to
    the user with specifics.
+
+## Match review depth to the surface — confirmatory is not enough
+A confirmatory review confirms exactly the cells the contract lists and is BLIND to
+every state nobody enumerated. On a **combinatorially-rich surface** — serializers,
+form↔payload round-trips, state machines, derivations/classifiers whose output
+depends on many input states (loaded vs edited × valid/invalid/empty inputs ×
+per-line vs aggregate flags × present/absent references) — the contract can only name
+a handful of states, so a confirmatory pass keeps signing off diffs that the external
+Codex bot's whole-state-space reasoning then breaks LATER, one edge per round. That
+"bot found another edge → patch → re-review → bot found the next" grind is a
+confirmatory review that should have been ADVERSARIAL.
+
+Classify the surface BEFORE dispatching the reviewer. If it is rich, escalate review
+to adversarial:
+- **Widen the reviewer's context.** Give it the changed surface PLUS its adjacency
+  (the read / serialize / validate functions around the diff, the type it targets,
+  the consumers) — not just the raw hunk. Independence comes from a DIFFERENT vendor
+  and withholding the implementer's transcript, NOT from starving the reviewer of
+  context.
+- **Change the mandate.** Not "verify the fix" but "find the states that break":
+  instruct it to ENUMERATE the state space of the surface and ATTACK the cells the
+  contract did not name — "list every combination of {axes}; for each, does
+  load→edit→serialize round-trip correctly? which combinations silently drop,
+  mis-write, or wrongly block?". Mirror the external bot.
+- **Demand the FULL list in one pass.** The reviewer surfaces every issue it can find
+  now, exhaustively — not a trickle that becomes N rounds.
+- **Front-run the external bot.** Prefer running this adversarial pass on the SAME
+  engine as the external reviewer (`codex`) so its whole class of findings lands in
+  the FAST internal loop instead of the slow PR loop (see `pr-bot-loop` → front-run
+  the bot). Keep it a DIFFERENT vendor from the implementer.
+
+The cheapest place to close a state-space bug is the implementer's FIRST pass: pair
+this with `review-before-pr` — the acceptance contract for a rich surface must name
+the state-space axes and require an invariant / round-trip matrix test as a delivered
+artifact, so the surface is built right once instead of hardened reactively.
 
 ## Notes
 - Cross-review requires a reviewer from a DIFFERENT vendor than the implementer,

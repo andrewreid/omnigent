@@ -44,6 +44,28 @@ something to review against.
 6. Record the PR URL in the registry and mark the task ready for the human to
    merge. **polly does NOT merge** — the human does.
 
+## Rich surfaces: specify the state space in the contract, up front
+The most expensive failure mode in this loop is a **combinatorially-rich surface**
+(serializer, form↔payload round-trip, state machine, multi-input derivation/filter)
+shipped against a contract that enumerated only a few of its states. Each unlisted
+state becomes a later bot finding — code → review → PR → bot → patch, for hours,
+one edge at a time. Head it off at the SPEC, not the review:
+- When a task touches a rich surface, the acceptance contract you hand the implementer
+  MUST name the **state-space axes** (e.g. loaded vs edited, valid/invalid/empty
+  input, per-line vs aggregate flag, present/absent reference) and REQUIRE, as a
+  delivered artifact:
+  - a **single source of truth** for the classification (one classifier/normalizer all
+    consumers derive from — no parallel re-derivation that can disagree), and
+  - an **invariant / transition / round-trip matrix test** that exercises the cells of
+    that state space (including a cross-consumer agreement assertion where several code
+    paths must agree).
+- The pre-PR review for a rich surface is ADVERSARIAL, not confirmatory — see
+  `cross-review` → "Match review depth to the surface". Run it (ideally front-running
+  the external bot on `codex`) BEFORE opening the PR, so the state-space class of
+  finding lands in the fast internal loop.
+Build the surface right in one pass; do not let the external bot enumerate the state
+space for you across a dozen slow rounds.
+
 ## Notes
 - This flips the older "implementer opens its own PR immediately, then we
   review" ordering. If any other skill still implies PR-first, THIS policy wins:
