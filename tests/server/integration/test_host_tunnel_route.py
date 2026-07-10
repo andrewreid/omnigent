@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+from typing import cast
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlHost
+from omnigent.db.enum_codecs import encode_host_status
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
     HostHarnessReadinessFrame,
@@ -19,7 +21,7 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.server.auth import AuthProvider
-from omnigent.server.host_registry import HostRegistry
+from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.stores.host_store import HostStore
 
@@ -27,6 +29,22 @@ pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "1444b179a19322377dcc75cf7fcd1bd2"
 _TUNNEL_PATH = f"/v1/hosts/{_HOST_ID}/tunnel"
+
+
+class _CloseTrackingWebSocket:
+    """Minimal websocket double for ping-loop tests."""
+
+    def __init__(self) -> None:
+        self.closed: tuple[int, str] | None = None
+
+    async def close(self, *, code: int, reason: str) -> None:
+        self.closed = (code, reason)
+
+    async def send_text(self, data: str) -> None:
+        raise AssertionError(f"unexpected send_text: {data!r}")
+
+    async def receive_text(self) -> str:
+        raise AssertionError("unexpected receive_text")
 
 
 def _websocket_scope(
@@ -163,6 +181,19 @@ async def _wait_offline(
         await asyncio.sleep(0.01)
 
 
+async def _wait_registered_connection(
+    registry: HostRegistry,
+    host_id: str,
+    previous: object | None = None,
+) -> HostConnection:
+    """Poll until the registry holds a connection different from *previous*."""
+    while True:
+        conn = registry.get(host_id)
+        if conn is not None and conn is not previous:
+            return conn
+        await asyncio.sleep(0.01)
+
+
 async def _wait_updated_at_at_least(
     store: HostStore,
     host_id: str,
@@ -222,26 +253,71 @@ async def test_host_tunnel_ping_loop_persists_heartbeat(
     comm = await _connect_route(app, _TUNNEL_PATH)
     await _send_hello_and_wait(comm, registry)
 
-    # Age the row far into the past, as if the last touch were long ago.
+    # Age the row and simulate residual stale cleanup marking it offline.
     stale = now_epoch() - 10_000
     engine = get_or_create_engine(db_uri)
     with Session(engine) as session:
         session.execute(
-            update(SqlHost).where(SqlHost.host_id == _HOST_ID).values(updated_at=stale)
+            update(SqlHost)
+            .where(SqlHost.host_id == _HOST_ID)
+            .values(status=encode_host_status("offline"), updated_at=stale)
         )
         session.commit()
 
-    # The ping loop should heartbeat within a couple of intervals,
-    # dragging updated_at back to ~now while status stays online.
+    # The ping loop should refresh liveness and self-heal status to online.
     observed = await _wait_updated_at_at_least(store, _HOST_ID, now_epoch() - 5)
     assert observed >= now_epoch() - 5, "ping loop did not persist a fresh heartbeat"
 
     host = store.get_host(_HOST_ID)
     assert host is not None
-    assert host.status == "online", "heartbeat must not change status"
+    assert host.status == "online", "heartbeat should self-heal a live tunnel online"
 
     # Clean up the live tunnel so the loop stops.
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+async def test_host_tunnel_ping_loop_exits_when_heartbeat_is_superseded(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero-row heartbeat means another session owns the host row."""
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.01)
+    monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
+
+    store = HostStore(db_uri)
+    store.upsert_on_connect(
+        _HOST_ID,
+        "test-laptop",
+        "alice@example.com",
+        conn_session_id="session-newer",
+    )
+    ws = _CloseTrackingWebSocket()
+    registry = HostRegistry()
+    conn = registry.register(
+        _HOST_ID,
+        ws,
+        HostHelloFrame(
+            version="0.1.0-test",
+            frame_protocol_version=1,
+            name="test-laptop",
+            runners=[],
+        ),
+        owner="alice@example.com",
+        session_id="session-stale",
+    )
+
+    await asyncio.wait_for(
+        tunnel_mod._ping_loop(cast(WebSocket, ws), conn, _HOST_ID, store),
+        timeout=1.0,
+    )
+
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert host.conn_session_id == "session-newer"
+    assert ws.closed is None
+    assert conn.outbound_queue.empty()
 
 
 async def test_host_tunnel_accepts_and_registers(
@@ -303,6 +379,7 @@ async def test_host_tunnel_upserts_db_on_connect(
     assert host is not None, "Host row should exist in DB after tunnel connect"
     assert host.name == "test-laptop"
     assert host.status == "online"
+    assert host.conn_session_id is not None
 
 
 async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
@@ -388,6 +465,56 @@ async def test_host_tunnel_sets_offline_on_disconnect(
     host = store.get_host(_HOST_ID)
     assert host is not None
     assert host.status == "offline"
+
+
+async def test_replaced_connection_cleanup_does_not_offline_new_connection(
+    db_uri: str,
+) -> None:
+    """A stale tunnel's cleanup cannot deregister or offline its replacement."""
+    registry = HostRegistry()
+    store = HostStore(db_uri)
+    disconnects: list[str] = []
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(
+            registry,
+            store,
+            on_host_disconnect=lambda host_id: _record_disconnect(disconnects, host_id),
+        ),
+        prefix="/v1",
+    )
+
+    comm_a = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm_a, registry, name="first")
+    conn_a = registry.get(_HOST_ID)
+    assert conn_a is not None
+
+    comm_b = await _connect_route(app, _TUNNEL_PATH)
+    await comm_b.send_input({"type": "websocket.receive", "text": _make_hello("second")})
+    conn_b = await asyncio.wait_for(
+        _wait_registered_connection(registry, _HOST_ID, previous=conn_a),
+        timeout=2.0,
+    )
+
+    await comm_a.wait(timeout=2.0)
+
+    assert registry.get(_HOST_ID) is conn_b
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert host.status == "online"
+    assert host.conn_session_id == conn_b.session_id
+    assert disconnects == []
+
+    await comm_b.send_input({"type": "websocket.disconnect", "code": 1000})
+    await comm_b.wait(timeout=2.0)
+    await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=2.0)
+    assert registry.get(_HOST_ID) is None
+    assert disconnects == [_HOST_ID]
+
+
+async def _record_disconnect(disconnects: list[str], host_id: str) -> None:
+    """Append a disconnect notification for route cleanup assertions."""
+    disconnects.append(host_id)
 
 
 async def test_host_tunnel_rejects_bad_protocol_version(

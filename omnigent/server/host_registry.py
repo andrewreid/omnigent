@@ -17,6 +17,7 @@ import asyncio
 import logging
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -222,6 +223,8 @@ class HostConnection:
         Resolved when the host sends ``host.fs_result``. Values
         carry ``status``, ``payload``, ``error_status``,
         ``error_code``, and ``error``.
+    :param session_id: Per-connection ownership token used to fence
+        disconnect cleanup against newer replacement connections.
     """
 
     host_id: str
@@ -261,6 +264,7 @@ class HostConnection:
     pending_fs_requests: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 class HostRegistry:
@@ -282,6 +286,8 @@ class HostRegistry:
         ws: WebSocketLike,
         hello: HostHelloFrame,
         owner: str | None,
+        *,
+        session_id: str | None = None,
     ) -> HostConnection:
         """Register a host connection (newest wins).
 
@@ -294,6 +300,8 @@ class HostRegistry:
         :param ws: The live WebSocket.
         :param hello: The hello frame from the host.
         :param owner: Authenticated user ID, or ``None``.
+        :param session_id: Optional preallocated ownership token. The
+            host tunnel passes the token already written to the DB row.
         :returns: The new :class:`HostConnection`. Its ``host_id`` is
             the canonical form (see :func:`_canonical_host_id`).
         """
@@ -307,6 +315,7 @@ class HostRegistry:
             outbound_queue=asyncio.Queue(),
             connected_at=now,
             last_frame_at=now,
+            session_id=session_id or uuid.uuid4().hex,
         )
         with self._lock:
             old = self._hosts.get(host_id)
@@ -319,16 +328,23 @@ class HostRegistry:
             self._hosts[host_id] = conn
         return conn
 
-    def deregister(self, host_id: str) -> None:
-        """Remove a host connection.
+    def deregister(self, host_id: str, conn: HostConnection) -> bool:
+        """Remove a host connection only if it is still current.
 
-        No-op if ``host_id`` is not registered.
+        No-op if ``host_id`` is not registered or has been replaced by
+        a newer connection.
 
         :param host_id: Host identifier to remove, in any accepted
             spelling (see :func:`_canonical_host_id`).
+        :param conn: Connection that is attempting cleanup.
+        :returns: ``True`` if the entry was removed, otherwise ``False``.
         """
         with self._lock:
-            self._hosts.pop(_canonical_host_id(host_id), None)
+            host_id = _canonical_host_id(host_id)
+            if self._hosts.get(host_id) is conn:
+                del self._hosts[host_id]
+                return True
+            return False
 
     def get(self, host_id: str) -> HostConnection | None:
         """Look up a live host connection.

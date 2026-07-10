@@ -80,8 +80,8 @@ def test_deregister() -> None:
     pop() call is missing or targeting the wrong key.
     """
     registry = HostRegistry()
-    registry.register("host_bbb", FakeWebSocket(), _make_hello(), owner="bob")
-    registry.deregister("host_bbb")
+    conn = registry.register("host_bbb", FakeWebSocket(), _make_hello(), owner="bob")
+    assert registry.deregister("host_bbb", conn) is True
 
     assert registry.get("host_bbb") is None
 
@@ -94,7 +94,8 @@ def test_deregister_noop_for_unknown() -> None:
     registration; it must not raise.
     """
     registry = HostRegistry()
-    registry.deregister("host_nonexistent")
+    conn = registry.register("host_other", FakeWebSocket(), _make_hello(), owner="bob")
+    assert registry.deregister("host_nonexistent", conn) is False
 
 
 def test_online_host_ids() -> None:
@@ -106,13 +107,13 @@ def test_online_host_ids() -> None:
     If a registered host is missing, the dict insert is broken.
     """
     registry = HostRegistry()
-    registry.register("host_c1", FakeWebSocket(), _make_hello(), owner="carol")
+    conn = registry.register("host_c1", FakeWebSocket(), _make_hello(), owner="carol")
     registry.register("host_c2", FakeWebSocket(), _make_hello(), owner="carol")
 
     ids = registry.online_host_ids()
     assert set(ids) == {"host_c1", "host_c2"}
 
-    registry.deregister("host_c1")
+    assert registry.deregister("host_c1", conn) is True
     ids = registry.online_host_ids()
     assert ids == ["host_c2"]
 
@@ -140,6 +141,20 @@ def test_register_replaces_stale_connection() -> None:
     # The None sentinel tells the sender loop to exit.
     poison = old_conn.outbound_queue.get_nowait()
     assert poison is None
+
+
+def test_deregister_old_connection_does_not_remove_replacement() -> None:
+    """A stale connection cannot deregister the newer live owner."""
+    registry = HostRegistry()
+    old_conn = registry.register("host_replace", FakeWebSocket(), _make_hello(), owner="dave")
+    new_conn = registry.register("host_replace", FakeWebSocket(), _make_hello(), owner="dave")
+
+    assert old_conn.session_id != new_conn.session_id
+    assert registry.deregister("host_replace", old_conn) is False
+    assert registry.get("host_replace") is new_conn
+
+    assert registry.deregister("host_replace", new_conn) is True
+    assert registry.get("host_replace") is None
 
 
 def test_send_text_enqueues_frame() -> None:

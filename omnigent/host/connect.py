@@ -15,6 +15,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,6 +89,8 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.limits import (
+    HOST_TUNNEL_INBOUND_IDLE_TIMEOUT_S,
+    HOST_TUNNEL_RECV_POLL_TIMEOUT_S,
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
@@ -192,7 +195,7 @@ def _install_child_subreaper() -> bool:
 
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
         _PR_SET_CHILD_SUBREAPER = 36
-        return libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
+        return bool(libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0)
     except (OSError, AttributeError):
         return False
 
@@ -2053,16 +2056,34 @@ class HostProcess:
         loop = asyncio.get_running_loop()
         next_quick_refresh = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
         next_full_refresh = loop.time() + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
+        last_inbound_at = time.monotonic()
+        watchdog_armed = False
         while True:
             raw: object | None = None
-            with contextlib.suppress(asyncio.TimeoutError):
+            # Wake on whichever comes first: a readiness-refresh deadline or the
+            # watchdog poll tick, so neither the refresh nor the idle check stalls.
+            deadline = min(
+                next_quick_refresh,
+                next_full_refresh,
+                loop.time() + HOST_TUNNEL_RECV_POLL_TIMEOUT_S,
+            )
+            try:
                 raw = await asyncio.wait_for(
                     ws.recv(),
-                    timeout=max(
-                        0.0,
-                        min(next_quick_refresh, next_full_refresh) - loop.time(),
-                    ),
+                    timeout=max(0.0, deadline - loop.time()),
                 )
+            except asyncio.TimeoutError as exc:
+                if watchdog_armed:
+                    idle_s = time.monotonic() - last_inbound_at
+                    if idle_s > HOST_TUNNEL_INBOUND_IDLE_TIMEOUT_S:
+                        missed = round(idle_s / TUNNEL_KEEPALIVE_PING_INTERVAL_S)
+                        _logger.warning(
+                            "Host tunnel inbound idle watchdog fired: idle %.1fs, "
+                            "~%d missed server pings; tearing down tunnel",
+                            idle_s,
+                            missed,
+                        )
+                        raise ConnectionError("host tunnel inbound idle timeout") from exc
 
             now = loop.time()
             refresh_full_map = now >= next_full_refresh
@@ -2087,11 +2108,13 @@ class HostProcess:
                     )
                     configured_harnesses = latest_harnesses
             if isinstance(raw, str):
-                await self._handle_raw_message(ws, raw)
+                last_inbound_at = time.monotonic()
+                if await self._handle_raw_message(ws, raw):
+                    watchdog_armed = True
 
     async def _handle_raw_message(
         self, ws: websockets.asyncio.client.ClientConnection, raw: str
-    ) -> None:
+    ) -> bool:
         """Decode one inbound text frame and route it to a handler.
 
         Host frames go to :meth:`_dispatch_host_frame`; a runner
@@ -2101,7 +2124,7 @@ class HostProcess:
 
         :param ws: The open tunnel connection, used to send replies.
         :param raw: The raw text frame received off the socket.
-        :returns: None.
+        :returns: ``True`` when the frame was a server app ``PingFrame``.
         """
         try:
             frame = decode_host_frame(raw)
@@ -2111,10 +2134,11 @@ class HostProcess:
             try:
                 runner_frame = decode_frame(raw)
             except ValueError:
-                return
+                return False
             if isinstance(runner_frame, PingFrame):
                 await ws.send(encode_frame(PongFrame(ts=runner_frame.ts)))
-            return
+                return True
+            return False
         # Handle the frame inside a CONSUMER span parented on the trace
         # context the server stamped into the frame envelope, so the
         # host's work (and the result frame it sends back) nests under
@@ -2131,6 +2155,7 @@ class HostProcess:
         kind = raw_kind if isinstance(raw_kind, str) else type(frame).__name__
         with telemetry.consume_frame_span(kind, carrier):
             await self._dispatch_host_frame(ws, frame)
+        return False
 
     async def _dispatch_host_frame(
         self,

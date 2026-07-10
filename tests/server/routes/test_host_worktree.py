@@ -48,6 +48,11 @@ class _FakeWebSocket:
         """
         self.sent.append(data)
 
+    async def receive_text(self) -> str:
+        """Block forever; worktree proxy tests only send to the fake."""
+        await asyncio.sleep(3600)
+        return ""  # pragma: no cover
+
 
 def _hello_frame() -> HostHelloFrame:
     """Construct a hello frame for registry registration.
@@ -72,7 +77,7 @@ async def host_setup() -> AsyncIterator[HostRegistry]:
     ws = _FakeWebSocket()
     conn = registry.register(
         host_id=_HOST_ID,
-        ws=ws,  # type: ignore[arg-type] — duck-typed
+        ws=ws,
         hello=_hello_frame(),
         owner=None,
     )
@@ -251,7 +256,7 @@ async def test_create_worktree_connection_lost_raises_unavailable(
     assert conn is not None
     # Deregister so the registry no longer recognizes this conn ->
     # send_text raises ConnectionError on the next send.
-    registry.deregister(_HOST_ID)
+    registry.deregister(_HOST_ID, conn)
 
     with pytest.raises(WorktreeHostUnavailableError) as exc:
         await create_worktree_on_host(
@@ -281,7 +286,7 @@ async def test_create_worktree_timeout_raises_unavailable(
     registry = HostRegistry()
     registry.register(
         host_id="host_silent",
-        ws=_FakeWebSocket(),  # type: ignore[arg-type] — duck-typed
+        ws=_FakeWebSocket(),
         hello=_hello_frame(),
         owner=None,
     )
