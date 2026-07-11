@@ -41,6 +41,10 @@ Every reaction binds to the head SHA the bot reviewed: after you push a fix the 
 ## Finding & resolving threads (GraphQL, not REST)
 REST (`gh api repos/<o>/<r>/pulls/<n>/comments`) reads a finding's body and posts a reply, but can't report resolution state — a PR looks "handled" while 30 threads sit UNRESOLVED. Use GraphQL to scan and resolve.
 
+> **Bot-login suffix trap (caused a real false clean bill).** The bot's login is spelled DIFFERENTLY across GitHub's two APIs: REST (`issues/comments`, `pulls/comments`, `reactions`) returns it WITH the suffix — `chatgpt-codex-connector[bot]` — but GraphQL `author.login` returns it WITHOUT — `chatgpt-codex-connector`. Never copy a login from a REST payload into a GraphQL `select(...)` filter: the `[bot]` suffix will match nothing, silently yield `unresolved=0`, and read as a clean bill while findings sit open. Use the GraphQL query above VERBATIM (login already correct); never hand-edit its login.
+>
+> **Treat `unresolved=0` as SUSPECT** whenever a review was just posted/re-requested. Cross-check against `reviewThreads.totalCount` (or count all `nodes`): if total threads > 0 but the bot-filtered unresolved count is 0, the FILTER is likely wrong (suffix trap, wrong `<your-login>`, wrong owner/repo) — re-verify before calling any clean bill.
+
 Scan bot threads (state + whether YOU replied):
 ```
 gh api graphql -f query='
