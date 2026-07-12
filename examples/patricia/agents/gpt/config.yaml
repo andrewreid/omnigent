@@ -31,12 +31,12 @@ description: >-
 # key under ``config`` would parse but be silently ignored, so none is written
 # here.
 #
-# Why codex rather than openai-agents: codex provides native web search for
-# free, which this head relies on (hence no web builtins are declared below);
-# openai-agents would require web tooling wired in explicitly. The codex CLI
-# login is this head's configured auth path. (Historically the codex harness
-# also avoided the openai-agents unpinned-model→Databricks fallback, but with
-# ``model: gpt-5.6-sol`` pinned above that concern no longer applies.)
+# Why codex rather than openai-agents: the codex harness provides native web
+# search at no extra config, which this head relies on — that is why no web
+# builtins are declared below (openai-agents would need web tooling wired in
+# explicitly). (Historically codex also avoided the openai-agents
+# unpinned-model→Databricks fallback; moot now that ``model: gpt-5.6-sol`` is
+# pinned above.)
 executor:
   type: omnigent
   model: gpt-5.6-sol
