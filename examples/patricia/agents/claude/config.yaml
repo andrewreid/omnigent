@@ -41,9 +41,14 @@ executor:
 # bwrap backend always provides, regardless of the read-only cwd. The head
 # writes any notes there (see prompt); the grounded repo is never mutated.
 #
-# The sandbox is ``linux_bwrap`` (not ``type: none``) because web_fetch/
-# web_search need outbound network, and network-enabled is the bwrap default
-# (``allow_network: true``, stated explicitly here for clarity).
+# The sandbox is ``linux_bwrap`` (not ``type: none``) to CONTAIN grounding: it
+# is what binds the grounded repo (cwd, incl ``.git``) READ-ONLY and masks the
+# repo's dotfile secrets, per the security model above. It is NOT required for
+# the web tools — ``web_search`` runs runner-side and ``web_fetch``'s researcher
+# inherits this parent sandbox, so web works under ``type: none`` too. Network
+# is enabled here anyway (``allow_network: true``, the bwrap default, stated
+# explicitly for clarity) so ``web_fetch`` can still reach outbound hosts from
+# inside the contained head.
 os_env:
   type: caller_process
   cwd: .
@@ -51,6 +56,15 @@ os_env:
     type: linux_bwrap
     # No write_paths: cwd (the grounded repo, incl .git) is read-only.
     cwd_allow_hidden: [".git"]
+    # Mask EVERY dotfile in the grounded cwd, whatever the repo size. The
+    # dotfile mask hides stray secrets (.env, .aws, .ssh, ...) by recursively
+    # scanning the cwd; the default ``warn`` overflow SILENTLY leaves files
+    # readable once the 50k-entry cap is hit, so a large real repo (node_modules,
+    # a deep .git) would leak creds past the cap — unacceptable. ``error`` would
+    # instead FAIL boot on any such repo, breaking grounding. ``unlimited`` walks
+    # the full tree and completes the mask with no leak, at a one-time boot-scan
+    # cost — the only safe choice for a head that grounds on arbitrary repos.
+    cwd_hidden_scan_overflow: unlimited
     allow_network: true
 
 # Same blast-radius guardrail Polly's sub-agents use, so the shell behaves
