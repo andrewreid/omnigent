@@ -5,11 +5,31 @@ description: >-
   real merged code (reads it, cites file:line), critiques the other head's
   position across rounds, and signs the ratified contract.
 
-# Engineering-debate responder on the Codex harness. No model is pinned, so it
-# resolves your configured OpenAI/Codex provider's default GPT model. It has
-# filesystem access (see the ``os_env`` block below) so it can read the merged
-# code it is grounded on. Web search is native/free on codex, so no web tool is
-# declared here (see the claude head, which must add web tools explicitly).
+# Engineering-debate responder on the Codex harness. The model is pinned to
+# ``gpt-5.6-sol`` (top-level ``executor.model``, parsed into
+# ``ExecutorSpec.model`` and forwarded to the harness launch via
+# ``HARNESS_CODEX_MODEL``) so this head always debates on the intended frontier
+# GPT model rather than the provider's default. ``gpt-5.6-sol`` is NOT in the
+# repo's static model catalog (codex static ids are gpt-5.5/5.4) — the model id
+# is a passthrough string (parser.py stores ``executor.model`` verbatim; there
+# is no catalog membership check), so it validates clean and resolves at the
+# codex CLI login. It has filesystem access (see the ``os_env`` block below) so
+# it can read the merged code it is grounded on. Web search is native/free on
+# codex, so no web tool is declared here (see the claude head, which must add
+# web tools explicitly).
+#
+# REASONING EFFORT IS NOT SPEC-PINNABLE HERE. For a ``type: omnigent`` harness
+# head, effort is a per-session value only — there is no static config slot. The
+# harness adapter reads effort exclusively from the per-turn request
+# (``omnigent/runtime/harnesses/_executor_adapter.py`` — "No per-conversation
+# executor configuration via spec"), and the launch env-var table
+# ``UcodeHarnessConfig`` (omnigent/runtime/workflow.py) carries a ``model_key``
+# but NO ``effort_key``. So to run this head at max effort you set it per
+# session (web ``/effort`` picker → ``xhigh`` for codex, the top of
+# ``OPENAI_EFFORTS`` in omnigent/reasoning_effort.py — OpenAI has no ``max``);
+# with nothing set the provider default effort applies. A ``reasoning_effort``
+# key under ``config`` would parse but be silently ignored, so none is written
+# here.
 #
 # Why codex rather than openai-agents: the openai-agents harness treats an
 # unpinned model as a Databricks model (see
@@ -20,6 +40,7 @@ description: >-
 # codex harness has no such unpinned-model Databricks fallback.
 executor:
   type: omnigent
+  model: gpt-5.6-sol
   config:
     harness: codex
 

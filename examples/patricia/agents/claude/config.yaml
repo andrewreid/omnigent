@@ -5,13 +5,29 @@ description: >-
   on real merged code (reads it, cites file:line), critiques the other head's
   position across rounds, and signs the ratified contract.
 
-# Engineering-debate responder on the Claude Agent SDK. No model is pinned, so
-# it runs on whatever Claude provider you configured (`omnigent setup`). It has
-# filesystem access (see the ``os_env`` block below) so it can read the merged
-# code it is grounded on, plus web tools so it can pull contemporary docs and
-# references mid-debate.
+# Engineering-debate responder on the Claude Agent SDK. The model is pinned to
+# ``claude-fable-5`` (top-level ``executor.model``, parsed into
+# ``ExecutorSpec.model`` and forwarded to the harness launch via
+# ``HARNESS_CLAUDE_SDK_MODEL``) so this head always debates on the intended
+# frontier model rather than whatever provider default ``omnigent setup`` left
+# configured. It has filesystem access (see the ``os_env`` block below) so it
+# can read the merged code it is grounded on, plus web tools so it can pull
+# contemporary docs and references mid-debate.
+#
+# REASONING EFFORT IS NOT SPEC-PINNABLE HERE. For a ``type: omnigent`` harness
+# head, effort is a per-session value only — there is no static config slot. The
+# harness adapter reads effort exclusively from the per-turn request
+# (``omnigent/runtime/harnesses/_executor_adapter.py`` — "No per-conversation
+# executor configuration via spec"), and the launch env-var table
+# ``UcodeHarnessConfig`` (omnigent/runtime/workflow.py) carries a ``model_key``
+# but NO ``effort_key``. So to run this head at max effort you set it per
+# session (web ``/effort`` picker → ``max`` for Claude, the top of
+# ``ANTHROPIC_EFFORTS`` in omnigent/reasoning_effort.py); with nothing set the
+# provider default effort applies. A ``reasoning_effort`` key under ``config``
+# would parse but be silently ignored, so none is written here.
 executor:
   type: omnigent
+  model: claude-fable-5
   config:
     harness: claude-sdk
 
