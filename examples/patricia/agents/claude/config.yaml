@@ -58,12 +58,14 @@ os_env:
     cwd_allow_hidden: [".git"]
     # Mask EVERY dotfile in the grounded cwd, whatever the repo size. The
     # dotfile mask hides stray secrets (.env, .aws, .ssh, ...) by recursively
-    # scanning the cwd; the default ``warn`` overflow SILENTLY leaves files
-    # readable once the 50k-entry cap is hit, so a large real repo (node_modules,
-    # a deep .git) would leak creds past the cap — unacceptable. ``error`` would
-    # instead FAIL boot on any such repo, breaking grounding. ``unlimited`` walks
+    # scanning the cwd; the default ``warn`` overflow leaves files readable PAST
+    # the 50k-entry cap (it does emit a CRITICAL log, not silently), so a large
+    # real repo (node_modules, a deep .git) would leak creds past the cap —
+    # unacceptable. ``error`` is the fail-safe (boot fails rather than risk a
+    # partial mask) but would break grounding on large repos. ``unlimited`` walks
     # the full tree and completes the mask with no leak, at a one-time boot-scan
-    # cost — the only safe choice for a head that grounds on arbitrary repos.
+    # cost — a deliberate availability-over-security tradeoff, acceptable HERE
+    # because Patricia grounds on TRUSTED repos, not arbitrary hostile input.
     cwd_hidden_scan_overflow: unlimited
     allow_network: true
 
