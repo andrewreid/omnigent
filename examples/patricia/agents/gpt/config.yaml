@@ -31,13 +31,14 @@ description: >-
 # key under ``config`` would parse but be silently ignored, so none is written
 # here.
 #
-# Why codex rather than openai-agents: the openai-agents harness treats an
-# unpinned model as a Databricks model (see
-# omnigent/inner/openai_agents_sdk_executor.py — `is_databricks_model =
-# model is None`) and, with no OPENAI_API_KEY/OPENAI_BASE_URL in the
-# environment, silently falls back to ambient Databricks credentials — routing
-# Patricia's "GPT" head through the Databricks gateway instead of OpenAI. The
-# codex harness has no such unpinned-model Databricks fallback.
+# Why codex rather than openai-agents: with ``model: gpt-5.6-sol`` pinned above,
+# the transport must be one that can actually serve that id. gpt-5.6-sol
+# resolves at the codex CLI login (the codex harness authenticates through it);
+# it is not a plain OpenAI-API model reachable from the openai-agents harness
+# with an OPENAI_API_KEY. Codex also provides native web search for free, which
+# this head relies on (hence no web builtins are declared below), whereas the
+# openai-agents harness would need web tooling wired in explicitly. So the codex
+# harness is chosen on its own merits for this pinned model.
 executor:
   type: omnigent
   model: gpt-5.6-sol
