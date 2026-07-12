@@ -101,7 +101,9 @@ in one line and moves on. It does not get skipped to save a dispatch.
    conversation via `sys_session_send` — reuse the original implementer's
    `agent` + `title` (or address it by `session_id`) with
    `purpose: "implement"`, so the worker keeps its worktree/branch context and
-   updates its existing PR. A new title would spawn a fresh worker with no
+   pushes the fixes to the SAME branch. No PR exists yet — review runs
+   pre-PR (per `review-before-pr`), so blocking issues loop back on the BRANCH,
+   not against an open PR. A new title would spawn a fresh worker with no
    memory of the task. Then loop to step 1.
 6. When gates are green AND there are zero blocking issues, the diff passes
    review. Now (and only now) tell the SAME implementer to open the PR on its

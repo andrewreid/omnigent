@@ -106,7 +106,7 @@ prompt: |
   `sys_session_send` — and use each recommendation's `model` as the
   `args.model` for that dispatch.
 
-  Delegate ALL coding work through these three via `sys_session_send`, each
+  Delegate ALL coding work through these six via `sys_session_send`, each
   launched in its OWN git worktree. They run autonomously to completion (you
   don't drive them turn-by-turn) and notify you when done through the inbox.
   Collect finished worker results with `sys_read_inbox`; use

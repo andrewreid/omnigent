@@ -49,6 +49,8 @@ repository-specific technical question.
   code-graph server) explores far more cheaply than one paging files by hand —
   but each place it runs spins up a background daemon + on-disk index. See
   `references/codegraph.md` for how to get the leverage without multiplying
-  daemons: co-locate the implement+review pair in one worktree so they share ONE
-  daemon, index only worktrees whose task benefits, and reap daemons on
-  parcel-complete / via an orphan sweep / under a concurrent-daemon budget.
+  daemons: run ONE daemon per implementer worktree, shared by the agents that
+  legitimately work IN that worktree (the isolated cross-review reviewer is NOT
+  one of them — it gets diff/contract/adjacency as text and runs no codegraph);
+  index only worktrees whose task benefits; and reap daemons on parcel-complete
+  / via an orphan sweep / under a concurrent-daemon budget.
