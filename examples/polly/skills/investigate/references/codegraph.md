@@ -16,10 +16,20 @@ bounding the daemon/index footprint.
 ## How the daemon actually works (the fact that makes sharing free)
 - **ONE detached daemon per project ROOT.** A client (the MCP server, or a bare
   `codegraph explore` / `codegraph node`) lazily spawns a single background
-  daemon for the repo root it runs in. Process signature: `codegraph serve
-  --mcp`. It listens on a Unix socket at `<root>/.codegraph/daemon.sock` and
-  records its pid in `<root>/.codegraph/daemon.log`
-  (`Listening on <…>/daemon.sock (pid <N>, v1.0.1). Idle timeout 300000ms.`).
+  daemon for the repo root it runs in. On 1.0.1 the daemon runs as the bundled
+  `node` binary (`comm` = `MainThread`, `/proc/<pid>/exe` → `…/codegraph-linux-x64/node`),
+  with the codegraph entrypoint in its argv:
+  `…/node … codegraph.js serve --mcp --path <root>`. It does NOT exec as a
+  process literally named `codegraph`.
+- **It records its own pid in a state file** at `<root>/.codegraph/daemon.pid`
+  (grounded against a live 1.0.1 daemon) — JSON:
+  `{"pid":<N>,"version":"1.0.1","socketPath":"/tmp/codegraph-<hash>.sock","startedAt":<epochMs>}`.
+  The same pid is echoed to `<root>/.codegraph/daemon.log`
+  (`Listening on /tmp/codegraph-<hash>.sock (pid <N>, v1.0.1). Idle timeout 300000ms.`).
+  Note the socket is a HASHED path under `/tmp`, not `<root>/.codegraph/daemon.sock`.
+  On a clean shutdown (SIGTERM / picker-stop) the daemon REMOVES `daemon.pid`
+  (verified) — so a present `daemon.pid` whose pid is alive means a live daemon,
+  and its absence means none.
 - **N concurrent clients share that ONE daemon over the socket.** The daemon
   tracks a live client count (its shutdown log reads
   `Shutting down (… clients=<N>)`). So multiple agents legitimately working in
@@ -79,56 +89,59 @@ daemon is mandatory (it is the RAM cost); keeping vs dropping the on-disk `.db`
 is a CHOICE — keep it if the same worktree will be reused for the next parcel
 (warm index), drop it if the worktree is being torn down for good.
 
-Target the ONE daemon for a given worktree root by cwd (each daemon's cwd is its
-project root — grounded via `/proc/<pid>/cwd`).
+Target the ONE daemon for a given worktree root by its OWN RECORDED PID, read
+from `<root>/.codegraph/daemon.pid`. Do NOT match process signatures — see below.
 
-> **DANGER — a bare `pgrep -f 'codegraph serve --mcp'` can kill its OWN shell.**
-> `pgrep -f` matches the FULL command line, so the shell that is running this
-> teardown (its argv literally contains the string `codegraph serve --mcp`),
-> the `pgrep` itself, and any editor/pager showing this doc ALL match — and the
-> invoking shell's cwd is usually `$ROOT` too, so the cwd filter does not save
-> you. NEVER kill on the `-f` pattern alone. A candidate is a real daemon ONLY
-> if `/proc/<pid>/exe` resolves to the codegraph binary, and you must EXCLUDE
-> the current shell pid and its ancestors.
+> **Why not `pgrep`/`pkill` on a signature (the trap this replaced).** Two
+> ways it fails on real 1.0.1:
+> 1. **It can't find the daemon.** The daemon runs as the bundled `node`
+>    (`/proc/<pid>/exe` → `…/codegraph-linux-x64/node`, `comm` = `MainThread`),
+>    NOT a process named `codegraph`. So `pgrep -x codegraph` matches NOTHING,
+>    and an exe-guard of `*/codegraph` rejects every `pgrep -f` hit — the kill is
+>    a no-op against the actual daemon (verified on this machine).
+> 2. **It can kill the wrong thing.** `pgrep -f 'codegraph serve --mcp'` matches
+>    the FULL command line, so the shell running this teardown (its argv contains
+>    that literal), the `pgrep` itself, and any editor/pager showing this doc all
+>    match — and the shell's cwd is usually `$ROOT` too, so a cwd filter does not
+>    save it.
+>
+> The recorded pid sidesteps both: it is the daemon's OWN pid (never the shell's,
+> so self-kill is impossible) and it is the ACTUAL running process (so the kill
+> works). Guard against a STALE pidfile (pid dead, or reused by an unrelated
+> process) by verifying the pid is alive, its cwd equals `$ROOT`, and its argv
+> still names the codegraph entrypoint before signalling.
 
-**Prefer codegraph's own stop path when a human is at the terminal.** v1.0.1
+**Prefer codegraph's own stop path when a human is at the terminal.** 1.0.1
 ships an interactive picker — `codegraph daemon` (alias `codegraph daemons`) —
 that lists running daemons and stops the selected one on Enter; it cannot
 self-match. Use it for hand-driven teardown. `CONFIRM against codegraph 1.0.1`:
-the picker exists, but a non-interactive `codegraph daemon stop <root>` form is
-NOT verified on this version — do not script it until confirmed.
+the picker exists (verified), but a non-interactive `codegraph daemon stop
+<root>` / `--pidfile` form is NOT verified on this version — do not script it
+until confirmed.
 
-For automated (non-interactive) teardown, use an exe-verified, self-excluding
-kill — it cannot terminate the invoking shell because a shell's `/proc/<pid>/exe`
-is the shell binary, never codegraph, and self+ancestors are excluded outright:
+For automated (non-interactive) teardown, kill by the recorded pid:
 
 ```bash
-# kill only the codegraph DAEMON serving <root>; never the caller or a look-alike
+# kill only the codegraph DAEMON serving <root>, by its OWN recorded pid.
 ROOT=/abs/path/to/worktree
+PIDFILE="$ROOT/.codegraph/daemon.pid"
 
-# build the exclusion set: this shell + every ancestor pid (walk the ppid chain)
-exclude=" $$ "
-p=$$
-while [ "$p" -gt 1 ]; do
-  ppid=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null) || break
-  [ -n "$ppid" ] || break
-  exclude="$exclude$ppid "
-  p=$ppid
-done
+[ -f "$PIDFILE" ] || { echo "no daemon.pid — no live daemon for $ROOT"; exit 0; }
+# daemon.pid is JSON: {"pid":N,"version":"1.0.1","socketPath":"/tmp/…","startedAt":…}
+PID=$(sed -n 's/.*"pid" *: *\([0-9]\{1,\}\).*/\1/p' "$PIDFILE")   # or: jq -r .pid "$PIDFILE"
 
-for pid in $(pgrep -x codegraph); do          # -x: exact argv0 == "codegraph", not a substring match
-  case "$exclude" in *" $pid "*) continue ;; esac          # never signal self or an ancestor
-  exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null)
-  case "$exe" in */codegraph) ;; *) continue ;; esac       # must resolve to the codegraph binary
-  grep -qz -- 'serve' "/proc/$pid/cmdline" 2>/dev/null || continue   # a serving daemon, not a one-shot client
-  [ "$(readlink /proc/$pid/cwd 2>/dev/null)" = "$ROOT" ] && kill "$pid"
-done
+[ -n "$PID" ] && kill -0 "$PID" 2>/dev/null || { echo "recorded pid dead/absent — stale pidfile"; exit 0; }
+# stale-pidfile / pid-reuse guards: right worktree AND still the codegraph daemon
+[ "$(readlink /proc/$PID/cwd 2>/dev/null)" = "$ROOT" ] || { echo "pid $PID cwd != $ROOT — not this daemon"; exit 0; }
+grep -qa 'codegraph.js' "/proc/$PID/cmdline" 2>/dev/null || { echo "pid $PID not a codegraph process — refusing"; exit 0; }
+
+kill "$PID"   # SIGTERM; the daemon removes its own daemon.pid on clean shutdown
 ```
 
-If `pgrep -x codegraph` misses the daemon on your install (some builds exec it
-as `node`/another argv0), fall back to `pgrep -f 'codegraph serve --mcp'` but
-KEEP every guard above — the `/proc/<pid>/exe` check and the self+ancestor
-exclusion are what make it safe, not the pattern.
+This is self-kill-impossible (the pid comes from the daemon's own state file, it
+is never `$$`) and functional (it is the live daemon's real pid). The `cwd` and
+`codegraph.js` checks are the only defence against a stale pidfile whose number
+has been recycled by an unrelated process — keep them.
 
 Drop the on-disk index too (only when retiring the worktree):
 
@@ -145,34 +158,41 @@ codegraph uninit "$ROOT"   # deletes <root>/.codegraph/  — CONFIRM subcommand 
 > active-worktree registry), and "idle / stale" needs an idleness source Polly
 > must define (e.g. the daemon's own last-activity from `daemon.log`, or an
 > mtime/registry timestamp — codegraph exposes no idle-age query as of v1.0.1,
-> `CONFIRM against codegraph 1.0.1`). Any real implementation MUST also carry the
-> exe-verified, self+ancestor-excluding guards from (i) — a sweep is more
-> dangerous than a single teardown, not less.
+> `CONFIRM against codegraph 1.0.1`). Do NOT enumerate by process signature
+> (see (i) — `pgrep`/`pkill` neither finds the `node`-hosted daemon nor is
+> self-safe). Enumerate via the per-root `daemon.pid` files of Polly's KNOWN
+> worktrees, and reuse (i)'s recorded-pid kill (alive + cwd + `codegraph.js`
+> guards) for each — a sweep is more dangerous than a single teardown, not less.
 
-Periodically enumerate every running daemon, cross-check against Polly's
-active-worktree registry, and kill any whose worktree is gone or is no longer
-active/idle-past-threshold:
+Because Polly already tracks its worktree roots, iterate THOSE, read each
+`<root>/.codegraph/daemon.pid`, and kill any whose worktree is gone or is no
+longer active/idle-past-threshold:
 
 ```bash
 # PSEUDOCODE — see the requirements box above; not safe to run verbatim.
-# Reuse (i)'s $exclude set and its exe/argv0 guards for every candidate pid.
-for p in $(list_codegraph_daemon_pids); do          # (i)'s guarded enumeration, NOT bare pgrep -f
-  cwd=$(readlink /proc/$p/cwd 2>/dev/null)
-  # kill if: cwd no longer exists, OR cwd is not in Polly's active-worktree set,
-  #          OR the daemon has been idle past Polly's threshold (idleness source TBD)
-  if [ -z "$cwd" ] || [ ! -d "$cwd" ] \
-     || ! polly_worktree_is_active "$cwd" \
-     || polly_daemon_idle_past_threshold "$p"; then
-    kill "$p"                                         # only after (i)'s exe + self/ancestor guards pass
+for root in $(polly_known_worktree_roots); do       # Polly's registry, NOT a process scan
+  pidfile="$root/.codegraph/daemon.pid"
+  [ -f "$pidfile" ] || continue                     # no daemon for this root
+  pid=$(sed -n 's/.*"pid" *: *\([0-9]\{1,\}\).*/\1/p' "$pidfile")
+  kill -0 "$pid" 2>/dev/null || continue            # dead pid / stale pidfile → nothing to reap
+  # kill if: root gone, OR root not in Polly's active set, OR idle past threshold
+  if [ ! -d "$root" ] \
+     || ! polly_worktree_is_active "$root" \
+     || polly_daemon_idle_past_threshold "$pid"; then
+    # apply (i)'s stale-pid guards before signalling:
+    [ "$(readlink /proc/$pid/cwd 2>/dev/null)" = "$root" ] \
+      && grep -qa 'codegraph.js' "/proc/$pid/cmdline" 2>/dev/null \
+      && kill "$pid"
   fi
 done
 ```
 
-`readlink /proc/<pid>/cwd` is the authoritative daemon→worktree map for a LIVE
-daemon — prefer it over the pid in `daemon.log`, which can be stale (a
-self-reaped daemon leaves its last pid in the log). The 5-minute idle backstop
-means a truly-forgotten daemon eventually self-reaps, but the sweep frees RAM
-immediately instead of waiting.
+The `daemon.pid` file is the authoritative daemon→worktree record; `/proc/<pid>/cwd`
+confirms it for a LIVE daemon. Prefer both over the pid in `daemon.log`, which
+can be stale (a self-reaped daemon may leave its last pid in the log). The
+5-minute idle backstop means a truly-forgotten daemon eventually self-reaps on
+its own — that self-reap is the PRIMARY cleanup; this sweep and (i)'s teardown
+are the BACKSTOPS that free RAM immediately instead of waiting.
 
 ### (iii) Concurrent-daemon budget
 
@@ -184,20 +204,23 @@ immediately instead of waiting.
 
 Cap the number of simultaneous daemons. Before indexing another worktree, if the
 cap is already hit, reap the LEAST-RECENTLY-USED idle daemon first (by (i)'s
-guarded cwd-targeted kill), then index. This keeps N large indexes from
-co-residing in RAM when only a few worktrees are actually hot.
+recorded-pid kill on that worktree's `daemon.pid`), then index. This keeps N
+large indexes from co-residing in RAM when only a few worktrees are actually hot.
 
 ## The kill mechanism — what is grounded vs what to confirm
-- **Scriptable, non-interactive (used above): exe-verified, self-excluding
-  `kill`.** A candidate pid is a real daemon ONLY if `/proc/<pid>/exe` resolves
-  to the codegraph binary; the current shell pid and its ancestors are excluded;
-  and the worktree is matched by `/proc/<pid>/cwd`. NEVER a bare
-  `pkill`/`pgrep -f 'codegraph serve --mcp'` — that pattern matches the invoking
-  shell (whose cmdline contains the literal) and can self-terminate. The exe
-  path and the cwd map were confirmed against a live v1.0.1 daemon on this
-  machine; the self/ancestor exclusion is what makes automating it safe.
+- **Scriptable, non-interactive (used above): kill by the daemon's OWN RECORDED
+  PID** from `<root>/.codegraph/daemon.pid` (JSON `{"pid":…}`), after verifying
+  the pid is alive, its `/proc/<pid>/cwd` == `<root>`, and its `/proc/<pid>/cmdline`
+  still names `codegraph.js`. NEVER a `pkill`/`pgrep` on a signature: on 1.0.1
+  the daemon runs as the bundled `node` (`/proc/<pid>/exe` → `…/codegraph-linux-x64/node`,
+  never `codegraph`), so `pgrep -x codegraph` finds nothing and an exe-guard of
+  `*/codegraph` rejects every match — the signature kill is a no-op against the
+  real daemon; and `pgrep -f 'codegraph serve --mcp'` additionally matches the
+  invoking shell and can self-terminate. The `daemon.pid` path/format, the pid's
+  cwd, the `node` exe, and that a SIGTERM removes `daemon.pid` were all confirmed
+  against a live 1.0.1 daemon on this machine.
 - **Interactive: `codegraph daemon` (alias `codegraph daemons`)** — a picker that
-  lists running daemons and stops the selected one on Enter. Grounded on v1.0.1,
+  lists running daemons and stops the selected one on Enter. Grounded on 1.0.1,
   and it cannot self-match — PREFER it for hand-driven teardown. It is a TUI
   prompt, so it is for a human at a terminal, not for Polly's automated sweep.
 - **On-disk index removal: `codegraph uninit <path>`** deletes the worktree's
@@ -205,8 +228,9 @@ co-residing in RAM when only a few worktrees are actually hot.
   before scripting a destructive delete — marked `CONFIRM against codegraph 1.0.1`
   above.
 
-If a future codegraph version ships a first-class non-interactive
-`codegraph daemon stop <root>` / `--pidfile` interface, prefer that over the
-signal-by-pid path; until then the exe-verified, self-excluding, cwd-filtered
-`kill` is the reliable per-worktree automated kill, and the interactive picker
-is the reliable hand-driven one.
+The 5-minute idle self-reap is the PRIMARY cleanup; the recorded-pid kill and
+the picker are backstops that reclaim RAM sooner. If a future codegraph version
+ships a first-class non-interactive `codegraph daemon stop <root>` / `--pidfile`
+interface, prefer that; until then the recorded-pid kill is the reliable
+per-worktree automated path, and the interactive picker the reliable hand-driven
+one.
