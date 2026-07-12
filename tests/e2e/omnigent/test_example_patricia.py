@@ -63,8 +63,9 @@ def test_patricia_is_two_headed_cross_vendor(patricia_spec: AgentSpec) -> None:
 def test_patricia_heads_pin_frontier_models(patricia_spec: AgentSpec) -> None:
     """
     Each head pins its intended frontier model via top-level ``executor.model``
-    so debates always run on the chosen models, not whatever provider default
-    ``omnigent setup`` left configured:
+    so debates run on the chosen models by default, not whatever provider default
+    ``omnigent setup`` left configured (a per-session ``/model`` override still
+    outranks the spec pin):
 
     - claude head -> ``claude-fable-5``
     - gpt head    -> ``gpt-5.6-sol``

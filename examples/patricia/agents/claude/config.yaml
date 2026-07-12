@@ -8,9 +8,10 @@ description: >-
 # Engineering-debate responder on the Claude Agent SDK. The model is pinned to
 # ``claude-fable-5`` (top-level ``executor.model``, parsed into
 # ``ExecutorSpec.model`` and forwarded to the harness launch via
-# ``HARNESS_CLAUDE_SDK_MODEL``) so this head always debates on the intended
-# frontier model rather than whatever provider default ``omnigent setup`` left
-# configured. It has filesystem access (see the ``os_env`` block below) so it
+# ``HARNESS_CLAUDE_SDK_MODEL``) so this head debates on the intended frontier
+# model by default rather than whatever provider default ``omnigent setup`` left
+# configured. A per-session ``/model`` override still takes precedence over this
+# spec pin. It has filesystem access (see the ``os_env`` block below) so it
 # can read the merged code it is grounded on, plus web tools so it can pull
 # contemporary docs and references mid-debate.
 #

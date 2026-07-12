@@ -8,8 +8,9 @@ description: >-
 # Engineering-debate responder on the Codex harness. The model is pinned to
 # ``gpt-5.6-sol`` (top-level ``executor.model``, parsed into
 # ``ExecutorSpec.model`` and forwarded to the harness launch via
-# ``HARNESS_CODEX_MODEL``) so this head always debates on the intended frontier
-# GPT model rather than the provider's default. ``gpt-5.6-sol`` is NOT in the
+# ``HARNESS_CODEX_MODEL``) so this head debates on the intended frontier GPT
+# model by default rather than the provider's default. A per-session ``/model``
+# override still takes precedence over this spec pin. ``gpt-5.6-sol`` is NOT in the
 # repo's static model catalog (codex static ids are gpt-5.5/5.4) — the model id
 # is a passthrough string (parser.py stores ``executor.model`` verbatim; there
 # is no catalog membership check), so a non-catalog id like this validates
