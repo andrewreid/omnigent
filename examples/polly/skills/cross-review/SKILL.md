@@ -9,12 +9,61 @@ The implementer never signs off on its own work — a different model does, and
 review is a sub-agent that returns a structured report, not a transcript
 anyone needs to read through.
 
-Default review is *confirmatory* — the reviewer gets the diff + contract and
-answers "does this fix do what it claims?". That is enough for isolated, low-state
-changes and NOT enough for stateful, combinatorial surfaces, where it is the single
-biggest time-sink polly hits: the states the contract never listed get discovered
-reactively, one external-bot round at a time, in the slow post-PR loop. Match the
-review DEPTH to the surface (see below).
+Every review runs TWO passes, ALWAYS, in one reviewer dispatch:
+- **[FOCUSED]** — diff-vs-contract: "does this change do what it claims, against
+  the acceptance contract?" This is the narrow, confirmatory pass.
+- **[WIDE]** — blast-radius: "what ELSE does this change touch that the diff does
+  not show?" This is the pass that catches the failures a diff-local reviewer is
+  structurally blind to.
+
+These are not "confirmatory review, with adversarial as an occasional
+escalation". Both passes run on every review. The WIDE pass MAY fast-exit with
+an explicit "no blast radius — nothing else touches this" verdict when that is
+genuinely true, but it is NEVER skipped. Skipping the wide pass is exactly how a
+one-line fix becomes a multi-round whack-a-mole: the stragglers the diff didn't
+show surface one at a time, each its own review round. Match the review DEPTH to
+the surface (rich surfaces get an ADVERSARIAL wide pass — see below), but the two
+passes themselves are not optional.
+
+## The two passes — label them in the reviewer's report
+Instruct the reviewer to structure its report under both headings so you can see
+each pass ran:
+
+**[FOCUSED] — diff vs contract.** The narrow pass. Reviewer gets the diff + the
+acceptance contract and answers whether the change satisfies the contract. Enough
+on its own only for isolated, low-state changes.
+
+**[WIDE] — blast radius.** The reviewer must WALK this checklist and report a
+line per item (a hit, or "clear"):
+- **All callers of every changed function/symbol.** Enumerate them. Flag sites
+  that SHOULD have changed to match but didn't.
+- **Consumer / event ripple.** Event-type consumers of anything the change emits
+  or renames; generated-client mirrors of a changed API shape; anything
+  downstream that decodes the changed payload.
+- **PARALLEL SURFACES.** A fix on one surface MUST be applied to every surface
+  running the same logic. Grep the sibling surface — do not just re-read the
+  changed one. Canonical pairs: client-render ↔ server/SSR loader/prefetch; a
+  read path ↔ its cached / materialized twin; an API handler ↔ its
+  generated-client mirror. If the change fixed one and left the twin untouched,
+  that is a blocking finding.
+- **TEST-SURFACE coverage.** Tests must exercise EVERY surface the change touches
+  (e.g. the component AND the route-loader), not just the convenient one. A green
+  suite that hits only one surface HIDES the bug on the parallel one — treat
+  single-surface coverage of a multi-surface change as a gap.
+- **ROUND-1 WHOLE-PARCEL GREP.** When the change renames or redefines a term,
+  status, concept, or claim, grep the ENTIRE parcel — source + tests + docs +
+  generated/published artifacts — for the OLD term/semantics. Classify every hit
+  and fix-or-justify each, in THIS round. A vocab/claim change reviewed only near
+  the diff guarantees multi-round whack-a-mole as stragglers surface one at a
+  time.
+- **ENV-DEPENDENT CLAIMS.** Static example configs and docs must assert only
+  intrinsic truths, never environment-dependent facts. Flag any "resolves at X
+  login / reachable via Y / routes through Z / this provider answers" claim — the
+  auth path, model reachability, and which provider resolves are deployment
+  facts, not properties of the file.
+
+When the wide pass finds genuinely nothing across the whole checklist, it says so
+in one line and moves on. It does not get skipped to save a dispatch.
 
 ## Procedure
 1. Get the task's diff. Per `review-before-pr`, review runs BEFORE a PR exists,
@@ -29,10 +78,16 @@ review DEPTH to the surface (see below).
    `codex` / `opencode` / `cursor` / `hermes` / `pi`, and so on). Use a
    task-based title such as `review-auth-refactor`, never the raw vendor name:
    `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"pi", title="review-<task_slug>",
-   args={purpose: "review", input: "<the diff> + <the acceptance contract>.
-   Review ONLY against the contract. Report blocking / non-blocking /
-   suggestions. Do not edit code."})`. Give it the diff as text — do NOT point
-   it at the implementer's worktree. Fetch the diff and emit the
+   args={purpose: "review", input: "<the diff> + <the acceptance contract>. Run
+   BOTH passes and report under both headings: [FOCUSED] diff-vs-contract, then
+   [WIDE] blast-radius — walk the blast-radius checklist (callers, consumer/event
+   ripple, PARALLEL SURFACES, test-surface coverage, whole-parcel grep for any
+   renamed term, env-dependent claims) and report a line per item. Report
+   blocking / non-blocking / suggestions. Do not edit code."})`. Give it the diff
+   as text — do NOT point it at the implementer's worktree. For the WIDE pass the
+   reviewer needs enough context to trace ripple: give it the changed surface
+   plus its adjacency (callers, sibling surfaces, the type it targets), not just
+   the raw hunk. Fetch the diff and emit the
    `sys_session_send` call in the SAME turn you decide to review — never end a
    turn having only announced "I'll load cross-review and fetch the diff" with
    no tool call (that dropped turn stalls the run; nothing dispatches and no
@@ -57,9 +112,11 @@ review DEPTH to the surface (see below).
 7. If the contract can't be satisfied after a few loops, stop and escalate to
    the user with specifics.
 
-## Match review depth to the surface — confirmatory is not enough
-A confirmatory review confirms exactly the cells the contract lists and is BLIND to
-every state nobody enumerated. On a **combinatorially-rich surface** — serializers,
+## Match review DEPTH to the surface — the wide pass goes adversarial
+The two passes above always run. On a rich surface the WIDE pass is not just a
+blast-radius walk — it must go ADVERSARIAL. A confirmatory-only pass confirms
+exactly the cells the contract lists and is BLIND to every state nobody
+enumerated. On a **combinatorially-rich surface** — serializers,
 form↔payload round-trips, state machines, derivations/classifiers whose output
 depends on many input states (loaded vs edited × valid/invalid/empty inputs ×
 per-line vs aggregate flags × present/absent references) — the contract can only name
@@ -68,8 +125,8 @@ Codex bot's whole-state-space reasoning then breaks LATER, one edge per round. T
 "bot found another edge → patch → re-review → bot found the next" grind is a
 confirmatory review that should have been ADVERSARIAL.
 
-Classify the surface BEFORE dispatching the reviewer. If it is rich, escalate review
-to adversarial:
+Classify the surface BEFORE dispatching the reviewer. If it is rich, deepen the
+WIDE pass into a full adversarial state-space attack:
 - **Widen the reviewer's context.** Give it the changed surface PLUS its adjacency
   (the read / serialize / validate functions around the diff, the type it targets,
   the consumers) — not just the raw hunk. Independence comes from a DIFFERENT vendor

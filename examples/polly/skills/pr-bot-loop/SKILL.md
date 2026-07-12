@@ -1,11 +1,22 @@
 ---
 name: pr-bot-loop
-description: Drive the GitHub Codex-review-bot feedback loop on a PR you pushed — arm a timer for the delayed bot review, reply in-thread to each finding (fix or pushback with rationale), re-request review, and after 3 straight rounds of small bugs escalate to a claude-vs-codex architectural debate. Loop until a clean bill, then disarm timers.
+description: Drive the GitHub Codex-review-bot feedback loop on a PR you pushed — but ONLY where a review bot is actually wired (detect presence as a tri-state first). Arm a timer for the delayed bot review, reply in-thread to each finding (fix or pushback with rationale), re-request review, and after 3 straight rounds of small bugs escalate to a claude-vs-codex architectural debate. Loop until a clean bill, then disarm timers.
 ---
 
 # pr-bot-loop — close the external review-bot loop on a PR
 
 After an implementer opens/updates a PR, a review bot (`chatgpt-codex-connector`, the "Codex" GitHub app) posts automated review comments ~10 min later. This is the EXTERNAL layer, separate from the internal `cross-review` skill (a different-vendor sub-agent judging the diff pre-push): cross-review gates the push, this loop services the bot on the live PR so the human can resolve threads. polly runs the loop; polly never merges.
+
+## This loop is CONDITIONAL — detect the bot BEFORE arming (don't wait on a bot that isn't wired)
+The standing rule is **run the bot-loop on every PR WHERE a review bot is wired** — NOT unconditionally. A repo with no review bot installed will never post a comment, so arming a timer and sweeping for findings there just burns rounds waiting on something that will never arrive, and delays the hand-off to the human. Before arming anything, determine bot presence as a TRI-STATE:
+
+- **PRESENT → arm the loop.** Either the org-installations inventory shows the Codex review app installed and unsuspended (`gh api /orgs/<org>/installations` or `gh api /repos/<owner>/<repo>/installation` — needs a token with repo-owner + `read:org`), OR you find historical bot activity on recent PRs (a `chatgpt-codex-connector` review/comment on any recent PR of this repo). Run the full procedure below.
+- **ABSENT → skip the loop cleanly.** The inventory call SUCCEEDS authoritatively AND shows no such app installed. Do not arm a timer; the PR goes straight to the human. Note in the registry/hand-off: "no review bot wired — skipping bot-loop".
+- **UNKNOWN → ask the human ONCE, then cache.** Anything that leaves presence undetermined: a selected-repos install you can't see into, a non-owner `403`/`404` on the inventory call, a personal (non-org) repo, or simply no PR history to judge from. Ask the human once ("is a Codex/review bot wired on this repo?"), and CACHE the answer for the rest of the session — do not re-ask per PR.
+
+**`installed` ≠ `review-enabled`.** The app being installed and the app being configured to actually review PRs are SEPARATE facts (a separate toggle on the app). Cache them separately: an install that never posts is effectively ABSENT for this loop's purposes — fall back to historical-activity evidence or the human's answer, and don't loop forever waiting on an installed-but-disabled app.
+
+Once PRESENT is established (or the human confirms), proceed:
 
 ## Procedure
 1. **Arm a timer after every push.** The bot lags ~10 min. After a push or `@codex review`, `sys_timer_set(seconds≈600-660, note="sweep codex-bot on PR #<n> ...")`. Don't busy-poll — end the turn; the timer (or inbox) revives you. One timer per PR.
