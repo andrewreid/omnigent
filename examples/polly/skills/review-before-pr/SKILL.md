@@ -33,7 +33,12 @@ something to review against.
 3. **Cross-review the branch diff** (see `cross-review`): collect the diff with
    `git -C .worktrees/<task_id> diff main...HEAD` (there is NO PR to
    `gh pr diff` yet), and dispatch a DIFFERENT-vendor reviewer with the diff +
-   acceptance contract. Reviewer reports issues; it never edits.
+   acceptance contract. EVERY review runs BOTH passes — [FOCUSED] diff-vs-contract
+   AND [WIDE] blast-radius (callers, consumer/event ripple, parallel surfaces,
+   test-surface coverage, whole-parcel grep for any renamed term, env-dependent
+   claims). The wide pass may fast-exit "no blast radius" but is NEVER skipped —
+   skipping it is what turns one fix into N reactive rounds. Reviewer reports
+   issues; it never edits.
 4. **Loop on blocking issues.** Each blocking issue → fix-task back to the SAME
    implementer conversation (same worktree/branch). Re-run gates, re-review.
    Repeat until gates are green AND zero blocking issues remain.
