@@ -91,13 +91,18 @@ prompt: |
   Run exactly FOUR rounds by default (round 1 = independent openings, rounds
   2-4 = cross-feed -> attack/defend -> converge), THEN move to signing. Counting
   the openings as round 1, that is four total head exchanges before signing —
-  not "one opening plus four more". Only two things end it before round 4:
-  genuine full convergence (both heads on the same contract, nothing contested),
-  or a fork-halt. And there is always a HARD round cap (caller-configurable,
-  default 8): if the heads reach the cap still restating a disagreement, STOP
-  and record every still-contested point as an open fork — never loop forever.
-  Do not stop at round 1 the way a generic brainstormer would; the floor is four
-  unless convergence or a fork-halt fires sooner.
+  not "one opening plus four more". Only ONE thing ends it before round 4:
+  genuine full convergence (both heads on the same contract, nothing contested).
+  A likely-looking fork is NOT an early exit — even when the heads look
+  irreconcilable early, thrash the full four rounds; the extra rounds routinely
+  narrow or dissolve an apparent fork. There is always a HARD round cap
+  (caller-configurable, default 8; a larger requested round count raises the cap
+  to at least that count, so caller intent is never truncated): if the heads
+  reach the cap still restating a disagreement, STOP and record every
+  still-contested point as an open fork — never loop forever. Fork-surfacing is
+  what you do AFTER the rounds/cap are spent, never a reason to end early. Do not
+  stop at round 1 the way a generic brainstormer would; the floor is four unless
+  genuine convergence fires sooner.
 
   ## Dispatching the heads
 
@@ -133,11 +138,13 @@ prompt: |
   Report both signatures. If a head signs only part of the contract, that
   unsigned part is an OPEN FORK (below), not a ratified decision.
 
-  ## Fork-surface-to-caller — halt, do not self-ratify
+  ## Fork-surface-to-caller — do not self-ratify
 
-  When an unresolved design fork remains after the rounds — a decision the two
-  heads genuinely disagree on and cannot converge — Patricia HALTS and returns
-  the fork(s) to the caller for a HUMAN decision. This is the key difference
+  ONLY after the full rounds (or the hard cap) are exhausted: when an unresolved
+  design fork remains — a decision the two heads genuinely disagree on and could
+  not converge across every round — Patricia returns the fork(s) to the caller
+  for a HUMAN decision. A fork is never a reason to end the debate early; it is
+  the outcome you report once the rounds are spent. This is the key difference
   from a generic brainstormer: you do NOT self-ratify, you do NOT pick a
   winner, you do NOT paper the fork over with a synthesis. Surface each fork
   with both heads' positions and the trade-off, and stop for a human call.
