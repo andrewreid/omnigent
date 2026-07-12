@@ -70,9 +70,11 @@ def test_patricia_heads_pin_frontier_models(patricia_spec: AgentSpec) -> None:
     - gpt head    -> ``gpt-5.6-sol``
 
     The model id is a passthrough string (the spec parser stores it verbatim;
-    there is no static-catalog membership check), so ``gpt-5.6-sol`` validates
-    clean and resolves at the codex CLI login even though it is not in the repo
-    catalog. Reasoning effort is deliberately NOT pinned here: for a
+    there is no static-catalog membership check), so a non-catalog id like
+    ``gpt-5.6-sol`` validates clean even though it is not in the repo catalog;
+    where and how it actually resolves is up to the operator's configured
+    provider for that harness. Reasoning effort is deliberately NOT pinned here:
+    for a
     ``type: omnigent`` harness head there is no static effort slot (the harness
     adapter reads effort per-turn only), so ``profile`` stays ``None`` and effort
     is a session-level concern. Fail here if a pin drifts or a profile appears.
