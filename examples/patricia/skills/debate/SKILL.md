@@ -56,26 +56,35 @@ signing — counting the independent openings as round 1:
    single contract.
 
 So the default is four total head exchanges (rounds 1–4), THEN signing —
-neither "one opening plus four more" nor "stop after round 1". Two exits can
-end it earlier than round 4:
+neither "one opening plus four more" nor "stop after round 1". Only ONE thing
+ends it before round 4:
 - **Genuine full convergence** — both heads on the same contract with nothing
   left contested. Convergence must be earned (both heads engaging the other's
   file:line evidence), not merely "no new words this round".
-- **Fork-halt** — an unresolved fork is surfaced to the caller (see below).
+
+A likely-looking fork is NOT an early exit. Even when the two heads look
+irreconcilable early, keep thrashing the full four rounds (or up to the hard
+cap) — the extra rounds routinely narrow or dissolve an apparent fork.
+Fork-surfacing happens AFTER the rounds/cap are exhausted (see the Hard round
+cap and Procedure below), never before the round floor.
 
 Honor a higher explicit round count from the caller. Do NOT stop at round 1 the
-way a generic brainstormer would; four is the floor unless one of the two exits
-above fires sooner.
+way a generic brainstormer would; four is the floor unless genuine convergence
+fires sooner.
 
 ## Hard round cap — never loop forever
 
 The caller MAY set a **hard round cap** (an explicit maximum, e.g. "cap at 8
-rounds"); absent one, use a default cap of **8 rounds**. If the heads reach the
-cap still contesting a point — restating disagreement without converging — do
-NOT keep dispatching. STOP at the cap and record every still-contested point as
-an **open fork** in the contract (human decision required). The cap exists to
-prevent an infinite restate-the-disagreement loop: an unresolved point at the
-cap is a fork for the human, not a reason to debate indefinitely.
+rounds"); absent one, use a default cap of **8 rounds**. A requested round
+count NEVER truncates below itself: the effective cap is
+`max(default 8, requested rounds)` — so a caller who asks for 10 rounds gets a
+cap of at least 10, and their intent is not silently cut to 8. If the heads
+reach the (possibly raised) cap still contesting a point — restating
+disagreement without converging — do NOT keep dispatching. STOP at the cap and
+record every still-contested point as an **open fork** in the contract (human
+decision required). The cap exists to prevent an infinite
+restate-the-disagreement loop: an unresolved point at the cap is a fork for the
+human, not a reason to debate indefinitely.
 
 ## Procedure
 
@@ -107,9 +116,11 @@ cap is a fork for the human, not a reason to debate indefinitely.
    into a compromise the heads did not both agree to, and do NOT pick a winner.
    A decision only one head signs is an OPEN FORK, not a ratified decision.
 
-4. **Fork-surface-to-caller — halt, do not self-ratify.** If any design fork
-   remains unresolved after the rounds — the heads genuinely disagree and can't
-   converge — HALT and return the fork(s) to the caller for a HUMAN decision.
+4. **Fork-surface-to-caller — do not self-ratify.** ONLY after the full rounds
+   (or the hard cap) are exhausted: if any design fork remains unresolved — the
+   heads genuinely disagree and could not converge across every round — return
+   the fork(s) to the caller for a HUMAN decision. A fork is never a reason to
+   end the debate early; it is the outcome you report once the rounds are spent.
    Do not self-ratify, do not pick a winner, do not paper the fork over. Give
    both heads' positions and the trade-off, and stop for a human call.
 
