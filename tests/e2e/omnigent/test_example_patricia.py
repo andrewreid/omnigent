@@ -60,16 +60,30 @@ def test_patricia_is_two_headed_cross_vendor(patricia_spec: AgentSpec) -> None:
     assert len(set(fam.values())) == 2
 
 
-def test_patricia_heads_are_unpinned(patricia_spec: AgentSpec) -> None:
+def test_patricia_heads_pin_frontier_models(patricia_spec: AgentSpec) -> None:
     """
-    Neither head pins a model: each inherits whatever Claude / OpenAI provider
-    the user configured. A Databricks-specific model id would 404 on a plain
-    Anthropic / OpenAI key, so re-introducing a pin re-couples a head to one
-    provider — fail here if a model reappears.
+    Each head pins its intended frontier model via top-level ``executor.model``
+    so debates run on the chosen models by default, not whatever provider default
+    ``omnigent setup`` left configured (a per-session ``/model`` override still
+    outranks the spec pin):
+
+    - claude head -> ``claude-fable-5``
+    - gpt head    -> ``gpt-5.6-sol``
+
+    The model id is a passthrough string (the spec parser stores it verbatim;
+    there is no static-catalog membership check), so a non-catalog id like
+    ``gpt-5.6-sol`` validates clean even though it is not in the repo catalog;
+    where and how it actually resolves is up to the operator's configured
+    provider for that harness. Reasoning effort is deliberately NOT pinned here:
+    for a
+    ``type: omnigent`` harness head there is no static effort slot (the harness
+    adapter reads effort per-turn only), so ``profile`` stays ``None`` and effort
+    is a session-level concern. Fail here if a pin drifts or a profile appears.
     """
     by_name = _by_name(patricia_spec)
+    assert by_name["claude"].executor.model == "claude-fable-5"
+    assert by_name["gpt"].executor.model == "gpt-5.6-sol"
     for name in ("claude", "gpt"):
-        assert by_name[name].executor.model is None, name
         assert by_name[name].executor.profile is None, name
 
 
