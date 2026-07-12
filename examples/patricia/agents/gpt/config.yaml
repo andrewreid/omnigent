@@ -12,8 +12,10 @@ description: >-
 # GPT model rather than the provider's default. ``gpt-5.6-sol`` is NOT in the
 # repo's static model catalog (codex static ids are gpt-5.5/5.4) — the model id
 # is a passthrough string (parser.py stores ``executor.model`` verbatim; there
-# is no catalog membership check), so it validates clean and resolves at the
-# codex CLI login. It has filesystem access (see the ``os_env`` block below) so
+# is no catalog membership check), so a non-catalog id like this validates
+# clean; where and how it actually resolves is up to the operator's configured
+# provider for the codex harness. It has filesystem access (see the ``os_env``
+# block below) so
 # it can read the merged code it is grounded on. Web search is native/free on
 # codex, so no web tool is declared here (see the claude head, which must add
 # web tools explicitly).
