@@ -103,17 +103,47 @@ def test_patricia_claude_head_has_web_tools(patricia_spec: AgentSpec) -> None:
     assert builtins["web_search"].config.get("search_provider") == "duckduckgo"
 
 
-def test_patricia_claude_head_is_network_sandboxed(patricia_spec: AgentSpec) -> None:
+def test_patricia_claude_head_read_only_repo_sandbox(patricia_spec: AgentSpec) -> None:
     """
-    The Claude head runs under ``linux_bwrap`` (network-enabled by default) so
-    its web tools have outbound access, with cwd writable. ``type: none`` would
-    still work for web, but bwrap is what the bundle ships — regressing it to
-    ``none`` here would drop the intended hardening.
+    The Claude head's sandbox enforces the grounding security model:
+
+    - ``type: linux_bwrap`` — network-enabled (for the web tools), and the
+      backend that binds cwd read-only by default.
+    - ``allow_network`` is true so web_fetch / web_search have egress.
+    - NO ``write_paths`` grant — the grounded repo (cwd), INCLUDING ``.git``,
+      stays READ-ONLY. If a ``write_paths`` covering ``.`` or ``.git`` ever
+      reappears, the head could rewrite refs/config/hooks/objects — the exact
+      defect this guards.
+    - ``cwd_allow_hidden == [".git"]`` — ``.git`` is VISIBLE (for SHA grounding)
+      but, per the point above, not writable. ``.venv`` is intentionally NOT in
+      the list: setting ``cwd_allow_hidden`` replaces the backend default
+      ``[".venv"]``, and SHA grounding only needs ``.git``.
     """
     claude = _by_name(patricia_spec)["claude"]
     assert claude.os_env is not None
-    assert claude.os_env.sandbox is not None
-    assert claude.os_env.sandbox.type == "linux_bwrap"
+    sandbox = claude.os_env.sandbox
+    assert sandbox is not None
+    assert sandbox.type == "linux_bwrap"
+    assert sandbox.allow_network is True
+
+    # Read-only repo: no write grant of any kind over the grounded worktree.
+    assert sandbox.write_paths is None, (
+        f"Claude head must not grant write_paths (repo incl .git is read-only); "
+        f"got {sandbox.write_paths!r}."
+    )
+    assert not sandbox.write_files, (
+        f"Claude head must not grant write_files over the grounded repo; "
+        f"got {sandbox.write_files!r}."
+    )
+
+    # .git visible for SHA grounding, .venv dropped.
+    assert sandbox.cwd_allow_hidden == [".git"], (
+        f"Claude head must admit exactly .git through the dotfile mask (visible, "
+        f"read-only); got {sandbox.cwd_allow_hidden!r}."
+    )
+    assert ".venv" not in (sandbox.cwd_allow_hidden or []), (
+        "SHA grounding needs only .git; .venv should not be re-admitted."
+    )
 
 
 def test_patricia_gpt_head_has_no_extra_web_builtins(patricia_spec: AgentSpec) -> None:

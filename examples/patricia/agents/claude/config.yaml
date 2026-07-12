@@ -21,21 +21,37 @@ executor:
 # / ``sys_os_shell`` tools (filesystem access comes bundled with a shell) so the
 # head can READ the merged code it is grounded on and cite file:line.
 #
+# SECURITY MODEL — read-only grounded repo + writable scratch:
+#
+# Patricia is launched FROM the grounded worktree root, so ``cwd: .`` IS the
+# repository being debated. Under ``linux_bwrap`` the cwd is bound READ-ONLY by
+# default (writes are rejected) — and because NO ``write_paths`` grant is
+# declared, the entire repo, INCLUDING ``.git``, stays read-only. The head can
+# read history/refs to ground on a SHA (``git show`` / ``git log`` /
+# ``git diff``) but CANNOT modify refs, config, hooks, or objects. Grounding
+# needs ``.git`` VISIBLE, not WRITABLE.
+#
+# ``cwd_allow_hidden: [".git"]`` re-admits the ``.git`` dotdir through the
+# sandbox's dotfile mask so it is visible (still read-only, per above). Setting
+# this field replaces the backend default of ``[".venv"]``; ``.venv`` is
+# deliberately dropped because SHA grounding only needs ``.git`` (the head reads
+# source, it does not run a project venv).
+#
+# The head's WRITABLE scratch is ``$TMPDIR`` — a per-session writable dir the
+# bwrap backend always provides, regardless of the read-only cwd. The head
+# writes any notes there (see prompt); the grounded repo is never mutated.
+#
 # The sandbox is ``linux_bwrap`` (not ``type: none``) because web_fetch/
 # web_search need outbound network, and network-enabled is the bwrap default
-# (``allow_network`` defaults true). ``write_paths: ["."]`` keeps cwd writable
-# so the head can scratch notes while reasoning; the scratch ``$TMPDIR`` is
-# writable regardless. ``cwd_allow_hidden`` re-admits ``.git`` on top of the
-# default ``.venv`` so the head can ground on a git SHA/branch
-# (``git show`` / ``git log`` / ``git diff``), not just a checked-out worktree
-# — grounding on merged code is the whole point.
+# (``allow_network: true``, stated explicitly here for clarity).
 os_env:
   type: caller_process
   cwd: .
   sandbox:
     type: linux_bwrap
-    write_paths: ["."]
-    cwd_allow_hidden: [".venv", ".git"]
+    # No write_paths: cwd (the grounded repo, incl .git) is read-only.
+    cwd_allow_hidden: [".git"]
+    allow_network: true
 
 # Same blast-radius guardrail Polly's sub-agents use, so the shell behaves
 # identically: the catastrophic set (force-push, ``rm -rf /``, hard-reset to a
@@ -71,18 +87,26 @@ prompt: |
 
   ## Ground every claim on real merged code
 
-  You are given a repo ref (a git SHA, branch, or worktree path) and file:line
-  anchors. Before you argue anything, READ the actual code with your `sys_os_*`
-  tools — `sys_os_read` for files, `sys_os_shell` for `grep`/`rg`, `git show`,
-  `git log`, `git diff`. Cite `file:line` in every claim about how the code
-  behaves. NEVER argue from memory or assumption about the code — if you are not
-  sure how something works, go read it. An argument without a file:line citation
-  is not admissible.
+  You run inside the grounded repository: the current working directory IS the
+  merged worktree being debated, bound READ-ONLY (including `.git`). You are
+  given a repo ref (a git SHA or branch) and file:line anchors. Before you argue
+  anything, READ the actual code with your `sys_os_*` tools — `sys_os_read` for
+  files (relative paths resolve against the repo root), `sys_os_shell` for
+  `grep`/`rg`, `git show`, `git log`, `git diff`. Cite `file:line` in every
+  claim about how the code behaves. NEVER argue from memory or assumption about
+  the code — if you are not sure how something works, go read it. An argument
+  without a file:line citation is not admissible.
+
+  The repo is read-only, so do not try to write into it. If you need scratch
+  space for notes, write under `$TMPDIR` (a per-session writable scratch dir) —
+  but your position and (finally) your signature are the deliverable, not files
+  on disk, so you rarely need it.
 
   Use your web tools (`web_fetch`, `web_search`) to pull contemporary docs,
   specs, or references when the design turns on how a library/protocol/API
-  actually behaves today — cite the source. Don't write files unless asked;
-  your position and (finally) your signature are the deliverable.
+  actually behaves today — cite the source. Web access is best-effort: if a
+  search or fetch fails or is rate-limited, do NOT stall — keep debating from
+  the code grounding, which is the primary source of truth.
 
   ## You are dispatched in one of these modes; the message makes it clear:
 
