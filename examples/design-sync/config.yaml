@@ -1,43 +1,16 @@
 spec_version: 1
 name: design-sync
 description: >-
-  Download-only Claude Design sync agent. Downloads TEXT files from a
-  claude.ai/design project to a local directory, preserving exact bytes and
-  directory structure. Binaries are skipped and reported. No automatic diff
-  detection or stale-file removal — full tree rewrite each sync. Never edits
-  product code, runs gates, or opens PRs.
+  Download-only Claude Design sync agent. Calls the local `design_sync` tool to
+  download TEXT files from a claude.ai/design project into a local directory
+  (exact bytes, dir structure preserved; binaries skipped). design_sync is the
+  ONLY mutation-capable tool; all write/edit/shell/browser/comment-mutation
+  builtins are denied by policy; remaining sys_* builtins are read-only. See
+  README for the exact tool surface + deployment requirements.
 
 executor:
-  type: omnigent
+  type: claude_sdk
   model: claude-haiku-4-5
-  config:
-    harness: claude-sdk
-    permission_mode: bypassPermissions
-
-# Minimal os_env for python tool to run (no shell/git/gh access)
-os_env:
-  type: caller_process
-  cwd: .
-  sandbox:
-    type: none
-
-# Local python tool sandbox (for network egress + credential read)
-tools:
-  sandbox:
-    type: none
-
-# Download-only: DENY (not ASK) push/PR/edit actions
-guardrails:
-  policies:
-    deny_mutations:
-      type: function
-      on: [tool_call]
-      function:
-        path: omnigent.inner.nessie.policies.blast_radius
-        arguments:
-          gate_pushes: hard_deny
-          gate_edits: hard_deny
-          gate_prs: hard_deny
 
 prompt: |
   You are a download-only Claude Design sync agent. Your ONLY job: when given a
@@ -45,7 +18,7 @@ prompt: |
   directory, preserving exact bytes and directory structure including the `_ds/`
   Design System tree. Binaries are skipped and reported.
 
-  You have ONE tool: `design_sync(project_url, out_dir='.design-mocks', include_ds=True)`.
+  You have ONE mutation-capable tool: `design_sync(project_url, out_dir='.design-mocks', include_ds=True)`.
   Call it with the project URL. It returns a structured summary of files written,
   skipped binaries, and any failures.
 
@@ -57,3 +30,27 @@ prompt: |
   - Push to git
 
   You are a pure download orchestrator. Call the tool, report the summary, done.
+
+async: false
+
+# Download-only: DENY (not ASK) every mutation-capable framework tool.
+# design_sync itself is intentionally NOT denied — it is the one write surface.
+guardrails:
+  policies:
+    deny_all_mutations:
+      type: function
+      function:
+        path: omnigent.policies.function.make_fixed_action_callable
+        arguments:
+          action: deny
+          reason: "download-only agent: mutations disabled"
+          on_phases: [tool_call]
+          on_tools:
+            - update_comment
+            - sys_add_policy
+            - browser_navigate
+            - browser_click
+            - browser_type
+            - sys_os_write
+            - sys_os_edit
+            - sys_os_shell

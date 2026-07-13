@@ -11,12 +11,13 @@ Pure read-only sync — never edits product code, runs gates, or opens PRs. Use 
 
 ## Locked Recipe (DO NOT RE-LITIGATE)
 
-This design is **proven** by 4 prior spikes + 2 cross-vendor review rounds. The ONLY working harness:
+This design is **proven** by 4 prior spikes + cross-vendor review rounds. The ONLY working harness:
 
-### Why claude-SDK only?
+### Why `executor.type: claude_sdk`?
 
 - **claude-NATIVE children** drop user python tools (relay allowlist `_NATIVE_RELAY_BUILTIN_TOOLS`) AND do not forward spec MCP servers → native is OUT.
-- **claude-SDK children** DO see `tools/python/*.py` (bridged to model as `mcp__omnigent__<fn>`) and run tools with NO elicitation under bypass → this is the winning harness.
+- **claude-SDK children** DO see `tools/python/*.py` (bridged to model as `mcp__omnigent__<fn>`) and run tools with NO elicitation → this is the winning harness.
+- Declared directly as `executor: {type: claude_sdk, model: claude-haiku-4-5}` (no `os_env` block — a local python tool does not need one to run; adding `os_env` only registers `sys_os_shell/write/edit`, a live push/edit surface we explicitly do NOT want).
 
 ### Why inline JSON-RPC transport?
 
@@ -28,23 +29,29 @@ This design is **proven** by 4 prior spikes + 2 cross-vendor review rounds. The 
 - Bearer token read from `~/.claude/.credentials.json` (field `claudeAiOauth.accessToken`)
 - Content is entity-decoded and wrapper-stripped in the python tool (not by the model)
 
-### Why permission_mode: bypassPermissions?
+### Download-only enforcement (accurate tool surface)
 
-- `permission_mode` OMITTED resolves to `auto`
-- Set it EXPLICITLY to `bypassPermissions` to avoid elicitation prompts when invoked via managed Claude settings (claude.ai context)
-- Headless/API-key runs may ignore this field based on caller's permission config
+There is **no allowlist/denylist to trim framework builtins** — a `claude_sdk`
+agent always gets ~19 always-on tools. So the surface is NOT "single tool only".
+What actually holds the download-only guarantee:
 
-### Why tools.sandbox: none?
-
-- Local python tools run under `spec.tools.sandbox`, NOT `os_env.sandbox`
-- `tools.sandbox: none` allows the python tool to make outbound HTTPS to `api.anthropic.com` and read `~/.claude/.credentials.json`
-- **Host-dependent**: on srt-enabled hosts with strict sandboxing, egress may still be denied — test with your sandbox config
-
-### Download-only structural enforcement
-
-- Agent has NO shell/git/gh tool access
-- Hard DENY policies for push/PR/edit actions (not ASK)
-- Exposed tool surface is exactly `{design_sync}` — no OS/shell/file-edit capability
+- **No `os_env` block** → the `sys_os_read/write/edit/shell` OS tools never register.
+  Verified: the assembled ToolManager builds exactly these 19 tools —
+  `browser_click`, `browser_navigate`, `browser_screenshot`, `browser_snapshot`,
+  `browser_type`, `design_sync`, `list_comments`, `load_skill`, `read_skill_file`,
+  `sys_add_policy`, `sys_agent_download`, `sys_agent_get`, `sys_agent_list`,
+  `sys_cancel_task`, `sys_policy_registry`, `sys_session_get_history`,
+  `sys_session_get_info`, `sys_session_list`, `update_comment`.
+- **`guardrails.policies.deny_all_mutations`** (a `type: function` policy built from
+  `omnigent.policies.function.make_fixed_action_callable`, `action: deny`) hard-DENIES
+  every mutation-capable builtin at the `tool_call` phase: `update_comment`,
+  `sys_add_policy`, `browser_navigate`, `browser_click`, `browser_type`, plus the
+  `sys_os_write/edit/shell` names (belt-and-suspenders — they aren't registered anyway).
+- **`design_sync` is the ONLY mutation-capable tool** left reachable (it writes to a
+  contained local `out_dir`). Everything else that survives is **read-only**:
+  `browser_screenshot/snapshot`, `list_comments`, `load_skill`, `read_skill_file`,
+  and the `sys_session_*` / `sys_agent_*` / `sys_policy_registry` / `sys_cancel_task`
+  inspection builtins.
 
 ## How to Launch
 
@@ -118,9 +125,30 @@ On subsequent runs to the same `out_dir`:
 .design-sync-manifest.md
 ```
 
+## Deployment Requirements (operator responsibility)
+
+These are **runtime/deployment properties, not agent-config**. The `design_sync`
+local python tool needs, at execution time:
+
+1. **Network egress to `api.anthropic.com`** — it downloads via raw JSON-RPC to
+   `https://api.anthropic.com/v1/design/mcp`. There is NO agent-config field that
+   grants this: `spec.tools.sandbox` only accepts `container_image` /
+   `docker_image` / `runtime` (a `type: none` there is silently ignored), and it
+   governs the tool's execution sandbox, not the host network policy. If the host
+   sandboxes local tools without egress, the download fails — that is the
+   **operator's** environment to provision, not something this spec can assert.
+2. **Read access to `~/.claude/.credentials.json`** — the tool reads
+   `claudeAiOauth.accessToken` for the bearer. The host must run the tool as a
+   principal that can read this file, with a non-expired token
+   (`omnigent setup` refreshes it).
+
+If either is missing the tool returns a structured error (no crash), but the
+sync will not produce files. Verify both in your target deployment before relying
+on the agent.
+
 ## Known Risks & Environment Dependencies
 
-1. **Sandbox egress (HOST-DEPENDENT)**: The python tool makes outbound HTTPS to `api.anthropic.com`. On hosts with strict `bwrap`/`srt` sandboxing that denies egress even with `tools.sandbox: none`, the tool will fail. Test with your sandbox config; adjust `tools.sandbox` if needed.
+1. **Sandbox egress (HOST-DEPENDENT)**: The python tool makes outbound HTTPS to `api.anthropic.com`. On hosts with strict `bwrap`/`srt` sandboxing that denies egress, the tool will fail. This is a deployment property (see **Deployment Requirements** above), not an agent-config setting — `spec.tools.sandbox` does not control host egress.
 
 2. **Bearer token expiry**: If `~/.claude/.credentials.json` has an expired `accessToken`, the tool fails with HTTP 401. Run `omnigent setup` to refresh. Token availability depends on authentication state.
 
@@ -134,11 +162,20 @@ On subsequent runs to the same `out_dir`:
 
 7. **Model availability (DEPLOYMENT-DEPENDENT)**: `executor.model: claude-haiku-4-5` must be available to the configured provider. If model unavailable, agent load fails.
 
-8. **Permission mode (CONTEXT-DEPENDENT)**: `bypassPermissions` only applies when invoked via managed Claude settings (claude.ai context). Headless/API-key runs may ignore this field based on caller's permission config.
+8. **Live full-session run is a DEPLOY-TIME gate**: Config-load + tool-build + policy-construction are verified offline (see below). A live, zero-elicitation full-session run under a real `claude_sdk` executor cannot be exercised from a build/review sub-agent (it can't spawn omnigent sessions) — it is the operator's final check at deploy time.
 
 ## Acceptance Gate Evidence
 
-See commit message for full evidence of:
-1. Agent loads via real omnigent local-tool loader (exposed tools == {design_sync}, no LocalToolLoadError)
-2. Transport/fidelity proof (exact byte sha256 match, binaries skipped, _ds/ present, manifest with full sha+etag)
-3. Unit tests passing (imports real production functions)
+Run `uv run python examples/design-sync/tests/acceptance_gate.py` for the assembled-agent
+proof. See the commit message for pasted output. It proves:
+1. **Assembled agent loads** via the REAL loader: `parse()` → 0 validation errors;
+   `ToolManager(spec, workdir)` builds 19 tools INCLUDING `design_sync`; `os_env`
+   absent; `resolve_function_policy` constructs the `deny_all_mutations` guardrail
+   without raising (and it denies `sys_os_shell`, abstains on `design_sync`).
+2. **Transport/fidelity proof** (`tests/self_test_download.py`): byte-exact sha256
+   over all text files, binaries skipped + reported, `_ds/` present, manifest with
+   full sha + etag — importing the REAL production functions.
+3. **Unit tests passing** (`tests/test_design_sync.py`, imports real production functions).
+4. **Live zero-elicitation full-session run is a DEPLOY-TIME gate** — a build/review
+   sub-agent cannot spawn omnigent sessions, so it is NOT claimed here; it is the
+   operator's final check (see Known Risks #8).
