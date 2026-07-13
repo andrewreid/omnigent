@@ -27,9 +27,14 @@ something to review against.
    run `gh pr create` / open a PR yet — report your branch name + a summary; I
    will tell you when to open the PR.* The worker still pushes its branch to the
    remote (so the diff is fetchable) but stops short of opening the PR.
-2. **Gates.** Run the deterministic gates (tests / lint / typecheck) yourself
-   against the branch via `sys_os_shell`. If red, loop back to the SAME
-   implementer to drive green before review.
+2. **Gates.** Run the repo's FULL deterministic validator set yourself against
+   the branch via `sys_os_shell` — not only tests / lint / typecheck, but every
+   spec / traceability / governance validator the repo defines (discover them
+   from its `package.json` scripts, a `scripts/` or `tools/` dir, and its
+   contributor docs — see `cross-review` Procedure step 2). The deterministic
+   couplings — traceability tags, requirement / spec index, pinned-line baseline
+   — must be GREEN before a PR opens, and they cost zero reviewer tokens. If any
+   is red, loop back to the SAME implementer to drive green before review.
 3. **Cross-review the branch diff** (see `cross-review`): collect the diff with
    `git -C .worktrees/<task_id> diff main...HEAD` (there is NO PR to
    `gh pr diff` yet), and dispatch a DIFFERENT-vendor reviewer with the diff +
@@ -70,6 +75,23 @@ one edge at a time. Head it off at the SPEC, not the review:
   finding lands in the fast internal loop.
 Build the surface right in one pass; do not let the external bot enumerate the state
 space for you across a dozen slow rounds.
+
+## Functional changes: list the coupled non-code artifacts in the contract
+A functional change usually obligates paired NON-CODE updates that the repo
+requires to move in lockstep — and an external bot will raise a missing one as a
+blocking finding. Head it off in the CONTRACT, not the review: when a task makes
+a functional change, the acceptance contract you hand the implementer MUST
+enumerate the coupled artifacts the diff is ALSO expected to update, so the
+implementer builds them in on the first pass instead of hardening reactively.
+Discover the couplings from the repo's OWN contributor / spec-governance docs
+(an `AGENTS.md` / `CONTRIBUTING` / a spec or docs tree — do not assume a fixed
+list), and name the actual artifacts for this change kind — e.g. docs / config
+reference for a new knob, traceability tags + requirement index for
+requirement-bearing code, API schema for a new response code, an ADR for an
+interface decision, the pinned-line baseline for test edits that shift a line.
+See `cross-review` → "Coupled-artifact sweep" for how the review splits the
+mechanical half (validators in the gate) from the judgment half (does the prose
+describe the new behavior).
 
 ## Notes
 - This flips the older "implementer opens its own PR immediately, then we
