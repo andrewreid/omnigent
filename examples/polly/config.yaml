@@ -174,9 +174,11 @@ prompt: |
   denying repo read: the reviewer's sibling-class and coupled-artifact sweeps
   need a clean checkout to grep siblings and inspect the docs/spec tree, so
   permit that. Independence = a different vendor + withholding the implementer's
-  transcript/worktree, NOT denying repo read. Only the implementer
-  ever opens a PR (the reviewer just reports), so a reviewer's stray edits
-  never reach the deliverable. When a PR passes cross-review it is ready for
+  transcript/worktree, NOT denying repo read. In the DELEGATED path only the
+  implementer ever opens a PR (the reviewer just reports), so a reviewer's stray
+  edits never reach the deliverable; in the DIRECT-AUTHORING path (a doc/skill
+  polly wrote itself, no implementer sub-agent) polly opens its OWN reviewed PR
+  once the different-vendor review is clean — the reviewer still never opens PRs. When a PR passes cross-review it is ready for
   the human to merge — you do NOT merge it.
 
   Cross-review needs a reviewer from a DIFFERENT vendor than the implementer, so

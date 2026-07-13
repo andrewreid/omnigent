@@ -1,6 +1,6 @@
 ---
 name: cross-review
-description: Verify an implementer's diff with an INDEPENDENT, different-vendor sub-agent (given the diff + contract, plus a clean repo checkout for the sibling-class and coupled-artifact sweeps — but never the implementer's transcript or worktree); turn blocking issues into fix-tasks and loop until clean.
+description: Verify a candidate diff (an implementer's, or a doc/skill polly authored directly) with an INDEPENDENT, different-vendor sub-agent (given the diff + contract, plus a clean repo checkout for the sibling-class and coupled-artifact sweeps — but never the implementer's transcript or worktree); turn blocking issues into fix-tasks and loop until clean.
 ---
 
 # cross-review — independent verification
@@ -87,12 +87,13 @@ The reviewer must WALK this checklist and report a line per item (a hit, or
 When the wide pass finds genuinely nothing across the whole checklist, it says so
 in one line and moves on. It does not get skipped to save a dispatch.
 
-## When the artifact under review is a doc / ADR / spec — two more mandatory passes
+## When the diff INCLUDES a doc / ADR / spec artifact — two more mandatory passes
 The two passes above are tuned for a CODE diff: claim-vs-code and blast radius.
-When the reviewed artifact is a documentation / ADR / spec file rather than code,
-those are necessary but NOT sufficient — a prose artifact fails in ways a
-code-centric lens is structurally blind to. Run BOTH of the following in ADDITION
-to [FOCUSED] and [WIDE], and label them in the reviewer's report:
+Whenever the diff INCLUDES a documentation / ADR / spec file — a prose-only diff
+OR a mixed code+docs diff — those are necessary but NOT sufficient for the doc
+files: a prose artifact fails in ways a code-centric lens is structurally blind
+to. Run BOTH of the following in ADDITION to [FOCUSED] and [WIDE], on the doc
+files, and label them in the reviewer's report:
 
 **[SELF-CONSISTENCY] — does the document contradict ITSELF?** The [FOCUSED] pass
 audits each claim against its source IN ISOLATION, so two mutually-contradictory
@@ -246,9 +247,11 @@ debate it.
    not against an open PR. A new title would spawn a fresh worker with no
    memory of the task. Then loop to step 1.
 6. When gates are green AND there are zero blocking issues, the diff passes
-   review. Now (and only now) tell the SAME implementer to open the PR on its
-   reviewed branch (per `review-before-pr` — the PR is opened on the reviewed
-   product, and only the implementer opens PRs). Then mark it ready in the
+   review. Now (and only now) the reviewed branch opens its PR: in the DELEGATED
+   path tell the SAME implementer to open it; in the DIRECT-AUTHORING path (a
+   doc/skill polly wrote itself, no implementer sub-agent) polly opens its OWN
+   reviewed PR (per `review-before-pr` — the PR is opened on the reviewed
+   product). Then mark it ready in the
    registry (with its PR URL) and leave it for the human to merge. polly does
    NOT merge it.
 7. If the contract can't be satisfied after a few loops, stop and escalate to
@@ -356,7 +359,8 @@ dropped siblings the external whole-PR bot then finds LATER, one per round.
   transcript/worktree, NOT denying repo read.
 - Review is a coding sub-agent (`claude_code`/`codex`/`opencode`/`cursor`/`hermes`/`pi`) dispatched with
   `purpose: "review"` — a DIFFERENT vendor from the one that built the diff. It
-  reports issues and never edits; only the implementer opens a PR, so a stray
+  reports issues and never edits; the reviewer NEVER opens a PR (in the delegated
+  path the implementer opens it; in the direct-authoring path polly does), so a stray
   reviewer edit never reaches the deliverable.
 - Non-blocking issues / suggestions go in the registry as follow-ups; they
   don't block the PR.
