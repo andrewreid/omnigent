@@ -1,13 +1,14 @@
 ---
 name: cross-review
-description: Verify an implementer's diff with an INDEPENDENT, different-vendor sub-agent (given the diff + contract, plus a clean repo checkout for the sibling-class and coupled-artifact sweeps — but never the implementer's transcript or worktree); turn blocking issues into fix-tasks and loop until clean.
+description: Verify a candidate diff (an implementer's, or a doc/skill polly authored directly) with an INDEPENDENT, different-vendor sub-agent (given the diff + contract, plus a clean repo checkout for the sibling-class and coupled-artifact sweeps — but never the implementer's transcript or worktree); turn blocking issues into fix-tasks and loop until clean.
 ---
 
 # cross-review — independent verification
 
-The implementer never signs off on its own work — a different model does, and
-review is a sub-agent that returns a structured report, not a transcript
-anyone needs to read through.
+Whoever authored the change — an implementer sub-agent, or polly itself for a
+directly-authored doc/skill — never signs off on its own work; a
+different-vendor model does, and review is a sub-agent that returns a structured
+report, not a transcript anyone needs to read through.
 
 Every review runs TWO passes, ALWAYS, in one reviewer dispatch:
 - **[FOCUSED]** — diff-vs-contract: "does this change do what it claims, against
@@ -76,9 +77,49 @@ The reviewer must WALK this checklist and report a line per item (a hit, or
   login / reachable via Y / routes through Z / this provider answers" claim — the
   auth path, model reachability, and which provider resolves are deployment
   facts, not properties of the file.
+- **CLAIM COMPLETENESS.** When the diff makes claims about named files,
+  workflows, or config, audit EVERY such claim — what is REMOVED, what is ADDED,
+  AND anything the diff asserts is UNCHANGED — not a convenient spot-check. A
+  partial audit catches one direction and misses its twins: a stale claim left
+  behind by a removal, a fresh claim that overreaches what it added, or an
+  "unchanged / still X / no change to Y" assertion that is itself false against
+  the actual code/config. Enumerate all of them; verify each.
 
 When the wide pass finds genuinely nothing across the whole checklist, it says so
 in one line and moves on. It does not get skipped to save a dispatch.
+
+## When the diff INCLUDES a doc / ADR / spec artifact — two more mandatory passes
+The two passes above are tuned for a CODE diff: claim-vs-code and blast radius.
+Whenever the diff INCLUDES a documentation / ADR / spec file — a prose-only diff
+OR a mixed code+docs diff — those are necessary but NOT sufficient for the doc
+files: a prose artifact fails in ways a code-centric lens is structurally blind
+to. Run BOTH of the following in ADDITION to [FOCUSED] and [WIDE], on the doc
+files, and label them in the reviewer's report:
+
+**[SELF-CONSISTENCY] — does the document contradict ITSELF?** The [FOCUSED] pass
+audits each claim against its source IN ISOLATION, so two mutually-contradictory
+claims can each individually "pass" while directly contradicting each other. This
+pass reads the document as a whole and reconciles it against itself: do its stated
+consequences / scope / non-goals match its own decision and any evidence it cites
+(a spike, a finding, a benchmark it references)? Reconcile statements introduced
+across MULTIPLE edit passes — hunt STALE scope left behind when a later edit
+superseded an earlier claim but the earlier wording was never removed. A document
+that is internally inconsistent is wrong even when every individual claim traces to
+a real source.
+
+**[GOVERNANCE] — does the change obey the repo's OWN doc conventions?** Load the
+repository's own documentation / ADR / spec governance — an ADR lifecycle (e.g.
+Proposed → Accepted → Superseded), any decision registry / index that must stay in
+sync with the documents it lists, numbering / status / cross-reference rules — and
+verify the change CONFORMS. Flag a status transition applied prematurely (e.g.
+marked Accepted before the gate that accepts it), a new document that skips a
+required lifecycle state, a registry / index copy that disagrees with the document
+it points at, or a duplicated status that drifts between copies. The repo's own
+rules are the contract here; the diff must not violate them.
+
+These two passes are as mandatory for a doc artifact as [WIDE] is for code: run
+both, label both, fast-exit a pass in one line only when it genuinely finds
+nothing. A doc/ADR/spec diff that skips them is not reviewed.
 
 ## Is the finding a one-off or an instance of a class?
 Before treating any fix as scoped to its flagged site, ask whether it addresses a
@@ -155,12 +196,15 @@ debate it.
    pinned-line baseline verifier, a schema/contract validator. Run them all via
    `sys_os_shell`. A functional change that fails ANY repo validator — a missing
    traceability tag, a stale requirement/spec index, a drifted pinned-line
-   baseline — is a RED gate: send it back to the implementer to drive green
-   first; don't involve the reviewer yet. These deterministic couplings are
+   baseline — is a RED gate: send it back to the fixer to drive green first —
+   the implementer for delegated work, or polly itself revising a
+   directly-authored artifact — and don't involve the reviewer yet. These deterministic couplings are
    caught here for free, with ZERO reviewer tokens — never spend a reviewer on a
    defect a validator already names.
 3. Dispatch a DIFFERENT-vendor sub-agent as reviewer: pick any AVAILABLE worker
-   whose vendor differs from the implementer's — `claude_code`, `codex`,
+   whose vendor differs from the AUTHOR's — the implementer for delegated work,
+   or polly's own Claude-family model for a directly-authored artifact —
+   `claude_code`, `codex`,
    `opencode`, `cursor`, `hermes`, or `pi` (e.g. Claude built it → any of
    `codex` / `opencode` / `cursor` / `hermes` / `pi`, and so on). Use a
    task-based title such as `review-auth-refactor`, never the raw vendor name:
@@ -169,17 +213,23 @@ debate it.
    BOTH passes and report under both headings: [FOCUSED] diff-vs-contract, then
    [WIDE] wide-angle sweep across all THREE axes — (1) downstream blast-radius
    (callers, consumer/event ripple, parallel surfaces, test-surface coverage,
-   whole-parcel grep for any renamed term, env-dependent claims); (2)
+   whole-parcel grep for any renamed term, env-dependent claims, claim
+   completeness — audit removed, added, AND unchanged-asserting claims); (2)
    sibling-class sweep (name the defect class, enumerate every un-touched site
    matching its shape); (3) coupled-artifact sweep (read the repo's contributor /
    spec-governance docs, verify each non-code artifact this change kind obligates
    was updated and its prose reflects the new behavior) — report a line per item.
-   Report blocking / non-blocking / suggestions. Do not edit code."})`. Give it the diff
+   PLUS: whenever the diff INCLUDES a doc/ADR/spec artifact (prose-only OR mixed
+   code+docs), ALSO run [SELF-CONSISTENCY] (does the doc contradict itself / carry
+   stale scope from an earlier edit pass?) and [GOVERNANCE] (does it obey the
+   repo's own ADR/spec lifecycle, numbering, and registry-sync rules?) on the doc
+   files. Report blocking / non-blocking / suggestions. Do not edit code."})`. Give it the diff
    as text and bar the implementer's WORKTREE and REASONING (its transcript) —
-   but the sibling-class and coupled-artifact sweeps REQUIRE the reviewer to grep
-   for siblings and inspect the docs/spec tree, so explicitly PERMIT it to read a
-   clean checkout of the repo. Independence = a different vendor + withholding the
-   implementer's transcript/worktree, NOT denying repo read. For the WIDE pass the
+   but the sibling-class, coupled-artifact, and doc self-consistency sweeps
+   REQUIRE the reviewer to grep for siblings and read the FULL final files (a
+   stale contradiction often lives OUTSIDE the diff hunk), so explicitly PERMIT it
+   to read a clean checkout of the repo. Independence = a different vendor +
+   withholding the implementer's transcript/worktree, NOT denying repo read. For the WIDE pass the
    reviewer needs enough context to trace ripple: give it the changed surface
    plus its adjacency (callers, sibling surfaces, the type it targets), not just
    the raw hunk. Fetch the diff and emit the
@@ -196,14 +246,20 @@ debate it.
    conversation via `sys_session_send` — reuse the original implementer's
    `agent` + `title` (or address it by `session_id`) with
    `purpose: "implement"`, so the worker keeps its worktree/branch context and
-   pushes the fixes to the SAME branch. No PR exists yet — review runs
+   pushes the fixes to the SAME branch. (This is the DELEGATED path.) In the
+   DIRECT-AUTHORING path there is NO implementer sub-agent — polly authored the
+   artifact itself — so polly revises the prose DIRECTLY, re-runs the gates and
+   all applicable review passes, and re-dispatches the different-vendor review;
+   the loop is identical, only the fixer differs. No PR exists yet — review runs
    pre-PR (per `review-before-pr`), so blocking issues loop back on the BRANCH,
    not against an open PR. A new title would spawn a fresh worker with no
    memory of the task. Then loop to step 1.
 6. When gates are green AND there are zero blocking issues, the diff passes
-   review. Now (and only now) tell the SAME implementer to open the PR on its
-   reviewed branch (per `review-before-pr` — the PR is opened on the reviewed
-   product, and only the implementer opens PRs). Then mark it ready in the
+   review. Now (and only now) the reviewed branch opens its PR: in the DELEGATED
+   path tell the SAME implementer to open it; in the DIRECT-AUTHORING path (a
+   doc/skill polly wrote itself, no implementer sub-agent) polly opens its OWN
+   reviewed PR (per `review-before-pr` — the PR is opened on the reviewed
+   product). Then mark it ready in the
    registry (with its PR URL) and leave it for the human to merge. polly does
    NOT merge it.
 7. If the contract can't be satisfied after a few loops, stop and escalate to
@@ -240,7 +296,8 @@ WIDE pass into a full adversarial state-space attack:
 - **Front-run the external bot.** Prefer running this adversarial pass on the SAME
   engine as the external reviewer (`codex`) so its whole class of findings lands in
   the FAST internal loop instead of the slow PR loop (see `pr-bot-loop` → front-run
-  the bot). Keep it a DIFFERENT vendor from the implementer.
+  the bot). Keep it a DIFFERENT vendor from the author (the implementer, or polly
+  for a directly-authored artifact).
 
 The cheapest place to close a state-space bug is the implementer's FIRST pass: pair
 this with `review-before-pr` — the acceptance contract for a rich surface must name
@@ -297,9 +354,11 @@ shapes the happy path exercises guarantees the review keeps signing off diffs wh
 dropped siblings the external whole-PR bot then finds LATER, one per round.
 
 ## Notes
-- Cross-review requires a reviewer from a DIFFERENT vendor than the implementer,
-  so it needs at least two AVAILABLE workers (per polly's roster preflight). If
-  only one worker — or only one vendor that can review this implementer's PR —
+- Cross-review requires a reviewer from a DIFFERENT vendor than the author (the
+  implementer for delegated work, or polly's own model family for a
+  directly-authored artifact), so it needs at least two AVAILABLE workers (per
+  polly's roster preflight). If
+  only one worker — or only one vendor that can review this author's PR —
   is available on the machine, you CANNOT run independent cross-vendor review:
   don't dispatch a reviewer that can't boot, say so explicitly, and pull in the
   human at the plan gate.
@@ -311,7 +370,8 @@ dropped siblings the external whole-PR bot then finds LATER, one per round.
   transcript/worktree, NOT denying repo read.
 - Review is a coding sub-agent (`claude_code`/`codex`/`opencode`/`cursor`/`hermes`/`pi`) dispatched with
   `purpose: "review"` — a DIFFERENT vendor from the one that built the diff. It
-  reports issues and never edits; only the implementer opens a PR, so a stray
+  reports issues and never edits; the reviewer NEVER opens a PR (in the delegated
+  path the implementer opens it; in the direct-authoring path polly does), so a stray
   reviewer edit never reaches the deliverable.
 - Non-blocking issues / suggestions go in the registry as follow-ups; they
   don't block the PR.
