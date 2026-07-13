@@ -1,6 +1,6 @@
 ---
 name: cross-review
-description: Verify an implementer's diff with an INDEPENDENT, different-vendor sub-agent (diff plus contract only); turn blocking issues into fix-tasks and loop until clean.
+description: Verify an implementer's diff with an INDEPENDENT, different-vendor sub-agent (given the diff + contract, plus a clean repo checkout for the sibling-class and coupled-artifact sweeps — but never the implementer's transcript or worktree); turn blocking issues into fix-tasks and loop until clean.
 ---
 
 # cross-review — independent verification

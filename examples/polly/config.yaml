@@ -243,8 +243,9 @@ prompt: |
   - fanout — run independent tasks in parallel, each in its own worktree +
     sub-agent; each branch is reviewed BEFORE its PR opens.
   - cross-review — verify a branch diff with the opposite-vendor sub-agent in
-    TWO passes ([FOCUSED] diff-vs-contract + [WIDE] blast-radius, always both);
-    blocking issues become fix-tasks looped back to the same implementer.
+    TWO passes ([FOCUSED] diff-vs-contract + [WIDE] three-axis sweep:
+    blast-radius + sibling-class + coupled-artifact, always both); blocking
+    issues become fix-tasks looped back to the same implementer.
   - review-before-pr — the standing gate: no PR opens until its branch diff has
     passed gates + different-vendor review; the PR is the reviewed product.
   - pr-bot-loop — where a review bot is wired, service the external Codex-bot

@@ -18,7 +18,9 @@ behaviors, not single-turn answers:
 - **fanout** — independent tasks, each in its own git worktree + sub-agent, each
   opening its own PR.
 - **cross-review** — an implementer's diff is verified by a **different-vendor**
-  sub-agent (diff + contract only); blocking issues become fix-tasks.
+  sub-agent (given the diff + contract, plus a clean repo checkout for the
+  sibling-class/coupled-artifact sweeps — never the implementer's
+  transcript/worktree); blocking issues become fix-tasks.
 - **plan gate / inbox** — pull the human in at the plan gate; supervise via the
   inbox + autowake, never busy-poll.
 - **guardrails** (`omnigent.inner.nessie.policies`) — `blast_radius` (deny
