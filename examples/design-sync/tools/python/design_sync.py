@@ -11,6 +11,7 @@ import urllib.request
 import urllib.error
 import html
 import hashlib
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
@@ -68,12 +69,15 @@ def _jsonrpc_call(
             result = json.load(resp)
 
             if "error" in result:
-                raise RuntimeError(f"JSON-RPC error: {result['error']}")
+                error_info = result['error']
+                # Redact error details to prevent leakage to model
+                error_code = error_info.get('code', 'unknown')
+                raise RuntimeError(f"JSON-RPC error (code {error_code})")
 
             return result.get("result")
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code}: {body}")
+        # Redact HTTP error bodies
+        raise RuntimeError(f"HTTP {e.code} error")
 
 
 def _strip_mcp_wrapper(content: str) -> str:
@@ -113,11 +117,16 @@ def _strip_mcp_wrapper(content: str) -> str:
 
 def _html_entity_decode(text: str) -> str:
     """Decode HTML entities, with &amp; decoded LAST to avoid double-decode."""
+    # Guard against sentinel collision (unlikely but possible)
+    sentinel = "\x00AMPERSAND_PLACEHOLDER_e4b9c2a1\x00"
+    if sentinel in text:
+        raise ValueError("Content contains entity-decode sentinel (collision)")
+
     # First pass: decode everything except &amp;
-    text = text.replace("&amp;", "\x00AMPERSAND\x00")
+    text = text.replace("&amp;", sentinel)
     text = html.unescape(text)
     # Second pass: decode &amp;
-    text = text.replace("\x00AMPERSAND\x00", "&")
+    text = text.replace(sentinel, "&")
     return text
 
 
@@ -247,7 +256,7 @@ def _read_file_content(
         # Check if it's a binary file error
         if "binary file" in error_content.lower() or "stored base64" in error_content.lower():
             return None, True, None
-        return None, False, error_content
+        return None, False, "Read error"
 
     # Collect all text blocks
     text_blocks = []
@@ -255,25 +264,21 @@ def _read_file_content(
     error_msg = None
 
     for item in result.get("content", []):
-        # Error response
+        # Error response (check BEFORE text processing)
         if item.get("isError"):
             error_text = item.get("text", "Unknown error")
             # Binary file indicator
             if "binary file" in error_text.lower() or "stored base64" in error_text.lower():
                 is_binary_file = True
                 break
-            error_msg = error_text
+            error_msg = "Read error"
             break
 
         # Text content
         if item.get("type") == "text":
             text_blocks.append(item.get("text", ""))
 
-        # Binary thumbnail indicator
-        if ".thumbnail" in str(item):
-            is_binary_file = True
-            break
-
+    # Binary detection AFTER processing all blocks
     if is_binary_file:
         return None, True, None
 
@@ -318,20 +323,24 @@ def design_sync(
     include_ds: bool = True
 ) -> Dict[str, Any]:
     """
-    Download all files from a Claude Design project to local directory.
+    Download all text files from a Claude Design project to local directory.
+
+    Downloads text files only (binaries are skipped and reported). Preserves
+    exact bytes and directory structure. No automatic diff detection or
+    stale-file removal — full tree rewrite each sync.
 
     Args:
         project_url: Full URL like https://claude.ai/design/p/<id>
-        out_dir: Local output directory (default: .design-mocks)
+        out_dir: Local output directory relative to cwd (default: .design-mocks)
         include_ds: Include Design System assets from _ds/ (default: True)
 
     Returns:
         Structured summary with:
-        - files_written: list of {path, size_bytes, sha256}
+        - files_written: list of {path, size_bytes, sha256, etag}
         - skipped_binaries: list of paths
         - skipped_unsafe: list of paths (traversal attempts)
         - failures: list of {path, error}
-        - mapping_path: path to sync-manifest.md
+        - manifest_path: path to .design-sync-manifest.md
         - total_bytes: sum of written bytes
     """
     # Extract project ID from URL
@@ -339,6 +348,20 @@ def design_sync(
         return {"error": "Invalid project URL (expected /p/<id>)"}
 
     project_id = project_url.split("/p/")[1].split("/")[0].split("?")[0]
+
+    # Resolve cwd and validate out_dir containment
+    cwd = Path.cwd().resolve()
+
+    # Reject absolute out_dir
+    if Path(out_dir).is_absolute():
+        return {"error": f"out_dir must be relative (got absolute path: {out_dir})"}
+
+    # Resolve out_dir and check containment
+    out_path = (cwd / out_dir).resolve()
+    try:
+        out_path.relative_to(cwd)
+    except ValueError:
+        return {"error": f"out_dir escapes cwd (tried: {out_dir})"}
 
     # Read bearer token
     try:
@@ -368,7 +391,6 @@ def design_sync(
         return {"error": f"Failed to list files: {e}"}
 
     # Prepare output directory
-    out_path = Path(out_dir).resolve()
     out_path.mkdir(parents=True, exist_ok=True)
 
     # Download each file
@@ -382,6 +404,7 @@ def design_sync(
     for file_info in files:
         path = file_info["path"]
         expected_size = file_info["size"]
+        etag = file_info["etag"]
 
         # Path containment check
         if not _is_path_safe(out_path, path):
@@ -432,32 +455,52 @@ def design_sync(
                 })
                 continue
 
-        # Validate then write (temp → verify → move)
+        # Validate then write (unique temp → verify → atomic rename)
         file_path = out_path / path
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
-        temp_path = file_path.with_suffix(file_path.suffix + ".tmp")
-        temp_path.write_bytes(content_bytes)
+        # Use unique temp file in same directory
+        temp_fd, temp_path_str = tempfile.mkstemp(
+            suffix=".tmp",
+            prefix=f".design-sync-{file_path.name}-",
+            dir=file_path.parent
+        )
+        temp_path = Path(temp_path_str)
 
-        # Verify size
-        if temp_path.stat().st_size != actual_size:
-            temp_path.unlink()
-            failures.append({
+        try:
+            # Write to temp
+            os.write(temp_fd, content_bytes)
+            os.close(temp_fd)
+
+            # Verify size
+            if temp_path.stat().st_size != actual_size:
+                raise RuntimeError(f"Write verification failed: expected {actual_size} bytes")
+
+            # Atomic rename
+            temp_path.rename(file_path)
+
+            sha256 = hashlib.sha256(content_bytes).hexdigest()
+            files_written.append({
                 "path": path,
-                "error": f"Write verification failed: expected {actual_size} bytes"
+                "size_bytes": actual_size,
+                "sha256": sha256,
+                "etag": etag
             })
+            total_bytes += actual_size
+
+        except Exception as e:
+            # Cleanup on failure
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except:
+                pass
+            failures.append({"path": path, "error": f"Write failed: {e}"})
             continue
 
-        # Commit
-        temp_path.rename(file_path)
-
-        sha256 = hashlib.sha256(content_bytes).hexdigest()
-        files_written.append({"path": path, "size_bytes": actual_size, "sha256": sha256})
-        total_bytes += actual_size
-
-    # Write sync manifest (non-colliding name)
+    # Write sync manifest OUTSIDE mirrored namespace (sibling to out_dir, not inside it)
     timestamp = datetime.now(timezone.utc).isoformat()
-    mapping_lines = [
+    manifest_lines = [
         f"# Design Sync Manifest\n",
         f"\n",
         f"**Project:** {project_url}\n",
@@ -467,12 +510,9 @@ def design_sync(
         f"\n",
         f"## Files\n",
         f"\n",
-        f"| Path | Bytes | SHA256 | Status |\n",
-        f"|------|-------|--------|--------|\n",
+        f"| Path | Bytes | SHA256 | ETag | Status |\n",
+        f"|------|-------|--------|------|--------|\n",
     ]
-
-    # Collect all known files
-    all_paths = {f["path"] for f in files}
 
     for file_info in files:
         path = file_info["path"]
@@ -482,26 +522,35 @@ def design_sync(
         if written:
             status = "✓"
             size_display = written["size_bytes"]
-            sha256_display = written["sha256"][:8]
+            sha256_display = written["sha256"]
+            etag_display = written["etag"]
         elif path in skipped_binaries:
             status = "binary"
             size_display = file_info["size"]
             sha256_display = "—"
+            etag_display = file_info["etag"]
         elif path in skipped_unsafe:
             status = "unsafe"
             size_display = "—"
             sha256_display = "—"
+            etag_display = "—"
         else:
             status = "FAILED"
             size_display = "—"
             sha256_display = "—"
+            etag_display = file_info["etag"]
 
-        # Escape markdown special chars in path
-        path_escaped = path.replace("|", "\\|")
-        mapping_lines.append(f"| `{path_escaped}` | {size_display} | `{sha256_display}` | {status} |\n")
+        # Escape markdown special chars
+        path_escaped = path.replace("|", "\\|").replace("`", "\\`")
+        sha256_escaped = str(sha256_display).replace("|", "\\|")
+        etag_escaped = str(etag_display).replace("|", "\\|")
 
-    manifest_path = out_path / "sync-manifest.md"
-    manifest_path.write_text("".join(mapping_lines))
+        manifest_lines.append(
+            f"| `{path_escaped}` | {size_display} | `{sha256_escaped}` | `{etag_escaped}` | {status} |\n"
+        )
+
+    manifest_path = cwd / ".design-sync-manifest.md"
+    manifest_path.write_text("".join(manifest_lines))
 
     return {
         "project_url": project_url,
@@ -511,7 +560,7 @@ def design_sync(
         "skipped_binaries": skipped_binaries,
         "skipped_unsafe": skipped_unsafe,
         "failures": failures,
-        "mapping_path": str(manifest_path),
+        "manifest_path": str(manifest_path),
         "total_bytes": total_bytes,
         "timestamp": timestamp
     }
