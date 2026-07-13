@@ -242,7 +242,11 @@ debate it.
    conversation via `sys_session_send` — reuse the original implementer's
    `agent` + `title` (or address it by `session_id`) with
    `purpose: "implement"`, so the worker keeps its worktree/branch context and
-   pushes the fixes to the SAME branch. No PR exists yet — review runs
+   pushes the fixes to the SAME branch. (This is the DELEGATED path.) In the
+   DIRECT-AUTHORING path there is NO implementer sub-agent — polly authored the
+   artifact itself — so polly revises the prose DIRECTLY, re-runs the gates and
+   all applicable review passes, and re-dispatches the different-vendor review;
+   the loop is identical, only the fixer differs. No PR exists yet — review runs
    pre-PR (per `review-before-pr`), so blocking issues loop back on the BRANCH,
    not against an open PR. A new title would spawn a fresh worker with no
    memory of the task. Then loop to step 1.

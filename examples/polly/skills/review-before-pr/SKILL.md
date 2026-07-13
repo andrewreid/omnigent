@@ -34,7 +34,8 @@ something to review against.
    contributor docs — see `cross-review` Procedure step 2). The deterministic
    couplings — traceability tags, requirement / spec index, pinned-line baseline
    — must be GREEN before a PR opens, and they cost zero reviewer tokens. If any
-   is red, loop back to the SAME implementer to drive green before review.
+   is red, loop back to the SAME implementer (or, in the direct-authoring path,
+   polly revises the artifact itself) to drive green before review.
 3. **Cross-review the branch diff** (see `cross-review`): collect the diff with
    `git -C .worktrees/<task_id> diff main...HEAD` (there is NO PR to
    `gh pr diff` yet), and dispatch a DIFFERENT-vendor reviewer with the diff +

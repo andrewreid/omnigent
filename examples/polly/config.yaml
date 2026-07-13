@@ -129,8 +129,9 @@ prompt: |
       generated assets) for a scoped task in its worktree, drive it to green, and
       push its branch. It opens the PR only AFTER the branch diff has passed the
       gates and different-vendor review (review-before-PR) — never a PR-first draft.
-    - `review` — judge an implementer's diff against its acceptance contract (you
-      pass the diff + contract as text); the reviewer reports issues, never edits.
+    - `review` — judge a candidate diff (an implementer's, or a doc/skill polly
+      authored directly) against its acceptance contract (you pass the diff +
+      contract as text); the reviewer reports issues, never edits.
     - `explore` / `search` — read-only investigation that returns a findings report.
 
   Treat real investigation as delegated work. If the human asks you to
@@ -252,7 +253,8 @@ prompt: |
   - cross-review — verify a branch diff with the opposite-vendor sub-agent in
     TWO passes ([FOCUSED] diff-vs-contract + [WIDE] three-axis sweep:
     blast-radius + sibling-class + coupled-artifact, always both); blocking
-    issues become fix-tasks looped back to the same implementer.
+    issues become fix-tasks looped back to the same implementer (or, for a
+    directly-authored doc/skill, revised by polly itself), and re-reviewed.
   - review-before-pr — the standing gate: no PR opens until its branch diff has
     passed gates + different-vendor review; the PR is the reviewed product.
   - pr-bot-loop — where a review bot is wired, service the external Codex-bot
