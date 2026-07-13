@@ -106,7 +106,8 @@ result = sys_session_send(
 
 The agent accepts natural language prompts referencing:
 - **project_url** (required): Full URL like `https://claude.ai/design/p/<id>`
-- **out_dir** (optional, default `.design-mocks`): Local output directory (relative to cwd, escaping rejected)
+- **out_dir** (optional, default `.design-mocks`): Gitignored mirror directory relative to cwd
+  (repository metadata, tracked trees, non-ignored paths, and escapes are rejected)
 - **include_ds** (optional, default `true`): Include Design System assets from `_ds/`
 
 Examples:
@@ -140,7 +141,7 @@ On subsequent runs to the same `out_dir`:
 
 ## Gitignore
 
-**IMPORTANT**: The consuming worktree should gitignore the output dir. Add to `.gitignore`:
+**IMPORTANT**: The consuming worktree must gitignore the output dir. Add to `.gitignore`:
 
 ```gitignore
 # Claude Design sync (ephemeral local mirrors)

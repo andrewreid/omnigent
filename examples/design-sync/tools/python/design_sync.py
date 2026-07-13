@@ -11,6 +11,8 @@ import html
 import json
 import os
 import re
+import stat
+import subprocess
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -32,13 +34,13 @@ def _read_bearer_token() -> str:
         creds = json.load(f)
 
     token = creds.get("claudeAiOauth", {}).get("accessToken")
-    if not token:
+    if not isinstance(token, str) or not token:
         raise ValueError("No accessToken found in credentials file")
 
     return token
 
 
-def _jsonrpc_call(
+def _jsonrpc_call(  # type: ignore[explicit-any]  # JSON-RPC uses schema-less JSON.
     bearer: str, method: str, params: dict[str, Any] | None = None, request_id: int = 1
 ) -> Any:
     """Make a JSON-RPC call to the Anthropic Design MCP endpoint."""
@@ -130,9 +132,12 @@ def _html_entity_decode(text: str) -> str:
 _ENTITY_RE = re.compile(r"&(#[0-9]+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]*);")
 
 
-def _list_all_files(bearer: str, project_id: str, include_ds: bool) -> list[dict[str, Any]]:
+def _list_all_files(  # type: ignore[explicit-any]  # MCP file entries are schema-less JSON.
+    bearer: str, project_id: str, include_ds: bool
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """Recursively list all files in the project, walking each directory."""
     all_files = []
+    failures = []
     dirs_to_walk = [""]  # Start with root
     visited = set()  # Prevent cycles
     req_id = 100
@@ -154,8 +159,17 @@ def _list_all_files(bearer: str, project_id: str, include_ds: bool) -> list[dict
         )
         req_id += 1
 
+        failure_path = current_dir or "/"
+        if not isinstance(result, dict) or result.get("isError"):
+            failures.append({"path": failure_path, "error": "List error"})
+            continue
+
         # Parse response — may be JSON-encoded text or structured response
         for item in result.get("content", []):
+            if item.get("isError"):
+                failures.append({"path": failure_path, "error": "List error"})
+                continue
+
             # JSON-encoded text response
             if item.get("type") == "text":
                 text_content = item.get("text", "")
@@ -165,12 +179,16 @@ def _list_all_files(bearer: str, project_id: str, include_ds: bool) -> list[dict
                     file_list = json.loads(text_content)
                 except (json.JSONDecodeError, TypeError):
                     # Not JSON — check if it's an error message
-                    if "error" in text_content.lower() or item.get("isError"):
+                    if "error" in text_content.lower():
+                        failures.append({"path": failure_path, "error": "List error"})
                         continue
                     file_list = []
 
                 # Handle both list and dict responses
                 if isinstance(file_list, dict):
+                    if file_list.get("isError") or file_list.get("error"):
+                        failures.append({"path": failure_path, "error": "List error"})
+                        continue
                     file_list = file_list.get("files", [])
 
                 for entry in file_list:
@@ -221,7 +239,7 @@ def _list_all_files(bearer: str, project_id: str, include_ds: bool) -> list[dict
                         }
                     )
 
-    return all_files
+    return all_files, failures
 
 
 def _read_file_content(
@@ -316,6 +334,64 @@ class UnsafePathError(Exception):
     """Raised when a path component is (or became) a symlink at write time."""
 
 
+def _replace_nondirectory_with_directory(parent_fd: int, name: str, rel_path: str) -> None:
+    """Create a real directory, replacing a stale non-directory mirror entry."""
+    try:
+        os.mkdir(name, mode=0o755, dir_fd=parent_fd)
+        return
+    except FileExistsError:
+        pass
+
+    entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if stat.S_ISDIR(entry.st_mode):
+        return
+    if stat.S_ISLNK(entry.st_mode):
+        raise UnsafePathError(f"unsafe component {name!r} in {rel_path!r}")
+
+    os.unlink(name, dir_fd=parent_fd)
+    os.mkdir(name, mode=0o755, dir_fd=parent_fd)
+
+
+def _remove_tree_at(parent_fd: int, name: str) -> None:
+    """Remove a directory tree relative to a verified descriptor without following links."""
+    child_fd = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=parent_fd,
+    )
+    try:
+        for child in os.listdir(child_fd):
+            child_stat = os.stat(child, dir_fd=child_fd, follow_symlinks=False)
+            if stat.S_ISDIR(child_stat.st_mode):
+                _remove_tree_at(child_fd, child)
+            else:
+                os.unlink(child, dir_fd=child_fd)
+    finally:
+        os.close(child_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def _replace_target(cur_fd: int, tmp_name: str, filename: str, quarantine_name: str) -> None:
+    """Atomically install a temp file, quarantining a stale directory first."""
+    try:
+        os.rename(tmp_name, filename, src_dir_fd=cur_fd, dst_dir_fd=cur_fd)
+        return
+    except IsADirectoryError:
+        pass
+
+    os.rename(filename, quarantine_name, src_dir_fd=cur_fd, dst_dir_fd=cur_fd)
+    try:
+        os.rename(tmp_name, filename, src_dir_fd=cur_fd, dst_dir_fd=cur_fd)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.rename(quarantine_name, filename, src_dir_fd=cur_fd, dst_dir_fd=cur_fd)
+        raise
+
+    # A concurrently changed quarantine may remain, but is still contained.
+    with contextlib.suppress(OSError):
+        _remove_tree_at(cur_fd, quarantine_name)
+
+
 def _write_file_contained(
     base_fd: int, rel_path: str, content_bytes: bytes, tmp_suffix: str
 ) -> None:
@@ -347,8 +423,7 @@ def _write_file_contained(
     cur_fd = base_fd
     try:
         for comp in dir_parts:
-            with contextlib.suppress(FileExistsError):
-                os.mkdir(comp, mode=0o755, dir_fd=cur_fd)
+            _replace_nondirectory_with_directory(cur_fd, comp, rel_path)
             try:
                 next_fd = os.open(
                     comp,
@@ -363,7 +438,9 @@ def _write_file_contained(
             fds_to_close.append(next_fd)
             cur_fd = next_fd
 
-        tmp_name = f".design-sync-{filename}-{tmp_suffix}.tmp"
+        temp_id = hashlib.sha256(f"{rel_path}\0{tmp_suffix}".encode()).hexdigest()[:16]
+        tmp_name = f".ds-{temp_id}.tmp"
+        quarantine_name = f".ds-{temp_id}.old"
 
         # Create temp exclusively in the verified parent dir; O_NOFOLLOW so an
         # attacker-planted symlink at this name is rejected, O_EXCL so we never
@@ -383,7 +460,7 @@ def _write_file_contained(
             if written != len(content_bytes):
                 raise OSError(f"short write: {written} != {len(content_bytes)}")
             # Atomic rename anchored to the verified dir fd on BOTH sides.
-            os.rename(tmp_name, filename, src_dir_fd=cur_fd, dst_dir_fd=cur_fd)
+            _replace_target(cur_fd, tmp_name, filename, quarantine_name)
             wrote_temp = False
         finally:
             if tmp_fd >= 0:
@@ -398,8 +475,58 @@ def _write_file_contained(
                 os.close(fd)
 
 
+def _validate_out_dir(cwd: Path, out_path: Path, rel: Path) -> str | None:
+    """Require mirrors to live in an ignored, non-repository namespace."""
+    protected = {".git", ".github", ".hg", ".svn", ".bzr"}
+    if any(part.lower() in protected for part in rel.parts):
+        return f"out_dir is a protected repository path (tried: {rel})"
+
+    try:
+        repo = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+
+    repo_root = Path(repo).resolve()
+    try:
+        repo_rel = out_path.relative_to(repo_root)
+    except ValueError:
+        return "out_dir must stay inside the current Git worktree"
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "--", str(repo_rel)],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if tracked.stdout.strip():
+        return f"out_dir contains tracked files (tried: {rel})"
+
+    ignored = subprocess.run(
+        [
+            "git",
+            "check-ignore",
+            "--quiet",
+            "--no-index",
+            "--",
+            f"{repo_rel.as_posix().rstrip('/')}/",
+        ],
+        cwd=repo_root,
+        check=False,
+    )
+    if ignored.returncode != 0:
+        return f"out_dir must be inside a gitignored mirror namespace (tried: {rel})"
+    return None
+
+
 @tool
-def design_sync(
+def design_sync(  # type: ignore[explicit-any]  # Tool payload is heterogeneous JSON.
     project_url: str, out_dir: str = ".design-mocks", include_ds: bool = True
 ) -> dict[str, Any]:
     """
@@ -455,6 +582,10 @@ def design_sync(
             )
         }
 
+    out_dir_error = _validate_out_dir(cwd, out_path, rel)
+    if out_dir_error:
+        return {"error": out_dir_error}
+
     # Read bearer token
     try:
         bearer = _read_bearer_token()
@@ -478,7 +609,7 @@ def design_sync(
 
     # List all files
     try:
-        files = _list_all_files(bearer, project_id, include_ds)
+        files, list_failures = _list_all_files(bearer, project_id, include_ds)
     except Exception as e:  # noqa: BLE001 — tool must return a structured error, never crash the session
         return {"error": f"Failed to list files: {e}"}
 
@@ -497,7 +628,7 @@ def design_sync(
     files_written = []
     skipped_binaries = []
     skipped_unsafe = []
-    failures = []
+    failures = list_failures.copy()
     total_bytes = 0
     req_id = 1000
 
@@ -637,6 +768,12 @@ def design_sync(
             f"| `{path_escaped}` | {size_display} | `{sha256_escaped}` | "
             f"`{etag_escaped}` | {status} |\n"
         )
+
+    if list_failures:
+        manifest_lines.extend(["\n", "## Listing failures\n", "\n"])
+        for failure in list_failures:
+            path = failure["path"].replace("`", "\\`")
+            manifest_lines.append(f"- `{path}`: {failure['error']}\n")
 
     manifest_path = cwd / ".design-sync-manifest.md"
     manifest_bytes = "".join(manifest_lines).encode("utf-8")
