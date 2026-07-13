@@ -62,10 +62,12 @@ line per item (a hit, or "clear"):
   auth path, model reachability, and which provider resolves are deployment
   facts, not properties of the file.
 - **CLAIM COMPLETENESS.** When the diff makes claims about named files,
-  workflows, or config, audit EVERY such claim — both what is REMOVED and what is
-  ADDED, not a convenient spot-check. A partial audit catches one direction and
-  misses its symmetric twin: a stale claim left behind by a removal, or a fresh
-  claim that overreaches what it added. Enumerate all of them; verify each.
+  workflows, or config, audit EVERY such claim — what is REMOVED, what is ADDED,
+  AND anything the diff asserts is UNCHANGED — not a convenient spot-check. A
+  partial audit catches one direction and misses its twins: a stale claim left
+  behind by a removal, a fresh claim that overreaches what it added, or an
+  "unchanged / still X / no change to Y" assertion that is itself false against
+  the actual code/config. Enumerate all of them; verify each.
 
 When the wide pass finds genuinely nothing across the whole checklist, it says so
 in one line and moves on. It does not get skipped to save a dispatch.
@@ -119,7 +121,8 @@ nothing. A doc/ADR/spec diff that skips them is not reviewed.
    BOTH passes and report under both headings: [FOCUSED] diff-vs-contract, then
    [WIDE] blast-radius — walk the blast-radius checklist (callers, consumer/event
    ripple, PARALLEL SURFACES, test-surface coverage, whole-parcel grep for any
-   renamed term, env-dependent claims, claim completeness) and report a line per
+   renamed term, env-dependent claims, claim completeness — audit removed, added,
+   AND unchanged-asserting claims) and report a line per
    item; if the reviewed artifact is a doc/ADR/spec rather than code, ALSO run
    [SELF-CONSISTENCY] (does it contradict itself / carry stale scope from an
    earlier edit pass?) and [GOVERNANCE] (does it obey the repo's own ADR/spec
