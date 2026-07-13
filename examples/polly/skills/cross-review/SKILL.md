@@ -220,8 +220,9 @@ debate it.
    whole-parcel grep for any renamed term, env-dependent claims, claim
    completeness — audit removed, added, AND unchanged-asserting claims); (2)
    sibling-class sweep (name the defect class, enumerate every un-touched site
-   matching its shape); (3) input-domain sweep (for any changed
-   classifier/parser/mapper/router/handler, enumerate the full input taxonomy —
+   matching its shape); (3) input-domain sweep (for any changed classifier,
+   parser, mapper, router, dispatcher, normalizer, or error/exception handler,
+   enumerate the full input taxonomy —
    all input shapes, alternate/legacy field names, nested/wrapped/chained forms,
    overlap/ordering so a broad match does not short-circuit a more-specific one,
    and the none-match fall-through; report any unhandled input shape as blocking);
