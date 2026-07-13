@@ -67,7 +67,7 @@ What actually holds the download-only guarantee:
   `read_skill_file`, `sys_policy_registry`, `sys_agent_get`, `sys_agent_list`,
   `sys_session_get_history`, `sys_session_get_info`, `sys_session_list`.
   (`sys_agent_download` and `sys_cancel_task` are NOT read-only — they mutate, and are
-  in the denied set above. `tests/acceptance_gate.py` asserts deny on all 7 and abstain
+  in the denied set above. `tests/acceptance_gate.py` asserts DENY on all 7 and ALLOW
   on all 12.)
 
 ## How to Launch
