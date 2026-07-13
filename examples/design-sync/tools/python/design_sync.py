@@ -5,16 +5,17 @@ Downloads all files from a claude.ai/design project via JSON-RPC to the
 Anthropic Design MCP endpoint, preserving exact bytes and directory structure.
 """
 
+import contextlib
+import hashlib
+import html
 import json
 import os
-import urllib.request
-import urllib.error
-import html
-import hashlib
 import tempfile
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 from omnigent_client import tool
 
@@ -24,8 +25,7 @@ def _read_bearer_token() -> str:
     creds_path = Path.home() / ".claude" / ".credentials.json"
     if not creds_path.exists():
         raise FileNotFoundError(
-            f"Credentials file not found: {creds_path}\n"
-            "Run `omnigent setup` to authenticate."
+            f"Credentials file not found: {creds_path}\nRun `omnigent setup` to authenticate."
         )
 
     with open(creds_path) as f:
@@ -39,20 +39,12 @@ def _read_bearer_token() -> str:
 
 
 def _jsonrpc_call(
-    bearer: str,
-    method: str,
-    params: Optional[Dict[str, Any]] = None,
-    request_id: int = 1
+    bearer: str, method: str, params: dict[str, Any] | None = None, request_id: int = 1
 ) -> Any:
     """Make a JSON-RPC call to the Anthropic Design MCP endpoint."""
     endpoint = "https://api.anthropic.com/v1/design/mcp"
 
-    payload = {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": method,
-        "params": params or {}
-    }
+    payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
 
     req = urllib.request.Request(
         endpoint,
@@ -61,7 +53,7 @@ def _jsonrpc_call(
             "Authorization": f"Bearer {bearer}",
             "Content-Type": "application/json",
         },
-        method="POST"
+        method="POST",
     )
 
     try:
@@ -69,15 +61,16 @@ def _jsonrpc_call(
             result = json.load(resp)
 
             if "error" in result:
-                error_info = result['error']
+                error_info = result["error"]
                 # Redact error details to prevent leakage to model
-                error_code = error_info.get('code', 'unknown')
+                error_code = error_info.get("code", "unknown")
                 raise RuntimeError(f"JSON-RPC error (code {error_code})")
 
             return result.get("result")
     except urllib.error.HTTPError as e:
-        # Redact HTTP error bodies
-        raise RuntimeError(f"HTTP {e.code} error")
+        # Redact HTTP error bodies; `from None` drops the chained
+        # HTTPError so its (possibly sensitive) body never surfaces.
+        raise RuntimeError(f"HTTP {e.code} error") from None
 
 
 def _strip_mcp_wrapper(content: str) -> str:
@@ -97,7 +90,7 @@ def _strip_mcp_wrapper(content: str) -> str:
     if content.startswith("<untrusted-project-content"):
         tag_end = content.find(">")
         if tag_end != -1:
-            content = content[tag_end + 1:]
+            content = content[tag_end + 1 :]
             # Remove single newline after opening tag (wrapper artifact)
             if content.startswith("\n"):
                 content = content[1:]
@@ -108,7 +101,7 @@ def _strip_mcp_wrapper(content: str) -> str:
     if close_pos != -1:
         # Remove single newline before closing tag (wrapper artifact)
         if close_pos > 0 and content[close_pos - 1] == "\n":
-            content = content[:close_pos - 1]
+            content = content[: close_pos - 1]
         else:
             content = content[:close_pos]
 
@@ -126,11 +119,10 @@ def _html_entity_decode(text: str) -> str:
     text = text.replace("&amp;", sentinel)
     text = html.unescape(text)
     # Second pass: decode &amp;
-    text = text.replace(sentinel, "&")
-    return text
+    return text.replace(sentinel, "&")
 
 
-def _list_all_files(bearer: str, project_id: str, include_ds: bool) -> List[Dict[str, Any]]:
+def _list_all_files(bearer: str, project_id: str, include_ds: bool) -> list[dict[str, Any]]:
     """Recursively list all files in the project, walking each directory."""
     all_files = []
     dirs_to_walk = [""]  # Start with root
@@ -150,13 +142,7 @@ def _list_all_files(bearer: str, project_id: str, include_ds: bool) -> List[Dict
             args["path"] = current_dir
 
         result = _jsonrpc_call(
-            bearer,
-            "tools/call",
-            {
-                "name": "list_files",
-                "arguments": args
-            },
-            request_id=req_id
+            bearer, "tools/call", {"name": "list_files", "arguments": args}, request_id=req_id
         )
         req_id += 1
 
@@ -193,12 +179,14 @@ def _list_all_files(bearer: str, project_id: str, include_ds: bool) -> List[Dict
                     if file_type == "directory":
                         dirs_to_walk.append(path)
                     elif file_type == "file":
-                        all_files.append({
-                            "path": path,
-                            "size": entry.get("size", 0),
-                            "etag": entry.get("etag", ""),
-                            "mimeType": ""
-                        })
+                        all_files.append(
+                            {
+                                "path": path,
+                                "size": entry.get("size", 0),
+                                "etag": entry.get("etag", ""),
+                                "mimeType": "",
+                            }
+                        )
                 continue
 
             # Fallback: resource format
@@ -216,22 +204,21 @@ def _list_all_files(bearer: str, project_id: str, include_ds: bool) -> List[Dict
                 if is_dir:
                     dirs_to_walk.append(path)
                 else:
-                    all_files.append({
-                        "path": path,
-                        "size": resource.get("size", 0),
-                        "etag": resource.get("annotations", {}).get("etag", ""),
-                        "mimeType": resource.get("mimeType", "")
-                    })
+                    all_files.append(
+                        {
+                            "path": path,
+                            "size": resource.get("size", 0),
+                            "etag": resource.get("annotations", {}).get("etag", ""),
+                            "mimeType": resource.get("mimeType", ""),
+                        }
+                    )
 
     return all_files
 
 
 def _read_file_content(
-    bearer: str,
-    project_id: str,
-    path: str,
-    request_id: int
-) -> Tuple[Optional[bytes], bool, Optional[str]]:
+    bearer: str, project_id: str, path: str, request_id: int
+) -> tuple[bytes | None, bool, str | None]:
     """
     Read file content via MCP.
 
@@ -243,11 +230,8 @@ def _read_file_content(
     result = _jsonrpc_call(
         bearer,
         "tools/call",
-        {
-            "name": "read_file",
-            "arguments": {"project_id": project_id, "path": path}
-        },
-        request_id=request_id
+        {"name": "read_file", "arguments": {"project_id": project_id, "path": path}},
+        request_id=request_id,
     )
 
     # Check result-level error
@@ -318,10 +302,8 @@ def _is_path_safe(base_dir: Path, target_path: str) -> bool:
 
 @tool
 def design_sync(
-    project_url: str,
-    out_dir: str = ".design-mocks",
-    include_ds: bool = True
-) -> Dict[str, Any]:
+    project_url: str, out_dir: str = ".design-mocks", include_ds: bool = True
+) -> dict[str, Any]:
     """
     Download all text files from a Claude Design project to local directory.
 
@@ -356,17 +338,29 @@ def design_sync(
     if Path(out_dir).is_absolute():
         return {"error": f"out_dir must be relative (got absolute path: {out_dir})"}
 
-    # Resolve out_dir and check containment
+    # Resolve out_dir and check containment (must stay strictly INSIDE cwd)
     out_path = (cwd / out_dir).resolve()
     try:
-        out_path.relative_to(cwd)
+        rel = out_path.relative_to(cwd)
     except ValueError:
         return {"error": f"out_dir escapes cwd (tried: {out_dir})"}
+
+    # Reject out_dir that IS the cwd / repo-root itself (e.g. '.', './',
+    # '', 'foo/..'). Writing the mirror into the working tree root would
+    # scatter downloaded files across the product tree. Require a distinct
+    # sub-directory so the mirror is contained and gitignorable.
+    if out_path == cwd or str(rel) == ".":
+        return {
+            "error": (
+                "out_dir must be a sub-directory, not the working directory / "
+                f"repo root itself (tried: {out_dir!r})"
+            )
+        }
 
     # Read bearer token
     try:
         bearer = _read_bearer_token()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — tool must return a structured error, never crash the session
         return {"error": f"Failed to read bearer token: {e}"}
 
     # Initialize MCP session
@@ -377,17 +371,17 @@ def design_sync(
             {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "design-sync-agent", "version": "1.0.0"}
+                "clientInfo": {"name": "design-sync-agent", "version": "1.0.0"},
             },
-            request_id=1
+            request_id=1,
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — tool must return a structured error, never crash the session
         return {"error": f"MCP initialization failed: {e}"}
 
     # List all files
     try:
         files = _list_all_files(bearer, project_id, include_ds)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — tool must return a structured error, never crash the session
         return {"error": f"Failed to list files: {e}"}
 
     # Prepare output directory
@@ -412,9 +406,7 @@ def design_sync(
             continue
 
         # Read file content
-        content_bytes, is_binary, error = _read_file_content(
-            bearer, project_id, path, req_id
-        )
+        content_bytes, is_binary, error = _read_file_content(bearer, project_id, path, req_id)
         req_id += 1
 
         if is_binary:
@@ -434,25 +426,30 @@ def design_sync(
         # EXACT size check (no tolerance)
         if expected_size != actual_size:
             # Retry once
-            content_bytes, is_binary, error = _read_file_content(
-                bearer, project_id, path, req_id
-            )
+            content_bytes, is_binary, error = _read_file_content(bearer, project_id, path, req_id)
             req_id += 1
 
             if error or is_binary or content_bytes is None:
-                failures.append({
-                    "path": path,
-                    "error": f"Size mismatch: expected {expected_size}, got {actual_size} (retry failed)"
-                })
+                failures.append(
+                    {
+                        "path": path,
+                        "error": (
+                            f"Size mismatch: expected {expected_size}, "
+                            f"got {actual_size} (retry failed)"
+                        ),
+                    }
+                )
                 continue
 
             actual_size = len(content_bytes)
 
             if expected_size != actual_size:
-                failures.append({
-                    "path": path,
-                    "error": f"Size mismatch: expected {expected_size}, got {actual_size}"
-                })
+                failures.append(
+                    {
+                        "path": path,
+                        "error": f"Size mismatch: expected {expected_size}, got {actual_size}",
+                    }
+                )
                 continue
 
         # Validate then write (unique temp → verify → atomic rename)
@@ -461,57 +458,59 @@ def design_sync(
 
         # Use unique temp file in same directory
         temp_fd, temp_path_str = tempfile.mkstemp(
-            suffix=".tmp",
-            prefix=f".design-sync-{file_path.name}-",
-            dir=file_path.parent
+            suffix=".tmp", prefix=f".design-sync-{file_path.name}-", dir=file_path.parent
         )
         temp_path = Path(temp_path_str)
+        fd_open = True
 
         try:
             # Write to temp
             os.write(temp_fd, content_bytes)
             os.close(temp_fd)
+            fd_open = False
 
             # Verify size
             if temp_path.stat().st_size != actual_size:
                 raise RuntimeError(f"Write verification failed: expected {actual_size} bytes")
 
-            # Atomic rename
+            # Atomic rename (temp_path no longer exists after this — the
+            # finally cleanup becomes a no-op on the success path)
             temp_path.rename(file_path)
 
             sha256 = hashlib.sha256(content_bytes).hexdigest()
-            files_written.append({
-                "path": path,
-                "size_bytes": actual_size,
-                "sha256": sha256,
-                "etag": etag
-            })
+            files_written.append(
+                {"path": path, "size_bytes": actual_size, "sha256": sha256, "etag": etag}
+            )
             total_bytes += actual_size
 
-        except Exception as e:
-            # Cleanup on failure
-            try:
-                if temp_path.exists():
-                    temp_path.unlink()
-            except:
-                pass
+        except Exception as e:  # noqa: BLE001 — per-file failure is recorded, never crashes the sync
             failures.append({"path": path, "error": f"Write failed: {e}"})
             continue
+
+        finally:
+            # Guarantee no orphaned fd or .tmp file, on ANY exit path
+            # (success rename already consumed temp_path → unlink no-ops).
+            if fd_open:
+                with contextlib.suppress(OSError):
+                    os.close(temp_fd)
+            with contextlib.suppress(OSError):
+                if temp_path.exists():
+                    temp_path.unlink()
 
     # Write sync manifest OUTSIDE mirrored namespace (sibling to out_dir, not inside it)
     timestamp = datetime.now(timezone.utc).isoformat()
     manifest_lines = [
-        f"# Design Sync Manifest\n",
-        f"\n",
+        "# Design Sync Manifest\n",
+        "\n",
         f"**Project:** {project_url}\n",
         f"**Project ID:** {project_id}\n",
         f"**Synced:** {timestamp}\n",
         f"**Include _ds/:** {include_ds}\n",
-        f"\n",
-        f"## Files\n",
-        f"\n",
-        f"| Path | Bytes | SHA256 | ETag | Status |\n",
-        f"|------|-------|--------|------|--------|\n",
+        "\n",
+        "## Files\n",
+        "\n",
+        "| Path | Bytes | SHA256 | ETag | Status |\n",
+        "|------|-------|--------|------|--------|\n",
     ]
 
     for file_info in files:
@@ -546,7 +545,8 @@ def design_sync(
         etag_escaped = str(etag_display).replace("|", "\\|")
 
         manifest_lines.append(
-            f"| `{path_escaped}` | {size_display} | `{sha256_escaped}` | `{etag_escaped}` | {status} |\n"
+            f"| `{path_escaped}` | {size_display} | `{sha256_escaped}` | "
+            f"`{etag_escaped}` | {status} |\n"
         )
 
     manifest_path = cwd / ".design-sync-manifest.md"
@@ -562,5 +562,5 @@ def design_sync(
         "failures": failures,
         "manifest_path": str(manifest_path),
         "total_bytes": total_bytes,
-        "timestamp": timestamp
+        "timestamp": timestamp,
     }
