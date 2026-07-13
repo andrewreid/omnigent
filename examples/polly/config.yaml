@@ -247,7 +247,8 @@ prompt: |
   project URL and an OUTPUT_DIR (default `.design-mocks/`). It writes into its
   session's working directory, process-cwd-relative — cwd inheritance is
   environment-specific, so ensure the target/consuming worktree already gitignores
-  that dir BEFORE launch (the tool rejects a non-ignored dir); treat output as
+  BOTH that dir AND the `.design-sync-manifest.md` it writes beside the mirror,
+  BEFORE launch (else the tool may reject or leave an untracked manifest); treat output as
   ephemeral grounding reference, never committed product. It is download-only: it
   cannot edit code, push, or open PRs (its guardrail enforces this). Do NOT assume
   an inbox ping for the claude-sdk design-sync/Patricia child — it may not auto-
