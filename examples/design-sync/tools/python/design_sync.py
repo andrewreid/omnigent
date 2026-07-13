@@ -10,7 +10,7 @@ import hashlib
 import html
 import json
 import os
-import tempfile
+import re
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -109,17 +109,25 @@ def _strip_mcp_wrapper(content: str) -> str:
 
 
 def _html_entity_decode(text: str) -> str:
-    """Decode HTML entities, with &amp; decoded LAST to avoid double-decode."""
-    # Guard against sentinel collision (unlikely but possible)
-    sentinel = "\x00AMPERSAND_PLACEHOLDER_e4b9c2a1\x00"
-    if sentinel in text:
-        raise ValueError("Content contains entity-decode sentinel (collision)")
+    """
+    Decode HTML entities in a SINGLE left-to-right pass.
 
-    # First pass: decode everything except &amp;
-    text = text.replace("&amp;", sentinel)
-    text = html.unescape(text)
-    # Second pass: decode &amp;
-    return text.replace(sentinel, "&")
+    The MCP wrapper escapes file bytes once (``&`` -> ``&amp;``, ``<`` ->
+    ``&lt;`` ...). A naive two-pass ``&amp;``-last scheme needs a magic
+    sentinel to protect already-decoded ``&`` from re-scanning, and any file
+    whose real content contains that sentinel string would raise — crashing
+    the whole sync (round-4 BLOCKER 3).
+
+    Instead we match each entity token with a regex and decode it exactly
+    ONCE via ``html.unescape``. Because the callback output is never re-scanned,
+    ``&amp;lt;`` correctly yields ``&lt;`` (not ``<``) and a bare ``&`` is left
+    untouched — with no sentinel, so no possible content collision.
+    """
+    return _ENTITY_RE.sub(lambda m: html.unescape(m.group(0)), text)
+
+
+# Named (&amp;), decimal (&#39;) and hex (&#x2014;) HTML entity tokens.
+_ENTITY_RE = re.compile(r"&(#[0-9]+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]*);")
 
 
 def _list_all_files(bearer: str, project_id: str, include_ds: bool) -> list[dict[str, Any]]:
@@ -285,9 +293,13 @@ def _read_file_content(
 
 def _is_path_safe(base_dir: Path, target_path: str) -> bool:
     """
-    Check if target_path is safe (stays within base_dir).
+    Cheap PRE-CHECK that target_path stays within base_dir.
 
-    Rejects: absolute paths, .., symlinks that escape, etc.
+    Rejects absolute paths and ``..`` escapes. This is only an early reject —
+    it resolves paths at check time and therefore cannot defend against a
+    symlink swapped in AFTER the check but BEFORE the write (TOCTOU). The real
+    defense is the descriptor-relative, ``O_NOFOLLOW`` write in
+    :func:`_write_file_contained`.
     """
     try:
         # Resolve both to absolute paths
@@ -298,6 +310,92 @@ def _is_path_safe(base_dir: Path, target_path: str) -> bool:
         return target_abs.is_relative_to(base_abs)
     except (ValueError, OSError):
         return False
+
+
+class UnsafePathError(Exception):
+    """Raised when a path component is (or became) a symlink at write time."""
+
+
+def _write_file_contained(
+    base_fd: int, rel_path: str, content_bytes: bytes, tmp_suffix: str
+) -> None:
+    """
+    Write ``content_bytes`` to ``base_fd/<rel_path>`` WITHOUT ever following a
+    symlink — the TOCTOU-safe write (round-4 BLOCKER 2).
+
+    Every parent component is opened relative to the previous directory's file
+    descriptor with ``O_DIRECTORY | O_NOFOLLOW``. If an attacker swaps any
+    component for a symlink between the pre-check and this write, ``os.open``
+    raises ``ELOOP`` and we abort that file with :class:`UnsafePathError`
+    rather than writing through the link. The temp file is created with
+    ``O_CREAT | O_EXCL | O_NOFOLLOW`` in the verified parent dir fd, its size
+    is checked by fd, then it is atomically renamed into place — both operands
+    anchored to the same verified directory fd — so the final bytes can only
+    land inside ``base_fd``.
+
+    :raises UnsafePathError: If any component is a symlink / not a directory.
+    :raises OSError: On any other filesystem error.
+    """
+    parts = [p for p in rel_path.split("/") if p not in ("", ".")]
+    if not parts:
+        raise UnsafePathError(f"empty path: {rel_path!r}")
+
+    dir_parts, filename = parts[:-1], parts[-1]
+
+    # Walk parents descriptor-relative; never follow a symlink.
+    fds_to_close: list[int] = []
+    cur_fd = base_fd
+    try:
+        for comp in dir_parts:
+            with contextlib.suppress(FileExistsError):
+                os.mkdir(comp, mode=0o755, dir_fd=cur_fd)
+            try:
+                next_fd = os.open(
+                    comp,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=cur_fd,
+                )
+            except OSError as e:
+                # ELOOP (symlink) or ENOTDIR → containment breach.
+                raise UnsafePathError(
+                    f"unsafe component {comp!r} in {rel_path!r}: {e.strerror}"
+                ) from None
+            fds_to_close.append(next_fd)
+            cur_fd = next_fd
+
+        tmp_name = f".design-sync-{filename}-{tmp_suffix}.tmp"
+
+        # Create temp exclusively in the verified parent dir; O_NOFOLLOW so an
+        # attacker-planted symlink at this name is rejected, O_EXCL so we never
+        # clobber an existing entry.
+        tmp_fd = os.open(
+            tmp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o644,
+            dir_fd=cur_fd,
+        )
+        wrote_temp = True
+        try:
+            os.write(tmp_fd, content_bytes)
+            written = os.fstat(tmp_fd).st_size
+            os.close(tmp_fd)
+            tmp_fd = -1
+            if written != len(content_bytes):
+                raise OSError(f"short write: {written} != {len(content_bytes)}")
+            # Atomic rename anchored to the verified dir fd on BOTH sides.
+            os.rename(tmp_name, filename, src_dir_fd=cur_fd, dst_dir_fd=cur_fd)
+            wrote_temp = False
+        finally:
+            if tmp_fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(tmp_fd)
+            if wrote_temp:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_name, dir_fd=cur_fd)
+    finally:
+        for fd in fds_to_close:
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 
 @tool
@@ -387,6 +485,14 @@ def design_sync(
     # Prepare output directory
     out_path.mkdir(parents=True, exist_ok=True)
 
+    # Open the base directory descriptor ONCE, refusing to follow a symlink at
+    # out_dir itself. All per-file writes are anchored to this fd so nothing
+    # can escape the mirror even if the tree is tampered with mid-sync.
+    try:
+        base_fd = os.open(str(out_path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        return {"error": f"out_dir is not a real directory (symlink?): {e.strerror}"}
+
     # Download each file
     files_written = []
     skipped_binaries = []
@@ -395,107 +501,90 @@ def design_sync(
     total_bytes = 0
     req_id = 1000
 
-    for file_info in files:
-        path = file_info["path"]
-        expected_size = file_info["size"]
-        etag = file_info["etag"]
+    try:
+        for file_info in files:
+            path = file_info["path"]
+            expected_size = file_info["size"]
+            etag = file_info["etag"]
 
-        # Path containment check
-        if not _is_path_safe(out_path, path):
-            skipped_unsafe.append(path)
-            continue
-
-        # Read file content
-        content_bytes, is_binary, error = _read_file_content(bearer, project_id, path, req_id)
-        req_id += 1
-
-        if is_binary:
-            skipped_binaries.append(path)
-            continue
-
-        if error:
-            failures.append({"path": path, "error": error})
-            continue
-
-        if content_bytes is None:
-            failures.append({"path": path, "error": "No content returned"})
-            continue
-
-        actual_size = len(content_bytes)
-
-        # EXACT size check (no tolerance)
-        if expected_size != actual_size:
-            # Retry once
-            content_bytes, is_binary, error = _read_file_content(bearer, project_id, path, req_id)
-            req_id += 1
-
-            if error or is_binary or content_bytes is None:
-                failures.append(
-                    {
-                        "path": path,
-                        "error": (
-                            f"Size mismatch: expected {expected_size}, "
-                            f"got {actual_size} (retry failed)"
-                        ),
-                    }
-                )
+            # Cheap pre-check (early reject); real defense is the write below.
+            if not _is_path_safe(out_path, path):
+                skipped_unsafe.append(path)
                 continue
 
-            actual_size = len(content_bytes)
-
-            if expected_size != actual_size:
-                failures.append(
-                    {
-                        "path": path,
-                        "error": f"Size mismatch: expected {expected_size}, got {actual_size}",
-                    }
+            # Per-file guard: a single bad file NEVER aborts the whole sync
+            # (round-4 BLOCKER 3). All read/decode/write errors are recorded.
+            try:
+                content_bytes, is_binary, error = _read_file_content(
+                    bearer, project_id, path, req_id
                 )
-                continue
+                req_id += 1
 
-        # Validate then write (unique temp → verify → atomic rename)
-        file_path = out_path / path
-        file_path.parent.mkdir(parents=True, exist_ok=True)
+                if is_binary:
+                    skipped_binaries.append(path)
+                    continue
 
-        # Use unique temp file in same directory
-        temp_fd, temp_path_str = tempfile.mkstemp(
-            suffix=".tmp", prefix=f".design-sync-{file_path.name}-", dir=file_path.parent
-        )
-        temp_path = Path(temp_path_str)
-        fd_open = True
+                if error:
+                    failures.append({"path": path, "error": error})
+                    continue
 
-        try:
-            # Write to temp
-            os.write(temp_fd, content_bytes)
-            os.close(temp_fd)
-            fd_open = False
+                if content_bytes is None:
+                    failures.append({"path": path, "error": "No content returned"})
+                    continue
 
-            # Verify size
-            if temp_path.stat().st_size != actual_size:
-                raise RuntimeError(f"Write verification failed: expected {actual_size} bytes")
+                actual_size = len(content_bytes)
 
-            # Atomic rename (temp_path no longer exists after this — the
-            # finally cleanup becomes a no-op on the success path)
-            temp_path.rename(file_path)
+                # EXACT size check (no tolerance)
+                if expected_size != actual_size:
+                    # Retry once
+                    content_bytes, is_binary, error = _read_file_content(
+                        bearer, project_id, path, req_id
+                    )
+                    req_id += 1
 
-            sha256 = hashlib.sha256(content_bytes).hexdigest()
-            files_written.append(
-                {"path": path, "size_bytes": actual_size, "sha256": sha256, "etag": etag}
-            )
-            total_bytes += actual_size
+                    if error or is_binary or content_bytes is None:
+                        failures.append(
+                            {
+                                "path": path,
+                                "error": (
+                                    f"Size mismatch: expected {expected_size}, "
+                                    f"got {actual_size} (retry failed)"
+                                ),
+                            }
+                        )
+                        continue
 
-        except Exception as e:  # noqa: BLE001 — per-file failure is recorded, never crashes the sync
-            failures.append({"path": path, "error": f"Write failed: {e}"})
-            continue
+                    actual_size = len(content_bytes)
 
-        finally:
-            # Guarantee no orphaned fd or .tmp file, on ANY exit path
-            # (success rename already consumed temp_path → unlink no-ops).
-            if fd_open:
-                with contextlib.suppress(OSError):
-                    os.close(temp_fd)
-            with contextlib.suppress(OSError):
-                if temp_path.exists():
-                    temp_path.unlink()
+                    if expected_size != actual_size:
+                        failures.append(
+                            {
+                                "path": path,
+                                "error": (
+                                    f"Size mismatch: expected {expected_size}, got {actual_size}"
+                                ),
+                            }
+                        )
+                        continue
+
+                # TOCTOU-safe descriptor-relative write.
+                _write_file_contained(base_fd, path, content_bytes, str(req_id))
+
+                sha256 = hashlib.sha256(content_bytes).hexdigest()
+                files_written.append(
+                    {"path": path, "size_bytes": actual_size, "sha256": sha256, "etag": etag}
+                )
+                total_bytes += actual_size
+
+            except UnsafePathError as e:
+                # Symlink / containment breach detected AT WRITE TIME.
+                skipped_unsafe.append(path)
+                failures.append({"path": path, "error": f"Unsafe path: {e}"})
+            except Exception as e:  # noqa: BLE001 — per-file failure recorded, never crashes the sync
+                failures.append({"path": path, "error": f"Failed: {e}"})
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(base_fd)
 
     # Write sync manifest OUTSIDE mirrored namespace (sibling to out_dir, not inside it)
     timestamp = datetime.now(timezone.utc).isoformat()

@@ -44,22 +44,35 @@ What actually holds the download-only guarantee:
   `sys_session_get_info`, `sys_session_list`, `update_comment`.
 - **`guardrails.policies.deny_all_mutations`** (a `type: function` policy built from
   `omnigent.policies.function.make_fixed_action_callable`, `action: deny`) hard-DENIES
-  every mutation-capable builtin at the `tool_call` phase: `update_comment`,
-  `sys_add_policy`, `browser_navigate`, `browser_click`, `browser_type`, plus the
-  `sys_os_write/edit/shell` names (belt-and-suspenders — they aren't registered anyway).
+  every mutation-capable builtin at the `tool_call` phase. Audited across all 19
+  registered tools, that set is **7 tools**: `update_comment` (edits a comment's
+  persisted state), `sys_add_policy` (creates a session policy), `sys_agent_download`
+  (**writes bundle bytes to disk** — arbitrary write), `sys_cancel_task` (POSTs a
+  stop/interrupt → mutates task lifecycle), `browser_navigate`, `browser_click`,
+  `browser_type`. Plus the `sys_os_write/edit/shell` names (belt-and-suspenders —
+  they aren't registered without an `os_env` block anyway).
 - **`design_sync` is the ONLY mutation-capable tool** left reachable (it writes to a
-  contained local `out_dir`). Everything else that survives is **read-only**:
-  `browser_screenshot/snapshot`, `list_comments`, `load_skill`, `read_skill_file`,
-  and the `sys_session_*` / `sys_agent_*` / `sys_policy_registry` / `sys_cancel_task`
-  inspection builtins.
+  contained local `out_dir`). The remaining **11 builtins are read-only**:
+  `browser_screenshot`, `browser_snapshot`, `list_comments`, `load_skill`,
+  `read_skill_file`, `sys_policy_registry`, `sys_agent_get`, `sys_agent_list`,
+  `sys_session_get_history`, `sys_session_get_info`, `sys_session_list`.
+  (`sys_agent_download` and `sys_cancel_task` are NOT read-only — they mutate, and are
+  in the denied set above. `tests/acceptance_gate.py` asserts deny on all 7 and abstain
+  on all 12.)
 
 ## How to Launch
 
-Via Omnigent runtime MCP tools (available in consuming sessions):
+Via Omnigent runtime MCP tools in a consuming session.
+
+**Caveat:** `sys_session_create` is NOT a generally-available tool — it is only
+registered for callers whose own spec sets `spawn: true` (session-spawning
+capability). From a caller without it, use whatever session-spawn path your host
+exposes (or launch the agent through the server API). The snippet below is
+illustrative of the shape, not a tool guaranteed to be present.
 
 ```python
-# Create session for design-sync agent
-# Note: agent_id discovery depends on how agent is registered; 
+# Create session for design-sync agent (requires spawn:true on the caller)
+# Note: agent_id discovery depends on how agent is registered;
 # may be "design-sync" or an "ag_<hash>" id
 session = sys_session_create(
     agent_id="design-sync",  # or discovered ag_<hash> id
@@ -166,16 +179,23 @@ on the agent.
 
 ## Acceptance Gate Evidence
 
-Run `uv run python examples/design-sync/tests/acceptance_gate.py` for the assembled-agent
-proof. See the commit message for pasted output. It proves:
-1. **Assembled agent loads** via the REAL loader: `parse()` → 0 validation errors;
-   `ToolManager(spec, workdir)` builds 19 tools INCLUDING `design_sync`; `os_env`
-   absent; `resolve_function_policy` constructs the `deny_all_mutations` guardrail
-   without raising (and it denies `sys_os_shell`, abstains on `design_sync`).
+Run the tests under `tests/`. See the commit message for pasted output. They prove:
+1. **Assembled agent loads + enforces** (`tests/acceptance_gate.py`) via the REAL loader:
+   `parse()` → 0 validation errors; `ToolManager(spec, workdir)` builds 19 tools
+   INCLUDING `design_sync`; `os_env` absent; `resolve_function_policy` constructs the
+   `deny_all_mutations` guardrail without raising; and a deny/abstain matrix asserts the
+   policy DENIES all 7 mutation-capable builtins (incl. `sys_agent_download` +
+   `sys_cancel_task`) and ABSTAINS on `design_sync` + all 11 read-only builtins, with the
+   classified set proven equal to the 19 registered tools.
 2. **Transport/fidelity proof** (`tests/self_test_download.py`): byte-exact sha256
    over all text files, binaries skipped + reported, `_ds/` present, manifest with
    full sha + etag — importing the REAL production functions.
-3. **Unit tests passing** (`tests/test_design_sync.py`, imports real production functions).
-4. **Live zero-elicitation full-session run is a DEPLOY-TIME gate** — a build/review
+3. **TOCTOU symlink-escape regression** (`tests/test_toctou.py`): a mirror sub-dir is
+   swapped for a symlink to an outside dir between the pre-check and the write; asserts
+   NO bytes escape `out_dir`, the file is reported unsafe, and the sync still completes.
+4. **Entity-sentinel collision regression** (`tests/test_sentinel.py`): content
+   containing the former decode sentinel round-trips byte-exact and does not abort.
+5. **Unit tests passing** (`tests/test_design_sync.py`, imports real production functions).
+6. **Live zero-elicitation full-session run is a DEPLOY-TIME gate** — a build/review
    sub-agent cannot spawn omnigent sessions, so it is NOT claimed here; it is the
    operator's final check (see Known Risks #8).
