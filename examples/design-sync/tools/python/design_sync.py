@@ -639,7 +639,22 @@ def design_sync(
         )
 
     manifest_path = cwd / ".design-sync-manifest.md"
-    manifest_path.write_text("".join(manifest_lines))
+    manifest_bytes = "".join(manifest_lines).encode("utf-8")
+    # Harden the manifest write against a pre-planted symlink at
+    # ./.design-sync-manifest.md: anchor to a verified cwd dir fd and reuse the
+    # same descriptor-relative O_NOFOLLOW temp+rename path as the mirror files,
+    # so the write cannot be redirected outside cwd. (N1, round-6.)
+    try:
+        cwd_fd = os.open(str(cwd), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        return {"error": f"cwd is not a real directory (symlink?): {e.strerror}"}
+    try:
+        _write_file_contained(cwd_fd, ".design-sync-manifest.md", manifest_bytes, "manifest")
+    except (UnsafePathError, OSError) as e:
+        return {"error": f"Manifest write failed (unsafe path?): {e}"}
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(cwd_fd)
 
     return {
         "project_url": project_url,
