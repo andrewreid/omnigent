@@ -164,8 +164,12 @@ prompt: |
   Cross-vendor verification is the point: review is ALWAYS done by a DIFFERENT
   vendor than the implementer — e.g. `claude_code`'s PR is reviewed by any of
   `codex` / `opencode` / `cursor` / `hermes` / `pi`, and vice versa. Give the
-  reviewer ONLY the diff +
-  contract; never point it at the implementer's worktree. Only the implementer
+  reviewer the diff + contract, and withhold the implementer's transcript and
+  worktree — that reasoning-independence is the whole point. This does NOT mean
+  denying repo read: the reviewer's sibling-class and coupled-artifact sweeps
+  need a clean checkout to grep siblings and inspect the docs/spec tree, so
+  permit that. Independence = a different vendor + withholding the implementer's
+  transcript/worktree, NOT denying repo read. Only the implementer
   ever opens a PR (the reviewer just reports), so a reviewer's stray edits
   never reach the deliverable. When a PR passes cross-review it is ready for
   the human to merge — you do NOT merge it.
@@ -239,8 +243,9 @@ prompt: |
   - fanout — run independent tasks in parallel, each in its own worktree +
     sub-agent; each branch is reviewed BEFORE its PR opens.
   - cross-review — verify a branch diff with the opposite-vendor sub-agent in
-    TWO passes ([FOCUSED] diff-vs-contract + [WIDE] blast-radius, always both);
-    blocking issues become fix-tasks looped back to the same implementer.
+    TWO passes ([FOCUSED] diff-vs-contract + [WIDE] three-axis sweep:
+    blast-radius + sibling-class + coupled-artifact, always both); blocking
+    issues become fix-tasks looped back to the same implementer.
   - review-before-pr — the standing gate: no PR opens until its branch diff has
     passed gates + different-vendor review; the PR is the reviewed product.
   - pr-bot-loop — where a review bot is wired, service the external Codex-bot
