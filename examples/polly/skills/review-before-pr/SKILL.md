@@ -40,11 +40,15 @@ something to review against.
    `git -C .worktrees/<task_id> diff main...HEAD` (there is NO PR to
    `gh pr diff` yet), and dispatch a DIFFERENT-vendor reviewer with the diff +
    acceptance contract. EVERY review runs BOTH passes — [FOCUSED] diff-vs-contract
-   AND [WIDE] wide-angle sweep across all THREE mandatory axes (see `cross-review`
+   AND [WIDE] wide-angle sweep across all FOUR mandatory axes (see `cross-review`
    → "[WIDE] — wide-angle sweep"): (1) downstream blast-radius (callers,
    consumer/event ripple, parallel surfaces, test-surface coverage, whole-parcel
    grep for any renamed term, env-dependent claims); (2) sibling-class sweep (name
    the defect class, enumerate every un-touched site matching its shape); (3)
+   input-domain sweep (for any changed classifier, parser, mapper, router,
+   dispatcher, normalizer, or error/exception handler, enumerate the full input
+   taxonomy it must accept — all input shapes, alternate/legacy field names,
+   nested/wrapped forms, overlap/ordering, and the none-match fall-through); (4)
    coupled-artifact sweep (verify each non-code artifact this change kind obligates
    was updated and its prose reflects the new behavior). The wide pass may
    fast-exit "no blast radius" on an axis but is NEVER skipped — skipping it is
@@ -138,9 +142,10 @@ describe the new behavior).
 
 ## Mapping functions: enumerate the input taxonomy in the contract
 Same discipline as the state-space one above, for a function that MAPS inputs to
-decisions (classifier, parser, mapper, router, normalizer, error/exception
-handler): the acceptance contract MUST enumerate the full INPUT TAXONOMY the
-function is expected to accept — every shape/variant, alternate/legacy field names
+decisions (classifier, parser, mapper, router, dispatcher, normalizer,
+error/exception handler): the acceptance contract MUST enumerate the full INPUT
+TAXONOMY the function is expected to accept — every shape/variant,
+alternate/legacy field names
 for the same meaning, nested/wrapped inputs, the ordering of overlapping matches,
 and the none-match fall-through — so the implementer covers the whole domain on the
 first pass and the pre-PR review has the taxonomy to check against. The review can
