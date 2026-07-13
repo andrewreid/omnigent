@@ -93,6 +93,18 @@ See `cross-review` → "Coupled-artifact sweep" for how the review splits the
 mechanical half (validators in the gate) from the judgment half (does the prose
 describe the new behavior).
 
+## Mapping functions: enumerate the input taxonomy in the contract
+Same discipline as the state-space one above, for a function that MAPS inputs to
+decisions (classifier, parser, mapper, router, normalizer, error/exception
+handler): the acceptance contract MUST enumerate the full INPUT TAXONOMY the
+function is expected to accept — every shape/variant, alternate/legacy field names
+for the same meaning, nested/wrapped inputs, the ordering of overlapping matches,
+and the none-match fall-through — so the implementer covers the whole domain on the
+first pass and the pre-PR review has the taxonomy to check against. The review can
+never out-scope the contract it is handed, so a narrow contract makes this blind
+spot recur round after round. See `cross-review` → "Input-domain coverage" and
+"The review can never out-scope its contract".
+
 ## Notes
 - This flips the older "implementer opens its own PR immediately, then we
   review" ordering. If any other skill still implies PR-first, THIS policy wins:

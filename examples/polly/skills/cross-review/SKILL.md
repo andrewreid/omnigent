@@ -247,6 +247,55 @@ this with `review-before-pr` — the acceptance contract for a rich surface must
 the state-space axes and require an invariant / round-trip matrix test as a delivered
 artifact, so the surface is built right once instead of hardened reactively.
 
+## Input-domain coverage — the pure-function analogue of the state-space attack
+The state-space attack above enumerates the STATES of a stateful surface. Its
+pure-function twin enumerates the INPUT SHAPES of a mapping function, and it runs
+as a peer WIDE-pass axis whenever the diff touches one — the same move applied to a
+different kind of code.
+
+When a change touches a function that MAPS inputs to decisions — a classifier,
+parser, mapper, router, dispatcher, normalizer, or error/exception handler —
+enumerate the FULL input taxonomy it must accept, not only the shapes the diff
+exercised. Cover: every distinct input shape/variant; every field or property the
+function may branch on (including alternate/legacy field names carrying the same
+meaning); nested or wrapped inputs (a cause/inner chain, envelope, or union
+member); and the ORDERING of overlapping matches (a broad early match that
+short-circuits before a more-specific later branch). Verify every branch of the
+decision tree, and verify what happens for an input that matches NONE. A function
+that handles the common shape but drops a sibling shape, mis-orders an overlapping
+match, or falls through silently on an unrecognized shape is a BLOCKING finding.
+State the taxonomy explicitly and check each member against the code.
+
+Both axes are the same discipline — "enumerate the space, then check each member" —
+applied to different kinds of code: state-space = the states of a stateful surface;
+input-domain = the input shapes of a mapping function. A diff looks correct
+precisely because the shape it dropped is never in the diff; only enumerating the
+whole taxonomy surfaces the gap.
+
+## The review can never out-scope its contract — author the contract wide
+The reviewer checks the DELTA against the acceptance contract it was handed, so any
+dimension the contract omits is a dimension the review starts BLIND on. The
+reviewer's ceiling is the contract: however diligent the review, a narrow contract
+makes the blind spot recur round after round. This is upstream of review — a
+discipline for whoever AUTHORS the acceptance contract BEFORE dispatching the
+reviewer, not something the reviewer can recover on its own.
+
+Before dispatching, the contract must itself enumerate:
+1. **For a mapping function** (classifier, parser, mapper, router, dispatcher,
+   normalizer, error/exception handler) — the INPUT TAXONOMY the function must
+   cover: every shape/variant, every field it branches on (including
+   alternate/legacy names carrying the same meaning), nested/wrapped inputs, the
+   ordering of overlapping matches, and the none-match fall-through. If the contract
+   omits the taxonomy, the reviewer inherits the omission — the input-domain axis
+   has nothing to check the delta against.
+2. **The coupled non-code artifacts** that must move in lockstep with this change
+   kind (discovered from the repo's OWN contributor / spec-governance docs — see
+   "Coupled-artifact sweep").
+
+Write the contract WIDE so the review can be wide. A contract that names only the
+shapes the happy path exercises guarantees the review keeps signing off diffs whose
+dropped siblings the external whole-PR bot then finds LATER, one per round.
+
 ## Notes
 - Cross-review requires a reviewer from a DIFFERENT vendor than the implementer,
   so it needs at least two AVAILABLE workers (per polly's roster preflight). If
