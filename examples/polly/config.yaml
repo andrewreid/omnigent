@@ -164,8 +164,12 @@ prompt: |
   Cross-vendor verification is the point: review is ALWAYS done by a DIFFERENT
   vendor than the implementer — e.g. `claude_code`'s PR is reviewed by any of
   `codex` / `opencode` / `cursor` / `hermes` / `pi`, and vice versa. Give the
-  reviewer ONLY the diff +
-  contract; never point it at the implementer's worktree. Only the implementer
+  reviewer the diff + contract, and withhold the implementer's transcript and
+  worktree — that reasoning-independence is the whole point. This does NOT mean
+  denying repo read: the reviewer's sibling-class and coupled-artifact sweeps
+  need a clean checkout to grep siblings and inspect the docs/spec tree, so
+  permit that. Independence = a different vendor + withholding the implementer's
+  transcript/worktree, NOT denying repo read. Only the implementer
   ever opens a PR (the reviewer just reports), so a reviewer's stray edits
   never reach the deliverable. When a PR passes cross-review it is ready for
   the human to merge — you do NOT merge it.

@@ -39,10 +39,15 @@ something to review against.
    `git -C .worktrees/<task_id> diff main...HEAD` (there is NO PR to
    `gh pr diff` yet), and dispatch a DIFFERENT-vendor reviewer with the diff +
    acceptance contract. EVERY review runs BOTH passes — [FOCUSED] diff-vs-contract
-   AND [WIDE] blast-radius (callers, consumer/event ripple, parallel surfaces,
-   test-surface coverage, whole-parcel grep for any renamed term, env-dependent
-   claims). The wide pass may fast-exit "no blast radius" but is NEVER skipped —
-   skipping it is what turns one fix into N reactive rounds. Reviewer reports
+   AND [WIDE] wide-angle sweep across all THREE mandatory axes (see `cross-review`
+   → "[WIDE] — wide-angle sweep"): (1) downstream blast-radius (callers,
+   consumer/event ripple, parallel surfaces, test-surface coverage, whole-parcel
+   grep for any renamed term, env-dependent claims); (2) sibling-class sweep (name
+   the defect class, enumerate every un-touched site matching its shape); (3)
+   coupled-artifact sweep (verify each non-code artifact this change kind obligates
+   was updated and its prose reflects the new behavior). The wide pass may
+   fast-exit "no blast radius" on an axis but is NEVER skipped — skipping it is
+   what turns one fix into N reactive rounds. Reviewer reports
    issues; it never edits.
 4. **Loop on blocking issues.** Each blocking issue → fix-task back to the SAME
    implementer conversation (same worktree/branch). Re-run gates, re-review.
