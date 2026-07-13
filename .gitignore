@@ -48,6 +48,10 @@ run-omnigents.sh
 *.db-wal
 *.db-shm
 # Persisted artifacts from ad-hoc runs.
+
+# Claude Design artefact sync (ephemeral local mirrors)
+.design-mocks/
+.design-sync-manifest.md
 artifacts/
 .tmp-codex-parity-target/
 
