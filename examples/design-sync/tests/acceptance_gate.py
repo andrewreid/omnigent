@@ -41,6 +41,20 @@ def main() -> int:
         print("!! validation FAILED")
         return 1
 
+    # 1b. Harness-spawn name: mirror the real spawn resolution
+    #     (omnigent/runner/app.py: `config.get("harness") or type`, canonicalized)
+    #     and confirm it lands on the REGISTERED harness name `claude-sdk`.
+    #     Round-7 boot blocker: without config.harness this fell back to the
+    #     underscore `claude_sdk`, which is not a registered harness.
+    from omnigent.harness_aliases import canonicalize_harness
+
+    raw_harness = spec.executor.config.get("harness") or spec.executor.type
+    harness_name = canonicalize_harness(raw_harness) or raw_harness
+    print(f"    spawn harness_name={harness_name!r} (registered harness name)")
+    if harness_name != "claude-sdk":
+        print(f"!! harness name is {harness_name!r}, expected 'claude-sdk' (would fail boot)")
+        return 1
+
     # 2. Bundle-upload allowlist: every guardrail handler must be REGISTERED.
     #    This mirrors omnigent.spec._reject_unregistered_spec_policy_handlers,
     #    the check that rejected round-5's make_fixed_action_callable at launch.
