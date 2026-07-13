@@ -71,6 +71,29 @@ one edge at a time. Head it off at the SPEC, not the review:
 Build the surface right in one pass; do not let the external bot enumerate the state
 space for you across a dozen slow rounds.
 
+## Review the FINAL state — a post-review edit re-triggers review
+The review must run against the artifact the PR will actually open on, NOT an
+earlier draft. Any SUBSTANTIVE edit to the artifact AFTER its review passed but
+BEFORE the PR opens — a scope change, a reworded claim, a new section, a status
+flip — invalidates the prior review and RE-TRIGGERS it: re-run the gates and
+re-dispatch a different-vendor review of the NEW diff before the PR opens. For a
+doc/ADR/spec artifact the re-review must at minimum re-run the [SELF-CONSISTENCY]
+and [GOVERNANCE] passes (see `cross-review`), because a late edit is exactly what
+introduces self-contradiction and stale scope. The PR opens on a reviewed FINAL
+state — never on a state that was reviewed and then quietly edited.
+
+## Docs polly authors DIRECTLY are NOT exempt from this gate
+polly's spec permits it to author docs / specs / prose DIRECTLY, without a coding
+sub-agent. That authoring carve-out is about WHO writes the doc — it is NOT a
+carve-out from review-before-pr. A doc/spec PR that polly authored still owes an
+independent, DIFFERENT-vendor doc-lens cross-review of its FINAL diff before it
+opens, exactly like a code PR. Otherwise polly is author, PR-opener, and
+self-fixer with no independent set of eyes on the final doc — precisely the
+single-vendor blind spot this gate exists to close. polly authoring the prose does
+not make polly its reviewer: dispatch a different-vendor `review` sub-agent on the
+doc diff (running the [SELF-CONSISTENCY] + [GOVERNANCE] passes), loop blocking
+issues, and only then open the PR.
+
 ## Notes
 - This flips the older "implementer opens its own PR immediately, then we
   review" ordering. If any other skill still implies PR-first, THIS policy wins:

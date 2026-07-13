@@ -61,9 +61,46 @@ line per item (a hit, or "clear"):
   login / reachable via Y / routes through Z / this provider answers" claim — the
   auth path, model reachability, and which provider resolves are deployment
   facts, not properties of the file.
+- **CLAIM COMPLETENESS.** When the diff makes claims about named files,
+  workflows, or config, audit EVERY such claim — both what is REMOVED and what is
+  ADDED, not a convenient spot-check. A partial audit catches one direction and
+  misses its symmetric twin: a stale claim left behind by a removal, or a fresh
+  claim that overreaches what it added. Enumerate all of them; verify each.
 
 When the wide pass finds genuinely nothing across the whole checklist, it says so
 in one line and moves on. It does not get skipped to save a dispatch.
+
+## When the artifact under review is a doc / ADR / spec — two more mandatory passes
+The two passes above are tuned for a CODE diff: claim-vs-code and blast radius.
+When the reviewed artifact is a documentation / ADR / spec file rather than code,
+those are necessary but NOT sufficient — a prose artifact fails in ways a
+code-centric lens is structurally blind to. Run BOTH of the following in ADDITION
+to [FOCUSED] and [WIDE], and label them in the reviewer's report:
+
+**[SELF-CONSISTENCY] — does the document contradict ITSELF?** The [FOCUSED] pass
+audits each claim against its source IN ISOLATION, so two mutually-contradictory
+claims can each individually "pass" while directly contradicting each other. This
+pass reads the document as a whole and reconciles it against itself: do its stated
+consequences / scope / non-goals match its own decision and any evidence it cites
+(a spike, a finding, a benchmark it references)? Reconcile statements introduced
+across MULTIPLE edit passes — hunt STALE scope left behind when a later edit
+superseded an earlier claim but the earlier wording was never removed. A document
+that is internally inconsistent is wrong even when every individual claim traces to
+a real source.
+
+**[GOVERNANCE] — does the change obey the repo's OWN doc conventions?** Load the
+repository's own documentation / ADR / spec governance — an ADR lifecycle (e.g.
+Proposed → Accepted → Superseded), any decision registry / index that must stay in
+sync with the documents it lists, numbering / status / cross-reference rules — and
+verify the change CONFORMS. Flag a status transition applied prematurely (e.g.
+marked Accepted before the gate that accepts it), a new document that skips a
+required lifecycle state, a registry / index copy that disagrees with the document
+it points at, or a duplicated status that drifts between copies. The repo's own
+rules are the contract here; the diff must not violate them.
+
+These two passes are as mandatory for a doc artifact as [WIDE] is for code: run
+both, label both, fast-exit a pass in one line only when it genuinely finds
+nothing. A doc/ADR/spec diff that skips them is not reviewed.
 
 ## Procedure
 1. Get the task's diff. Per `review-before-pr`, review runs BEFORE a PR exists,
@@ -82,7 +119,11 @@ in one line and moves on. It does not get skipped to save a dispatch.
    BOTH passes and report under both headings: [FOCUSED] diff-vs-contract, then
    [WIDE] blast-radius — walk the blast-radius checklist (callers, consumer/event
    ripple, PARALLEL SURFACES, test-surface coverage, whole-parcel grep for any
-   renamed term, env-dependent claims) and report a line per item. Report
+   renamed term, env-dependent claims, claim completeness) and report a line per
+   item; if the reviewed artifact is a doc/ADR/spec rather than code, ALSO run
+   [SELF-CONSISTENCY] (does it contradict itself / carry stale scope from an
+   earlier edit pass?) and [GOVERNANCE] (does it obey the repo's own ADR/spec
+   lifecycle, numbering, and registry-sync rules?). Report
    blocking / non-blocking / suggestions. Do not edit code."})`. Give it the diff
    as text — do NOT point it at the implementer's worktree. For the WIDE pass the
    reviewer needs enough context to trace ripple: give it the changed surface
