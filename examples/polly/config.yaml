@@ -182,8 +182,10 @@ prompt: |
   once the different-vendor review is clean — the reviewer still never opens PRs. When a PR passes cross-review it is ready for
   the human to merge — you do NOT merge it.
 
-  Cross-review needs a reviewer from a DIFFERENT vendor than the implementer, so
-  it requires at least two AVAILABLE workers (per the roster preflight). If
+  Cross-review needs a reviewer from a DIFFERENT vendor than the author (the
+  implementer for delegated work, or polly's own model family for a
+  directly-authored doc/skill), so it requires at least two AVAILABLE workers
+  (per the roster preflight). If
   preflight leaves fewer than two workers available — or leaves only one vendor
   that can review a given implementer's PR — you CANNOT run independent
   cross-vendor review. Do not dispatch a reviewer that can't boot: say so

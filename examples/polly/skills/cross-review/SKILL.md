@@ -5,9 +5,10 @@ description: Verify a candidate diff (an implementer's, or a doc/skill polly aut
 
 # cross-review — independent verification
 
-The implementer never signs off on its own work — a different model does, and
-review is a sub-agent that returns a structured report, not a transcript
-anyone needs to read through.
+Whoever authored the change — an implementer sub-agent, or polly itself for a
+directly-authored doc/skill — never signs off on its own work; a
+different-vendor model does, and review is a sub-agent that returns a structured
+report, not a transcript anyone needs to read through.
 
 Every review runs TWO passes, ALWAYS, in one reviewer dispatch:
 - **[FOCUSED]** — diff-vs-contract: "does this change do what it claims, against
@@ -195,12 +196,15 @@ debate it.
    pinned-line baseline verifier, a schema/contract validator. Run them all via
    `sys_os_shell`. A functional change that fails ANY repo validator — a missing
    traceability tag, a stale requirement/spec index, a drifted pinned-line
-   baseline — is a RED gate: send it back to the implementer to drive green
-   first; don't involve the reviewer yet. These deterministic couplings are
+   baseline — is a RED gate: send it back to the fixer to drive green first —
+   the implementer for delegated work, or polly itself revising a
+   directly-authored artifact — and don't involve the reviewer yet. These deterministic couplings are
    caught here for free, with ZERO reviewer tokens — never spend a reviewer on a
    defect a validator already names.
 3. Dispatch a DIFFERENT-vendor sub-agent as reviewer: pick any AVAILABLE worker
-   whose vendor differs from the implementer's — `claude_code`, `codex`,
+   whose vendor differs from the AUTHOR's — the implementer for delegated work,
+   or polly's own Claude-family model for a directly-authored artifact —
+   `claude_code`, `codex`,
    `opencode`, `cursor`, `hermes`, or `pi` (e.g. Claude built it → any of
    `codex` / `opencode` / `cursor` / `hermes` / `pi`, and so on). Use a
    task-based title such as `review-auth-refactor`, never the raw vendor name:
@@ -292,7 +296,8 @@ WIDE pass into a full adversarial state-space attack:
 - **Front-run the external bot.** Prefer running this adversarial pass on the SAME
   engine as the external reviewer (`codex`) so its whole class of findings lands in
   the FAST internal loop instead of the slow PR loop (see `pr-bot-loop` → front-run
-  the bot). Keep it a DIFFERENT vendor from the implementer.
+  the bot). Keep it a DIFFERENT vendor from the author (the implementer, or polly
+  for a directly-authored artifact).
 
 The cheapest place to close a state-space bug is the implementer's FIRST pass: pair
 this with `review-before-pr` — the acceptance contract for a rich surface must name
@@ -349,9 +354,11 @@ shapes the happy path exercises guarantees the review keeps signing off diffs wh
 dropped siblings the external whole-PR bot then finds LATER, one per round.
 
 ## Notes
-- Cross-review requires a reviewer from a DIFFERENT vendor than the implementer,
-  so it needs at least two AVAILABLE workers (per polly's roster preflight). If
-  only one worker — or only one vendor that can review this implementer's PR —
+- Cross-review requires a reviewer from a DIFFERENT vendor than the author (the
+  implementer for delegated work, or polly's own model family for a
+  directly-authored artifact), so it needs at least two AVAILABLE workers (per
+  polly's roster preflight). If
+  only one worker — or only one vendor that can review this author's PR —
   is available on the machine, you CANNOT run independent cross-vendor review:
   don't dispatch a reviewer that can't boot, say so explicitly, and pull in the
   human at the plan gate.
