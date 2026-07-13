@@ -9,21 +9,26 @@ description: >-
 
 executor:
   type: omnigent
+  model: claude-haiku-4-5
   config:
     harness: claude-sdk
-    model: claude-haiku-4-5
     permission_mode: bypassPermissions
 
 os_env:
   type: caller_process
-
-sandbox:
-  type: none
-
-cwd: .
+  cwd: .
+  sandbox:
+    type: none
 
 guardrails:
-  gate_pushes: true
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: true
 
 prompt: |
   You are a download-only Claude Design sync agent. Your ONLY job: when given a
