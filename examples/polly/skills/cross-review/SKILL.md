@@ -15,7 +15,7 @@ Every review runs TWO passes, ALWAYS, in one reviewer dispatch:
   the acceptance contract?" This is the narrow, confirmatory pass.
 - **[WIDE]** — wide-angle sweep: "what ELSE does this change touch that the diff
   does not show?" This is the pass that catches the failures a diff-local
-  reviewer is structurally blind to. It carries THREE mandatory axes, not one —
+  reviewer is structurally blind to. It carries FOUR mandatory axes, not one —
   see below.
 
 These are not "confirmatory review, with adversarial as an occasional
@@ -35,8 +35,8 @@ each pass ran:
 acceptance contract and answers whether the change satisfies the contract. Enough
 on its own only for isolated, low-state changes.
 
-**[WIDE] — wide-angle sweep.** The wide pass carries THREE axes, and the
-reviewer must answer ALL THREE as mandatory questions — the diff-local view
+**[WIDE] — wide-angle sweep.** The wide pass carries FOUR axes, and the
+reviewer must answer ALL FOUR as mandatory questions — the diff-local view
 covers only the first:
 - **Downstream blast-radius** — who CONSUMES the contract this diff changed?
   (callers, event consumers, generated-client mirrors, anything that decodes the
@@ -45,6 +45,10 @@ covers only the first:
   diff did NOT touch? (parallel modules/handlers/routes running the same logic,
   other callers of the same helper/pattern). See "Is the finding a one-off or an
   instance of a class?" below.
+- **Input-domain sweep** — when the diff touches a function that MAPS inputs to
+  decisions (classifier, parser, mapper, router, dispatcher, normalizer,
+  error/exception handler), enumerate the FULL input taxonomy it must accept, not
+  only the shapes the diff exercised. See "Input-domain coverage" below.
 - **Coupled-artifact / traceability sweep** — for this change KIND, which
   NON-CODE artifacts must move in lockstep, and did they? (docs, spec, schema,
   traceability index, config reference). See "Coupled-artifact sweep" below.
@@ -211,12 +215,17 @@ debate it.
    `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"pi", title="review-<task_slug>",
    args={purpose: "review", input: "<the diff> + <the acceptance contract>. Run
    BOTH passes and report under both headings: [FOCUSED] diff-vs-contract, then
-   [WIDE] wide-angle sweep across all THREE axes — (1) downstream blast-radius
+   [WIDE] wide-angle sweep across all FOUR axes — (1) downstream blast-radius
    (callers, consumer/event ripple, parallel surfaces, test-surface coverage,
    whole-parcel grep for any renamed term, env-dependent claims, claim
    completeness — audit removed, added, AND unchanged-asserting claims); (2)
    sibling-class sweep (name the defect class, enumerate every un-touched site
-   matching its shape); (3) coupled-artifact sweep (read the repo's contributor /
+   matching its shape); (3) input-domain sweep (for any changed
+   classifier/parser/mapper/router/handler, enumerate the full input taxonomy —
+   all input shapes, alternate/legacy field names, nested/wrapped/chained forms,
+   overlap/ordering so a broad match does not short-circuit a more-specific one,
+   and the none-match fall-through; report any unhandled input shape as blocking);
+   (4) coupled-artifact sweep (read the repo's contributor /
    spec-governance docs, verify each non-code artifact this change kind obligates
    was updated and its prose reflects the new behavior) — report a line per item.
    PLUS: whenever the diff INCLUDES a doc/ADR/spec artifact (prose-only OR mixed
@@ -328,6 +337,18 @@ applied to different kinds of code: state-space = the states of a stateful surfa
 input-domain = the input shapes of a mapping function. A diff looks correct
 precisely because the shape it dropped is never in the diff; only enumerating the
 whole taxonomy surfaces the gap.
+
+**Shape an enumeration fix as an allowlist, not a denylist.** When the fix for a
+sibling / input-domain class is itself an ENUMERATION, prefer an ALLOWLIST —
+enumerate the KNOWN-GOOD cases and route anything unrecognized to the safe/strict
+branch — over an EXCLUDE-LIST / denylist that enumerates the known-bad. A denylist
+is fail-OPEN: every new or future sibling nobody enumerated slips through as a
+fresh hole, so the review/fix loop cannot converge — each round just finds the next
+un-excluded sibling. An allowlist is fail-CLOSED: it converges by construction,
+since any unrecognized case falls to the safe branch without having had to be
+foreseen. Reviewer cue: if a fix enumerates the BAD cases to reject, flag it — ask
+whether an allowlist of the good cases would close the class instead of chasing
+siblings one at a time.
 
 ## The review can never out-scope its contract — author the contract wide
 The reviewer checks the DELTA against the acceptance contract it was handed, so any
