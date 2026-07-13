@@ -41,28 +41,29 @@ async: false
 
 # Download-only: DENY (not ASK) every mutation-capable framework tool.
 # design_sync itself is intentionally NOT denied — it is the one write surface.
+#
+# The handler MUST be a REGISTERED policy handler: the agent-bundle upload path
+# (omnigent.spec.load -> _reject_unregistered_spec_policy_handlers) rejects any
+# type:function policy whose function.path is not in the policy registry. Only
+# handlers exported by a module's POLICY_REGISTRY are allowed for uploaded
+# bundles. `omnigent.policies.builtins.cel.cel_policy` is registered; an
+# arbitrary factory like make_fixed_action_callable is NOT, so it boots offline
+# but is rejected at launch. We use the registered CEL handler here.
 guardrails:
   policies:
     deny_all_mutations:
       type: function
       function:
-        path: omnigent.policies.function.make_fixed_action_callable
+        path: omnigent.policies.builtins.cel.cel_policy
         arguments:
-          action: deny
+          # DENY the 7 mutation-capable builtins on tool_call; ALLOW everything
+          # else (design_sync + the 11 read-only builtins + all non-tool_call
+          # phases). event.data.name is the tool name on a tool_call event.
+          #   update_comment      — changes a review comment's persisted state
+          #   sys_add_policy      — creates a new session policy
+          #   sys_agent_download  — writes bundle bytes to disk (arbitrary write)
+          #   sys_cancel_task     — POSTs stop/interrupt → mutates task lifecycle
+          #   browser_navigate/click/type — drive external browser/UI state
+          expression: |
+            event.type == "tool_call" && event.data.name in ["update_comment","sys_add_policy","sys_agent_download","sys_cancel_task","browser_navigate","browser_click","browser_type"] ? {"result":"DENY","reason":"download-only agent: mutations disabled"} : {"result":"ALLOW"}
           reason: "download-only agent: mutations disabled"
-          on_phases: [tool_call]
-          on_tools:
-            # Registered mutation-capable builtins (audited across all 19 tools).
-            - update_comment       # changes a review comment's persisted state
-            - sys_add_policy       # creates a new session policy
-            - sys_agent_download   # writes bundle bytes to disk (arbitrary write)
-            - sys_cancel_task      # POSTs stop/interrupt → mutates task lifecycle
-            - browser_navigate     # drives external browser page/URL
-            - browser_click        # mutates page/UI state
-            - browser_type         # fires input/change events on the page
-            # Belt-and-suspenders: OS tools are NOT registered (no os_env block),
-            # but deny them anyway so a future os_env addition can't silently
-            # re-open a write/edit/shell surface.
-            - sys_os_write
-            - sys_os_edit
-            - sys_os_shell

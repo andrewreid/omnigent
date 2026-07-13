@@ -42,15 +42,22 @@ What actually holds the download-only guarantee:
   `sys_add_policy`, `sys_agent_download`, `sys_agent_get`, `sys_agent_list`,
   `sys_cancel_task`, `sys_policy_registry`, `sys_session_get_history`,
   `sys_session_get_info`, `sys_session_list`, `update_comment`.
-- **`guardrails.policies.deny_all_mutations`** (a `type: function` policy built from
-  `omnigent.policies.function.make_fixed_action_callable`, `action: deny`) hard-DENIES
-  every mutation-capable builtin at the `tool_call` phase. Audited across all 19
-  registered tools, that set is **7 tools**: `update_comment` (edits a comment's
-  persisted state), `sys_add_policy` (creates a session policy), `sys_agent_download`
+- **`guardrails.policies.deny_all_mutations`** — a `type: function` policy whose
+  handler is the **REGISTERED** CEL policy
+  `omnigent.policies.builtins.cel.cel_policy`. This matters: the agent-bundle upload
+  path (`omnigent.spec.load` → `_reject_unregistered_spec_policy_handlers`) rejects any
+  `type: function` policy whose `function.path` is not in the policy registry, so an
+  arbitrary factory (e.g. `make_fixed_action_callable`) constructs offline but is
+  **rejected at launch** — round 6's boot blocker. `cel_policy` is registered.
+  Its CEL expression returns `{"result":"DENY"}` on
+  `event.type == "tool_call" && event.data.name in [...7 tools...]` and
+  `{"result":"ALLOW"}` otherwise. The denied set (audited across all 19 registered
+  tools) is **7 tools**: `update_comment` (edits a comment's persisted state),
+  `sys_add_policy` (creates a session policy), `sys_agent_download`
   (**writes bundle bytes to disk** — arbitrary write), `sys_cancel_task` (POSTs a
   stop/interrupt → mutates task lifecycle), `browser_navigate`, `browser_click`,
-  `browser_type`. Plus the `sys_os_write/edit/shell` names (belt-and-suspenders —
-  they aren't registered without an `os_env` block anyway).
+  `browser_type`. (The `sys_os_*` OS tools aren't registered without an `os_env`
+  block, so they need no explicit deny.)
 - **`design_sync` is the ONLY mutation-capable tool** left reachable (it writes to a
   contained local `out_dir`). The remaining **11 builtins are read-only**:
   `browser_screenshot`, `browser_snapshot`, `list_comments`, `load_skill`,
@@ -169,7 +176,7 @@ on the agent.
 
 4. **Binary file detection**: Tool skips files where `read_file` response contains text "binary file" or "stored base64". If a binary file is served without these markers, it may be written but corrupted.
 
-5. **HTML entity sentinel collision**: If file content contains the exact sentinel string used for entity decoding, tool raises ValueError. Extremely unlikely but possible.
+5. **Per-file failure isolation (no whole-run abort)**: Entity decoding is a single-pass regex `html.unescape` with no magic sentinel, so no file content can trigger a decode crash (the old sentinel-collision `ValueError` was eliminated in round 5). Each file's read/decode/write is wrapped independently — a bad file is recorded as `FAILED`/`unsafe` in the result + manifest and the rest of the sync completes. See Acceptance-Evidence #4 (sentinel regression) + #3 (TOCTOU).
 
 6. **No incremental sync**: Every run rewrites the full tree. For large projects, this is wasteful but guarantees consistency.
 
@@ -181,11 +188,13 @@ on the agent.
 
 Run the tests under `tests/`. See the commit message for pasted output. They prove:
 1. **Assembled agent loads + enforces** (`tests/acceptance_gate.py`) via the REAL loader:
-   `parse()` → 0 validation errors; `ToolManager(spec, workdir)` builds 19 tools
-   INCLUDING `design_sync`; `os_env` absent; `resolve_function_policy` constructs the
-   `deny_all_mutations` guardrail without raising; and a deny/abstain matrix asserts the
-   policy DENIES all 7 mutation-capable builtins (incl. `sys_agent_download` +
-   `sys_cancel_task`) and ABSTAINS on `design_sync` + all 11 read-only builtins, with the
+   `parse()` → 0 validation errors; the guardrail handler is confirmed a REGISTERED
+   policy handler (`is_registered_handler` — the exact bundle-upload guard that rejected
+   round 5's unregistered handler at launch); `ToolManager(spec, workdir)` builds 19 tools
+   INCLUDING `design_sync`; `os_env` absent; `resolve_function_policy` constructs the CEL
+   `deny_all_mutations` guardrail without raising; and a deny/allow matrix asserts the
+   policy returns `DENY` for all 7 mutation-capable builtins (incl. `sys_agent_download` +
+   `sys_cancel_task`) and `ALLOW` for `design_sync` + all 11 read-only builtins, with the
    classified set proven equal to the 19 registered tools.
 2. **Transport/fidelity proof** (`tests/self_test_download.py`): byte-exact sha256
    over all text files, binaries skipped + reported, `_ds/` present, manifest with

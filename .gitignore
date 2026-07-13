@@ -53,6 +53,7 @@ run-omnigents.sh
 
 # Claude Design artefact sync (ephemeral local mirrors)
 .design-mocks/
+.design-sync-manifest.md
 artifacts/
 .tmp-codex-parity-target/
 
