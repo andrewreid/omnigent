@@ -26,7 +26,7 @@ import design_sync as ds  # noqa: E402
 URL = "https://claude.ai/design/p/deadbeef-0000-1111-2222-333344445555"
 
 
-def main() -> int:
+def test_mirror_toctou() -> bool:
     prev_cwd = os.getcwd()
     tmp = tempfile.mkdtemp(prefix="toctou-cwd-")
     outside = tempfile.mkdtemp(prefix="toctou-outside-")
@@ -110,12 +110,77 @@ def main() -> int:
             print("  ✗ benign ok.txt missing — sync did not complete")
             ok = False
 
-        print("\n" + ("✓ TOCTOU REGRESSION PASSED" if ok else "✗ TOCTOU REGRESSION FAILED"))
-        return 0 if ok else 1
+        print("  " + ("✓ mirror TOCTOU ok" if ok else "✗ mirror TOCTOU FAILED"))
+        return ok
     finally:
         os.chdir(prev_cwd)
         shutil.rmtree(tmp, ignore_errors=True)
         shutil.rmtree(outside, ignore_errors=True)
+
+
+def test_manifest_symlink() -> bool:
+    """N1 (round-6): a pre-planted symlink at ./.design-sync-manifest.md must
+    not redirect the manifest write outside cwd."""
+    prev_cwd = os.getcwd()
+    tmp = tempfile.mkdtemp(prefix="toctou-manifest-cwd-")
+    outside = tempfile.mkdtemp(prefix="toctou-manifest-outside-")
+    try:
+        os.chdir(tmp)
+
+        def fake_jsonrpc(bearer, method, params=None, request_id=1):  # noqa: ARG001
+            if method == "initialize":
+                return {}
+            name = params["name"]
+            if name == "list_files" and not params["arguments"].get("path"):
+                entries = [{"path": "ok.txt", "type": "file", "size": 2, "etag": "e1"}]
+                return {"content": [{"type": "text", "text": json.dumps(entries)}]}
+            if name == "list_files":
+                return {"content": [{"type": "text", "text": json.dumps([])}]}
+            raise AssertionError(f"unexpected call {name}")
+
+        ds._read_bearer_token = lambda: "fake-token"
+        ds._jsonrpc_call = fake_jsonrpc
+        ds._read_file_content = lambda b, p, path, r: (b"OK", False, None)  # noqa: ARG005
+
+        # Pre-plant the malicious symlink: ./.design-sync-manifest.md → outside file.
+        target = Path(outside) / "pwned-manifest.md"
+        Path(tmp, ".design-sync-manifest.md").symlink_to(target)
+
+        result = ds.design_sync(URL, out_dir=".design-mocks", include_ds=True)
+
+        ok = True
+        # The manifest write must NOT have followed the symlink to `outside`.
+        if target.exists():
+            print(f"  ✗ MANIFEST_OUTSIDE_WRITE True {target.read_bytes()!r}  <-- EXPLOIT")
+            ok = False
+        else:
+            print("  ✓ no bytes written through symlink to outside cwd")
+
+        # The O_NOFOLLOW temp + anchored rename atomically REPLACES the planted
+        # symlink with a real regular file inside cwd — contained, no crash.
+        manifest = Path(tmp, ".design-sync-manifest.md")
+        if manifest.is_symlink():
+            print("  ✗ manifest path is still a symlink (write followed/failed to replace)")
+            ok = False
+        elif manifest.is_file() and "# Design Sync Manifest" in manifest.read_text():
+            print("  ✓ manifest replaced symlink with a real contained file")
+        else:
+            print(f"  ✗ manifest not a contained regular file: {result.get('error')}")
+            ok = False
+
+        print("  " + ("✓ manifest symlink ok" if ok else "✗ manifest symlink FAILED"))
+        return ok
+    finally:
+        os.chdir(prev_cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+def main() -> int:
+    ok = test_mirror_toctou()
+    ok = test_manifest_symlink() and ok
+    print("\n" + ("✓ TOCTOU REGRESSION PASSED" if ok else "✗ TOCTOU REGRESSION FAILED"))
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

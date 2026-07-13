@@ -2,10 +2,15 @@
 """
 Acceptance gate for the ASSEMBLED design-sync agent.
 
-Loads the example via the REAL omnigent loader:
-  1. parse(dir)                -> AgentSpec, print validation errors (must be [])
-  2. ToolManager(spec, workdir)-> registered tools (must INCLUDE design_sync)
-  3. resolve_function_policy   -> construct the guardrail (must NOT raise)
+Loads the example via the REAL omnigent loader/registry:
+  1. parse(dir)                       -> AgentSpec, validation errors (must be [])
+  2. bundle-upload allowlist check    -> handler MUST be a REGISTERED policy
+                                         handler (this is what the real launch
+                                         path enforces; round-5's unregistered
+                                         make_fixed_action_callable failed here)
+  3. ToolManager(spec, workdir)       -> registered tools (must INCLUDE design_sync)
+  4. resolve_function_policy          -> construct the CEL guardrail (must NOT raise)
+                                         and DENY the 7 mutation tools / ALLOW rest
 
 Run: uv run python examples/design-sync/tests/acceptance_gate.py
 """
@@ -14,6 +19,7 @@ import sys
 from pathlib import Path
 
 from omnigent.policies.function import resolve_function_policy
+from omnigent.policies.registry import is_registered_handler
 from omnigent.spec.parser import parse
 from omnigent.spec.validator import validate
 from omnigent.tools.manager import ToolManager
@@ -35,10 +41,26 @@ def main() -> int:
         print("!! validation FAILED")
         return 1
 
-    # 2. Build ToolManager against real code; list tools
+    # 2. Bundle-upload allowlist: every guardrail handler must be REGISTERED.
+    #    This mirrors omnigent.spec._reject_unregistered_spec_policy_handlers,
+    #    the check that rejected round-5's make_fixed_action_callable at launch.
+    print("\n[2] registered-policy-handler check (bundle-upload guard):")
+    policies = spec.guardrails.policies or []
+    handler_failures = []
+    for p in policies:
+        path = p.function.path
+        reg = is_registered_handler(path)
+        print(f"    {p.name!r}: handler={path} registered={reg}")
+        if not reg:
+            handler_failures.append(path)
+    if handler_failures:
+        print(f"!! UNREGISTERED handler(s) — bundle upload would be REJECTED: {handler_failures}")
+        return 1
+
+    # 3. Build ToolManager against real code; list tools
     tm = ToolManager(spec, workdir=EXAMPLE_DIR, sandbox_enabled=False)
     tool_names = sorted(tm._tools.keys())
-    print(f"\n[2] ToolManager built {len(tool_names)} tools:")
+    print(f"\n[3] ToolManager built {len(tool_names)} tools:")
     for n in tool_names:
         print(f"      - {n}")
     has_design_sync = any("design_sync" in n for n in tool_names)
@@ -47,19 +69,17 @@ def main() -> int:
         print("!! design_sync tool MISSING")
         return 1
 
-    # 3. Construct the guardrail policy (must NOT raise)
-    policies = spec.guardrails.policies or []
-    print(f"\n[3] guardrail policy count: {len(policies)}")
+    # 4. Construct the guardrail policy (must NOT raise)
+    print(f"\n[4] guardrail policy count: {len(policies)}")
     constructed = []
     for p in policies:
         fp = resolve_function_policy(p)
         constructed.append(fp)
         print(f"    constructed policy {p.name!r} -> {type(fp).__name__} (no raise)")
 
-    # 4. Behavioural proof: the policy must DENY every mutation-capable
-    #    registered builtin and ABSTAIN (None -> ALLOW) only on design_sync +
-    #    genuinely read-only builtins. Classification audited against
-    #    omnigent/runner/tool_dispatch.py + omnigent/tools/builtins/.
+    # 5. Behavioural proof: the CEL policy must DENY every mutation-capable
+    #    registered builtin and ALLOW design_sync + the read-only builtins.
+    #    Classification audited across all 19 registered tools.
     MUTATION = [
         "update_comment",
         "sys_add_policy",
@@ -87,23 +107,28 @@ def main() -> int:
     fp = constructed[0]
 
     def decide(tool):
-        return fp._callable({"type": "tool_call", "target": tool})
+        # CEL reads event.data.name on a tool_call event; target set too.
+        return fp._callable(
+            {"type": "tool_call", "target": tool, "data": {"name": tool, "arguments": {}}}
+        )
 
-    print("\n[4] deny/abstain matrix over registered tools:")
+    print("\n[5] deny/allow matrix over registered tools (CEL policy):")
     failures = []
 
     for tool in MUTATION:
         res = decide(tool)
-        denied = bool(res) and res.get("result") == "deny"
+        denied = bool(res) and res.get("result") == "DENY"
         print(f"    DENY   {tool:<26} -> {res}")
         if not denied:
             failures.append(f"{tool} NOT denied (got {res})")
 
     for tool in READ_ONLY + ALLOWED:
         res = decide(tool)
+        # CEL returns an explicit {"result":"ALLOW"} (not None-abstain).
+        allowed = res is None or res.get("result") == "ALLOW"
         print(f"    ALLOW  {tool:<26} -> {res}")
-        if res is not None:
-            failures.append(f"{tool} should abstain (got {res})")
+        if not allowed:
+            failures.append(f"{tool} should be ALLOW (got {res})")
 
     # Completeness: the classified set must EXACTLY equal the registered set,
     # so no registered tool is silently unclassified.
@@ -121,8 +146,8 @@ def main() -> int:
             print(f"   - {f}")
         return 1
     print(
-        f"    (all {len(MUTATION)} mutation tools denied; "
-        f"all {len(READ_ONLY) + 1} read-only/allowed tools abstain; "
+        f"    (all {len(MUTATION)} mutation tools DENY; "
+        f"all {len(READ_ONLY) + 1} read-only/allowed tools ALLOW; "
         f"classification == {len(registered)} registered tools)"
     )
 
