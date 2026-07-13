@@ -1,0 +1,3 @@
+# Claude Design sync (ephemeral local mirrors — never commit)
+.design-mocks/
+.design-sync-manifest.md
