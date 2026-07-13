@@ -10,8 +10,19 @@ description: >-
   read-only. See README for the exact tool surface + deployment requirements.
 
 executor:
+  # `type` is the spec-validator discriminator: the offline validator's
+  # allowlist is {claude_sdk, agents_sdk, omnigent} (UNDERSCORE) — a hyphenated
+  # `claude-sdk` here is rejected at parse (`must be one of [...]`).
   type: claude_sdk
   model: claude-haiku-4-5
+  # `config.harness` is the RUNNER harness-registry name (HYPHEN): the spawn
+  # path resolves `executor.config.harness or executor.type` and looks it up in
+  # the harness registry, whose registered name is `claude-sdk`. Without this
+  # the spawn falls back to the underscore `claude_sdk`, which is NOT a
+  # registered harness → `unknown harness 'claude_sdk'` at boot. Every shipping
+  # SDK example (debby/patricia/polly/scribe/…) pins the harness this way.
+  config:
+    harness: claude-sdk
 
 prompt: |
   You are a download-only Claude Design sync agent. Your ONLY job: when given a

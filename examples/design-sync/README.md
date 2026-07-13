@@ -13,11 +13,14 @@ Pure read-only sync — never edits product code, runs gates, or opens PRs. Use 
 
 This design is **proven** by 4 prior spikes + cross-vendor review rounds. The ONLY working harness:
 
-### Why `executor.type: claude_sdk`?
+### Why the claude-sdk harness?
 
 - **claude-NATIVE children** drop user python tools (relay allowlist `_NATIVE_RELAY_BUILTIN_TOOLS`) AND do not forward spec MCP servers → native is OUT.
 - **claude-SDK children** DO see `tools/python/*.py` (bridged to model as `mcp__omnigent__<fn>`) and run tools with NO elicitation → this is the winning harness.
-- Declared directly as `executor: {type: claude_sdk, model: claude-haiku-4-5}` (no `os_env` block — a local python tool does not need one to run; adding `os_env` only registers `sys_os_shell/write/edit`, a live push/edit surface we explicitly do NOT want).
+- **Two names for the same thing, one underscore + one hyphen — get both right:**
+  - `executor.type: claude_sdk` (UNDERSCORE) is the spec-**validator** discriminator; the validator allowlist is `{claude_sdk, agents_sdk, omnigent}`, so a hyphenated value here is rejected at parse.
+  - `executor.config.harness: claude-sdk` (HYPHEN) is the **runner harness-registry** name. The spawn path resolves `config.harness or type` and looks it up in the registry (registered names include `claude`, `claude-native`, `claude-sdk`). Without `config.harness`, the fallback `claude_sdk` is NOT a registered harness → boot fails with `unknown harness 'claude_sdk'`. Every shipping SDK example (debby/patricia/polly/scribe/…) pins the harness this way.
+- No `os_env` block — a local python tool does not need one to run; adding `os_env` only registers `sys_os_shell/write/edit`, a live push/edit surface we explicitly do NOT want.
 
 ### Why inline JSON-RPC transport?
 
@@ -31,7 +34,7 @@ This design is **proven** by 4 prior spikes + cross-vendor review rounds. The ON
 
 ### Download-only enforcement (accurate tool surface)
 
-There is **no allowlist/denylist to trim framework builtins** — a `claude_sdk`
+There is **no allowlist/denylist to trim framework builtins** — a claude-sdk
 agent always gets ~19 always-on tools. So the surface is NOT "single tool only".
 What actually holds the download-only guarantee:
 
@@ -182,7 +185,7 @@ on the agent.
 
 7. **Model availability (DEPLOYMENT-DEPENDENT)**: `executor.model: claude-haiku-4-5` must be available to the configured provider. If model unavailable, agent load fails.
 
-8. **Live full-session run is a DEPLOY-TIME gate**: Config-load + tool-build + policy-construction are verified offline (see below). A live, zero-elicitation full-session run under a real `claude_sdk` executor cannot be exercised from a build/review sub-agent (it can't spawn omnigent sessions) — it is the operator's final check at deploy time.
+8. **Live full-session run is a DEPLOY-TIME gate**: Config-load + tool-build + policy-construction are verified offline (see below). A live, zero-elicitation full-session run under the real claude-sdk harness cannot be exercised from a build/review sub-agent (it can't spawn omnigent sessions) — it is the operator's final check at deploy time.
 
 ## Acceptance Gate Evidence
 
