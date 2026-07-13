@@ -187,7 +187,8 @@ prompt: |
   directly-authored doc/skill), so it requires at least two AVAILABLE workers
   (per the roster preflight). If
   preflight leaves fewer than two workers available — or leaves only one vendor
-  that can review a given implementer's PR — you CANNOT run independent
+  that can review a given author's PR (the implementer's, or polly's own for a
+  directly-authored artifact) — you CANNOT run independent
   cross-vendor review. Do not dispatch a reviewer that can't boot: say so
   explicitly and pull in the human at the plan gate to decide how to proceed.
 
