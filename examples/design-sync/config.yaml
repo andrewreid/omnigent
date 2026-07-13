@@ -4,9 +4,10 @@ description: >-
   Download-only Claude Design sync agent. Calls the local `design_sync` tool to
   download TEXT files from a claude.ai/design project into a local directory
   (exact bytes, dir structure preserved; binaries skipped). design_sync is the
-  ONLY mutation-capable tool; all write/edit/shell/browser/comment-mutation
-  builtins are denied by policy; remaining sys_* builtins are read-only. See
-  README for the exact tool surface + deployment requirements.
+  only mutation-capable tool left reachable; every other mutation-capable
+  builtin (comment-update, add-policy, agent-download, cancel-task, browser
+  navigate/click/type) is denied by policy; the remaining builtins are
+  read-only. See README for the exact tool surface + deployment requirements.
 
 executor:
   type: claude_sdk
@@ -22,11 +23,16 @@ prompt: |
   Call it with the project URL. It returns a structured summary of files written,
   skipped binaries, and any failures.
 
+  What the tool DOES touch on disk:
+  - Reads `~/.claude/.credentials.json` for the auth bearer token
+  - Writes the downloaded mirror under the output directory
+  - Writes one `.design-sync-manifest.md` beside the output directory
+  It makes no other writes.
+
   You NEVER:
   - Edit product code
   - Run tests, lint, typecheck, or gates
   - Open PRs or commit changes
-  - Read or modify files outside the output directory
   - Push to git
 
   You are a pure download orchestrator. Call the tool, report the summary, done.
@@ -46,11 +52,17 @@ guardrails:
           reason: "download-only agent: mutations disabled"
           on_phases: [tool_call]
           on_tools:
-            - update_comment
-            - sys_add_policy
-            - browser_navigate
-            - browser_click
-            - browser_type
+            # Registered mutation-capable builtins (audited across all 19 tools).
+            - update_comment       # changes a review comment's persisted state
+            - sys_add_policy       # creates a new session policy
+            - sys_agent_download   # writes bundle bytes to disk (arbitrary write)
+            - sys_cancel_task      # POSTs stop/interrupt → mutates task lifecycle
+            - browser_navigate     # drives external browser page/URL
+            - browser_click        # mutates page/UI state
+            - browser_type         # fires input/change events on the page
+            # Belt-and-suspenders: OS tools are NOT registered (no os_env block),
+            # but deny them anyway so a future os_env addition can't silently
+            # re-open a write/edit/shell surface.
             - sys_os_write
             - sys_os_edit
             - sys_os_shell

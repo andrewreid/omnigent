@@ -56,17 +56,75 @@ def main() -> int:
         constructed.append(fp)
         print(f"    constructed policy {p.name!r} -> {type(fp).__name__} (no raise)")
 
-    # Prove the constructed policy actually DENIES a mutation tool and
-    # ABSTAINS on design_sync (belt-and-suspenders behavioural check).
+    # 4. Behavioural proof: the policy must DENY every mutation-capable
+    #    registered builtin and ABSTAIN (None -> ALLOW) only on design_sync +
+    #    genuinely read-only builtins. Classification audited against
+    #    omnigent/runner/tool_dispatch.py + omnigent/tools/builtins/.
+    MUTATION = [
+        "update_comment",
+        "sys_add_policy",
+        "sys_agent_download",
+        "sys_cancel_task",
+        "browser_navigate",
+        "browser_click",
+        "browser_type",
+    ]
+    READ_ONLY = [
+        "browser_snapshot",
+        "browser_screenshot",
+        "list_comments",
+        "load_skill",
+        "read_skill_file",
+        "sys_policy_registry",
+        "sys_agent_get",
+        "sys_agent_list",
+        "sys_session_get_history",
+        "sys_session_get_info",
+        "sys_session_list",
+    ]
+    ALLOWED = ["design_sync"]
+
     fp = constructed[0]
-    deny_evt = {"type": "tool_call", "target": "sys_os_shell"}
-    allow_evt = {"type": "tool_call", "target": "design_sync"}
-    deny_res = fp._callable(deny_evt)
-    allow_res = fp._callable(allow_evt)
-    print(f"    sys_os_shell -> {deny_res}")
-    print(f"    design_sync  -> {allow_res}")
-    assert deny_res and deny_res.get("result") == "deny", "expected deny on sys_os_shell"
-    assert allow_res is None, "expected abstain (None) on design_sync"
+
+    def decide(tool):
+        return fp._callable({"type": "tool_call", "target": tool})
+
+    print("\n[4] deny/abstain matrix over registered tools:")
+    failures = []
+
+    for tool in MUTATION:
+        res = decide(tool)
+        denied = bool(res) and res.get("result") == "deny"
+        print(f"    DENY   {tool:<26} -> {res}")
+        if not denied:
+            failures.append(f"{tool} NOT denied (got {res})")
+
+    for tool in READ_ONLY + ALLOWED:
+        res = decide(tool)
+        print(f"    ALLOW  {tool:<26} -> {res}")
+        if res is not None:
+            failures.append(f"{tool} should abstain (got {res})")
+
+    # Completeness: the classified set must EXACTLY equal the registered set,
+    # so no registered tool is silently unclassified.
+    classified = set(MUTATION) | set(READ_ONLY) | set(ALLOWED)
+    registered = set(tool_names)
+    if classified != registered:
+        failures.append(
+            f"classification != registered tools; "
+            f"missing={registered - classified} extra={classified - registered}"
+        )
+
+    if failures:
+        print("\n!! POLICY MATRIX FAILED:")
+        for f in failures:
+            print(f"   - {f}")
+        return 1
+    print(
+        f"    (all {len(MUTATION)} mutation tools denied; "
+        f"all {len(READ_ONLY) + 1} read-only/allowed tools abstain; "
+        f"classification == {len(registered)} registered tools)"
+    )
 
     print("\n== ACCEPTANCE GATE PASSED ==")
     return 0
