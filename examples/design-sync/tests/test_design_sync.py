@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Tests for design_sync tool (imports real production functions)."""
 
+import json
+import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -12,10 +15,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "tools/python"))
 sys.modules["omnigent_client"] = type(sys)("omnigent_client")
 sys.modules["omnigent_client"].tool = lambda f: f
 
+import design_sync as ds  # noqa: E402
 from design_sync import (  # noqa: E402 — sys.path + omnigent_client stub must precede import
     _html_entity_decode,
     _is_path_safe,
+    _list_all_files,
     _strip_mcp_wrapper,
+    _write_file_contained,
 )
 
 
@@ -138,11 +144,150 @@ def test_path_safety():
     print("  ✓ All path safety tests passed")
 
 
+def test_list_errors_are_structured_failures():
+    """Tool-level list errors must survive top-level, nested, and partial walks."""
+    print("Testing list_files error propagation...")
+
+    def run(responses):
+        original = ds._jsonrpc_call
+
+        def fake_call(bearer, method, params=None, request_id=1):  # noqa: ARG001
+            path = params["arguments"].get("path", "")
+            return responses[path]
+
+        try:
+            ds._jsonrpc_call = fake_call
+            return _list_all_files("token", "project", True)
+        finally:
+            ds._jsonrpc_call = original
+
+    files, failures = run({"": {"isError": True, "content": []}})
+    assert files == []
+    assert failures == [{"path": "/", "error": "List error"}]
+
+    root_entries = [
+        {"path": "ok.txt", "type": "file", "size": 2, "etag": "ok"},
+        {"path": "broken", "type": "directory"},
+    ]
+    files, failures = run(
+        {
+            "": {"content": [{"type": "text", "text": json.dumps(root_entries)}]},
+            "broken": {"isError": True, "content": []},
+        }
+    )
+    assert [entry["path"] for entry in files] == ["ok.txt"]
+    assert failures == [{"path": "broken", "error": "List error"}]
+
+    files, failures = run(
+        {
+            "": {
+                "content": [
+                    {"type": "text", "text": json.dumps(root_entries[:1])},
+                    {"type": "text", "isError": True, "text": "permission denied"},
+                ]
+            }
+        }
+    )
+    assert [entry["path"] for entry in files] == ["ok.txt"]
+    assert failures == [{"path": "/", "error": "List error"}]
+    print("  ✓ top-level, subdirectory, and partial list failures preserved")
+
+
+def test_resync_replaces_stale_entry_types():
+    """Re-sync must replace stale file/dir entries without following symlinks."""
+    print("Testing re-sync type changes...")
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            (base / "foo").write_text("stale file")
+            _write_file_contained(base_fd, "foo/bar.txt", b"new child", "file-to-dir")
+            assert (base / "foo/bar.txt").read_bytes() == b"new child"
+
+            (base / "reverse/old").mkdir(parents=True)
+            (base / "reverse/old/stale.txt").write_text("stale child")
+            _write_file_contained(base_fd, "reverse/old", b"new file", "dir-to-file")
+            assert (base / "reverse/old").read_bytes() == b"new file"
+            assert not list(base.rglob(".ds-*.old"))
+        finally:
+            os.close(base_fd)
+    print("  ✓ file→dir and dir→file re-syncs passed")
+
+
+def test_long_basename_uses_short_temp_name():
+    """A valid near-limit basename must not be lengthened by the temp file."""
+    print("Testing near-limit basename...")
+    filename = "x" * 236 + ".txt"
+    assert len(filename.encode()) == 240
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            _write_file_contained(base_fd, filename, b"long-name", "long")
+        finally:
+            os.close(base_fd)
+        assert (base / filename).read_bytes() == b"long-name"
+        assert not list(base.glob(".ds-*.tmp"))
+    print("  ✓ 240-byte basename synced")
+
+
+def test_out_dir_requires_gitignored_mirror_namespace():
+    """Repository metadata and tracked trees are rejected; ignored mirrors work."""
+    print("Testing out_dir repository containment...")
+    original_cwd = os.getcwd()
+    original_token = ds._read_bearer_token
+    original_rpc = ds._jsonrpc_call
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+        (root / ".gitignore").write_text(".design-mocks/\n.design-sync-manifest.md\n")
+        (root / ".github/workflows").mkdir(parents=True)
+        (root / ".github/workflows/ci.yml").write_text("name: test\n")
+        (root / "tracked").mkdir()
+        (root / "tracked/source.py").write_text("print('product')\n")
+        subprocess.run(["git", "add", ".gitignore", ".github", "tracked"], cwd=root, check=True)
+
+        def fake_rpc(bearer, method, params=None, request_id=1):  # noqa: ARG001
+            if method == "initialize":
+                return {}
+            return {"content": [{"type": "text", "text": "[]"}]}
+
+        try:
+            os.chdir(root)
+            ds._read_bearer_token = lambda: "token"
+            ds._jsonrpc_call = fake_rpc
+            for rejected in (".git", ".github", "tracked"):
+                result = ds.design_sync("https://claude.ai/design/p/project", rejected)
+                assert "error" in result, f"{rejected} unexpectedly accepted"
+
+            result = ds.design_sync("https://claude.ai/design/p/project", ".design-mocks")
+            assert "error" not in result, result
+            assert result["failures"] == []
+            assert (root / ".design-mocks").is_dir()
+
+            ds._jsonrpc_call = lambda bearer, method, params=None, request_id=1: (  # noqa: ARG005
+                {} if method == "initialize" else {"isError": True, "content": []}
+            )
+            failed = ds.design_sync("https://claude.ai/design/p/project", ".design-mocks")
+            assert failed["failures"] == [{"path": "/", "error": "List error"}]
+            manifest = Path(failed["manifest_path"]).read_text()
+            assert "## Listing failures" in manifest and "`/`: List error" in manifest
+        finally:
+            ds._read_bearer_token = original_token
+            ds._jsonrpc_call = original_rpc
+            os.chdir(original_cwd)
+    print("  ✓ .git/.github/tracked rejected; ignored mirror accepted")
+
+
 if __name__ == "__main__":
     try:
         test_strip_mcp_wrapper()
         test_html_entity_decode()
         test_path_safety()
+        test_list_errors_are_structured_failures()
+        test_resync_replaces_stale_entry_types()
+        test_long_basename_uses_short_temp_name()
+        test_out_dir_requires_gitignored_mirror_namespace()
         print("\n✓ All tests passed")
         sys.exit(0)
     except AssertionError as e:
