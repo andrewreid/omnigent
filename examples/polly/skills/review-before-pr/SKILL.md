@@ -92,17 +92,31 @@ and [GOVERNANCE] passes (see `cross-review`), because a late edit is exactly wha
 introduces self-contradiction and stale scope. The PR opens on a reviewed FINAL
 state — never on a state that was reviewed and then quietly edited.
 
-## Docs polly authors DIRECTLY are NOT exempt from this gate
-polly's spec permits it to author docs / specs / prose DIRECTLY, without a coding
-sub-agent. That authoring carve-out is about WHO writes the doc — it is NOT a
-carve-out from review-before-pr. A doc/spec PR that polly authored still owes an
-independent, DIFFERENT-vendor doc-lens cross-review of its FINAL diff before it
-opens, exactly like a code PR. Otherwise polly is author, PR-opener, and
-self-fixer with no independent set of eyes on the final doc — precisely the
-single-vendor blind spot this gate exists to close. polly authoring the prose does
-not make polly its reviewer: dispatch a different-vendor `review` sub-agent on the
-doc diff (running the [SELF-CONSISTENCY] + [GOVERNANCE] passes), loop blocking
+## Docs (and skills) polly authors DIRECTLY are NOT exempt from this gate
+polly's spec permits it to author docs / specs / prose AND skills DIRECTLY,
+without a coding sub-agent. That authoring carve-out is about WHO writes the
+artifact — it is NOT a carve-out from review-before-pr. A docs / spec / skill PR
+that polly authored still owes an independent, DIFFERENT-vendor cross-review of
+its FINAL diff before it opens, exactly like a code PR. Otherwise polly is author,
+PR-opener, and self-fixer with no independent set of eyes on the final artifact —
+precisely the single-vendor blind spot this gate exists to close. polly authoring
+the prose does not make polly its reviewer.
+
+Dispatch a different-vendor `review` sub-agent on the diff, and because the
+artifact is prose run the FULL set, not a narrowed doc-only subset: [FOCUSED] and
+[WIDE] still apply (claim-vs-source and blast-radius — a directly authored doc
+with a false named-file claim but no internal contradiction must still be caught
+here), PLUS the doc-lens [SELF-CONSISTENCY] + [GOVERNANCE] passes. Loop blocking
 issues, and only then open the PR.
+
+Who opens the PR here: the procedure above says "only the same implementer opens
+the PR" for the DELEGATED case, where that implementer is a different agent from
+the reviewer. In the direct-authoring path there is NO implementer sub-agent —
+polly wrote the artifact itself — so the different-vendor REVIEWER is the
+independent set of eyes, and POLLY opens its OWN reviewed PR once the review is
+clean. The invariant is preserved: the PR opens on an artifact an independent
+different-vendor reviewer signed off, never one only its author saw. (The
+reviewer itself still never opens PRs.)
 
 ## Functional changes: list the coupled non-code artifacts in the contract
 A functional change usually obligates paired NON-CODE updates that the repo
@@ -141,6 +155,14 @@ spot recur round after round. See `cross-review` → "Input-domain coverage" and
   polly's roster preflight). If independent cross-vendor review cannot run,
   do NOT open the PR on unreviewed code — say so and pull in the human at the
   plan gate.
+- An ALREADY-OPEN PR is still under this gate. When you push a FIX to a PR that
+  already exists — e.g. servicing review-bot findings on a branch whose PR was
+  opened earlier — that fix diff owes the SAME different-vendor cross-review
+  BEFORE it is pushed to the PR branch. Do not push first and review after: a
+  push updates the deliverable, so pushing an unreviewed fix is the same
+  single-vendor blind spot this gate closes for a fresh PR. `pr-bot-loop`
+  governs only the live-PR iteration RHYTHM (bot posts → you reply/fix → re-request);
+  it does not waive the pre-push cross-review on each fix.
 - A pre-existing PR (opened before this policy, or by a human) is a legitimate
   exception: review its diff and loop fixes in place — you cannot un-open it.
   For all NEW work, follow the ordering above.
