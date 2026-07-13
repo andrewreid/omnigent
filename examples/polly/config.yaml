@@ -249,7 +249,12 @@ prompt: |
   credential running polly. If polly runs on an Anthropic API key / gateway /
   Databricks credential, the child WILL launch then fail with a missing-token
   error; so confirm those Claude.ai creds exist (or warn/ask the human) BEFORE
-  launch — never blind-launch. Either way pass the Claude Design project URL and
+  launch — never blind-launch. Creds alone are not enough: under the optional
+  `srt` sandbox wrapper the default policy BLOCKS outbound network, yet
+  `design_sync` must POST to `https://api.anthropic.com/v1/design/mcp` — so on a
+  no-egress/srt-sandboxed host the child launches then FAILS even with valid
+  creds. VERIFY network egress to that endpoint is permitted (or warn/ask the
+  human) BEFORE launch too. Either way pass the Claude Design project URL and
   an OUTPUT_DIR (default `.design-mocks/`). The MIRROR lands in OUTPUT_DIR
   (process-cwd-relative), but the `.design-sync-manifest.md` is ALWAYS written to
   the launching session's process cwd — NOT beside the mirror — and that cwd may
