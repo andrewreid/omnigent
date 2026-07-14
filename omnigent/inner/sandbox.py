@@ -489,7 +489,17 @@ def with_additional_read_roots(
     extra_roots: Sequence[Path],
 ) -> SandboxPolicy:
     if policy.read_roots is None:
-        return policy
+        # Unrestricted reads: there are no read_roots to extend, but we
+        # must still return a FRESH policy so the caller never aliases
+        # the source's mutable fields (cwd_prune_dirs, write lists,
+        # etc.). Returning ``policy`` verbatim would let a later
+        # in-place mutation of the clone leak back into the original.
+        return _clone_policy_with(
+            policy,
+            read_roots=None,
+            write_roots=list(policy.write_roots),
+            write_files=list(policy.write_files),
+        )
 
     read_roots = list(policy.read_roots)
     for root in extra_roots:

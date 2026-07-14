@@ -312,6 +312,27 @@ def test_with_additional_helpers_preserve_cwd_prune_dirs() -> None:
         # Defensive copy: a fresh list, not the same object.
         assert clone.cwd_prune_dirs is not base.cwd_prune_dirs
 
+    # Unrestricted-read case: with read_roots=None the helper has no
+    # roots to extend, but it must STILL return a fresh policy — not the
+    # original — so a caller can't mutate shared state through the alias.
+    unrestricted = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=None,
+        write_roots=[Path("/repo")],
+        write_files=[],
+        allow_network=True,
+        cwd_prune_dirs=["node_modules", ".pnpm"],
+    )
+    clone = with_additional_read_roots(unrestricted, [Path("/extra")])
+    assert clone is not unrestricted, (
+        "with_additional_read_roots returned the original policy when "
+        "read_roots is None; callers would alias its mutable fields."
+    )
+    assert clone.read_roots is None
+    assert clone.cwd_prune_dirs == ["node_modules", ".pnpm"]
+    assert clone.cwd_prune_dirs is not unrestricted.cwd_prune_dirs
+
 
 def test_with_denied_unix_sockets_resolves_dedupes_and_is_pure() -> None:
     """``with_denied_unix_sockets`` resolves + de-duplicates the socket

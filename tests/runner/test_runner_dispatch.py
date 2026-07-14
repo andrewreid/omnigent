@@ -2003,6 +2003,7 @@ def test_clone_os_env_spec_preserves_all_sandbox_fields() -> None:
         write_files=["~/.ssh/known_hosts"],
         allow_network=True,
         cwd_allow_hidden=[".git", ".venv"],
+        cwd_prune_dirs=["node_modules", ".pnpm"],
         cwd_hidden_scan_max_entries=12345,
         cwd_hidden_scan_overflow="warn",
         env_passthrough=["DATABRICKS_HOST", "DATABRICKS_TOKEN"],
@@ -2031,6 +2032,7 @@ def test_clone_os_env_spec_preserves_all_sandbox_fields() -> None:
         "write_paths",
         "write_files",
         "cwd_allow_hidden",
+        "cwd_prune_dirs",
         "env_passthrough",
         "egress_rules",
     ):
