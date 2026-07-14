@@ -16,52 +16,79 @@ expressions for Seatbelt), but the *decision* of which paths to mask
 is identical. Centralising the walker here guarantees both backends
 hide exactly the same set of entries; only the emit shape differs.
 
-Bounded emission
-----------------
+Masking policy
+--------------
 
-Each :class:`MaskedEntry` becomes one mask token per backend (bwrap
-emits ``--bind /dev/null <path>`` / ``--tmpfs <path>``; Seatbelt a
-``(deny ... (literal/subpath ...))`` line). bwrap in particular has a
-hard ceiling of 9000 total argv entries, so the walker must keep the
-mask count small even on trees with tens of thousands of maskable
-leaves. Two coalescing rules do this WITHOUT walking (and emitting)
-one entry per leaf:
+The ONLY reason to mask a cwd entry is that it is not already safely
+exposed: a non-allowed dotfile (a secret the operator didn't opt in to)
+or an *escaping symlink* (a link whose target resolves OUTSIDE the
+exposed roots — the host-relative dereference defense). Real in-cwd
+files and directories are already exposed by the cwd bind and are left
+readable and untouched. In particular there is NO name-based special
+casing: a directory called ``node_modules`` is treated like any other.
 
-- **Regenerable dep dirs** (:data:`_DEFAULT_COALESCE_DIRS`:
-  ``node_modules``, ``.venv``, ``.mypy_cache``, ``.codex-tmp``) that
-  are NOT on ``allow_hidden`` are masked as a SINGLE ``kind="dir"``
-  entry and pruned — the walker never descends into them. Their
-  contents are regenerable and shouldn't be exposed to the helper
-  anyway, so hiding the whole directory is both cheaper and safer than
-  masking each child. A pnpm ``node_modules`` (a symlink farm with
-  tens of thousands of store links) collapses from ~N masks to one.
-- **Generic symlink farm** — any other directory that is dominated by
-  escaping symlinks (at least
-  :data:`_ESCAPING_SYMLINK_COALESCE_THRESHOLD` of them AND at least
-  :data:`_COALESCE_DOMINANCE_FRACTION` of its direct children) is
-  likewise masked once and pruned. The dominance guard means a
-  directory that mixes readable project files with a few escaping
-  links is NEVER hidden wholesale — only near-pure farms coalesce.
+- A **real npm/yarn ``node_modules``** (real package directories, few
+  or no escaping symlinks) is walked normally and stays readable, so
+  ``node app.js`` / ``npm test`` / local CLIs work.
+- A **cross-store pnpm ``node_modules``** (where the content-addressable
+  store lives on another filesystem, so each package is an escaping
+  symlink into ``~/.local/share/pnpm/store``) is a farm of thousands of
+  escaping symlinks. Same-store (hardlink) pnpm has NO escaping symlinks
+  and is simply readable.
+
+Subtree collapse (bounded emission)
+-----------------------------------
+
+Each :class:`MaskedEntry` becomes one mask token per backend, and bwrap
+has a hard ceiling of 9000 total argv entries, so a farm of tens of
+thousands of escaping symlinks would blow the command line if each were
+masked individually. The escaping symlinks of a cross-store pnpm are
+*spread* — roughly one per ``.pnpm/<pkg>@<ver>/node_modules/`` directory
+— so a per-directory dominance test never fires; the density only shows
+up when aggregated over a subtree.
+
+So collapse is decided over the **subtree**: after the walk, a directory
+``D`` is collapsed to a single ``kind="dir"`` mask (replacing every mask
+beneath it) when
+
+- the number of masks within ``D``'s subtree reaches
+  :data:`_SUBTREE_COLLAPSE_THRESHOLD`, AND
+- those masks *dominate* the directory's browsable content —
+  ``masks >= _COALESCE_DOMINANCE_FRACTION * (masks + readable_files)`` —
+  so a directory that mixes a farm with real, readable source is NEVER
+  hidden wholesale.
+
+Collapse fires at the **shallowest** dominated directory on each branch
+(never the scan root itself), which for a cross-store pnpm is the
+``node_modules`` dir — collapsing the whole farm to one mask — while a
+directory of real source that merely *contains* a nested farm keeps its
+own files readable (only the nested farm dir collapses). The dominance
+guard is what makes this safe: a real ``node_modules`` full of readable
+package files has ~zero masks, never reaches the threshold, and stays
+readable.
 
 ``allow_hidden`` directories
 ----------------------------
 
 A directory whose basename is on ``allow_hidden`` (e.g. ``.git`` when
-the operator sets ``cwd_allow_hidden: [".git"]``) is meant to be
-READABLE. The walker passes it through and does NOT descend into it:
-deep-walking an allowed directory to mask its interior escaping
-symlinks (e.g. a large ``.git/worktrees`` admin tree) both contradicts
-"allowed = readable" and can emit thousands of masks. The interior of
-an allowed directory is therefore left readable, not masked.
+the operator sets ``cwd_allow_hidden: [".git"]``) is left READABLE at
+the top level — the directory itself is not masked — but is still WALKED
+so nested non-allowed secrets (``.git`` interior ``.env`` / ``.aws`` /
+``.ssh`` dotfiles, escaping symlinks) are masked as normal. The subtree
+collapse above still applies inside it, so a dense interior farm (e.g. a
+large ``.git/worktrees`` admin tree of escaping symlinks) collapses to a
+few masks rather than thousands. Because a readable directory like
+``.git`` carries lots of browsable content (loose objects, config,
+refs), the dominance guard keeps the directory itself from collapsing.
 
 Bounded traversal
 -----------------
 
 - ``max_entries`` caps how many filesystem entries the recursive walk
-  is allowed to visit. Realistic projects fit well under the default
-  (50000) because the walker prunes at masked dot-directories and at
-  coalesced dep dirs / symlink farms (their contents are never
-  counted toward the cap once the directory itself is masked).
+  is allowed to visit. The walker prunes at masked dot-directories
+  (their contents are never counted once the directory itself is
+  masked). A non-allowed dep dir that is a real, readable tree is
+  walked in full, so a very large workspace can approach the cap.
 - ``overflow`` chooses behaviour when the cap is hit:
 
   - ``"warn"``: emit a ``CRITICAL`` log line, stop scanning, and
@@ -71,14 +98,13 @@ Bounded traversal
     naming both spec keys the user can tune. Fail-Loud — the right
     pick for untrusted source trees.
   - ``"unlimited"``: ignore the cap and walk the full tree. O(N) on
-    total entries; safe but can be slow on huge monorepos. The
-    coalescing rules above keep even this mode from emitting an
-    unbounded number of masks for symlink-dense dep dirs.
+    total entries; safe but can be slow on huge monorepos. The subtree
+    collapse keeps even this mode from emitting an unbounded number of
+    masks for symlink-dense farms.
 
 When the cap is hit, the overflow message names the directories the
 walk did not finish — distinguishing the one directory it was mid-scan
-of ("partially scanned") from those it never reached ("not scanned")
-— so an operator can tell at a glance which subtree was left unmasked.
+of ("partially scanned") from those it never reached ("not scanned").
 The list is bounded (see :data:`_MAX_UNFINISHED_DIRS_REPORTED`) so a
 pathological tree can't produce a multi-KB log line.
 """
@@ -87,6 +113,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -97,44 +124,22 @@ _LOGGER = logging.getLogger(__name__)
 
 MaskKind = Literal["file", "dir"]
 
-# Directory basenames whose subtrees are masked as a SINGLE
-# ``kind="dir"`` entry and pruned (the walker never descends into
-# them) when they are NOT on ``allow_hidden``. Kept as a module
-# constant (rather than a spec field) so both backends get the same
-# behaviour for free; callers can override via the ``coalesce_names``
-# parameter of :func:`scan_cwd_mask_entries`.
-#
-# These are large, regenerable trees (``node_modules`` is a symlink
-# farm; ``.venv`` / ``.mypy_cache`` / ``.codex-tmp`` are build caches)
-# that rarely carry the project's own secrets and shouldn't be exposed
-# to the sandboxed helper anyway. Masking the whole directory once is
-# both cheaper (no per-leaf mask, so no bwrap arg explosion) and safer
-# (contents hidden wholesale) than walking them. The dot-prefixed ones
-# are already masked-and-pruned by the dotfile rule when un-allowed, so
-# listing them here only changes behaviour for a plain-named dir like
-# ``node_modules``; when a dot-dir IS on ``allow_hidden`` it is left
-# readable and this set does not apply.
-_DEFAULT_COALESCE_DIRS: tuple[str, ...] = (
-    "node_modules",
-    ".venv",
-    ".mypy_cache",
-    ".codex-tmp",
-)
+# Subtree collapse: a directory whose subtree accumulates at least this
+# many masks (escaping symlinks + non-allowed dotfiles) is collapsed to
+# a single ``kind="dir"`` mask, provided the masks also dominate the
+# directory's browsable content (see _COALESCE_DOMINANCE_FRACTION).
+# Chosen well below bwrap's 9000-arg ceiling (each mask costs 2-3 argv
+# tokens) yet far above any plausible count of intentional escaping
+# symlinks / secrets in real project content, so collapse only fires on
+# genuine farms (a cross-store pnpm node_modules, a huge escaping-link
+# admin tree) — never on a hand-authored source directory.
+_SUBTREE_COLLAPSE_THRESHOLD = 100
 
-# Generic symlink-farm collapse: a single non-coalesce directory that
-# would emit at least this many escaping-symlink child masks is
-# collapsed to one ``kind="dir"`` mask and pruned, rather than emitting
-# one mask per link. Chosen well below bwrap's 9000-arg ceiling (each
-# mask costs 2-3 argv tokens) yet far above any plausible count of
-# intentional escaping symlinks in real project content, so this only
-# fires on symlink farms — never on hand-authored source directories.
-_ESCAPING_SYMLINK_COALESCE_THRESHOLD = 100
-
-# The generic collapse additionally requires escaping symlinks to
-# DOMINATE the directory: at least this fraction of its direct children
-# must be escaping symlinks. A directory that mixes readable content
-# with many links is therefore never hidden wholesale — only near-pure
-# farms coalesce. Guards against over-masking browsable project trees.
+# The collapse additionally requires masks to DOMINATE the directory:
+# at least this fraction of ``masks + readable_files`` in the subtree
+# must be masks. A directory that mixes a farm with real readable source
+# is therefore never hidden wholesale — its files stay browsable and its
+# masks are emitted individually (still bounded well under the ceiling).
 _COALESCE_DOMINANCE_FRACTION = 0.9
 
 # Cap on how many unfinished-directory paths the overflow message
@@ -154,7 +159,7 @@ class MaskedEntry:
         argument.
     :param kind: ``"file"`` for regular files, symlinks, sockets, and
         broken-symlink fall-throughs; ``"dir"`` for real directories
-        (including a coalesced dep dir / symlink farm masked wholesale).
+        (including a whole subtree collapsed to one mask).
         The bwrap emitter maps ``"file"`` to ``--bind /dev/null`` and
         ``"dir"`` to ``--tmpfs``; the Seatbelt emitter maps ``"file"``
         to ``(deny ... (literal ...))`` and ``"dir"`` to
@@ -174,102 +179,85 @@ def scan_cwd_mask_entries(
     overflow: str,
     logger_name: str | None = None,
     scope_label: str = "cwd",
-    coalesce_names: Sequence[str] = _DEFAULT_COALESCE_DIRS,
 ) -> list[MaskedEntry]:
     """
     Walk *cwd* and identify entries that must be masked from the helper.
 
-    Iterative DFS over *cwd* with early termination at masked
-    dot-directories, coalesced dep dirs, symlink farms, and
-    ``allow_hidden`` directories (the walker never descends into any of
-    these). For each entry it visits, the entry is masked when EITHER:
+    Iterative DFS over *cwd*. For each entry it visits, the entry is
+    masked when EITHER:
 
     - the basename starts with ``.`` and is not in *allow_hidden*, OR
     - the entry is a symlink whose resolved target lies outside every
       path in *safe_roots*.
 
-    Directory-level coalescing keeps the emitted mask count bounded:
+    A masked dot-directory is pruned (not descended into). Every other
+    real directory — including an ``allow_hidden`` directory, which stays
+    readable at the top level — IS walked so nested secrets are masked.
 
-    - A directory whose basename is in *coalesce_names* (default:
-      :data:`_DEFAULT_COALESCE_DIRS`) and is NOT on *allow_hidden* is
-      masked as a single ``kind="dir"`` entry and pruned — not walked.
-    - A directory dominated by escaping symlinks (see
-      :data:`_ESCAPING_SYMLINK_COALESCE_THRESHOLD` /
-      :data:`_COALESCE_DOMINANCE_FRACTION`) is likewise masked once and
-      pruned.
-    - A directory whose basename is on *allow_hidden* passes through
-      readable and is NOT descended into, so its interior is never a
-      source of per-entry masks.
+    After the walk, dense farms are collapsed: a directory whose subtree
+    accumulates at least :data:`_SUBTREE_COLLAPSE_THRESHOLD` masks that
+    also dominate the directory's readable content (see
+    :data:`_COALESCE_DOMINANCE_FRACTION`) is replaced by a single
+    ``kind="dir"`` mask, at the shallowest such directory on each branch
+    (never the scan root). This bounds the emitted mask count for a
+    cross-store pnpm ``node_modules`` (a spread farm of escaping
+    symlinks) while leaving a real, readable ``node_modules`` — which has
+    ~zero masks — untouched.
 
-    Walker termination is deterministic: ``follow_symlinks=False`` on
-    the recursion check ensures symlink loops can't cause infinite
-    descent, and every coalescing/pruning rule removes a directory from
-    the work stack rather than adding to it.
+    Walker termination is deterministic: ``follow_symlinks=False`` on the
+    recursion check ensures symlink loops can't cause infinite descent.
 
-    :param cwd: Absolute, resolved-without-strict path of the
-        helper's working directory. The walk starts here. Must be a
-        real directory; if it isn't, the function returns an empty
-        list without raising (the backend wraps the missing dir at
-        spawn time and gets the kernel error message).
+    :param cwd: Absolute, resolved-without-strict path of the helper's
+        working directory. The walk starts here. Must be a real
+        directory; if it isn't, the function returns an empty list
+        without raising (the backend wraps the missing dir at spawn time
+        and gets the kernel error message).
     :param allow_hidden: Dotfile/dotdir basenames that pass through
-        unmasked at any depth, e.g. ``[".git"]``. Matched by
-        basename, so ``".venv"`` exempts both ``cwd/.venv`` and
-        ``cwd/services/api/.venv``. An allowed *directory* is left
-        readable and not descended into. Pass an empty sequence to
-        mask every dotfile.
+        unmasked at any depth, e.g. ``[".git"]``. Matched by basename.
+        An allowed *directory* is left readable at the top level but is
+        still walked so its non-allowed nested secrets are masked. Pass
+        an empty sequence to mask every dotfile.
     :param safe_roots: Paths the sandbox already exposes (typically
-        ``cwd``, the backend's default mounts, the policy's read /
-        write roots). A symlink whose resolved target lies inside
-        any of these is considered safe and not masked. The backend
-        is responsible for assembling this list — bwrap and Seatbelt
-        expose different system paths.
+        ``cwd``, the backend's default mounts, the policy's read / write
+        roots). A symlink whose resolved target lies inside any of these
+        is considered safe and not masked. The backend assembles this
+        list — bwrap and Seatbelt expose different system paths.
     :param max_entries: Cap on the number of filesystem entries the
-        walker may visit. The walker counts every child returned by
-        :func:`os.scandir`, masked or not, EXCEPT children of a
-        coalesced/pruned directory (those are never visited). Set to a
-        large value together with ``overflow="unlimited"`` to disable
-        the cap.
+        walker may visit. Set to a large value together with
+        ``overflow="unlimited"`` to disable the cap.
     :param overflow: One of ``"error"``, ``"warn"``, ``"unlimited"``.
         See module docstring for per-mode semantics.
     :param logger_name: Logger name used for the warn-mode warning
-        message. ``None`` falls back to this module's logger; backends
-        pass their own logger name so the warning surfaces under the
-        backend's logging namespace.
+        message. ``None`` falls back to this module's logger.
     :param scope_label: Short label used in overflow log / error
-        messages to identify what the walker was scanning. Defaults
-        to ``"cwd"``; backends that re-use the walker for
-        ``read_paths`` roots pass e.g. ``"read_paths"``.
-    :param coalesce_names: Directory basenames masked wholesale (as a
-        single ``kind="dir"`` entry) and pruned when un-allowed;
-        defaults to :data:`_DEFAULT_COALESCE_DIRS`. Matched by basename
-        at any depth. A name that is also on *allow_hidden* is left
-        readable (the allow rule wins). Pass an empty sequence to walk
-        every directory in plain DFS order (the generic symlink-farm
-        collapse still applies).
+        messages to identify what the walker was scanning. Defaults to
+        ``"cwd"``; backends re-using the walker for ``read_paths`` roots
+        pass e.g. ``"read_paths"``.
     :returns: A list of :class:`MaskedEntry`. Empty when *cwd* has
         nothing worth masking or when *cwd* is not a directory.
     :raises OSError: When the cap is reached and *overflow* is
-        ``"error"``. The message names both tunable spec keys plus the
-        directories the walk did not finish so a user hitting the cap
-        can find the escape hatches and the culprit without re-reading
-        source.
+        ``"error"``.
     """
-    entries: list[MaskedEntry] = []
     if not cwd.is_dir():
-        return entries
+        return []
 
     allow = set(allow_hidden)
     safe_root_list = list(safe_roots)
     cap_enabled = overflow != "unlimited"
     logger = logging.getLogger(logger_name) if logger_name else _LOGGER
 
-    coalesce = set(coalesce_names)
-    seen: set[str] = set()
+    root_key = str(cwd)
+    mask_records: list[tuple[Path, MaskKind]] = []
+    # Per-directory subtree aggregates used only by the collapse pass:
+    # how many masks live under each ancestor directory, and how many
+    # readable (browsable) leaf entries — so a farm can be told apart
+    # from real source.
+    mask_count: dict[str, int] = defaultdict(int)
+    readable_count: dict[str, int] = defaultdict(int)
+
     stack: list[Path] = [cwd]
     entries_visited = 0
     truncated = False
-    # The directory the walk was mid-``scandir`` of when the cap
-    # tripped — reported as "partially scanned". ``None`` until then.
     partial_dir: Path | None = None
 
     while stack and not truncated:
@@ -277,21 +265,8 @@ def scan_cwd_mask_entries(
         try:
             children = sorted(os.scandir(current), key=lambda e: e.name)
         except OSError:
-            # Unreadable directory — skip without masking. The backend
-            # will surface any deeper issue at spawn time. The parent
-            # is in the safe set; its inaccessibility doesn't leak
-            # content.
-            continue
-
-        # Generic symlink-farm collapse (backstop to the named-dir
-        # coalesce below): a non-cwd directory dominated by escaping
-        # symlinks is masked once and pruned, so a symlink farm that
-        # isn't a known regenerable dep dir still can't emit one arg
-        # per link. cwd itself is never collapsed — that would hide the
-        # whole working directory. The dominance guard keeps readable
-        # project content from being hidden wholesale.
-        if current != cwd and _is_escaping_symlink_farm(children, safe_root_list):
-            _record_mask(entries, seen, current, "dir")
+            # Unreadable directory — skip without masking. The parent is
+            # in the safe set; its inaccessibility doesn't leak content.
             continue
 
         for child in children:
@@ -313,31 +288,24 @@ def scan_cwd_mask_entries(
             if should_mask:
                 # ``is_dir`` follows symlinks by default — matches what
                 # the agent would observe through the bind. For broken
-                # symlinks it returns False; the backend's "file"
-                # emitter handles both.
+                # symlinks it returns False; the backend's "file" emitter
+                # handles both.
                 kind: MaskKind = "dir" if child.is_dir() else "file"
-                _record_mask(entries, seen, child_path, kind)
+                mask_records.append((child_path, kind))
+                _increment_ancestors(mask_count, child_path, cwd)
                 # Prune: don't descend into a masked dir.
                 continue
 
-            # Not masked — recurse only into real directories so a
-            # rogue symlink-to-dir can't cause a loop.
+            # Not masked. Recurse into real directories (including
+            # allow_hidden dirs, so nested secrets are still masked); a
+            # rogue symlink-to-dir is not followed. Everything else is a
+            # readable leaf that contributes to the dominance guard.
             if child.is_dir(follow_symlinks=False):
-                if child.name in allow:
-                    # allow_hidden dir → operator opted into
-                    # readability; pass through WITHOUT deep-walking.
-                    # Deep-walking would mask its interior escaping
-                    # symlinks (e.g. a large .git/worktrees admin tree)
-                    # one token apiece, contradicting "allowed =
-                    # readable" and risking the backend's arg ceiling.
-                    continue
-                if child.name in coalesce:
-                    # Regenerable dep dir (node_modules, ...) not on
-                    # allow_hidden: mask the whole dir once and prune
-                    # instead of walking its (often huge) symlink farm.
-                    _record_mask(entries, seen, child_path, "dir")
-                    continue
                 stack.append(child_path)
+            else:
+                _increment_ancestors(readable_count, child_path, cwd)
+
+    entries = _collapse_farms(mask_records, mask_count, readable_count, root_key)
 
     if truncated:
         _handle_scan_overflow(
@@ -346,8 +314,6 @@ def scan_cwd_mask_entries(
             max_entries=max_entries,
             overflow=overflow,
             partial_dir=partial_dir,
-            # Directories the walk never finished: the one it was
-            # mid-scan of (partial) plus everything still queued.
             not_scanned=list(stack),
             entries_visited=entries_visited,
             masks_emitted=len(entries),
@@ -357,89 +323,118 @@ def scan_cwd_mask_entries(
     return entries
 
 
-def _record_mask(
-    entries: list[MaskedEntry],
-    seen: set[str],
-    path: Path,
-    kind: MaskKind,
-) -> None:
+def _increment_ancestors(counter: dict[str, int], path: Path, root: Path) -> None:
     """
-    Append a :class:`MaskedEntry` for *path*, de-duplicating by path.
+    Add one to *counter* for every ancestor directory of *path* from its
+    immediate parent up to and including *root*.
 
-    :param entries: Accumulator the new entry is appended to.
-    :param seen: Set of already-masked path strings; *path* is skipped
-        if present, otherwise added.
-    :param path: Absolute path to mask.
-    :param kind: ``"file"`` or ``"dir"`` mask kind.
+    Used to build the per-directory subtree tallies the collapse pass
+    consumes. *path* is always under *root* (the walk guarantees it), so
+    the ascent stops at *root* and never leaks counts above the scan.
+
+    :param counter: Accumulator keyed by ``str(directory)``.
+    :param path: The masked entry / readable leaf being counted.
+    :param root: The scan root; the ascent stops here (inclusive).
     """
-    key = str(path)
-    if key in seen:
-        return
-    seen.add(key)
-    entries.append(MaskedEntry(path=path, kind=kind))
+    for ancestor in path.parents:
+        counter[str(ancestor)] += 1
+        if ancestor == root:
+            break
 
 
-def _is_escaping_symlink_farm(
-    children: Sequence[os.DirEntry[str]],
-    safe_roots: Sequence[Path],
-) -> bool:
+def _collapse_farms(
+    mask_records: list[tuple[Path, MaskKind]],
+    mask_count: dict[str, int],
+    readable_count: dict[str, int],
+    root_key: str,
+) -> list[MaskedEntry]:
     """
-    Return whether *children* make a directory a coalescible symlink farm.
+    Replace dense mask farms with a single directory mask each.
 
-    True only when the directory is dominated by escaping symlinks —
-    at least :data:`_ESCAPING_SYMLINK_COALESCE_THRESHOLD` of them AND at
-    least :data:`_COALESCE_DOMINANCE_FRACTION` of the direct children.
-    Both guards must hold so a directory mixing readable files with a
-    handful of escaping links is never coalesced (its links are masked
-    individually instead).
+    A directory ``D`` (never the scan *root_key*) is a collapse candidate
+    when its subtree holds at least :data:`_SUBTREE_COLLAPSE_THRESHOLD`
+    masks AND those masks dominate its browsable content
+    (``masks >= _COALESCE_DOMINANCE_FRACTION * (masks + readable)``).
+    Collapse fires at the SHALLOWEST candidate on each branch (a
+    candidate with no candidate ancestor), so a spread farm collapses at
+    the one directory that contains it rather than at each sub-cluster,
+    and a directory of real source that merely contains a nested farm
+    keeps its own files readable while the nested farm dir collapses.
 
-    Symlink resolution (the expensive step) is only performed once the
-    cheap ``is_symlink`` counts already clear both thresholds, so
-    ordinary source directories — which have few or no symlinks — never
-    pay for the escape check twice.
+    Every individual mask under a collapse directory is dropped in favour
+    of the single directory mask; masks outside all collapse directories
+    are kept as-is. Output is de-duplicated by path.
 
-    :param children: The directory's direct children, from
-        :func:`os.scandir`.
-    :param safe_roots: Paths the sandbox already exposes; a symlink
-        resolving inside any of these does not count as escaping.
-    :returns: ``True`` when the directory should be masked wholesale.
+    :param mask_records: ``(path, kind)`` for every individually masked
+        entry from the walk, in visit order.
+    :param mask_count: Per-directory subtree mask tally.
+    :param readable_count: Per-directory subtree readable-leaf tally.
+    :param root_key: ``str`` of the scan root; excluded from collapse so
+        the whole working directory can never be hidden.
+    :returns: The final de-duplicated :class:`MaskedEntry` list.
     """
-    total = len(children)
-    if total < _ESCAPING_SYMLINK_COALESCE_THRESHOLD:
-        return False
-    # Cheap pre-filter on the scandir-cached ``is_symlink`` flag —
-    # dotfile symlinks are excluded because the dotfile rule already
-    # masks them and shouldn't drag a dir into wholesale hiding.
-    symlink_children = [
-        child for child in children if not child.name.startswith(".") and _safe_is_symlink(child)
-    ]
-    if len(symlink_children) < _ESCAPING_SYMLINK_COALESCE_THRESHOLD:
-        return False
-    if len(symlink_children) < _COALESCE_DOMINANCE_FRACTION * total:
-        return False
-    escaping = 0
-    for child in symlink_children:
-        resolved = Path(child.path).resolve(strict=False)
-        if not any(_is_within(resolved, root) for root in safe_roots):
-            escaping += 1
-    return (
-        escaping >= _ESCAPING_SYMLINK_COALESCE_THRESHOLD
-        and escaping >= _COALESCE_DOMINANCE_FRACTION * total
-    )
+    candidates = {
+        directory
+        for directory, masks in mask_count.items()
+        if directory != root_key
+        and masks >= _SUBTREE_COLLAPSE_THRESHOLD
+        and masks >= _COALESCE_DOMINANCE_FRACTION * (masks + readable_count.get(directory, 0))
+    }
+    # Keep only the shallowest candidate on each branch: a candidate that
+    # has a candidate ancestor would be redundant (its parent collapses
+    # the whole cluster already).
+    collapse = {
+        directory
+        for directory in candidates
+        if not _has_ancestor_in(directory, candidates, root_key)
+    }
+
+    seen: set[str] = set()
+    entries: list[MaskedEntry] = []
+    for path, kind in mask_records:
+        if _is_under_any(str(path), collapse):
+            continue
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(MaskedEntry(path=path, kind=kind))
+    for directory in sorted(collapse):
+        if directory in seen:
+            continue
+        seen.add(directory)
+        entries.append(MaskedEntry(path=Path(directory), kind="dir"))
+    return entries
 
 
-def _safe_is_symlink(child: os.DirEntry[str]) -> bool:
+def _has_ancestor_in(directory: str, candidates: set[str], root_key: str) -> bool:
     """
-    Return ``child.is_symlink()``, treating an OS error as "not a symlink".
+    Return whether any proper ancestor of *directory* (up to but not
+    including *root_key*) is in *candidates*.
 
-    :param child: A :func:`os.scandir` entry.
-    :returns: ``True`` when *child* is a symlink; ``False`` on
-        ``is_symlink`` failure (e.g. the entry vanished mid-scan).
+    :param directory: The candidate directory path string.
+    :param candidates: All collapse-candidate directory path strings.
+    :param root_key: The scan root; the ascent stops before it.
+    :returns: ``True`` when a shallower candidate already covers this one.
     """
-    try:
-        return child.is_symlink()
-    except OSError:
-        return False
+    for ancestor in Path(directory).parents:
+        ancestor_key = str(ancestor)
+        if ancestor_key == root_key:
+            break
+        if ancestor_key in candidates:
+            return True
+    return False
+
+
+def _is_under_any(path: str, directories: set[str]) -> bool:
+    """
+    Return whether *path* equals or lives under any dir in *directories*.
+
+    :param path: Candidate path string.
+    :param directories: Collapse directory path strings.
+    :returns: ``True`` when *path* is covered by a collapse directory.
+    """
+    return any(path == d or path.startswith(d + os.sep) for d in directories)
 
 
 def _handle_scan_overflow(
@@ -528,11 +523,6 @@ def _summarize_unfinished_dirs(
     the one the walk was mid-scan of (listed first), "not scanned" for
     those it never reached. The list is truncated to
     :data:`_MAX_UNFINISHED_DIRS_REPORTED` with a ``(+N more)`` suffix.
-
-    Note the walker's coalescing rules mask-and-prune regenerable dep
-    dirs / symlink farms / allow_hidden dirs before they are ever queued,
-    so those never appear here — an unfinished dir is always a plain
-    directory the cap stopped the walk inside of or before.
 
     :param partial_dir: The directory the walk was mid-``scandir`` of
         when the cap tripped. ``None`` when the cap tripped at a

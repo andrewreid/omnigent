@@ -543,29 +543,31 @@ class OSEnvSandboxSpec:
     cwd_allow_hidden: list[str] | None = None
     # Maximum number of filesystem entries the shared dotfile/symlink
     # masker (used by both ``linux_bwrap`` and ``darwin_seatbelt``)
-    # will visit while walking cwd. The walk prunes at masked
-    # dot-directories AND coalesces whole directories rather than
-    # walking them: a regenerable dep dir (``node_modules``, ``.venv``,
-    # ``.mypy_cache``, ``.codex-tmp``) that isn't on
-    # :attr:`cwd_allow_hidden`, or any directory dominated by escaping
-    # symlinks, is masked as a single entry and pruned — so a pnpm
-    # ``node_modules`` symlink farm contributes ONE entry, not tens of
-    # thousands. A directory on :attr:`cwd_allow_hidden` is left
-    # readable and not descended into. Only plain, non-coalesced
-    # directories consume the cap, so realistic projects fit well under
-    # the default. Behaviour when the cap is reached is controlled by
-    # :attr:`cwd_hidden_scan_overflow`. Ignored by backends that don't
-    # do filesystem masking.
+    # will visit while walking cwd. The masker hides only what is not
+    # already safely exposed — non-allowed dotfiles and ESCAPING symlinks
+    # (targets outside the exposed roots) — so real in-cwd content stays
+    # readable and is NOT masked. There is no name-based special casing:
+    # a real npm/yarn ``node_modules`` (real package dirs, no escaping
+    # symlinks) stays readable, while a cross-store pnpm ``node_modules``
+    # (each package an escaping symlink into a store on another
+    # filesystem) is a farm. To keep such a farm from emitting tens of
+    # thousands of masks, the walker collapses any directory whose
+    # subtree is DOMINATED by masks into a single entry — so the farm
+    # contributes ONE mask, not thousands. A directory on
+    # :attr:`cwd_allow_hidden` is left readable at the top level but is
+    # still WALKED so its nested non-allowed secrets are masked (the same
+    # subtree collapse applies inside it). Behaviour when the cap is
+    # reached is controlled by :attr:`cwd_hidden_scan_overflow`. Ignored
+    # by backends that don't do filesystem masking.
     cwd_hidden_scan_max_entries: int = 50000
     # What to do when :attr:`cwd_hidden_scan_max_entries` is reached:
     # - ``"warn"`` (default): emit a logging warning, stop scanning, and
     #   return the partial mask. Dotfiles past the cap remain visible.
     #   This is the default because a hard failure that blocks every
     #   spawn is worse than a best-effort mask for the typical
-    #   trusted-workspace case. Because coalescing already collapses the
-    #   big regenerable trees (``node_modules`` etc.) to one entry each,
-    #   the cap is now reached only by an unusually large tree of plain
-    #   directories (see :mod:`omnigent.inner._cwd_scan`).
+    #   trusted-workspace case. Because the walker no longer prunes a real
+    #   ``node_modules`` by name, a large readable dep tree is walked in
+    #   full and can approach the cap (see :mod:`omnigent.inner._cwd_scan`).
     # - ``"error"``: the resolver raises ``OSError`` so the user notices
     #   and tunes the limit explicitly. Fail-Loud — the right pick for
     #   untrusted source trees where an unmasked dotfile is a leak.
@@ -588,10 +590,10 @@ class OSEnvSandboxSpec:
     # - ``"unlimited"`` removes the cap entirely. Safer from a
     #   masking standpoint (the whole tree is walked) but lets a
     #   malicious workspace bomb the resolver — a tarbomb with
-    #   millions of dot-files would burn CPU. Whole-dir coalescing keeps
-    #   symlink farms from emitting an unbounded mask list, but a tree
-    #   of millions of distinct plain dotfiles can still produce a large
-    #   SBPL / bwrap-arg list. The :data:`_MAX_PROFILE_BYTES` cap
+    #   millions of dot-files would burn CPU. The subtree collapse keeps
+    #   escaping-symlink farms from emitting an unbounded mask list, but a
+    #   tree of millions of distinct plain dotfiles can still produce a
+    #   large SBPL / bwrap-arg list. The :data:`_MAX_PROFILE_BYTES` cap
     #   (256 KiB on seatbelt) and the bwrap arg-ceiling check still
     #   fail-loud catch the runaway, but the walker can spend minutes
     #   getting there.

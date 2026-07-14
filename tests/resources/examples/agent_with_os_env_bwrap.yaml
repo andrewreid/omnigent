@@ -131,16 +131,19 @@ os_env:
     # cwd_allow_hidden: [".venv", ".git", ".gitignore"]
 
     # Optional: cap on the number of filesystem entries the recursive
-    # dotfile walker visits under cwd. The walker prunes at masked
-    # dot-directories AND coalesces whole directories instead of
-    # walking them: a regenerable dep dir (``node_modules``, ``.venv``,
-    # ``.mypy_cache``, ``.codex-tmp``) that isn't on cwd_allow_hidden,
-    # or any directory dominated by escaping symlinks, is masked as ONE
-    # entry and pruned — so a pnpm ``node_modules`` symlink farm costs
-    # a single entry/mask, not tens of thousands. A dir on
-    # cwd_allow_hidden is left readable and not descended into. Only
-    # plain non-coalesced dirs count toward the cap, so realistic
-    # projects fit well under the default (50000).
+    # dotfile walker visits under cwd. The walker masks only what is not
+    # already safely exposed — non-allowed dotfiles and ESCAPING symlinks
+    # (targets outside the exposed roots). Real in-cwd content stays
+    # readable and is not masked; there is no name-based special casing,
+    # so a real npm/yarn ``node_modules`` (real package dirs) is walked
+    # and stays readable and runnable. A cross-store pnpm ``node_modules``
+    # (each package an escaping symlink into an off-device store) is a
+    # farm: to keep it from emitting thousands of masks, the walker
+    # collapses any directory whose subtree is dominated by masks into a
+    # SINGLE entry — so the farm costs one mask, not tens of thousands.
+    # A dir on cwd_allow_hidden is readable at the top level but still
+    # walked so its nested secrets are masked. A large readable dep tree
+    # is walked in full and can approach the cap.
     # cwd_hidden_scan_max_entries: 100000
 
     # Optional: what to do when ``cwd_hidden_scan_max_entries`` is
@@ -149,9 +152,8 @@ os_env:
     #   unfinished directories, stop scanning, and use the partial
     #   mask. Dotfiles past the cap remain visible — acceptable for a
     #   trusted workspace where blocking every spawn is worse than a
-    #   best-effort mask. (Coalescing collapses the big regenerable
-    #   trees, so the cap is now reached only by an unusually large
-    #   tree of plain directories.)
+    #   best-effort mask. (A real, readable dep tree is walked in full,
+    #   so a very large workspace can reach the cap.)
     # - "error": fail at spawn time with an actionable message naming
     #   both spec keys. Fail-Loud — use for untrusted source trees.
     # - "unlimited": ignore the cap and scan the full tree. O(N) on

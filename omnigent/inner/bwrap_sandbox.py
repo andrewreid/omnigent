@@ -97,12 +97,12 @@ _PR_SET_NO_NEW_PRIVS = 38
 # option parser): it aborts with "Exceeded maximum number of arguments
 # 9000" — before argv[0] — once the assembled command line reaches this
 # many tokens. The dotfile / escaping-symlink mask is the only part of
-# the command line that scales with the cwd tree, so a symlink-dense or
-# regenerable dir under cwd (a pnpm ``node_modules``, a large
-# ``.git/worktrees``) is what pushes it over. The walker coalesces those
-# to a single mask each, but we still check the assembled count here as
-# a fail-loud backstop: a cryptic mid-exec bwrap death becomes an
-# actionable error naming the count, the likely culprit, and the knobs.
+# the command line that scales with the cwd tree, so a farm of escaping
+# symlinks under cwd (a cross-store pnpm ``node_modules``) is what pushes
+# it over. The walker's subtree collapse folds a dense farm into a single
+# mask, but we still check the assembled count here as a fail-loud
+# backstop: a cryptic mid-exec bwrap death becomes an actionable error
+# naming the count, the likely culprit, and the knobs.
 _BWRAP_MAX_ARGS = 9000
 
 # Top-level cwd dotfiles allowed through by default when the spec
@@ -1081,15 +1081,24 @@ def _reexpose_target_after_mask(target: str, cwd: Path, policy: SandboxPolicy) -
     """
     Return a bind that restores the exec *target* if a mask shadowed it.
 
-    The dotfile / escaping-symlink mask (and in particular the
-    coalesced ``--tmpfs <cwd>/node_modules`` that hides a symlink farm)
-    is emitted after the cwd bind, so a *target* living under a masked
-    subtree — e.g. ``cwd/node_modules/.bin/claude`` — would be hidden
-    before the launcher can exec it. bwrap layers later mounts on top of
-    earlier ones, so re-binding the resolved target at its literal path
-    AFTER the mask restores exactly that path (bwrap creates the
-    intermediate mountpoint inside the tmpfs) without re-exposing the
-    rest of the coalesced subtree.
+    The dotfile / escaping-symlink mask — in particular the subtree
+    collapse that folds a farm of escaping symlinks into a single
+    ``--tmpfs <dir>`` (e.g. a cross-store pnpm ``node_modules``) — is
+    emitted after the cwd bind, so a *target* living under a collapsed
+    subtree (``cwd/node_modules/.bin/claude``) would be hidden before the
+    launcher can exec it. bwrap layers later mounts on top of earlier
+    ones, so re-binding the resolved target at its literal path AFTER the
+    mask restores exactly that path (bwrap creates the intermediate
+    mountpoint inside the tmpfs) without re-exposing the rest of the
+    collapsed subtree.
+
+    Residual: when the collapsed subtree is a pnpm store, the resolved
+    target is a ``bin`` script whose sibling package files live behind
+    the (now hidden) escaping store links, so relative ``require()`` /
+    resource lookups from that CLI can still fail — an accepted residual
+    for pnpm-store CLIs. A real npm/yarn ``node_modules`` is NOT a farm,
+    is never collapsed, and keeps full package context (this function
+    emits a harmless no-op re-bind for that case).
 
     The bind is only emitted when the target's literal path falls inside
     a scope the mask actually walks (``cwd`` or a ``read_paths`` root);
@@ -1129,12 +1138,12 @@ def _check_bwrap_arg_ceiling(bwrap_args: Sequence[str], cwd: Path) -> None:
     (:data:`_BWRAP_MAX_ARGS`) — before argv[0] — when the assembled
     command line is too long. Almost all of that length comes from the
     dotfile / escaping-symlink mask, which scales with the cwd tree, so
-    the overwhelmingly likely culprit is a symlink-dense or regenerable
-    directory under cwd (a pnpm ``node_modules``, a large
-    ``.git/worktrees``). The walker coalesces those to one mask each;
-    this is the fail-loud backstop for any case coalescing misses, and
-    it turns bwrap's cryptic mid-exec death into an actionable error
-    naming the count, the culprit, and the tuning knobs.
+    the overwhelmingly likely culprit is a farm of escaping symlinks
+    under cwd (a cross-store pnpm ``node_modules``) that the walker's
+    subtree collapse didn't fold, or an unusually broad ``read_paths``
+    grant. This is the fail-loud backstop for any case the collapse
+    misses, turning bwrap's cryptic mid-exec death into an actionable
+    error naming the count, the culprit, and the tuning knobs.
 
     :param bwrap_args: The fully assembled ``bwrap`` argv (including
         ``bwrap`` itself, all mounts, ``--``, and the helper command).
@@ -1151,20 +1160,19 @@ def _check_bwrap_arg_ceiling(bwrap_args: Sequence[str], cwd: Path) -> None:
         f"bwrap's hard limit of {_BWRAP_MAX_ARGS} — bwrap would abort with "
         f"'Exceeded maximum number of arguments {_BWRAP_MAX_ARGS}' before "
         f"exec. Almost all of these come from the dotfile / escaping-symlink "
-        f"mask, so the likely culprit is a symlink-dense directory under "
-        f"{cwd} (a symlink farm the coalescing didn't collapse) or an "
-        f"unusually broad read_paths grant. Safe remediations: narrow the "
-        f"os_env.sandbox.read_paths grant so fewer roots are walked; "
-        f"restructure or remove the offending directory so the walker's "
-        f"whole-dir coalescing applies to it; or, if the directory is on "
-        f"os_env.sandbox.cwd_allow_hidden purely to keep it readable, drop "
-        f"it from the allowlist so it coalesces to a single mask instead of "
-        f"being walked. NOTE: raising cwd_hidden_scan_max_entries cannot cure "
-        f"an argv overflow (it permits MORE masks, not fewer), and switching "
+        f"mask, so the likely culprit is a farm of escaping symlinks under "
+        f"{cwd} (e.g. a cross-store pnpm node_modules) that the walker's "
+        f"subtree collapse didn't fold, or an unusually broad read_paths "
+        f"grant. Safe remediations: narrow the os_env.sandbox.read_paths "
+        f"grant so fewer roots are walked; or restructure/relocate the "
+        f"symlink farm (e.g. move the pnpm store on-device so packages are "
+        f"hardlinks, not escaping symlinks — then nothing needs masking). "
+        f"NOTE: raising cwd_hidden_scan_max_entries cannot cure an argv "
+        f"overflow (it permits MORE masks, not fewer), and switching "
         f"cwd_hidden_scan_overflow to 'warn'/'unlimited' only lowers the arg "
-        f"count by leaving entries UNMASKED — both EXPOSE directory contents "
-        f"to the sandboxed helper, so use them only as a deliberate exposure "
-        f"trade-off."
+        f"count by leaving escaping entries UNMASKED — both EXPOSE those "
+        f"paths to the sandboxed helper, so use them only as a deliberate "
+        f"exposure trade-off."
     )
 
 
