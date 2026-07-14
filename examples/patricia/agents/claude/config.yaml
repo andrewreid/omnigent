@@ -36,60 +36,14 @@ executor:
 #
 # ``os_env`` registers the ``sys_os_read`` / ``sys_os_write`` / ``sys_os_edit``
 # / ``sys_os_shell`` tools (filesystem access comes bundled with a shell) so the
-# head can READ the merged code it is grounded on and cite file:line.
-#
-# SECURITY MODEL — read-only grounded repo + writable scratch:
-#
-# Patricia is launched FROM the grounded worktree root, so ``cwd: .`` IS the
-# repository being debated. Under ``linux_bwrap`` the cwd is bound READ-ONLY by
-# default (writes are rejected) — and because NO ``write_paths`` grant is
-# declared, the entire repo, INCLUDING ``.git``, stays read-only. The head can
-# read history/refs to ground on a SHA (``git show`` / ``git log`` /
-# ``git diff``) but CANNOT modify refs, config, hooks, or objects. Grounding
-# needs ``.git`` VISIBLE, not WRITABLE.
-#
-# ``cwd_allow_hidden: [".git"]`` re-admits the ``.git`` dotdir through the
-# sandbox's dotfile mask so it is visible (still read-only, per above). Setting
-# this field replaces the backend default of ``[".venv"]``; ``.venv`` is
-# deliberately dropped because SHA grounding only needs ``.git`` (the head reads
-# source, it does not run a project venv).
-#
-# The head's WRITABLE scratch is ``$TMPDIR`` — a per-session writable dir the
-# bwrap backend always provides, regardless of the read-only cwd. The head
-# writes any notes there (see prompt); the grounded repo is never mutated.
-#
-# The sandbox is ``linux_bwrap`` (not ``type: none``) to CONTAIN grounding: it
-# is what binds the grounded repo (cwd, incl ``.git``) READ-ONLY and masks the
-# repo's dotfile secrets, per the security model above. It is NOT required for
-# the web tools — ``web_search`` runs runner-side and ``web_fetch``'s researcher
-# inherits this parent sandbox, so web works under ``type: none`` too. Network
-# is enabled here anyway (``allow_network: true``, the bwrap default, stated
-# explicitly for clarity) so ``web_fetch`` can still reach outbound hosts from
-# inside the contained head.
+# head can READ the merged code it is grounded on and cite file:line, plus read
+# ``.git`` history/refs to ground on a SHA. ``sandbox: type: none`` runs
+# unsandboxed in the caller's working directory (the grounded worktree root).
 os_env:
   type: caller_process
   cwd: .
   sandbox:
-    type: linux_bwrap
-    # No write_paths: cwd (the grounded repo, incl .git) is read-only.
-    cwd_allow_hidden: [".git"]
-    # Prune the dependency / vendor farms. Patricia grounds on merged SOURCE and
-    # never reads a dependency tree, so mask each of these as ONE entry and do
-    # NOT descend into it. This is the fix for the walker exploding on a
-    # cross-filesystem pnpm store, where every package under ``node_modules`` is
-    # an ESCAPING symlink and would otherwise emit one bwrap mask arg apiece —
-    # tens of thousands of args that blow past bwrap's ~9000-arg ceiling. With
-    # these boundaries the farm collapses to a couple of masks and the scan
-    # stays well under the entry cap.
-    cwd_prune_dirs: [node_modules, .pnpm]
-    # Bounded default overflow (``warn``): scan up to the 50k-entry cap, emit a
-    # partial best-effort mask plus a CRITICAL log past it. Safe HERE because
-    # (a) the big dependency trees are pruned above so the source tree fits well
-    # under the cap, and (b) Patricia grounds on TRUSTED merged repos, not
-    # arbitrary hostile input. (Formerly ``unlimited`` — needed only because the
-    # unpruned pnpm farm made the full walk the sole leak-free option; the prune
-    # list removes that need and restores the bounded default.)
-    allow_network: true
+    type: none
 
 # Same blast-radius guardrail Polly's sub-agents use, so the shell behaves
 # identically: the catastrophic set (force-push, ``rm -rf /``, hard-reset to a
@@ -126,7 +80,9 @@ prompt: |
   ## Ground every claim on real merged code
 
   You run inside the grounded repository: the current working directory IS the
-  merged worktree being debated, bound READ-ONLY (including `.git`). You are
+  merged worktree being debated (including `.git`, visible for SHA grounding).
+  Treat it as read-only: READ the code to ground your argument, but do NOT
+  modify the grounded repo — no edits, no writes, no ref changes. You are
   given a repo ref (a git SHA or branch) and file:line anchors. Before you argue
   anything, READ the actual code with your `sys_os_*` tools — `sys_os_read` for
   files (relative paths resolve against the repo root), `sys_os_shell` for
@@ -135,7 +91,7 @@ prompt: |
   the code — if you are not sure how something works, go read it. An argument
   without a file:line citation is not admissible.
 
-  The repo is read-only, so do not try to write into it. If you need scratch
+  Do not write into the grounded repo. If you need scratch
   space for notes, write under `$TMPDIR` (a per-session writable scratch dir) —
   but your position and (finally) your signature are the deliverable, not files
   on disk, so you rarely need it.
