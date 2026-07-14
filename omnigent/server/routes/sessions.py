@@ -12751,20 +12751,46 @@ def _create_session_from_bundle(
     # ``omnigent run`` uploads the operator's own bundle through this same
     # path, so custom handlers must keep working (the operator already has
     # code execution — the restriction would add no security there).
+    # Workspace override on the multipart/CLI path (``omnigent run
+    # --workspace``). Deny-by-default: the server-side canonical
+    # validation below (realpath on the SERVER filesystem) is only sound
+    # when the server shares the runner's filesystem, so honor a
+    # workspace ONLY on the co-located local no-host surface and REJECT
+    # it (fail-fast, before storing the bundle) on every other topology
+    # instead of validating against the wrong filesystem:
+    #   - host_id set  => the runner launches on a separate host; the
+    #     workspace is a path there, not on this server (FIX 1).
+    #   - not a local single-user server => a remote state server is not
+    #     co-located with the (laptop) runner, so its realpath resolves
+    #     the wrong filesystem. local_single_user_enabled() is the
+    #     existing marker the managed local-spawn paths set for THE
+    #     user's own loopback server; deployed servers never set it, so
+    #     this fails closed there (FIX 2).
+    if metadata.workspace is not None:
+        if metadata.host_id is not None:
+            raise OmnigentError(
+                "workspace override is not supported with host_id",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not local_single_user_enabled():
+            raise OmnigentError(
+                "workspace override is only supported on a co-located local server, "
+                "not a remote --server target",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
     spec = validate_agent_bundle(
         bundle_bytes,
         enforce_handler_allowlist=not local_single_user_enabled(),
     )
     assert spec.name is not None
 
-    # Close the sibling entry point: a workspace uploaded on the
-    # multipart/CLI path (``omnigent run --workspace``) must clear the
-    # SAME canonical-containment check as the JSON no-host spawn before
-    # it is persisted and later becomes the harness sandbox cwd /
-    # scan-root. Only the no-host case is validated here (host_id set =>
-    # the workspace is a path on a remote host, canonicalized there via
-    # host.stat, not on the server's filesystem).
-    if metadata.workspace is not None and metadata.host_id is None:
+    # Co-located no-host workspace: canonically validate it against the
+    # uploaded agent's os_env.cwd boundary (same chokepoint as the JSON
+    # spawn) before it is persisted and later becomes the harness sandbox
+    # cwd / scan-root. Reachable only after the deny-by-default gate
+    # above, so host_id is None and the server shares the runner's fs.
+    if metadata.workspace is not None:
         from omnigent.server.routes._workspace_validation import (
             WorkspaceValidationError,
             validate_workspace_no_host,
