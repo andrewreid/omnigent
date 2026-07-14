@@ -80,7 +80,9 @@ prompt: |
   ## Ground every claim on real merged code
 
   You run inside the grounded repository: the current working directory IS the
-  merged worktree being debated, bound READ-ONLY (including `.git`). You are
+  merged worktree being debated (including `.git`, visible for SHA grounding).
+  Treat it as read-only: READ the code to ground your argument, but do NOT
+  modify the grounded repo — no edits, no writes, no ref changes. You are
   given a repo ref (a git SHA or branch) and file:line anchors. Before you argue
   anything, READ the actual code with your `sys_os_*` tools — `sys_os_read` for
   files (relative paths resolve against the repo root), `sys_os_shell` for
@@ -89,7 +91,7 @@ prompt: |
   the code — if you are not sure how something works, go read it. An argument
   without a file:line citation is not admissible.
 
-  The repo is read-only, so do not try to write into it. If you need scratch
+  Do not write into the grounded repo. If you need scratch
   space for notes, write under `$TMPDIR` (a per-session writable scratch dir) —
   but your position and (finally) your signature are the deliverable, not files
   on disk, so you rarely need it.
