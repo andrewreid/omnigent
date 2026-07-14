@@ -23,7 +23,11 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner._cwd_scan import MaskedEntry, scan_cwd_mask_entries
+from omnigent.inner._cwd_scan import (
+    _ESCAPING_SYMLINK_COALESCE_THRESHOLD,
+    MaskedEntry,
+    scan_cwd_mask_entries,
+)
 
 # The walker contract says ``safe_roots`` should include cwd plus the
 # backend-specific exposed mounts. For these decision-level tests we
@@ -41,7 +45,7 @@ def _scan(
     safe_roots: list[Path] | None = None,
     max_entries: int = _DEFAULT_MAX,
     overflow: str = "error",
-    deprioritize_names: list[str] | None = None,
+    coalesce_names: list[str] | None = None,
 ) -> list[MaskedEntry]:
     """
     Thin wrapper that mirrors what each backend passes through.
@@ -65,10 +69,11 @@ def _scan(
         cap/overflow tests can assert on the raised :class:`OSError`;
         note this differs from the production default (``"warn"``),
         which is pinned in the spec-parser tests instead.
-    :param deprioritize_names: Directory basenames walked last.
+    :param coalesce_names: Directory basenames masked wholesale (as a
+        single ``kind="dir"`` entry) and pruned when un-allowed.
         ``None`` (the default) lets the walker apply its own default
-        (``("node_modules",)``); pass ``[]`` to disable
-        deprioritization for the no-defer contrast cases.
+        (:data:`_DEFAULT_COALESCE_DIRS`); pass ``[]`` to disable the
+        named-dir coalesce for the plain-DFS contrast cases.
     :returns: List of :class:`MaskedEntry`.
     """
     roots = [cwd.resolve(strict=False), *_SYSTEM_SAFE_ROOTS]
@@ -76,7 +81,7 @@ def _scan(
         roots = safe_roots
     # Only override the walker's default when the test asked to, so the
     # common case still exercises the production default (node_modules).
-    if deprioritize_names is None:
+    if coalesce_names is None:
         return scan_cwd_mask_entries(
             cwd.resolve(strict=False),
             allow_hidden=allow_hidden or [],
@@ -90,7 +95,7 @@ def _scan(
         safe_roots=roots,
         max_entries=max_entries,
         overflow=overflow,
-        deprioritize_names=deprioritize_names,
+        coalesce_names=coalesce_names,
     )
 
 
@@ -393,211 +398,243 @@ def test_overflow_unlimited_walks_full_tree(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Deprioritized directories (node_modules walked last)
+# Coalesced regenerable dep dirs (node_modules et al. masked wholesale)
 # ---------------------------------------------------------------------------
 
 
-def _build_deprioritize_tree(cwd: Path) -> None:
+def _make_escaping_symlink_farm(directory: Path, count: int) -> None:
     """
-    Create a fixed three-way tree used by the deprioritization tests.
+    Fill *directory* with *count* symlinks that escape every safe root.
 
-    Layout (each directory has exactly three children so the entry
-    counts are deterministic):
+    Each link points at ``/etc/hostname`` (a real file outside the
+    test's ``[cwd, /usr]`` safe roots) so the walker classifies it as an
+    escaping symlink — the same shape a pnpm ``node_modules/.pnpm`` store
+    presents. The directory is created if it does not exist.
 
-    - ``cwd/.env``                 (project dotfile)
-    - ``cwd/app/.secret``          (project dotfile, + two plain files)
-    - ``cwd/node_modules/.npmrc``  (dep-tree dotfile, + two plain files)
-
-    ``app`` sorts before ``node_modules`` alphabetically, so a plain
-    DFS (no deprioritization) would pop ``node_modules`` off the LIFO
-    stack *before* ``app`` and spend the cap budget there — leaving
-    ``app/.secret`` unmasked. With deprioritization, ``app`` is walked
-    first and ``node_modules`` last. The two regimes therefore drop
-    opposite dotfiles, which is what the contrast test asserts.
-
-    :param cwd: Throwaway tempdir to populate.
+    :param directory: Directory to populate (created if missing).
+    :param count: Number of escaping symlinks to create.
     """
-    (cwd / ".env").write_text("PROJECT_SECRET=1")
-    app = cwd / "app"
-    app.mkdir()
-    (app / ".secret").write_text("APP_SECRET=1")
-    (app / "a.txt").write_text("x")
-    (app / "b.txt").write_text("x")
-    node_modules = cwd / "node_modules"
+    directory.mkdir(parents=True, exist_ok=True)
+    target = Path("/etc/hostname")
+    for i in range(count):
+        (directory / f"link_{i:05d}").symlink_to(target)
+
+
+def test_coalesced_dep_dir_masked_as_single_dir_and_pruned(tmp_path: Path) -> None:
+    """
+    A ``node_modules`` that is NOT on ``allow_hidden`` is masked as a
+    single ``kind="dir"`` entry and its subtree is pruned — the walker
+    never emits a separate entry for anything inside it, even a dotfile.
+
+    This is the core of the arg-explosion fix: whatever lives under a
+    regenerable dep dir collapses to one mask instead of one-per-child.
+    """
+    node_modules = tmp_path / "node_modules"
     node_modules.mkdir()
     (node_modules / ".npmrc").write_text("token=zzz")
     (node_modules / "m1.txt").write_text("x")
-    (node_modules / "m2.txt").write_text("x")
+    (tmp_path / "regular.txt").write_text("x")
 
-
-def test_deprioritized_dir_walked_last_so_project_dotfiles_win(tmp_path: Path) -> None:
-    """
-    With ``node_modules`` deprioritized, a cap that can't cover the
-    whole tree masks the project's own dotfiles (``cwd/.env`` and
-    ``cwd/app/.secret``) and leaves only the ``node_modules`` dotfile
-    unmasked. The no-deprioritization contrast drops the opposite
-    dotfile, proving the deferral — not luck of DFS ordering — is what
-    protects the project secret.
-
-    A failure of the first block means deprioritization stopped
-    deferring ``node_modules`` (project secret would leak instead);
-    a failure of the contrast block means the tree no longer
-    distinguishes the two regimes and the test has lost its teeth.
-    """
-    _build_deprioritize_tree(tmp_path)
-    # max_entries=6: budget covers cwd's 3 children + app's 3 children;
-    # node_modules contents are reached only after, so the 7th entry
-    # (node_modules/.npmrc) trips the cap. warn => partial mask returned.
-    defer = _scan(tmp_path, max_entries=6, overflow="warn")
-    assert _entry_for(defer, tmp_path / ".env") is not None, (
-        "Top-level project .env must be masked — it is visited before "
-        "the cap trips regardless of deprioritization."
+    entries = _scan(tmp_path)
+    nm_entry = _entry_for(entries, node_modules)
+    assert nm_entry is not None and nm_entry.kind == "dir", (
+        "node_modules must be masked as a single directory entry."
     )
-    assert _entry_for(defer, tmp_path / "app" / ".secret") is not None, (
-        "app/.secret must be masked: deprioritizing node_modules means "
-        "app is walked before the budget is exhausted. If this is None, "
-        "node_modules was NOT deferred and stole the budget."
+    nested = [e for e in entries if str(e.path).startswith(str(node_modules) + os.sep)]
+    assert nested == [], (
+        "The coalesced node_modules subtree must be pruned — no per-child "
+        f"masks. Got nested entries: {[e.path for e in nested]}"
     )
-    assert _entry_for(defer, tmp_path / "node_modules" / ".npmrc") is None, (
-        "node_modules/.npmrc must be the dropped (unmasked) entry — it is "
-        "walked last, after the cap is already exhausted."
-    )
-
-    # Same tree + same cap, but deprioritization disabled: plain DFS
-    # pops node_modules before app, so node_modules/.npmrc is masked
-    # and app/.secret is the one dropped — the mirror image.
-    no_defer = _scan(tmp_path, max_entries=6, overflow="warn", deprioritize_names=[])
-    assert _entry_for(no_defer, tmp_path / "node_modules" / ".npmrc") is not None, (
-        "Without deprioritization, node_modules is walked first and its "
-        ".npmrc is masked — confirming the budget went there."
-    )
-    assert _entry_for(no_defer, tmp_path / "app" / ".secret") is None, (
-        "Without deprioritization, app is walked last and app/.secret is "
-        "dropped — the exact leak deprioritization exists to prevent."
-    )
+    # Sibling project content stays visible.
+    assert _entry_for(entries, tmp_path / "regular.txt") is None
 
 
-def test_deprioritized_dir_dotfiles_masked_when_under_cap(tmp_path: Path) -> None:
+def test_coalesced_dep_dir_symlink_farm_emits_exactly_one_entry(tmp_path: Path) -> None:
     """
-    Deprioritize means "walk last", NOT "skip". When the cap is large
-    enough to cover the whole tree, the ``node_modules`` dotfile is
-    masked just like every other dotfile.
-
-    Regression guard: if a future change implemented deprioritization
-    as "exclude from the walk" instead of "defer", this would fail
-    because node_modules/.npmrc would never be masked.
+    A pnpm-shaped ``node_modules`` — thousands of escaping store links —
+    produces EXACTLY ONE :class:`MaskedEntry`, not one per link. This is
+    the concrete regression the fix targets: without coalescing this
+    farm would emit tens of thousands of masks and blow bwrap's
+    9000-arg ceiling. The subtree must not be visited past the dir.
     """
-    _build_deprioritize_tree(tmp_path)
-    entries = _scan(tmp_path)  # default cap (50000) comfortably covers the tree
-    npmrc = _entry_for(entries, tmp_path / "node_modules" / ".npmrc")
-    assert npmrc is not None and npmrc.kind == "file", (
-        "node_modules/.npmrc must still be masked when budget remains; "
-        "deprioritization defers the subtree, it does not skip it."
-    )
+    farm = tmp_path / "node_modules" / ".pnpm"
+    _make_escaping_symlink_farm(farm, 500)
 
-
-def test_nested_deprioritized_dir_terminates_and_masks_deep_dotfile(tmp_path: Path) -> None:
-    """
-    A ``node_modules`` nested inside another ``node_modules`` must be
-    re-deferred on each drain and still walked — the walk terminates
-    (no infinite re-deferral) and the deeply nested dotfile is masked
-    when the cap allows.
-
-    If the re-deferral logic looped forever, this test would hang
-    rather than fail; the mask assertion confirms the inner subtree
-    was actually reached.
-    """
-    deep = tmp_path / "node_modules" / "pkg" / "node_modules"
-    deep.mkdir(parents=True)
-    deep_secret = deep / ".npmrc"
-    deep_secret.write_text("nested=secret")
     entries = _scan(tmp_path, overflow="unlimited")
-    entry = _entry_for(entries, deep_secret)
-    assert entry is not None and entry.kind == "file", (
-        "The dotfile inside a nested node_modules must be masked under "
-        "unlimited overflow — proving nested deferral terminates and "
-        "still visits the inner subtree."
+    node_modules = tmp_path / "node_modules"
+    nm_entry = _entry_for(entries, node_modules)
+    assert nm_entry is not None and nm_entry.kind == "dir", (
+        "node_modules must coalesce to a single dir mask before its symlink farm is ever walked."
+    )
+    under_nm = [e for e in entries if str(e.path).startswith(str(node_modules) + os.sep)]
+    assert under_nm == [], (
+        "No entry under the coalesced node_modules may be emitted; the "
+        f"symlink farm must be pruned unvisited. Got: {len(under_nm)} entries."
+    )
+    assert len(entries) == 1, (
+        f"The whole tree should collapse to one mask (node_modules). "
+        f"Got {len(entries)}: {[(e.path, e.kind) for e in entries]}"
     )
 
 
-# The dot-prefixed deprioritized basenames. These are only walked at
-# all when on ``allow_hidden`` (otherwise they are masked + pruned),
-# which is the "if they are allowed" condition under which
-# deprioritization can apply.
-_DEPRIORITIZED_DOT_DIRS = [".venv", ".mypy_cache", ".codex-tmp"]
-
-
-@pytest.mark.parametrize("dotdir", _DEPRIORITIZED_DOT_DIRS)
-def test_allowed_dot_dir_is_treated_as_deprioritized(dotdir: str, tmp_path: Path) -> None:
+def test_allowed_dep_dir_is_readable_not_masked_and_not_walked(tmp_path: Path) -> None:
     """
-    An *allowed* deprioritized dot-dir (``.venv`` / ``.mypy_cache`` /
-    ``.codex-tmp``) is walked last like ``node_modules``: when the cap
-    trips, the overflow message flags that dir as ``deprioritized``,
-    and the project's own dotfile (``cwd/proj/.secret``) is masked
-    rather than dropped.
-
-    Why the ``deprioritized`` flag is the load-bearing assertion: a
-    dot-dir already sorts before sibling regular dirs, so plain DFS
-    happens to pop it last anyway — the masked *set* alone wouldn't
-    distinguish the two regimes. The flag is emitted only because the
-    basename is in ``_DEFAULT_DEPRIORITIZED_DIRS``. If this name were
-    removed from that set, the dir would be a normal stack entry and
-    the message would say ``partially scanned`` WITHOUT
-    ``deprioritized`` — so this assertion fails exactly when the
-    feature regresses.
+    Operator opt-in wins: when ``node_modules`` is on ``allow_hidden``
+    it is left readable — NOT masked — and (per the allow_hidden rule)
+    NOT deep-walked, so its interior escaping symlinks are not masked
+    either. This preserves "allowed = readable" and keeps an allowed
+    dep dir from becoming a source of per-interior masks.
     """
-    cache = tmp_path / dotdir
-    cache.mkdir()
-    (cache / "inner.txt").write_text("x")
-    proj = tmp_path / "proj"
-    proj.mkdir()
-    (proj / ".secret").write_text("PROJECT_SECRET=1")
-    (proj / "a.txt").write_text("x")
-    (proj / "b.txt").write_text("x")
-    # cwd children sorted: <dotdir>, proj. dotdir is allowed → deferred;
-    # proj (3 children) is walked in the primary phase. With cap=5 the
-    # budget covers <dotdir> (1) + proj (2) as cwd children, then proj's
-    # 3 children (3,4,5); the 6th entry (inner.txt under the promoted
-    # dotdir) trips the cap, leaving the dotdir partially scanned.
-    with pytest.raises(OSError) as exc_info:
-        _scan(tmp_path, allow_hidden=[dotdir], max_entries=5, overflow="error")
-    msg = str(exc_info.value)
-    dotdir_path = str((tmp_path / dotdir).resolve(strict=False))
-    assert f"{dotdir_path} (partially scanned, deprioritized)" in msg, (
-        f"{dotdir} must be flagged as deprioritized in the overflow message "
-        f"when allowed. If the flag is missing, {dotdir} is no longer in "
-        f"_DEFAULT_DEPRIORITIZED_DIRS. Got: {msg!r}"
+    farm = tmp_path / "node_modules" / ".pnpm"
+    _make_escaping_symlink_farm(farm, 200)
+
+    entries = _scan(tmp_path, allow_hidden=["node_modules"], overflow="unlimited")
+    assert _entry_for(entries, tmp_path / "node_modules") is None, (
+        "An allow_hidden node_modules must be readable, not masked."
+    )
+    under_nm = [
+        e for e in entries if str(e.path).startswith(str(tmp_path / "node_modules") + os.sep)
+    ]
+    assert under_nm == [], (
+        "An allow_hidden dir must not be deep-walked; its interior "
+        f"escaping symlinks must not be masked. Got: {len(under_nm)} entries."
     )
 
 
-@pytest.mark.parametrize("dotdir", _DEPRIORITIZED_DOT_DIRS)
-def test_unallowed_deprioritized_dot_dir_is_masked_not_walked(dotdir: str, tmp_path: Path) -> None:
-    """
-    The "if they are allowed" guard: when a deprioritized dot-dir is
-    NOT on ``allow_hidden``, membership in the deprioritize set is a
-    no-op — the dir is masked and pruned (its contents never walked),
-    exactly as any other un-allowed dotdir.
+# ---------------------------------------------------------------------------
+# Generic symlink-farm collapse (Part 1 backstop, non-dep dirs)
+# ---------------------------------------------------------------------------
 
-    This guards the ordering of the two branches: masking is decided
-    before the deprioritize/defer branch, so a name in the deprioritize
-    set can never be promoted to "walked" while un-allowed (which would
-    expose its contents to the cap walk).
+
+def test_generic_symlink_farm_collapses_to_single_dir(tmp_path: Path) -> None:
+    """
+    A directory NOT in the coalesce set but dominated by escaping
+    symlinks (>= the threshold, >= the dominance fraction) is masked
+    once as a ``kind="dir"`` entry and pruned. Backstop for symlink
+    farms that aren't a known regenerable dep dir.
+    """
+    farm = tmp_path / "store"
+    _make_escaping_symlink_farm(farm, _ESCAPING_SYMLINK_COALESCE_THRESHOLD + 10)
+
+    entries = _scan(tmp_path, overflow="unlimited")
+    farm_entry = _entry_for(entries, farm)
+    assert farm_entry is not None and farm_entry.kind == "dir", (
+        "A near-pure escaping-symlink farm must collapse to one dir mask."
+    )
+    under = [e for e in entries if str(e.path).startswith(str(farm) + os.sep)]
+    assert under == [], f"The collapsed farm must be pruned. Got nested: {[e.path for e in under]}"
+
+
+def test_generic_collapse_does_not_fire_below_threshold(tmp_path: Path) -> None:
+    """
+    A handful of escaping symlinks (below the threshold) are masked
+    INDIVIDUALLY, not collapsed — the whole-dir collapse must not fire
+    for the ordinary "a few escaping links" case.
+    """
+    sub = tmp_path / "sub"
+    _make_escaping_symlink_farm(sub, 3)
+
+    entries = _scan(tmp_path, overflow="unlimited")
+    assert _entry_for(entries, sub) is None, (
+        "A dir with only a few escaping links must not be collapsed."
+    )
+    for i in range(3):
+        link = sub / f"link_{i:05d}"
+        entry = _entry_for(entries, link)
+        assert entry is not None and entry.kind == "file", (
+            f"{link} must be masked individually below the collapse threshold."
+        )
+
+
+def test_generic_collapse_respects_dominance_and_keeps_content_visible(tmp_path: Path) -> None:
+    """
+    A directory with many escaping symlinks but ALSO abundant readable
+    content (so links are below the dominance fraction) is NOT
+    collapsed: readable files stay visible and each link is masked
+    individually. Guards against over-masking browsable project trees.
+    """
+    mixed = tmp_path / "mixed"
+    mixed.mkdir()
+    # Threshold escaping links, but an equal amount of readable files so
+    # links are only ~50% of children — under the dominance fraction.
+    _make_escaping_symlink_farm(mixed, _ESCAPING_SYMLINK_COALESCE_THRESHOLD)
+    for i in range(_ESCAPING_SYMLINK_COALESCE_THRESHOLD):
+        (mixed / f"src_{i:05d}.txt").write_text("readable")
+
+    entries = _scan(tmp_path, overflow="unlimited")
+    assert _entry_for(entries, mixed) is None, (
+        "A dir mixing readable content with links must not be hidden "
+        "wholesale — the dominance guard must keep it browsable."
+    )
+    # A readable file stays visible; a link is still masked individually.
+    assert _entry_for(entries, mixed / "src_00000.txt") is None
+    link_entry = _entry_for(entries, mixed / "link_00000")
+    assert link_entry is not None and link_entry.kind == "file"
+
+
+# ---------------------------------------------------------------------------
+# allow_hidden directories are readable, not deep-walked (Part 3)
+# ---------------------------------------------------------------------------
+
+
+def test_allow_hidden_dir_is_not_deep_walked_for_masking(tmp_path: Path) -> None:
+    """
+    An ``allow_hidden`` directory (e.g. ``.git`` when the operator sets
+    ``cwd_allow_hidden: [".git"]``) passes through readable and is NOT
+    descended into: an interior escaping symlink (mimicking a
+    ``.git/worktrees`` admin link) is left unmasked, so the allowed dir
+    never becomes a source of per-interior mask emits. A sibling
+    non-allowed dotfile must still be masked — the dotfile guarantee is
+    unchanged for entries that were not opted in.
+    """
+    git_dir = tmp_path / ".git"
+    wt = git_dir / "worktrees" / "wt1"
+    wt.mkdir(parents=True)
+    (wt / "gitdir").symlink_to("/etc/hostname")  # escapes cwd + /usr
+    (tmp_path / ".env").write_text("SECRET=1")
+
+    entries = _scan(tmp_path, allow_hidden=[".git"])
+    assert _entry_for(entries, git_dir) is None, ".git (allowed) must be readable."
+    under_git = [e for e in entries if str(e.path).startswith(str(git_dir) + os.sep)]
+    assert under_git == [], (
+        "allow_hidden .git must not be deep-walked; its interior escaping "
+        f"symlinks must not be masked. Got: {[e.path for e in under_git]}"
+    )
+    # The non-allowed sibling dotfile is still masked.
+    env_entry = _entry_for(entries, tmp_path / ".env")
+    assert env_entry is not None and env_entry.kind == "file"
+
+
+# The dot-prefixed coalesce basenames. When NOT on ``allow_hidden`` the
+# dotfile rule masks + prunes them before the coalesce branch is
+# reached, so membership in the coalesce set is a no-op for them.
+_COALESCE_DOT_DIRS = [".venv", ".mypy_cache", ".codex-tmp"]
+
+
+@pytest.mark.parametrize("dotdir", _COALESCE_DOT_DIRS)
+def test_unallowed_coalesce_dot_dir_is_masked_not_walked(dotdir: str, tmp_path: Path) -> None:
+    """
+    When a coalesce dot-dir is NOT on ``allow_hidden``, the dotfile rule
+    masks it as a directory and prunes it (its contents never walked) —
+    membership in the coalesce set changes nothing here because the
+    dotfile decision runs first.
+
+    This guards the branch ordering: masking is decided before the
+    coalesce branch, so a name in the coalesce set can never be promoted
+    to "walked" while un-allowed.
     """
     cache = tmp_path / dotdir
     cache.mkdir()
     (cache / ".inner_secret").write_text("SECRET=1")
-    # allow_hidden=[] (mask every dotfile). The cache dir is not allowed.
-    entries = _scan(tmp_path)
+    entries = _scan(tmp_path)  # allow_hidden=[] → mask every dotfile
     cache_entry = _entry_for(entries, cache)
     assert cache_entry is not None and cache_entry.kind == "dir", (
         f"Un-allowed {dotdir} must be masked as a directory, not walked."
     )
-    # Pruned: nothing under the masked cache dir is emitted separately.
     nested = [e for e in entries if str(e.path).startswith(str(cache) + os.sep)]
     assert nested == [], (
-        f"Walker descended into a masked {dotdir}; deprioritization must not "
-        f"override masking + pruning for an un-allowed dotdir. Got: "
-        f"{[e.path for e in nested]}"
+        f"Walker descended into a masked {dotdir}; masking + pruning must "
+        f"win for an un-allowed dotdir. Got: {[e.path for e in nested]}"
     )
 
 
@@ -606,35 +643,32 @@ def test_unallowed_deprioritized_dot_dir_is_masked_not_walked(dotdir: str, tmp_p
 # ---------------------------------------------------------------------------
 
 
-def test_overflow_error_message_names_unfinished_node_modules(tmp_path: Path) -> None:
+def test_overflow_error_message_names_unfinished_dir(tmp_path: Path) -> None:
     """
-    The ``error`` overflow message must name the directories the walk
-    did not finish and flag the deprioritized ``node_modules`` so an
-    operator can see at a glance which subtree was left unmasked.
+    The ``error`` overflow message must name the directory the walk did
+    not finish so an operator can see at a glance which subtree was left
+    unmasked, and keep naming both tuning knobs.
 
     A failure here means the enriched message regressed back to the
-    counts-only form, which left operators guessing which folder
-    (node_modules vs a real source dir) was only partially walked.
+    counts-only form, which left operators guessing which folder was
+    only partially walked.
     """
-    _build_deprioritize_tree(tmp_path)
-    # Budget math (see _build_deprioritize_tree, every dir has 3 children):
-    # cwd's children .env/app/node_modules are entries 1-3 (node_modules
-    # deferred), app's children are 4-6, then node_modules is promoted and
-    # its first child trips the 7th entry > cap=6 — so node_modules is the
-    # partially-scanned, deprioritized dir the message must name.
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(5):
+        (src / f"f{i}.txt").write_text("x")
+    # cwd's only child `src` is entry 1 (pushed). Popped, its files are
+    # entries 2,3,4; the 4th (> cap=3) trips inside src, making it the
+    # partially-scanned dir the message must name.
     with pytest.raises(OSError) as exc_info:
-        _scan(tmp_path, max_entries=6, overflow="error")
+        _scan(tmp_path, max_entries=3, overflow="error")
     msg = str(exc_info.value)
-    nm = str((tmp_path / "node_modules").resolve(strict=False))
+    src_path = str(src.resolve(strict=False))
     assert "Unfinished directories" in msg, (
         f"Message must introduce the unfinished-dirs clause. Got: {msg!r}"
     )
-    assert nm in msg, (
-        f"Message must name the node_modules path that was left unwalked. Got: {msg!r}"
-    )
-    assert "deprioritized" in msg, (
-        f"node_modules must be flagged as deprioritized so the operator "
-        f"knows why it was last in line. Got: {msg!r}"
+    assert f"{src_path} (partially scanned)" in msg, (
+        f"Message must name the partially-scanned dir. Got: {msg!r}"
     )
     # The tuning knobs stay in the message so users can find the escape hatches.
     assert "cwd_hidden_scan_max_entries" in msg and "cwd_hidden_scan_overflow" in msg, (

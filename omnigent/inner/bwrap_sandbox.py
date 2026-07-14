@@ -93,6 +93,18 @@ _LOGGER = logging.getLogger(__name__)
 
 _PR_SET_NO_NEW_PRIVS = 38
 
+# bwrap's hard ceiling on total argv entries (``MAX_ARGS`` in its
+# option parser): it aborts with "Exceeded maximum number of arguments
+# 9000" — before argv[0] — once the assembled command line reaches this
+# many tokens. The dotfile / escaping-symlink mask is the only part of
+# the command line that scales with the cwd tree, so a symlink-dense or
+# regenerable dir under cwd (a pnpm ``node_modules``, a large
+# ``.git/worktrees``) is what pushes it over. The walker coalesces those
+# to a single mask each, but we still check the assembled count here as
+# a fail-loud backstop: a cryptic mid-exec bwrap death becomes an
+# actionable error naming the count, the likely culprit, and the knobs.
+_BWRAP_MAX_ARGS = 9000
+
 # Top-level cwd dotfiles allowed through by default when the spec
 # doesn't override ``cwd_allow_hidden``. ``.venv`` is whitelisted so the
 # common Python project layout (per the project's CLAUDE.md guidance to
@@ -467,6 +479,7 @@ class BwrapSandboxBackend(SandboxBackend):
             "--",
         ]
         bwrap_args.extend(argv)
+        _check_bwrap_arg_ceiling(bwrap_args, cwd_resolved)
         return bwrap_args
 
     def activate(self, policy: SandboxPolicy) -> None:
@@ -1052,6 +1065,45 @@ def _path_exists_lstat(path: Path) -> bool:
     except OSError:
         return False
     return True
+
+
+def _check_bwrap_arg_ceiling(bwrap_args: Sequence[str], cwd: Path) -> None:
+    """
+    Raise before exec if *bwrap_args* would exceed bwrap's arg ceiling.
+
+    bwrap aborts with "Exceeded maximum number of arguments 9000"
+    (:data:`_BWRAP_MAX_ARGS`) — before argv[0] — when the assembled
+    command line is too long. Almost all of that length comes from the
+    dotfile / escaping-symlink mask, which scales with the cwd tree, so
+    the overwhelmingly likely culprit is a symlink-dense or regenerable
+    directory under cwd (a pnpm ``node_modules``, a large
+    ``.git/worktrees``). The walker coalesces those to one mask each;
+    this is the fail-loud backstop for any case coalescing misses, and
+    it turns bwrap's cryptic mid-exec death into an actionable error
+    naming the count, the culprit, and the tuning knobs.
+
+    :param bwrap_args: The fully assembled ``bwrap`` argv (including
+        ``bwrap`` itself, all mounts, ``--``, and the helper command).
+    :param cwd: The helper's resolved working directory, named in the
+        error so the operator knows which tree to inspect.
+    :raises OSError: When ``len(bwrap_args)`` reaches
+        :data:`_BWRAP_MAX_ARGS`.
+    """
+    count = len(bwrap_args)
+    if count < _BWRAP_MAX_ARGS:
+        return
+    raise OSError(
+        f"Assembled bwrap command line has {count} arguments, at or over "
+        f"bwrap's hard limit of {_BWRAP_MAX_ARGS} — bwrap would abort with "
+        f"'Exceeded maximum number of arguments {_BWRAP_MAX_ARGS}' before "
+        f"exec. Almost all of these come from the dotfile / escaping-symlink "
+        f"mask, so the likely culprit is a symlink-dense or regenerable "
+        f"directory under {cwd} (e.g. a pnpm node_modules or a large "
+        f".git/worktrees). Add it to os_env.sandbox.cwd_allow_hidden to leave "
+        f"it readable and unmasked, or tune os_env.sandbox."
+        f"cwd_hidden_scan_max_entries / cwd_hidden_scan_overflow to bound the "
+        f"scan."
+    )
 
 
 def _scratch_tmpdir(write_roots: list[Path]) -> Path | None:
