@@ -1389,44 +1389,65 @@ def _argv_mentions(argv: list[str], path: str, *, after_token: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def test_arg_ceiling_raises_actionable_error_at_limit() -> None:
+def test_arg_ceiling_boundary_is_exactly_the_limit() -> None:
     """
-    When the assembled bwrap argv reaches bwrap's hard ceiling
-    (:data:`_BWRAP_MAX_ARGS`), :func:`_check_bwrap_arg_ceiling` raises
-    an :class:`OSError` BEFORE exec whose message (a) states the arg
-    count and the 9000-arg bwrap limit, (b) names the likely culprit
-    (a symlink-dense / regenerable dir under cwd), and (c) names all
-    three tunables an operator can reach for.
+    Pin the raise boundary exactly at :data:`_BWRAP_MAX_ARGS`: an argv of
+    ``_BWRAP_MAX_ARGS - 1`` tokens passes, and an argv of exactly
+    ``_BWRAP_MAX_ARGS`` tokens raises. Prod uses ``>=`` (bwrap aborts
+    AT its limit, not one past it), so the just-under case must be
+    accepted and the at-limit case rejected.
+    """
+    cwd = Path("/work")
+    just_under = ["x"] * (_BWRAP_MAX_ARGS - 1)
+    assert len(just_under) == _BWRAP_MAX_ARGS - 1
+    # Must not raise at one below the limit.
+    _check_bwrap_arg_ceiling(just_under, cwd)
 
-    This backstops the walker's coalescing: if some future tree slips
-    past coalescing and still overflows, the operator gets an
-    actionable error instead of bwrap's cryptic mid-exec death.
+    at_limit = ["x"] * _BWRAP_MAX_ARGS
+    assert len(at_limit) == _BWRAP_MAX_ARGS
+    with pytest.raises(OSError):
+        _check_bwrap_arg_ceiling(at_limit, cwd)
+
+
+def test_arg_ceiling_error_is_actionable_and_safe() -> None:
+    """
+    The over-ceiling :class:`OSError` message (a) states the arg count
+    and the 9000-arg bwrap limit, (b) names the likely culprit and the
+    cwd to inspect, (c) offers SAFE remediations (narrow read_paths /
+    restructure / drop an allowlist entry so it coalesces), and (d) when
+    it mentions the cap / overflow knobs, labels them explicitly as
+    exposing directory contents rather than presenting them as cures.
+
+    The safety wording is the P2 fix: the message must NOT tell an
+    operator to ADD the culprit to cwd_allow_hidden (which would make the
+    whole dir readable) or imply raising the cap fixes an argv overflow.
     """
     cwd = Path("/work/grounded-repo")
-    # One token over the ceiling — simulates a mask that blew the budget.
-    oversized = ["bwrap"] + ["--tmpfs"] * (_BWRAP_MAX_ARGS - 1) + ["/x"]
-    assert len(oversized) > _BWRAP_MAX_ARGS
+    over = ["x"] * (_BWRAP_MAX_ARGS + 1)
 
     with pytest.raises(OSError) as exc_info:
-        _check_bwrap_arg_ceiling(oversized, cwd)
+        _check_bwrap_arg_ceiling(over, cwd)
     msg = str(exc_info.value)
 
-    assert str(len(oversized)) in msg, f"Message must state the arg count. Got: {msg!r}"
+    assert str(len(over)) in msg, f"Message must state the arg count. Got: {msg!r}"
     assert str(_BWRAP_MAX_ARGS) in msg, (
         f"Message must state bwrap's {_BWRAP_MAX_ARGS}-arg limit. Got: {msg!r}"
     )
     assert str(cwd) in msg, f"Message must name the cwd to inspect. Got: {msg!r}"
-    # Culprit named.
-    assert "node_modules" in msg or "symlink" in msg, (
-        f"Message must name the likely culprit. Got: {msg!r}"
+    assert "symlink" in msg, f"Message must name the likely culprit. Got: {msg!r}"
+    # Safe remediations offered.
+    assert "read_paths" in msg, f"Message must offer narrowing read_paths. Got: {msg!r}"
+    # The cap/overflow knobs, if mentioned, are labelled as an exposure —
+    # never presented as a cure for an argv overflow.
+    assert "cwd_hidden_scan_max_entries" in msg and "cannot cure" in msg, (
+        f"Message must state raising the cap cannot cure an argv overflow. Got: {msg!r}"
     )
-    # All three tunables named.
-    assert "cwd_allow_hidden" in msg, f"Message must name cwd_allow_hidden. Got: {msg!r}"
-    assert "cwd_hidden_scan_max_entries" in msg, (
-        f"Message must name cwd_hidden_scan_max_entries. Got: {msg!r}"
+    assert "cwd_hidden_scan_overflow" in msg and "EXPOSE" in msg, (
+        f"Message must label overflow=warn/unlimited as exposing contents. Got: {msg!r}"
     )
-    assert "cwd_hidden_scan_overflow" in msg, (
-        f"Message must name cwd_hidden_scan_overflow. Got: {msg!r}"
+    # Must NOT advise adding the culprit to the allowlist (security downgrade).
+    assert "Add it to os_env.sandbox.cwd_allow_hidden" not in msg, (
+        f"Message must not recommend adding the culprit to cwd_allow_hidden. Got: {msg!r}"
     )
 
 
@@ -1439,3 +1460,76 @@ def test_arg_ceiling_allows_normal_arg_counts() -> None:
     assert len(normal) < _BWRAP_MAX_ARGS
     # Must not raise.
     _check_bwrap_arg_ceiling(normal, Path("/work"))
+
+
+def test_target_under_coalesced_node_modules_survives_mask(tmp_path: Path) -> None:
+    """
+    P1 regression: an exec ``target`` living under a coalesced dep dir
+    (``cwd/node_modules/.bin/<x>``) must remain reachable in the
+    assembled argv — the coalesce ``--tmpfs <cwd>/node_modules`` must NOT
+    shadow it. bwrap layers later mounts on top, so the target re-overlay
+    has to appear AFTER the tmpfs for the path to survive.
+
+    This is the argv-order case the scanner-only tests missed: the walker
+    correctly coalesces node_modules, but that same tmpfs would hide the
+    binary the launcher exec's unless it is re-bound afterwards.
+    """
+    node_modules = tmp_path / "node_modules"
+    bin_dir = node_modules / ".bin"
+    bin_dir.mkdir(parents=True)
+    target = bin_dir / "claude"
+    target.write_text("#!/bin/sh\n")
+    target.chmod(0o755)
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path)
+    argv = backend.wrap_launcher_argv(
+        [sys.executable, "-c", "pass"],
+        policy,
+        tmp_path,
+        target=str(target),
+    )
+
+    tmpfs_dest = str(node_modules.resolve(strict=False))
+    target_literal = str(target.resolve(strict=False))
+
+    # The whole node_modules is coalesced to a single --tmpfs.
+    tmpfs_idx = _last_index(argv, tmpfs_dest, after_token="--tmpfs")
+    assert tmpfs_idx is not None, (
+        f"node_modules must be coalesced to a --tmpfs mask. argv tail: {argv[-30:]}"
+    )
+    # The target is re-bound at its literal path AFTER the tmpfs, so the
+    # later mount wins and the exec path is not shadowed.
+    target_idx = _last_index(argv, target_literal, after_token="--ro-bind-try")
+    assert target_idx is not None, (
+        f"Target {target_literal} must be re-bound after the mask. argv tail: {argv[-30:]}"
+    )
+    assert target_idx > tmpfs_idx, (
+        "Target re-overlay must come AFTER the node_modules tmpfs so the "
+        f"later mount wins (tmpfs at {tmpfs_idx}, target at {target_idx})."
+    )
+
+
+def _last_index(argv: list[str], path: str, *, after_token: str) -> int | None:
+    """
+    Return the greatest index at which *path* appears as the value of
+    *after_token* (``--tmpfs <path>`` or the dest of ``--ro-bind-try
+    <src> <path>``), or ``None`` if it never does.
+
+    Used to compare mount ordering: the re-overlay must win, so its
+    index must exceed the mask's.
+
+    :param argv: The assembled bwrap argv.
+    :param path: The path to locate.
+    :param after_token: The verb token that introduces the mount.
+    :returns: The last matching index, or ``None``.
+    """
+    found: int | None = None
+    for i in range(len(argv) - 1):
+        if argv[i] != after_token:
+            continue
+        # ``--tmpfs <path>`` (path at i+1) or ``--ro-bind-try <src> <path>``
+        # (dest at i+2).
+        if argv[i + 1] == path or (i + 2 < len(argv) and argv[i + 2] == path):
+            found = i
+    return found

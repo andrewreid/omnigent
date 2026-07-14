@@ -138,11 +138,18 @@ os_env:
     # cwd_allow_hidden: [".venv", ".git", ".gitignore"]
 
     # Optional: cap on the number of filesystem entries the recursive
-    # dotfile walker visits under cwd. ``node_modules`` is walked LAST
-    # so the budget masks the project's own dotfiles first. Default
-    # 50000 is enough for most repos; raising it is fine on small
-    # projects but watch the SBPL profile size cap (~32 KiB) on huge
-    # monorepos.
+    # dotfile walker visits under cwd. The walker prunes at masked
+    # dot-directories AND coalesces whole directories instead of
+    # walking them: a regenerable dep dir (``node_modules``, ``.venv``,
+    # ``.mypy_cache``, ``.codex-tmp``) that isn't on cwd_allow_hidden,
+    # or any directory dominated by escaping symlinks, is masked as ONE
+    # entry (a single ``(deny ... (subpath ...))``) and pruned, so a
+    # pnpm ``node_modules`` symlink farm costs one rule, not tens of
+    # thousands. A dir on cwd_allow_hidden is left readable and not
+    # descended into. Only plain non-coalesced dirs count toward the
+    # cap. Default 50000 is enough for most repos; raising it is fine on
+    # small projects but watch the SBPL profile size cap (~32 KiB) on
+    # huge monorepos.
     # cwd_hidden_scan_max_entries: 100000
 
     # Optional: what to do when ``cwd_hidden_scan_max_entries`` is
