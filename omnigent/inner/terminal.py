@@ -601,7 +601,7 @@ def _clone_sandbox_spec(sandbox: OSEnvSandboxSpec | None) -> OSEnvSandboxSpec | 
     carried through automatically — the previous hand-written
     field-by-field constructor silently dropped fields added after
     it was written (``egress_rules``, ``egress_allow_private_destinations``,
-    ``cwd_allow_hidden``, ``env_passthrough``,
+    ``cwd_allow_hidden``, ``cwd_prune_dirs``, ``env_passthrough``,
     ``cwd_hidden_scan_max_entries``, ``cwd_hidden_scan_overflow``),
     which downgraded terminal sandboxes to "no MITM proxy, default
     env, only ``.venv`` allowed through" even when the YAML defined
@@ -619,6 +619,9 @@ def _clone_sandbox_spec(sandbox: OSEnvSandboxSpec | None) -> OSEnvSandboxSpec | 
         cwd_allow_hidden=(
             list(sandbox.cwd_allow_hidden) if sandbox.cwd_allow_hidden is not None else None
         ),
+        # cwd_prune_dirs is an immutable tuple (normalized in
+        # OSEnvSandboxSpec.__post_init__); replace carries it through
+        # safely with no defensive copy.
         env_passthrough=(
             list(sandbox.env_passthrough) if sandbox.env_passthrough is not None else None
         ),

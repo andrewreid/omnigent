@@ -2003,6 +2003,7 @@ def test_clone_os_env_spec_preserves_all_sandbox_fields() -> None:
         write_files=["~/.ssh/known_hosts"],
         allow_network=True,
         cwd_allow_hidden=[".git", ".venv"],
+        cwd_prune_dirs=["node_modules", ".pnpm"],
         cwd_hidden_scan_max_entries=12345,
         cwd_hidden_scan_overflow="warn",
         env_passthrough=["DATABRICKS_HOST", "DATABRICKS_TOKEN"],
@@ -2041,6 +2042,11 @@ def test_clone_os_env_spec_preserves_all_sandbox_fields() -> None:
             f"{name} must be a new list so later mutation of the clone "
             "does not leak into the original spec."
         )
+    # cwd_prune_dirs is an immutable tuple (normalized in
+    # OSEnvSandboxSpec.__post_init__), so it cannot be mutably shared —
+    # object identity is irrelevant. Assert value + immutability.
+    assert clone.sandbox.cwd_prune_dirs == ("node_modules", ".pnpm")
+    assert isinstance(clone.sandbox.cwd_prune_dirs, tuple)
 
 
 def test_effective_runner_os_env_defaults_when_spec_has_no_os_env(monkeypatch) -> None:
