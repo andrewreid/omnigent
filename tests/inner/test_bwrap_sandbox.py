@@ -38,10 +38,12 @@ import pytest
 
 from omnigent.inner.bwrap_sandbox import (
     _ALLOWED_SOCKET_FAMILIES,
+    _BWRAP_MAX_ARGS,
     _CLONE_NEW_FLAG_BITS,
     _DEFAULT_CWD_ALLOW_HIDDEN,
     BwrapSandboxBackend,
     _bwrap_extra_seccomp_rules,
+    _check_bwrap_arg_ceiling,
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.sandbox import SandboxPolicy, with_denied_unix_sockets
@@ -1380,3 +1382,60 @@ def _argv_mentions(argv: list[str], path: str, *, after_token: str) -> bool:
         if i + 2 < len(argv) and argv[i] == after_token and argv[i + 2] == path:
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# bwrap arg-ceiling backstop (Part 2)
+# ---------------------------------------------------------------------------
+
+
+def test_arg_ceiling_raises_actionable_error_at_limit() -> None:
+    """
+    When the assembled bwrap argv reaches bwrap's hard ceiling
+    (:data:`_BWRAP_MAX_ARGS`), :func:`_check_bwrap_arg_ceiling` raises
+    an :class:`OSError` BEFORE exec whose message (a) states the arg
+    count and the 9000-arg bwrap limit, (b) names the likely culprit
+    (a symlink-dense / regenerable dir under cwd), and (c) names all
+    three tunables an operator can reach for.
+
+    This backstops the walker's coalescing: if some future tree slips
+    past coalescing and still overflows, the operator gets an
+    actionable error instead of bwrap's cryptic mid-exec death.
+    """
+    cwd = Path("/work/grounded-repo")
+    # One token over the ceiling — simulates a mask that blew the budget.
+    oversized = ["bwrap"] + ["--tmpfs"] * (_BWRAP_MAX_ARGS - 1) + ["/x"]
+    assert len(oversized) > _BWRAP_MAX_ARGS
+
+    with pytest.raises(OSError) as exc_info:
+        _check_bwrap_arg_ceiling(oversized, cwd)
+    msg = str(exc_info.value)
+
+    assert str(len(oversized)) in msg, f"Message must state the arg count. Got: {msg!r}"
+    assert str(_BWRAP_MAX_ARGS) in msg, (
+        f"Message must state bwrap's {_BWRAP_MAX_ARGS}-arg limit. Got: {msg!r}"
+    )
+    assert str(cwd) in msg, f"Message must name the cwd to inspect. Got: {msg!r}"
+    # Culprit named.
+    assert "node_modules" in msg or "symlink" in msg, (
+        f"Message must name the likely culprit. Got: {msg!r}"
+    )
+    # All three tunables named.
+    assert "cwd_allow_hidden" in msg, f"Message must name cwd_allow_hidden. Got: {msg!r}"
+    assert "cwd_hidden_scan_max_entries" in msg, (
+        f"Message must name cwd_hidden_scan_max_entries. Got: {msg!r}"
+    )
+    assert "cwd_hidden_scan_overflow" in msg, (
+        f"Message must name cwd_hidden_scan_overflow. Got: {msg!r}"
+    )
+
+
+def test_arg_ceiling_allows_normal_arg_counts() -> None:
+    """
+    A realistic bwrap argv (well under the ceiling) passes the backstop
+    without raising, so the check never trips on ordinary spawns.
+    """
+    normal = ["bwrap", "--ro-bind-try", "/usr", "/usr", "--", "/bin/true"]
+    assert len(normal) < _BWRAP_MAX_ARGS
+    # Must not raise.
+    _check_bwrap_arg_ceiling(normal, Path("/work"))
