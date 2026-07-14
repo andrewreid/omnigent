@@ -4,16 +4,25 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import dataclasses
 import json
 import logging
 import os
 import subprocess
 import sys
+from pathlib import Path
+
+import pytest
 
 from omnigent.inner.sandbox import (
     SandboxPolicy,
     create_exec_launcher,
     run_launcher,
+    with_additional_read_roots,
+    with_additional_write_files,
+    with_additional_write_roots,
+    with_denied_unix_sockets,
+    with_spawn_env_allowlist,
 )
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 
@@ -252,6 +261,161 @@ def test_sandbox_policy_round_trips_deny_unix_socket_paths() -> None:
     # Old payloads (no key) and unset policies decode to None — "no
     # deny", not an empty-but-present list.
     assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).deny_unix_socket_paths is None
+
+
+def test_sandbox_policy_round_trips_cwd_prune_dirs() -> None:
+    """``cwd_prune_dirs`` survives the launcher wire encoding.
+
+    Both backends read the prune list from the *decoded* policy to
+    collapse dependency farms. If the field dropped out of
+    ``to_jsonable`` / ``from_jsonable`` it would decode as ``None``,
+    pruning would silently disable, and a pnpm-store cwd would explode
+    the argv again.
+    """
+    policy = _noop_policy()
+    policy.cwd_prune_dirs = ("node_modules", ".pnpm")
+
+    decoded = SandboxPolicy.from_jsonable(policy.to_jsonable())
+
+    # Decodes to the immutable tuple form.
+    assert decoded.cwd_prune_dirs == ("node_modules", ".pnpm")
+    assert isinstance(decoded.cwd_prune_dirs, tuple)
+    # Old payloads (no key) and unset policies decode to None — "no
+    # pruning", not an empty-but-present list.
+    assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).cwd_prune_dirs is None
+
+
+def test_sandbox_policy_cwd_prune_dirs_is_immutable_by_construction() -> None:
+    """``SandboxPolicy.__post_init__`` coerces ``cwd_prune_dirs`` to a
+    tuple at EVERY construction point.
+
+    A caller passing a list must not be able to keep an alias to a
+    mutable field on the built policy — the whole point of the
+    immutable-by-construction fix. ``None`` stays ``None``.
+    """
+    from pathlib import Path
+
+    src = ["node_modules", ".pnpm"]
+    policy = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=None,
+        write_roots=[Path("/repo")],
+        write_files=[],
+        allow_network=True,
+        cwd_prune_dirs=src,  # type: ignore[arg-type]  # deliberately pass a list
+    )
+    assert policy.cwd_prune_dirs == ("node_modules", ".pnpm")
+    assert isinstance(policy.cwd_prune_dirs, tuple)
+    # Mutating the list the caller passed must NOT affect the policy.
+    src.append("evil")
+    assert policy.cwd_prune_dirs == ("node_modules", ".pnpm")
+
+    assert (
+        SandboxPolicy(
+            backend_type="none",
+            active=False,
+            read_roots=None,
+            write_roots=[],
+            write_files=[],
+            allow_network=True,
+        ).cwd_prune_dirs
+        is None
+    )
+
+
+def _base_prune_policy() -> SandboxPolicy:
+    """A base policy carrying a non-empty ``cwd_prune_dirs`` for the
+    clone-preservation matrix."""
+    return SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=[Path("/repo")],
+        write_roots=[Path("/repo")],
+        write_files=[Path("/repo/.env.local")],
+        allow_network=True,
+        cwd_prune_dirs=("node_modules", ".pnpm"),
+    )
+
+
+@pytest.mark.parametrize(
+    "clone_fn",
+    [
+        pytest.param(
+            lambda p: with_additional_write_roots(p, [Path("/tmp/scratch")]),
+            id="with_additional_write_roots",
+        ),
+        pytest.param(
+            lambda p: with_additional_read_roots(p, [Path("/extra")]),
+            id="with_additional_read_roots",
+        ),
+        pytest.param(
+            lambda p: with_additional_write_files(p, [Path("/repo/x.txt")]),
+            id="with_additional_write_files",
+        ),
+        pytest.param(
+            lambda p: with_spawn_env_allowlist(p, ["HOME", "PATH"]),
+            id="with_spawn_env_allowlist",
+        ),
+        pytest.param(
+            lambda p: with_denied_unix_sockets(p, [Path("/tmp/tmux.sock")]),
+            id="with_denied_unix_sockets",
+        ),
+        # Represents the os_env.py / terminal.py egress replace() sites,
+        # which add egress_relay_port/egress_socket_path to a policy.
+        pytest.param(
+            lambda p: dataclasses.replace(
+                p, egress_relay_port=12345, egress_socket_path="/tmp/egress.sock"
+            ),
+            id="dataclasses.replace(egress)",
+        ),
+    ],
+)
+def test_all_policy_clone_paths_preserve_immutable_cwd_prune_dirs(clone_fn) -> None:
+    """Chokepoint verification: EVERY SandboxPolicy clone path preserves
+    ``cwd_prune_dirs`` in value AND yields an immutable tuple.
+
+    Covers the four sites flagged across review rounds
+    (``with_spawn_env_allowlist``, ``with_denied_unix_sockets``, and the
+    os_env / terminal egress ``replace()`` paths) plus the
+    ``with_additional_*`` helpers. Because the field is normalized to a
+    tuple in ``__post_init__``, no clone can alias or mutate a shared
+    list — object identity is irrelevant once the value is immutable, so
+    we assert immutability (``isinstance(..., tuple)``) rather than
+    ``is not``.
+    """
+    base = _base_prune_policy()
+    clone = clone_fn(base)
+
+    assert clone.cwd_prune_dirs == ("node_modules", ".pnpm")
+    assert isinstance(clone.cwd_prune_dirs, tuple), (
+        "clone must yield an immutable tuple so no caller can mutate a "
+        "shared prune list across policies."
+    )
+    # Source is untouched (still the same immutable tuple).
+    assert base.cwd_prune_dirs == ("node_modules", ".pnpm")
+
+
+def test_with_additional_read_roots_none_branch_returns_fresh_policy() -> None:
+    """With ``read_roots=None`` the helper must return a fresh policy
+    object, not the original — otherwise callers alias the source."""
+    unrestricted = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=None,
+        write_roots=[Path("/repo")],
+        write_files=[],
+        allow_network=True,
+        cwd_prune_dirs=("node_modules", ".pnpm"),
+    )
+    clone = with_additional_read_roots(unrestricted, [Path("/extra")])
+    assert clone is not unrestricted, (
+        "with_additional_read_roots returned the original policy when "
+        "read_roots is None; callers would alias its mutable fields."
+    )
+    assert clone.read_roots is None
+    assert clone.cwd_prune_dirs == ("node_modules", ".pnpm")
+    assert isinstance(clone.cwd_prune_dirs, tuple)
 
 
 def test_with_denied_unix_sockets_resolves_dedupes_and_is_pure() -> None:

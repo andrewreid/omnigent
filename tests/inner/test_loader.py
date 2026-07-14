@@ -684,6 +684,97 @@ os_env:
         # Regression: loader used to silently drop this field.
         self.assertEqual(sb.egress_allow_private_destinations, True)
 
+    def test_load_agent_def_preserves_cwd_prune_dirs(self):
+        """The legacy loader must populate ``cwd_prune_dirs``.
+
+        Patricia is loaded through this path; if the loader drops the
+        field the prune list decodes as ``None`` and the whole fix is
+        inert for the exact agent it exists for.
+        """
+        yaml_content = """
+name: t
+prompt: hi
+os_env:
+  type: caller_process
+  sandbox:
+    type: linux_bwrap
+    cwd_prune_dirs: [node_modules, .pnpm]
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+            try:
+                agent = load_agent_def(f.name)
+            finally:
+                os.unlink(f.name)
+        self.assertIsNotNone(agent.os_env)
+        sb = agent.os_env.sandbox
+        self.assertIsNotNone(sb)
+        # Regression: loader used to silently drop this field (None).
+        self.assertEqual(sb.cwd_prune_dirs, ("node_modules", ".pnpm"))
+
+    def test_load_agent_def_cwd_prune_dirs_absent_is_none(self):
+        """Omitting ``cwd_prune_dirs`` leaves it ``None`` — no pruning."""
+        yaml_content = """
+name: t
+prompt: hi
+os_env:
+  type: caller_process
+  sandbox:
+    type: linux_bwrap
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+            try:
+                agent = load_agent_def(f.name)
+            finally:
+                os.unlink(f.name)
+        self.assertIsNotNone(agent.os_env)
+        self.assertIsNotNone(agent.os_env.sandbox)
+        self.assertIsNone(agent.os_env.sandbox.cwd_prune_dirs)
+
+    def test_load_agent_def_rejects_cwd_prune_dirs_traversal(self):
+        """The loader enforces the same single-path-component rule as the
+        spec parser — a traversal entry is rejected at load time."""
+        yaml_content = """
+name: t
+prompt: hi
+os_env:
+  type: caller_process
+  sandbox:
+    type: linux_bwrap
+    cwd_prune_dirs: ["../etc"]
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+            try:
+                with self.assertRaisesRegex(ValueError, "single path components"):
+                    load_agent_def(f.name)
+            finally:
+                os.unlink(f.name)
+
+    def test_load_agent_def_rejects_cwd_prune_dirs_scalar(self):
+        """A non-list ``cwd_prune_dirs`` is rejected (TypeError)."""
+        yaml_content = """
+name: t
+prompt: hi
+os_env:
+  type: caller_process
+  sandbox:
+    type: linux_bwrap
+    cwd_prune_dirs: node_modules
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+            try:
+                with self.assertRaisesRegex(TypeError, "must be a list"):
+                    load_agent_def(f.name)
+            finally:
+                os.unlink(f.name)
+
     def test_load_agent_def_rejects_egress_rules_on_none(self):
         yaml_content = """
 name: t

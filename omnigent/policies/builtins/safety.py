@@ -338,6 +338,7 @@ _SANDBOX_OVERRIDE_KEYS = frozenset(
         "write_files",
         "allow_network",
         "cwd_allow_hidden",
+        "cwd_prune_dirs",
         "env_passthrough",
         "egress_rules",
         "egress_allow_private_destinations",

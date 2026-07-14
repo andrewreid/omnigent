@@ -93,6 +93,19 @@ _LOGGER = logging.getLogger(__name__)
 
 _PR_SET_NO_NEW_PRIVS = 38
 
+# bwrap aborts with ``bwrap: Exceeded maximum number of arguments 9000``
+# once its argv passes this many tokens. We check the assembled argv
+# against the same ceiling BEFORE exec so a workspace whose dotfile /
+# escaping-symlink mask explodes (a cross-filesystem pnpm store turns
+# every package under ``node_modules`` into an escaping symlink → one
+# mask token each) produces an actionable operator error naming the
+# offending directories and the tunables, instead of bwrap's cryptic
+# crash. Mirrors the seatbelt ``_MAX_PROFILE_BYTES`` fail-loud cap.
+_BWRAP_MAX_ARGS = 9000
+
+# How many offending top-level directories the ceiling error names.
+_BWRAP_CEILING_TOP_OFFENDERS = 5
+
 # Top-level cwd dotfiles allowed through by default when the spec
 # doesn't override ``cwd_allow_hidden``. ``.venv`` is whitelisted so the
 # common Python project layout (per the project's CLAUDE.md guidance to
@@ -268,6 +281,8 @@ class BwrapSandboxBackend(SandboxBackend):
             write_files=write_files,
             allow_network=sandbox_spec.allow_network,
             cwd_allow_hidden=cwd_allow_hidden,
+            # Immutable tuple on both spec and policy — pass through.
+            cwd_prune_dirs=sandbox_spec.cwd_prune_dirs,
             cwd_hidden_scan_max_entries=sandbox_spec.cwd_hidden_scan_max_entries,
             cwd_hidden_scan_overflow=sandbox_spec.cwd_hidden_scan_overflow,
             env_passthrough=(
@@ -467,6 +482,13 @@ class BwrapSandboxBackend(SandboxBackend):
             "--",
         ]
         bwrap_args.extend(argv)
+
+        # Fail-loud guardrail: bwrap dies with a cryptic
+        # ``Exceeded maximum number of arguments 9000`` if we hand it
+        # too many tokens. Convert that into an actionable operator
+        # error before exec.
+        _check_bwrap_arg_ceiling(bwrap_args, cwd_resolved)
+
         return bwrap_args
 
     def activate(self, policy: SandboxPolicy) -> None:
@@ -977,6 +999,7 @@ def _dotfile_and_symlink_mask_args(
     """
     safe_roots = _bwrap_safe_roots(cwd, policy, argv=argv)
     seen_mask_paths: set[str] = set()
+    prune_dirs = policy.cwd_prune_dirs or ()
     entries = scan_cwd_mask_entries(
         cwd,
         allow_hidden=allow_hidden,
@@ -984,6 +1007,7 @@ def _dotfile_and_symlink_mask_args(
         max_entries=policy.cwd_hidden_scan_max_entries,
         overflow=policy.cwd_hidden_scan_overflow,
         logger_name=__name__,
+        prune_dirs=prune_dirs,
     )
     for entry in entries:
         seen_mask_paths.add(str(entry.path))
@@ -1002,6 +1026,7 @@ def _dotfile_and_symlink_mask_args(
                 overflow=policy.cwd_hidden_scan_overflow,
                 logger_name=__name__,
                 scope_label="read_paths",
+                prune_dirs=prune_dirs,
             )
         except OSError as err:
             # Re-raise with read_paths-specific advice, forwarding the
@@ -1034,6 +1059,99 @@ def _dotfile_and_symlink_mask_args(
         else:
             args.extend(["--bind-try", "/dev/null", str(entry.path)])
     return args
+
+
+def _check_bwrap_arg_ceiling(bwrap_args: list[str], cwd: Path) -> None:
+    """
+    Fail loud when the assembled bwrap argv would exceed bwrap's limit.
+
+    bwrap caps its own argv at :data:`_BWRAP_MAX_ARGS` tokens and aborts
+    with ``bwrap: Exceeded maximum number of arguments 9000`` when the
+    launcher hands it more — an opaque failure whose real cause (a
+    dependency / vendor farm whose escaping symlinks each emit a mask
+    token) is invisible to the operator. This check runs on the fully
+    assembled argv just before ``return`` and raises an actionable
+    :class:`OSError` that names the directories contributing the most
+    tokens plus the tunables that reduce them.
+
+    :param bwrap_args: The complete bwrap argv about to be returned.
+    :param cwd: The resolved workspace root, used to attribute path
+        tokens to their top-level directory under cwd.
+    :raises OSError: When ``len(bwrap_args)`` exceeds
+        :data:`_BWRAP_MAX_ARGS`.
+    """
+    if len(bwrap_args) <= _BWRAP_MAX_ARGS:
+        return
+    offenders = _summarize_argv_offenders(bwrap_args, cwd)
+    raise OSError(
+        f"linux_bwrap: assembled bwrap argv has {len(bwrap_args)} tokens, "
+        f"over bwrap's ceiling of {_BWRAP_MAX_ARGS} — bwrap would abort with "
+        f"'Exceeded maximum number of arguments {_BWRAP_MAX_ARGS}'. Most of the "
+        f"argv growth comes from cwd / read_paths masks under: {offenders}. "
+        "This usually means a dependency / vendor tree (e.g. a cross-filesystem "
+        "pnpm store whose packages are escaping symlinks) is being masked entry "
+        "by entry. To fix: add the offending directory basenames to "
+        "os_env.sandbox.cwd_prune_dirs (masks each whole tree as ONE entry), "
+        "narrow os_env.sandbox.read_paths so those trees aren't walked, or lower "
+        "os_env.sandbox.cwd_hidden_scan_max_entries (with "
+        "cwd_hidden_scan_overflow='warn'/'error') to bound the scan."
+    )
+
+
+def _summarize_argv_offenders(bwrap_args: list[str], cwd: Path) -> str:
+    """
+    Name the directories contributing the most bwrap argv tokens.
+
+    Buckets every absolute-path token in *bwrap_args* by the top-level
+    directory it lives under within *cwd* (so all masks under
+    ``cwd/node_modules/...`` collapse to ``cwd/node_modules``), then
+    returns the busiest buckets. Path tokens outside *cwd* — e.g.
+    ``read_paths`` masks — bucket by their own parent directory. Only a
+    coarse attribution is needed: when the argv explodes, one dependency
+    tree dominates and this makes it obvious which one.
+
+    :param bwrap_args: The assembled bwrap argv.
+    :param cwd: The resolved workspace root.
+    :returns: A comma-joined ``"<dir> (<n> args)"`` summary of the top
+        :data:`_BWRAP_CEILING_TOP_OFFENDERS` buckets.
+    """
+    counts: dict[str, int] = {}
+    for token in bwrap_args:
+        if not token.startswith("/"):
+            continue
+        # ``/dev/null`` is the SOURCE side of every file mask
+        # (``--bind-try /dev/null <dest>``), repeated once per masked
+        # file. Counting it would pin the blame on ``/dev`` instead of
+        # the directory whose files exploded, so skip it — we want the
+        # mask DESTINATIONS, which are the real offenders.
+        if token == "/dev/null":
+            continue
+        bucket = _argv_offender_bucket(Path(token), cwd)
+        counts[bucket] = counts.get(bucket, 0) + 1
+    top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    top = top[:_BWRAP_CEILING_TOP_OFFENDERS]
+    return ", ".join(f"{bucket} ({n} args)" for bucket, n in top)
+
+
+def _argv_offender_bucket(path: Path, cwd: Path) -> str:
+    """
+    Attribute an argv path token to a reporting bucket.
+
+    Paths under *cwd* bucket by their first component below *cwd*
+    (``cwd/node_modules/.pnpm/foo`` → ``cwd/node_modules``); paths
+    outside *cwd* bucket by their immediate parent.
+
+    :param path: The path token being attributed.
+    :param cwd: The resolved workspace root.
+    :returns: The bucket key as a string.
+    """
+    try:
+        rel = path.relative_to(cwd)
+    except ValueError:
+        return str(path.parent)
+    if not rel.parts:
+        return str(cwd)
+    return str(cwd / rel.parts[0])
 
 
 def _path_exists_lstat(path: Path) -> bool:

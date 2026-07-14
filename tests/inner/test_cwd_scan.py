@@ -732,3 +732,141 @@ def test_unreadable_subdirectory_is_skipped_silently(tmp_path: Path) -> None:
         assert "locked" not in str(entry.path) or entry.path == sub, (
             f"Unreadable subdir leaked a child mask entry: {entry.path}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Opt-in boundary prune (cwd_prune_dirs)
+# ---------------------------------------------------------------------------
+
+
+def _make_escaping_symlink_farm(root: Path, *, count: int) -> None:
+    """
+    Populate *root* with a pnpm-store-shaped farm of escaping symlinks.
+
+    Each entry is a symlink whose target resolves OUTSIDE the walk's
+    safe roots (``/tmp`` here — the tests pass only ``[cwd, /usr]`` as
+    safe roots), so absent pruning the walker masks every one of them
+    individually — the exact explosion the ``cwd_prune_dirs`` knob
+    exists to collapse.
+
+    :param root: Directory to fill (created if absent).
+    :param count: Number of escaping symlinks to create.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    escape_target = Path("/tmp")
+    for i in range(count):
+        (root / f"pkg_{i}").symlink_to(escape_target)
+
+
+def test_prune_dir_masked_once_and_not_descended(tmp_path: Path) -> None:
+    """
+    A directory whose basename is in ``prune_dirs`` is masked as a
+    SINGLE ``"dir"`` entry and the walker does not descend into it —
+    the escaping symlinks inside never get their own mask entries.
+    """
+    farm = tmp_path / "node_modules"
+    _make_escaping_symlink_farm(farm, count=50)
+    entries = scan_cwd_mask_entries(
+        tmp_path.resolve(strict=False),
+        allow_hidden=[],
+        safe_roots=[tmp_path.resolve(strict=False), Path("/usr")],
+        max_entries=_DEFAULT_MAX,
+        overflow="error",
+        prune_dirs=["node_modules"],
+    )
+    farm_entry = _entry_for(entries, farm)
+    assert farm_entry is not None, "Pruned node_modules must be masked."
+    assert farm_entry.kind == "dir"
+    nested = [e for e in entries if str(e.path).startswith(str(farm) + os.sep)]
+    assert nested == [], (
+        "Walker descended into a pruned directory; expected a single "
+        f"boundary mask, got nested entries: {[e.path for e in nested]}"
+    )
+    # Exactly one entry for the whole farm.
+    assert len(entries) == 1
+
+
+def test_prune_empty_leaves_behavior_unchanged(tmp_path: Path) -> None:
+    """
+    With an empty ``prune_dirs`` (the default), the same farm is walked
+    normally: every escaping symlink is masked individually. This pins
+    that the knob is opt-in — agents that don't set it are unchanged.
+    """
+    farm = tmp_path / "node_modules"
+    _make_escaping_symlink_farm(farm, count=50)
+    entries = scan_cwd_mask_entries(
+        tmp_path.resolve(strict=False),
+        allow_hidden=[],
+        safe_roots=[tmp_path.resolve(strict=False), Path("/usr")],
+        max_entries=_DEFAULT_MAX,
+        overflow="error",
+        prune_dirs=(),
+    )
+    # node_modules is a plain dir with a non-escaping target, so it is
+    # NOT masked itself; each of the 50 escaping symlinks inside is.
+    assert _entry_for(entries, farm) is None
+    nested = [e for e in entries if str(e.path).startswith(str(farm) + os.sep)]
+    assert len(nested) == 50, (
+        f"Expected all 50 escaping symlinks masked individually without "
+        f"pruning; got {len(nested)}."
+    )
+
+
+def test_prune_matches_basename_at_any_depth(tmp_path: Path) -> None:
+    """
+    ``prune_dirs`` matches by basename at any depth — a plain
+    ``node_modules`` nested deep under the tree is collapsed just like
+    a top-level one. Uses a non-dot basename so the collapse is
+    attributable to pruning, not to dotdir masking.
+    """
+    nested_nm = tmp_path / "packages" / "app" / "node_modules"
+    _make_escaping_symlink_farm(nested_nm, count=20)
+    entries = scan_cwd_mask_entries(
+        tmp_path.resolve(strict=False),
+        allow_hidden=[],
+        safe_roots=[tmp_path.resolve(strict=False), Path("/usr")],
+        max_entries=_DEFAULT_MAX,
+        overflow="error",
+        prune_dirs=["node_modules"],
+    )
+    nm_entry = _entry_for(entries, nested_nm)
+    assert nm_entry is not None and nm_entry.kind == "dir"
+    nested = [e for e in entries if str(e.path).startswith(str(nested_nm) + os.sep)]
+    assert nested == []
+
+
+def test_patricia_shaped_cwd_is_bounded_with_prune(tmp_path: Path) -> None:
+    """
+    A Patricia-shaped cwd — real source files plus a big farm of
+    escaping package symlinks directly under ``node_modules`` (the
+    cross-filesystem pnpm-store shape) — yields a BOUNDED, small entry
+    count when ``node_modules`` is pruned, and an unbounded one when it
+    is not. This is the walker-level analogue of the bwrap arg-count
+    assertion in ``test_bwrap_sandbox``.
+    """
+    # Real merged source the design head actually grounds on.
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("print('hi')\n")
+    (tmp_path / "README.md").write_text("# project\n")
+    (tmp_path / ".env").write_text("SECRET=1\n")  # a stray dotfile → masked
+    # A large cross-filesystem pnpm store: every package under
+    # node_modules is an escaping symlink into an out-of-cwd store.
+    _make_escaping_symlink_farm(tmp_path / "node_modules", count=500)
+
+    common = {
+        "allow_hidden": [],
+        "safe_roots": [tmp_path.resolve(strict=False), Path("/usr")],
+        "max_entries": _DEFAULT_MAX,
+        "overflow": "error",
+    }
+    pruned = scan_cwd_mask_entries(
+        tmp_path.resolve(strict=False), prune_dirs=["node_modules", ".pnpm"], **common
+    )
+    unpruned = scan_cwd_mask_entries(tmp_path.resolve(strict=False), prune_dirs=(), **common)
+
+    # Pruned: node_modules collapses to one mask; plus the stray .env.
+    assert len(pruned) == 2, [str(e.path) for e in pruned]
+    assert _entry_for(pruned, tmp_path / "node_modules") is not None
+    assert _entry_for(pruned, tmp_path / ".env") is not None
+    # Unpruned: the 500-symlink farm explodes the count.
+    assert len(unpruned) > 500
