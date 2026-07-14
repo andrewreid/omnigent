@@ -5962,6 +5962,117 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sys_session_create_threads_workspace_into_body() -> None:
+    """
+    An explicit ``workspace`` on ``sys_session_create`` (agent_id mode)
+    is carried into the JSON create body verbatim, so the server can
+    validate it and store it as the child's sandbox cwd / scan-root. A
+    child that omits it keeps the default (no ``workspace`` key), which
+    is what preserves the pre-existing no-regression behavior.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    captured: dict[str, Any] = {}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={"id": "conv_child", "agent_id": "ag_x", "status": "idle"},
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {"agent_id": "ag_x", "workspace": "/home/me/projects/timesheets"}
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert captured["workspace"] == "/home/me/projects/timesheets"
+    assert captured["parent_session_id"] == "conv_caller"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_omitted_workspace_absent_from_body() -> None:
+    """
+    Omitting ``workspace`` (the default) leaves it out of the create
+    body entirely — no key, no regression for any existing agent.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    captured: dict[str, Any] = {}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured.update(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_child", "agent_id": "ag_x"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert "workspace" not in captured
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_workspace_rejected_with_config_path() -> None:
+    """
+    ``workspace`` is an agent_id-mode-only override; pairing it with
+    ``config_path`` fails loud (before any bundling or server call)
+    rather than silently dropping the caller's scoping intent.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"server must not be reached: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {"config_path": "helper.yaml", "workspace": "/home/me/repo"}
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert "agent_id mode only" in json.loads(output)["error"]
+
+
+def test_sys_session_create_schema_exposes_optional_workspace() -> None:
+    """
+    The tool schema advertises an optional string ``workspace`` and
+    does not add it to ``required`` (both create modes stay optional).
+    """
+    from omnigent.tools.builtins.spawn import SysSessionCreateTool
+
+    params = SysSessionCreateTool().get_schema()["function"]["parameters"]
+    ws = params["properties"]["workspace"]
+    assert ws["type"] == "string"
+    assert "absolute" in ws["description"].lower()
+    assert params["required"] == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "arguments",
     [

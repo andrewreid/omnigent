@@ -6085,6 +6085,7 @@ def _dispatch_run(
     resume_parts: list[str] | None = None,
     auto_open_conversation: bool = False,
     server_from_cli: bool = False,
+    workspace: str | None = None,
 ) -> None:
     """
     Route ``omnigent run`` to the right impl.
@@ -6127,6 +6128,10 @@ def _dispatch_run(
     :param server_from_cli: ``True`` when ``--server`` was explicitly
         provided on the command line. Used to distinguish direct-server
         mode from a configured default server.
+    :param workspace: Optional absolute directory to root the agent's
+        workspace in (its sandbox cwd / dotfile-scan root), from
+        ``--workspace``. ``None`` uses the launching shell's cwd.
+        Applies to the daemon-backed local-agent launch path only.
     """
     if target is not None and _is_server_url(target):
         raise click.ClickException(
@@ -6319,6 +6324,7 @@ def _dispatch_run(
                 ephemeral=False,
                 debug_events=debug_events,
                 auto_open_conversation=auto_open_conversation,
+                workspace=workspace,
             )
             return
 
@@ -6354,6 +6360,7 @@ def _dispatch_run(
         debug_events=debug_events,
         resume_parts=resume_parts,
         auto_open_conversation=auto_open_conversation,
+        workspace=workspace,
     )
 
 
@@ -6560,6 +6567,18 @@ def attach(
         "(inline equivalent of `omnigent host`). Requires --server."
     ),
 )
+@click.option(
+    "--workspace",
+    "workspace",
+    default=None,
+    help=(
+        "Absolute (or relative-to-cwd) directory to root the agent's "
+        "workspace in — its sandbox cwd and dotfile-scan root — instead "
+        "of the launching shell's cwd. Use to scope a sandboxed agent "
+        "to a grounding repo rather than inheriting $HOME. Must be an "
+        "existing directory."
+    ),
+)
 def run(
     target: str | None,
     tools: str | None,
@@ -6575,6 +6594,7 @@ def run(
     server: str | None,
     debug_events: bool,
     register_host: bool,
+    workspace: str | None,
 ) -> None:
     """Start a session with an Omnigent agent.
 
@@ -6650,6 +6670,18 @@ def run(
     # redundant (the daemon is always ensured) and kept only as a no-op.
     del register_host
 
+    # Resolve an explicit --workspace to an absolute path up front so the
+    # captured session workspace (which becomes the runner's sandbox cwd /
+    # scan-root) is that directory rather than the launching shell's cwd.
+    resolved_workspace: str | None = None
+    if workspace is not None:
+        ws_path = Path(workspace).expanduser().resolve()
+        if not ws_path.is_dir():
+            raise click.ClickException(
+                f"--workspace must be an existing directory: {workspace}"
+            )
+        resolved_workspace = str(ws_path)
+
     choice = _split_resume_value(resume)
     # Capture resume-safe CLI parts before dispatch mutates target,
     # harness, or model for no-AGENT launcher mode.
@@ -6672,6 +6704,7 @@ def run(
         resume_parts=resume_parts,
         auto_open_conversation=auto_open_conversation,
         server_from_cli=server_from_cli,
+        workspace=resolved_workspace,
     )
 
 

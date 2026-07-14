@@ -919,6 +919,24 @@ class SysSessionCreateTool(Tool):
                                 "sys_session_send."
                             ),
                         },
+                        "workspace": {
+                            "type": "string",
+                            "description": (
+                                "Optional ABSOLUTE path to pin the "
+                                "child's workspace to (its sandbox cwd "
+                                "and dotfile-scan root), e.g. "
+                                "'/home/me/projects/timesheets'. Use to "
+                                "scope a launched agent to a specific "
+                                "grounding repo instead of inheriting "
+                                "the caller's cwd / $HOME. The path must "
+                                "be absolute (no '~', no relative paths) "
+                                "and, when the agent pins an absolute "
+                                "os_env.cwd, must fall within it. Omit "
+                                "(default) to keep the existing behavior "
+                                "(the runner's workspace). Supported "
+                                "with agent_id mode only."
+                            ),
+                        },
                     },
                     # Only the always-optional fields are listed in
                     # ``required`` (none): the agent_id-vs-config_path

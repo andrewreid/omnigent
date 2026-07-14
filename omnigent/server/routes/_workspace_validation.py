@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 from typing import Any
 
@@ -304,4 +305,61 @@ async def validate_workspace(
                 f"agent expects subdirectory '{subdir}' which is not present at {workspace}"
             )
 
+    return canonical_workspace
+
+
+def validate_workspace_no_host(*, workspace: str, spec_cwd: str | None) -> str:
+    """
+    Validate an explicit workspace pick when there is NO host to stat.
+
+    Used for a sub-agent spawn that carries an explicit ``workspace``
+    but no ``host_id``: the child inherits the parent runner's host
+    affinity, so there is no separate host connection to send
+    ``host.stat`` frames to. The server therefore cannot confirm the
+    path exists or resolve symlinks; it enforces only the
+    host-independent path-safety rules so a spawned session cannot pin
+    its sandbox cwd/scan-root outside the boundary the agent allows:
+
+    - the workspace must be an absolute path (``~`` and relative paths
+      are rejected — the server never expands ``~``);
+    - when the agent pins an *absolute* ``os_env.cwd`` boundary, the
+      workspace must be that directory or a subdirectory of it. The
+      comparison is lexical on :func:`os.path.normpath`-normalized
+      paths, so ``..`` segments are collapsed first and cannot escape
+      the boundary.
+
+    Relative agent cwds (``"."`` / ``"./"`` / ``""`` / ``None`` and the
+    ``./subdir`` form) impose no boundary — matching
+    :func:`validate_workspace`. Existence and ``./subdir`` presence
+    checks that require a live host are intentionally skipped; the
+    runner resolves and sandboxes the path when it reads it back.
+
+    :param workspace: Caller-supplied absolute path, e.g.
+        ``"/home/andrew/projects/timesheets"``.
+    :param spec_cwd: The bound agent's ``os_env.cwd`` as written in the
+        YAML (or ``None`` when the agent has no ``os_env`` block).
+    :returns: The normalized workspace path to store on the session row.
+    :raises WorkspaceValidationError: On a relative/tilde workspace, a
+        non-absolute agent boundary, or a workspace outside that
+        boundary.
+    """
+    if not workspace.startswith("/"):
+        raise WorkspaceValidationError("workspace must be an absolute path starting with /")
+    canonical_workspace = os.path.normpath(workspace)
+    if not _is_relative_cwd(spec_cwd):
+        # spec_cwd pins a boundary (``./subdir`` is treated as
+        # boundary-less by _is_relative_cwd). Without a host we cannot
+        # expand ``~``, so reject a tilde/relative boundary loudly
+        # rather than compare against a literal directory name.
+        boundary = spec_cwd or ""
+        if not boundary.startswith("/"):
+            raise WorkspaceValidationError(
+                "cannot validate workspace containment without a host: agent's "
+                f"os_env.cwd '{spec_cwd}' is not an absolute path"
+            )
+        canonical_boundary = os.path.normpath(boundary)
+        if not _is_subpath_of(canonical_workspace, canonical_boundary):
+            raise WorkspaceValidationError(
+                f"workspace '{workspace}' is outside the agent's required path '{spec_cwd}'"
+            )
     return canonical_workspace

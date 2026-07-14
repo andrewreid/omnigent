@@ -6244,6 +6244,83 @@ async def _validate_session_workspace(
         ) from exc
 
 
+async def _validate_session_workspace_no_host(
+    *,
+    workspace: str,
+    agent: Any,
+    agent_cache: AgentCache | None,
+) -> str:
+    """
+    Validate an explicit ``workspace`` supplied WITHOUT a ``host_id``.
+
+    This is the sub-agent-spawn case (e.g. ``sys_session_create`` with
+    a ``workspace`` override): the child inherits the parent runner's
+    host affinity, so there is no separate host to send ``host.stat``
+    frames to. Enforces only the host-independent path-safety rules —
+    absolute path plus containment within the agent's absolute
+    ``os_env.cwd`` boundary — via
+    :func:`omnigent.server.routes._workspace_validation.validate_workspace_no_host`,
+    so a spawned session cannot pin its sandbox cwd/scan-root outside
+    the grounding directory the agent allows. The path's existence is
+    left to the runner, which resolves and sandboxes it when it reads
+    the stored workspace back.
+
+    :param workspace: Caller-supplied absolute path, e.g.
+        ``"/home/andrew/projects/timesheets"``.
+    :param agent: The agent the session binds to; its ``os_env.cwd``
+        is the containment boundary.
+    :param agent_cache: Cache for loading the parsed agent spec.
+        ``None`` is treated as a server config error.
+    :returns: The normalized workspace path to store on the session row.
+    :raises OmnigentError: ``INVALID_INPUT`` on any path-safety
+        failure; ``INTERNAL_ERROR`` when the agent cache is unset or
+        the spec fails to load.
+    """
+    from omnigent.server.routes._workspace_validation import (
+        WorkspaceValidationError,
+        validate_workspace_no_host,
+    )
+
+    if not workspace.startswith("/"):
+        raise OmnigentError(
+            "workspace must be an absolute path starting with /",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if agent_cache is None:
+        raise OmnigentError(
+            "workspace validation requires an agent cache",
+            code=ErrorCode.INTERNAL_ERROR,
+        )
+
+    # Mirror the os_env.cwd load in _validate_session_workspace: a
+    # headless agent (no os_env) has no boundary, so its cwd stays None
+    # and the containment check is skipped.
+    spec_cwd: str | None = None
+    if agent.bundle_location is not None:
+        try:
+            loaded = await asyncio.to_thread(
+                agent_cache.load,
+                agent.id,
+                agent.bundle_location,
+            )
+            os_env = getattr(loaded.spec, "os_env", None)
+            spec_cwd = getattr(os_env, "cwd", None) if os_env is not None else None
+        except Exception as exc:
+            _logger.exception("Failed to load agent spec for workspace validation")
+            raise OmnigentError(
+                f"failed to load agent spec: {exc}",
+                code=ErrorCode.INTERNAL_ERROR,
+            ) from exc
+
+    try:
+        return validate_workspace_no_host(workspace=workspace, spec_cwd=spec_cwd)
+    except WorkspaceValidationError as exc:
+        raise OmnigentError(
+            exc.message,
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+
+
 @dataclass
 class _HostLaunchAttempt:
     """
@@ -12395,6 +12472,18 @@ async def _create_session_from_existing_agent(
             agent=agent,
             agent_cache=agent_cache,
             request=request,
+        )
+    elif body.workspace is not None:
+        # Explicit workspace override with no host to stat against
+        # (sub-agent spawn inheriting the parent runner's affinity, e.g.
+        # sys_session_create with `workspace`). Still enforce
+        # path-safety so it cannot escape the agent's os_env.cwd
+        # boundary — the runner honors this stored workspace as the
+        # session's sandbox cwd/scan-root (app._session_runtime_cwd).
+        canonical_workspace = await _validate_session_workspace_no_host(
+            workspace=body.workspace,
+            agent=agent,
+            agent_cache=agent_cache,
         )
 
     # Git worktree options (optional). Two modes on body.git:

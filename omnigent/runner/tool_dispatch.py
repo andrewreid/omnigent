@@ -2037,6 +2037,7 @@ def _build_session_create_body(
     conversation_id: str,
     title: Any,
     message: Any,
+    workspace: Any = None,
 ) -> dict[str, Any]:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -2053,6 +2054,11 @@ def _build_session_create_body(
         string.
     :param message: Optional first user message; included only when a
         non-empty string.
+    :param workspace: Optional absolute path to pin the child's
+        workspace (sandbox cwd / scan-root) to. Included only when a
+        non-empty string; the server validates it (absolute + within
+        the agent's os_env.cwd boundary). ``None``/empty preserves the
+        default (runner workspace) behavior.
     :returns: The JSON request body.
     """
     body: dict[str, Any] = {
@@ -2061,6 +2067,8 @@ def _build_session_create_body(
     }
     if isinstance(title, str) and title:
         body["title"] = title
+    if isinstance(workspace, str) and workspace:
+        body["workspace"] = workspace
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -2195,7 +2203,23 @@ async def _execute_session_create(
                 )
             }
         )
+    workspace = args.get("workspace")
     if has_config_path:
+        # The workspace override binds a stored session workspace that
+        # the server validates against the target agent's os_env.cwd;
+        # config_path uploads a brand-new agent whose spec the server
+        # validates on its own multipart path. Rather than silently drop
+        # the override there, fail loud so the caller re-launches the
+        # (already-registered) agent by agent_id with the workspace.
+        if isinstance(workspace, str) and workspace:
+            return json.dumps(
+                {
+                    "error": (
+                        "sys_session_create 'workspace' is supported with "
+                        "agent_id mode only, not config_path"
+                    )
+                }
+            )
         return await _session_create_from_config_path(
             str(config_path),
             args,
@@ -2206,7 +2230,11 @@ async def _execute_session_create(
             runner_workspace=runner_workspace,
         )
     body = _build_session_create_body(
-        str(agent_id), conversation_id, args.get("title"), args.get("message")
+        str(agent_id),
+        conversation_id,
+        args.get("title"),
+        args.get("message"),
+        workspace,
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)

@@ -269,6 +269,7 @@ def run_chat(
     debug_events: bool = False,
     resume_parts: list[str] | None = None,
     auto_open_conversation: bool = False,
+    workspace: str | None = None,
 ) -> None:
     """
     Main entry point for ``omnigent run`` (and the ``attach`` client).
@@ -345,6 +346,10 @@ def run_chat(
         resume hint on exit.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL when the session id becomes known.
+    :param workspace: Optional absolute directory to root the agent's
+        workspace in (its sandbox cwd / dotfile-scan root) instead of
+        the launching shell's cwd. Applies to the daemon-backed
+        local-agent path only; ``None`` keeps the cwd default.
     """
     # Client-side tools are a CLI/TUI convenience (e.g. shell access
     # for coding agents). They don't affect agent behavior — the spec
@@ -361,6 +366,17 @@ def run_chat(
         raise click.ClickException(
             "--server is for binding a local agent YAML to a server. "
             "Pass a YAML path as the target (got a URL)."
+        )
+
+    if workspace is not None and (_is_url(target) or ephemeral):
+        # --workspace pins the daemon-owned runner's sandbox cwd via the
+        # uploaded session workspace. A remote URL target has no local
+        # runner to root, and --no-session uses the legacy in-process
+        # ephemeral runner that roots at cwd; neither honors it, so fail
+        # loud instead of silently ignoring the flag.
+        raise click.ClickException(
+            "--workspace applies to daemon-backed local-agent launches only "
+            "(not remote --server URLs or --no-session)."
         )
 
     if _is_url(target):
@@ -446,6 +462,7 @@ def run_chat(
             debug_events=debug_events,
             resume_parts=resume_parts,
             auto_open_conversation=auto_open_conversation,
+            workspace=workspace,
         )
 
 
@@ -1734,6 +1751,7 @@ def _chat_via_daemon(
     debug_events: bool = False,
     resume_parts: list[str] | None = None,
     auto_open_conversation: bool = False,
+    workspace: str | None = None,
 ) -> None:
     """
     Run a local agent against a daemon-backed server with a daemon-owned runner.
@@ -1760,6 +1778,10 @@ def _chat_via_daemon(
     :param resume_parts: Argument-list prefix for the resume hint on exit.
     :param auto_open_conversation: When ``True``, open the browser
         conversation URL once the session id is known.
+    :param workspace: Optional absolute directory to upload as the
+        session workspace (the daemon roots the runner's sandbox cwd /
+        scan-root there) instead of the launching shell's cwd. ``None``
+        captures ``Path.cwd()`` as before.
     :returns: None.
     """
     from omnigent.host.identity import load_or_create_host_identity
@@ -1807,7 +1829,11 @@ def _chat_via_daemon(
             headers = _remote_headers(server_url=base_url)
             auth = _server_auth(server_url=base_url)
             host_id = load_or_create_host_identity().host_id
-            workspace = str(Path.cwd().resolve())
+            # An explicit --workspace (already absolutized by the CLI)
+            # roots the session — and thus the daemon-owned runner's
+            # sandbox cwd / scan-root — at a grounding repo instead of
+            # the launching shell's cwd (which may be $HOME).
+            session_workspace = workspace if workspace is not None else str(Path.cwd().resolve())
 
             # The interactive resume picker reads stdin, so clear the spinner
             # first — it must not animate over the prompt. ``--continue`` and an
@@ -1838,7 +1864,7 @@ def _chat_via_daemon(
                     bundle=bundle_bytes,
                     resume_conversation_id=effective_resume_id,
                     fork_session_id=fork_session_id,
-                    workspace=workspace,
+                    workspace=session_workspace,
                     progress=progress,
                 )
             )
