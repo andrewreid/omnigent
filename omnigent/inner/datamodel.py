@@ -592,6 +592,26 @@ class OSEnvSandboxSpec:
     # (untrusted source trees, supervisor-spawned forks) where an
     # unmasked dotfile past the cap would be an unacceptable leak.
     cwd_hidden_scan_overflow: str = "warn"
+    # OPT-IN boundary-prune list. Directory basenames whose matching
+    # real directories the dotfile/symlink masker (both ``linux_bwrap``
+    # and ``darwin_seatbelt``) masks as a SINGLE entry and does NOT
+    # descend into. Matched by basename at any depth under cwd and under
+    # every ``read_paths`` root. ``None`` / empty (the default) means no
+    # pruning, so existing agents are unchanged.
+    #
+    # This is the escape hatch for dependency / vendor farms. A
+    # cross-filesystem ``pnpm`` store makes every package under
+    # ``node_modules`` an ESCAPING symlink, so the masker would emit one
+    # bwrap ``--bind-try`` / seatbelt ``(deny ...)`` per package — tens
+    # of thousands of args that blow past bwrap's ~9000-arg ceiling.
+    # Listing ``["node_modules", ".pnpm"]`` collapses the whole farm to
+    # a couple of masks. Safe precisely because it is opt-in: a general
+    # coding agent that needs to read ``node_modules`` simply leaves this
+    # empty; a design/review agent that only reads merged SOURCE prunes
+    # the dependency trees it never opens. Do NOT use this to hide
+    # content an agent needs — a pruned directory is invisible to the
+    # helper, exactly like any other mask.
+    cwd_prune_dirs: list[str] | None = None
     # Environment-variable allowlist for the helper subprocess, beyond
     # the always-passed minimal default (PATH/HOME/USER/LANG/LC_*/etc.;
     # see :data:`omnigent.inner.os_env._DEFAULT_ENV_PASSTHROUGH`).

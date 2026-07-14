@@ -73,6 +73,14 @@ class SandboxPolicy:
         dotfile whose basename is not in this list); other backends
         ignore the field. ``None`` means the policy carries no
         allowlist and the consuming backend applies its own default.
+    :param cwd_prune_dirs: OPT-IN boundary basenames whose matching
+        real directories the dotfile/symlink masker collapses to a
+        single ``"dir"`` mask and does not descend into. Consumed by
+        both the bwrap and seatbelt backends. ``None`` / empty means no
+        pruning (the default), so agents that don't opt in are
+        unchanged. Used to collapse dependency / vendor farms
+        (``node_modules``, ``.pnpm``) whose escaping package symlinks
+        would otherwise emit one mask each.
     :param cwd_hidden_scan_max_entries: Cap on entries the bwrap
         backend's recursive cwd walker visits. Ignored by other
         backends. Pair with :attr:`cwd_hidden_scan_overflow` to
@@ -141,6 +149,7 @@ class SandboxPolicy:
     write_files: list[Path]
     allow_network: bool
     cwd_allow_hidden: list[str] | None = None
+    cwd_prune_dirs: list[str] | None = None
     cwd_hidden_scan_max_entries: int = 50000
     cwd_hidden_scan_overflow: str = "warn"
     env_passthrough: list[str] | None = None
@@ -168,6 +177,9 @@ class SandboxPolicy:
             "allow_network": self.allow_network,
             "cwd_allow_hidden": (
                 list(self.cwd_allow_hidden) if self.cwd_allow_hidden is not None else None
+            ),
+            "cwd_prune_dirs": (
+                list(self.cwd_prune_dirs) if self.cwd_prune_dirs is not None else None
             ),
             "cwd_hidden_scan_max_entries": self.cwd_hidden_scan_max_entries,
             "cwd_hidden_scan_overflow": self.cwd_hidden_scan_overflow,
@@ -203,6 +215,10 @@ class SandboxPolicy:
         cwd_allow_hidden: list[str] | None = None
         if isinstance(cwd_allow_hidden_data, list):
             cwd_allow_hidden = [str(name) for name in cwd_allow_hidden_data]
+        cwd_prune_dirs_data = data.get("cwd_prune_dirs")
+        cwd_prune_dirs: list[str] | None = None
+        if isinstance(cwd_prune_dirs_data, list):
+            cwd_prune_dirs = [str(name) for name in cwd_prune_dirs_data]
         # Narrow scan-cap fields defensively — ``data`` is a generic
         # JSON map that could carry any value at runtime even though
         # the spec parser already validated the source. The typed
@@ -240,6 +256,7 @@ class SandboxPolicy:
             write_files=[Path(str(path)) for path in write_files_data],
             allow_network=bool(data.get("allow_network", True)),
             cwd_allow_hidden=cwd_allow_hidden,
+            cwd_prune_dirs=cwd_prune_dirs,
             cwd_hidden_scan_max_entries=max_entries,
             cwd_hidden_scan_overflow=overflow,
             env_passthrough=env_passthrough,

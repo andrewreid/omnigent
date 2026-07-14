@@ -73,17 +73,22 @@ os_env:
     type: linux_bwrap
     # No write_paths: cwd (the grounded repo, incl .git) is read-only.
     cwd_allow_hidden: [".git"]
-    # Mask EVERY dotfile in the grounded cwd, whatever the repo size. The
-    # dotfile mask hides stray secrets (.env, .aws, .ssh, ...) by recursively
-    # scanning the cwd; the default ``warn`` overflow leaves files readable PAST
-    # the 50k-entry cap (it does emit a CRITICAL log, not silently), so a large
-    # real repo (node_modules, a deep .git) would leak creds past the cap —
-    # unacceptable. ``error`` is the fail-safe (boot fails rather than risk a
-    # partial mask) but would break grounding on large repos. ``unlimited`` walks
-    # the full tree and completes the mask with no leak, at a one-time boot-scan
-    # cost — a deliberate availability-over-security tradeoff, acceptable HERE
-    # because Patricia grounds on TRUSTED repos, not arbitrary hostile input.
-    cwd_hidden_scan_overflow: unlimited
+    # Prune the dependency / vendor farms. Patricia grounds on merged SOURCE and
+    # never reads a dependency tree, so mask each of these as ONE entry and do
+    # NOT descend into it. This is the fix for the walker exploding on a
+    # cross-filesystem pnpm store, where every package under ``node_modules`` is
+    # an ESCAPING symlink and would otherwise emit one bwrap mask arg apiece —
+    # tens of thousands of args that blow past bwrap's ~9000-arg ceiling. With
+    # these boundaries the farm collapses to a couple of masks and the scan
+    # stays well under the entry cap.
+    cwd_prune_dirs: [node_modules, .pnpm]
+    # Bounded default overflow (``warn``): scan up to the 50k-entry cap, emit a
+    # partial best-effort mask plus a CRITICAL log past it. Safe HERE because
+    # (a) the big dependency trees are pruned above so the source tree fits well
+    # under the cap, and (b) Patricia grounds on TRUSTED merged repos, not
+    # arbitrary hostile input. (Formerly ``unlimited`` — needed only because the
+    # unpruned pnpm farm made the full walk the sole leak-free option; the prune
+    # list removes that need and restores the bounded default.)
     allow_network: true
 
 # Same blast-radius guardrail Polly's sub-agents use, so the shell behaves

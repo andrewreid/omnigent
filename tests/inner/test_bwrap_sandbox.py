@@ -36,12 +36,14 @@ from unittest.mock import patch
 
 import pytest
 
+from omnigent.inner import bwrap_sandbox
 from omnigent.inner.bwrap_sandbox import (
     _ALLOWED_SOCKET_FAMILIES,
     _CLONE_NEW_FLAG_BITS,
     _DEFAULT_CWD_ALLOW_HIDDEN,
     BwrapSandboxBackend,
     _bwrap_extra_seccomp_rules,
+    _check_bwrap_arg_ceiling,
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.sandbox import SandboxPolicy, with_denied_unix_sockets
@@ -89,6 +91,7 @@ def _make_policy(
     read_roots: list[Path] | None = None,
     cwd_hidden_scan_max_entries: int | None = None,
     cwd_hidden_scan_overflow: str | None = None,
+    cwd_prune_dirs: list[str] | None = None,
 ) -> SandboxPolicy:
     """
     Build a :class:`SandboxPolicy` directly without going through the
@@ -121,6 +124,7 @@ def _make_policy(
         "write_files": [],
         "allow_network": allow_network,
         "cwd_allow_hidden": allow_hidden,
+        "cwd_prune_dirs": cwd_prune_dirs,
     }
     if cwd_hidden_scan_max_entries is not None:
         kwargs["cwd_hidden_scan_max_entries"] = cwd_hidden_scan_max_entries
@@ -1380,3 +1384,99 @@ def _argv_mentions(argv: list[str], path: str, *, after_token: str) -> bool:
         if i + 2 < len(argv) and argv[i] == after_token and argv[i + 2] == path:
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Opt-in boundary prune (cwd_prune_dirs) + fail-loud arg-ceiling guardrail
+# ---------------------------------------------------------------------------
+
+# A path guaranteed to resolve outside every bwrap safe root (cwd, /usr,
+# /lib*, /bin, /sbin, /proc, /dev, /tmp, read/write roots), so a symlink
+# pointing at it is treated as escaping and masked. Nonexistent by design
+# — the escape check uses resolve(strict=False), and a broken symlink is
+# still lstat-present so the emitter keeps its mask.
+_ESCAPE_TARGET = Path("/omnigent-test-escape-root")
+
+
+def _make_pnpm_farm(root: Path, *, count: int) -> None:
+    """
+    Create a ``node_modules`` farm of *count* escaping package symlinks.
+
+    Mirrors a cross-filesystem pnpm store: every package is a symlink
+    resolving outside the sandbox mounts, so absent pruning the bwrap
+    emitter masks each with a ``--bind-try /dev/null <path>`` triple.
+
+    :param root: The ``node_modules`` directory (created if absent).
+    :param count: Number of escaping package symlinks to create.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    for i in range(count):
+        (root / f"pkg_{i}").symlink_to(_ESCAPE_TARGET)
+
+
+def test_wrap_launcher_argv_prune_collapses_dependency_farm(tmp_path: Path) -> None:
+    """
+    A Patricia-shaped cwd (real source + a big escaping-symlink farm
+    under ``node_modules``) produces a BOUNDED, small bwrap argv when
+    ``cwd_prune_dirs=["node_modules"]`` is set, and a large one with an
+    empty prune list. Pins both the fix (prune collapses the farm) and
+    that the knob is opt-in (empty prune → unchanged, unbounded shape).
+    """
+    backend = _make_backend()
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("print('hi')\n")
+    _make_pnpm_farm(tmp_path / "node_modules", count=800)
+
+    pruned_policy = _make_policy(tmp_path, cwd_prune_dirs=["node_modules"])
+    unpruned_policy = _make_policy(tmp_path, cwd_prune_dirs=None)
+    cmd = [sys.executable, "-c", "pass"]
+
+    pruned_argv = backend.wrap_launcher_argv(cmd, pruned_policy, tmp_path)
+    unpruned_argv = backend.wrap_launcher_argv(cmd, unpruned_policy, tmp_path)
+
+    # node_modules collapses to a single --tmpfs mask; the whole argv
+    # stays tiny and well under the 9000 ceiling.
+    assert len(pruned_argv) < 100, len(pruned_argv)
+    assert "--tmpfs" in pruned_argv
+    nm = str((tmp_path / "node_modules").resolve(strict=False))
+    assert nm in pruned_argv
+    # No per-package mask leaked through the boundary.
+    assert not any(str(nm + os.sep + "pkg_") in tok for tok in pruned_argv)
+
+    # Empty prune list: every escaping package is masked individually,
+    # so the argv is an order of magnitude larger.
+    assert len(unpruned_argv) > 800, len(unpruned_argv)
+
+
+def test_wrap_launcher_argv_arg_ceiling_fails_loud(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    When the assembled bwrap argv would exceed the arg ceiling, the
+    launcher raises an actionable :class:`OSError` — naming the ceiling,
+    the offending directory, and the ``cwd_prune_dirs`` tunable —
+    instead of letting bwrap die with its cryptic ``Exceeded maximum
+    number of arguments`` abort. The ceiling is monkeypatched low so the
+    test stays fast without materialising 9000+ real symlinks.
+    """
+    monkeypatch.setattr(bwrap_sandbox, "_BWRAP_MAX_ARGS", 100)
+    _make_pnpm_farm(tmp_path / "node_modules", count=200)
+    policy = _make_policy(tmp_path, cwd_prune_dirs=None)
+
+    with pytest.raises(OSError) as excinfo:
+        backend = _make_backend()
+        backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    message = str(excinfo.value)
+    assert "Exceeded maximum number of arguments" in message
+    assert "node_modules" in message
+    assert "cwd_prune_dirs" in message
+
+
+def test_check_bwrap_arg_ceiling_under_limit_is_noop(tmp_path: Path) -> None:
+    """
+    The guardrail does nothing when the argv is within the ceiling — the
+    common case must not raise.
+    """
+    # A short argv, comfortably under the 9000-token ceiling.
+    _check_bwrap_arg_ceiling(["bwrap", "--ro-bind", "/usr", "/usr", "--", "true"], tmp_path)

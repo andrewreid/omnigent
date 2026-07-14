@@ -1748,6 +1748,82 @@ def test_parse_os_env_sandbox_cwd_allow_hidden_validation(
         parse(tmp_path)
 
 
+def test_parse_os_env_sandbox_with_cwd_prune_dirs(tmp_path: Path) -> None:
+    """
+    ``cwd_prune_dirs`` parses through to
+    :class:`OSEnvSandboxSpec.cwd_prune_dirs` verbatim; ``None`` (absent)
+    is preserved so the resolver treats it as "no pruning".
+    """
+    config = {
+        "spec_version": 1,
+        "name": "with-prune-dirs",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "cwd_prune_dirs": ["node_modules", ".pnpm"],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.os_env is not None
+    assert spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.cwd_prune_dirs == ["node_modules", ".pnpm"]
+
+
+def test_parse_os_env_sandbox_cwd_prune_dirs_absent_is_none(tmp_path: Path) -> None:
+    """
+    Omitting ``cwd_prune_dirs`` leaves the field ``None`` — the default
+    that means "no pruning", so existing agents are unchanged.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "no-prune-dirs",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"type": "linux_bwrap"},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.os_env is not None
+    assert spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.cwd_prune_dirs is None
+
+
+@pytest.mark.parametrize(
+    "bad_value,match_regex",
+    [
+        ("node_modules", r"must be a list"),
+        (["node_modules", 7], r"must be strings"),
+        (["node_modules", ""], r"must not be empty"),
+        (["node_modules/x"], r"single path components"),
+        (["../etc"], r"single path components"),
+    ],
+    ids=["scalar", "non_string_entry", "empty_string", "with_slash", "traversal"],
+)
+def test_parse_os_env_sandbox_cwd_prune_dirs_validation(
+    tmp_path: Path, bad_value: object, match_regex: str
+) -> None:
+    """
+    Invalid ``cwd_prune_dirs`` values raise :class:`OmnigentError` at
+    parse time, same single-path-component discipline as
+    ``cwd_allow_hidden``.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "bad-prune-dirs",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"type": "linux_bwrap", "cwd_prune_dirs": bad_value},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=match_regex):
+        parse(tmp_path)
+
+
 def test_parse_os_env_sandbox_cwd_hidden_scan_defaults(tmp_path: Path) -> None:
     """
     When the spec omits ``cwd_hidden_scan_max_entries`` and
