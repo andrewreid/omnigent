@@ -74,6 +74,7 @@ def _make_policy(
     read_roots: list[Path] | None = None,
     egress_relay_port: int | None = None,
     egress_socket_path: str | None = None,
+    cwd_prune_dirs: list[str] | None = None,
 ) -> SandboxPolicy:
     """
     Build a :class:`SandboxPolicy` directly without going through the
@@ -108,6 +109,7 @@ def _make_policy(
         write_files=[],
         allow_network=allow_network,
         cwd_allow_hidden=allow_hidden,
+        cwd_prune_dirs=cwd_prune_dirs,
         egress_relay_port=egress_relay_port,
         egress_socket_path=egress_socket_path,
     )
@@ -753,6 +755,53 @@ def test_profile_dotfile_mask_uses_deny_rules(tmp_path: Path) -> None:
         "Dotfile deny rule appears before the cwd allow; the "
         "intended profile order is cwd-allow first, deny mask "
         "after, even though SBPL deny-wins doesn't depend on order."
+    )
+
+
+def test_profile_prune_dir_emits_single_subpath_deny_and_overrides_allow(
+    tmp_path: Path,
+) -> None:
+    """
+    Seatbelt twin of the bwrap boundary-prune test.
+
+    A directory whose basename is in ``cwd_prune_dirs`` is masked with
+    exactly ONE recursive ``(deny file-read* file-write* (subpath ...))``
+    rule, its children get NO per-path denies (the walker never descends
+    into a pruned dir), and the deny lands AFTER the cwd ``file-read*``
+    allow so SBPL deny-wins overrides the grant for the whole subtree.
+    """
+    # A cross-filesystem pnpm-store shape: escaping package symlinks
+    # directly under node_modules, plus a real nested subdir.
+    farm = tmp_path / "node_modules"
+    farm.mkdir()
+    escape = Path("/omnigent-test-escape-root")
+    for i in range(30):
+        (farm / f"pkg_{i}").symlink_to(escape)
+    (farm / "deep").mkdir()
+    (farm / "deep" / ".secret").write_text("would-be-masked-without-prune")
+
+    cwd = tmp_path.resolve(strict=False)
+    policy = _make_policy(tmp_path, allow_hidden=[".venv"], cwd_prune_dirs=["node_modules"])
+    profile = _build_profile(policy, cwd)
+
+    nm_deny = f'(deny file-read* file-write* (subpath "{cwd / "node_modules"}"))'
+    # Exactly one recursive deny for the pruned boundary.
+    assert profile.count(nm_deny) == 1, profile
+
+    # No child of node_modules gets its own deny line — the escaping
+    # symlinks and the nested .secret must NOT appear (prune skips
+    # descent, so a single subpath deny covers them all).
+    child_prefix = f'(subpath "{cwd / "node_modules"}/'
+    child_literal = f'(literal "{cwd / "node_modules"}/'
+    assert child_prefix not in profile, "A child subpath deny leaked past the prune boundary."
+    assert child_literal not in profile, "A child literal deny leaked past the prune boundary."
+
+    # Override: the pruned-dir deny must follow the cwd allow so
+    # deny-wins masks the subtree that the cwd subpath allow granted.
+    cwd_allow_idx = profile.index(f'(allow file-read* (subpath "{cwd}"))')
+    assert profile.index(nm_deny) > cwd_allow_idx, (
+        "Prune deny appears before the cwd allow; the intended order is "
+        "cwd-allow first, prune mask after (mask overrides the grant)."
     )
 
 

@@ -438,6 +438,9 @@ def _clone_policy_with(
         cwd_allow_hidden=(
             list(policy.cwd_allow_hidden) if policy.cwd_allow_hidden is not None else None
         ),
+        cwd_prune_dirs=(
+            list(policy.cwd_prune_dirs) if policy.cwd_prune_dirs is not None else None
+        ),
         cwd_hidden_scan_max_entries=policy.cwd_hidden_scan_max_entries,
         cwd_hidden_scan_overflow=policy.cwd_hidden_scan_overflow,
         env_passthrough=(

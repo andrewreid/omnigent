@@ -254,6 +254,65 @@ def test_sandbox_policy_round_trips_deny_unix_socket_paths() -> None:
     assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).deny_unix_socket_paths is None
 
 
+def test_sandbox_policy_round_trips_cwd_prune_dirs() -> None:
+    """``cwd_prune_dirs`` survives the launcher wire encoding.
+
+    Both backends read the prune list from the *decoded* policy to
+    collapse dependency farms. If the field dropped out of
+    ``to_jsonable`` / ``from_jsonable`` it would decode as ``None``,
+    pruning would silently disable, and a pnpm-store cwd would explode
+    the argv again.
+    """
+    policy = _noop_policy()
+    policy.cwd_prune_dirs = ["node_modules", ".pnpm"]
+
+    decoded = SandboxPolicy.from_jsonable(policy.to_jsonable())
+
+    assert decoded.cwd_prune_dirs == ["node_modules", ".pnpm"]
+    # Old payloads (no key) and unset policies decode to None — "no
+    # pruning", not an empty-but-present list.
+    assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).cwd_prune_dirs is None
+
+
+def test_with_additional_helpers_preserve_cwd_prune_dirs() -> None:
+    """The ``with_additional_*`` clone helpers must carry
+    ``cwd_prune_dirs`` through unchanged.
+
+    ``_clone_policy_with`` rebuilds the policy field-by-field, so a
+    missing field silently resets pruning to ``None`` mid-run — and
+    these helpers run for every executor / terminal that adds a scratch
+    write root, read root, or write file. That would re-expose the exact
+    argv explosion the knob fixes. Assert all three helpers preserve the
+    list (and defensive-copy it, not alias it).
+    """
+    from pathlib import Path
+
+    from omnigent.inner.sandbox import (
+        with_additional_read_roots,
+        with_additional_write_files,
+        with_additional_write_roots,
+    )
+
+    base = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=[Path("/repo")],
+        write_roots=[Path("/repo")],
+        write_files=[Path("/repo/.env.local")],
+        allow_network=True,
+        cwd_prune_dirs=["node_modules", ".pnpm"],
+    )
+
+    for clone in (
+        with_additional_write_roots(base, [Path("/tmp/scratch")]),
+        with_additional_read_roots(base, [Path("/extra")]),
+        with_additional_write_files(base, [Path("/repo/extra.txt")]),
+    ):
+        assert clone.cwd_prune_dirs == ["node_modules", ".pnpm"]
+        # Defensive copy: a fresh list, not the same object.
+        assert clone.cwd_prune_dirs is not base.cwd_prune_dirs
+
+
 def test_with_denied_unix_sockets_resolves_dedupes_and_is_pure() -> None:
     """``with_denied_unix_sockets`` resolves + de-duplicates the socket
     paths and never mutates the input policy.

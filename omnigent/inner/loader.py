@@ -732,6 +732,49 @@ def _parse_terminal_env_spec(data: YamlData | str | bool | None) -> TerminalEnvS
     )
 
 
+def _parse_cwd_prune_dirs_legacy(raw: object) -> list[str] | None:
+    """
+    Validate ``os_env.sandbox.cwd_prune_dirs`` on the legacy loader path.
+
+    Mirrors :func:`omnigent.spec.parser._parse_cwd_prune_dirs` rule-for-
+    rule so the single-file / legacy YAML path and the bundle
+    ``config.yaml`` path can never disagree on what a valid prune list
+    is: each entry must be a non-empty single path component (no ``/``,
+    ``\\``, ``.``, or ``..``). Raises ``ValueError`` / ``TypeError`` to
+    match this loader's convention (the spec parser raises
+    ``OmnigentError``; the rules enforced are identical).
+
+    :param raw: Raw ``cwd_prune_dirs`` value from the YAML mapping, or
+        ``None`` when absent.
+    :returns: The validated basename list, or ``None`` when absent (no
+        pruning — the dataclass default).
+    :raises TypeError: If ``raw`` is not a list, or an entry is not a
+        string.
+    :raises ValueError: If an entry is empty or is not a single path
+        component.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise TypeError(f"os_env.sandbox.cwd_prune_dirs must be a list, got {type(raw).__name__}")
+    sanitized: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            raise TypeError(
+                "os_env.sandbox.cwd_prune_dirs entries must be strings, "
+                f"got {type(entry).__name__}: {entry!r}"
+            )
+        if not entry:
+            raise ValueError("os_env.sandbox.cwd_prune_dirs entries must not be empty strings")
+        if "/" in entry or "\\" in entry or entry in (".", ".."):
+            raise ValueError(
+                "os_env.sandbox.cwd_prune_dirs entries must be single path "
+                f"components (no separators or '.'/'..'): {entry!r}"
+            )
+        sanitized.append(entry)
+    return sanitized
+
+
 def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandboxSpec:
     if isinstance(data, str):
         return OSEnvSandboxSpec(type=data)
@@ -825,6 +868,7 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         ),
         allow_network=data.get("allow_network", True),
         cwd_allow_hidden=data.get("cwd_allow_hidden"),
+        cwd_prune_dirs=_parse_cwd_prune_dirs_legacy(data.get("cwd_prune_dirs")),
         cwd_hidden_scan_max_entries=(
             int(max_entries_raw)
             if max_entries_raw is not None
