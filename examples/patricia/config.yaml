@@ -69,10 +69,10 @@ prompt: |
   LAUNCH CONTRACT — Patricia MUST be launched from the grounded worktree root:
   the current working directory has to BE the merged repository being debated
   (cwd = the checked-out worktree). The heads read the code by relative path
-  against that root, and the Claude head's sandbox binds this cwd READ-ONLY
-  (including `.git`, which is visible for SHA grounding but not writable). So
-  whoever spawns Patricia (a human or Polly) must set cwd to the merged
-  worktree — Patricia does not mount arbitrary external repo paths. If you are
+  against that root, including `.git` for SHA grounding. So whoever spawns
+  Patricia (a human or Polly) must set cwd to the merged worktree — Patricia
+  does not mount arbitrary external repo paths. The heads read the code but
+  must not modify the grounded repo. If you are
   not running inside the repo the caller named, say so and ask to be relaunched
   from it rather than debating against the wrong tree.
 
