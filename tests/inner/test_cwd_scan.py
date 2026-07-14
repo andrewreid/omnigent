@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.inner._cwd_scan import (
+    _COALESCE_DOMINANCE_FRACTION,
     _SUBTREE_COLLAPSE_THRESHOLD,
     MaskedEntry,
     scan_cwd_mask_entries,
@@ -446,10 +447,9 @@ def test_real_npm_node_modules_stays_readable(tmp_path: Path) -> None:
     escaping symlinks) is NOT masked and its package content stays
     readable, so project commands (``node app.js`` / local CLIs) work.
     There is no name-based masking: the dir simply has ~zero masks and
-    never collapses. (A ``.bin`` dotdir would be masked like any hidden
-    dir — omitted here to keep the "readable package content" assertion
-    unambiguous; the CLI-target-under-.bin path is covered in the bwrap
-    re-overlay matrix.)
+    never collapses. (A real ``.bin`` shim dir stays readable too — see
+    :func:`test_shim_only_dotdir_stays_readable`; omitted here to keep
+    the "readable package content" assertion unambiguous.)
     """
     node_modules = tmp_path / "node_modules"
     for i in range(150):
@@ -467,6 +467,73 @@ def test_real_npm_node_modules_stays_readable(tmp_path: Path) -> None:
     # No mask anywhere under it (no dotfiles, no escaping links).
     under = [e for e in entries if str(e.path).startswith(str(node_modules) + os.sep)]
     assert under == [], f"Real node_modules must stay fully readable; got {under}."
+
+
+def test_shim_only_dotdir_stays_readable(tmp_path: Path) -> None:
+    """
+    P2-a: a real ``node_modules/.bin`` — a hidden dir whose entries are
+    ALL non-escaping symlinks into sibling packages — is kept READABLE
+    (not masked by dotfile policy) so ``npm test`` / ``npx`` / local CLIs
+    can resolve their shims. The shims themselves (non-escaping symlinks)
+    stay reachable, not masked.
+    """
+    node_modules = tmp_path / "node_modules"
+    pkg = node_modules / "eslint" / "bin"
+    pkg.mkdir(parents=True)
+    (pkg / "eslint.js").write_text("#!/usr/bin/env node\n")
+    bin_dir = node_modules / ".bin"
+    bin_dir.mkdir()
+    # Relative shim into a sibling package — resolves inside cwd (safe).
+    (bin_dir / "eslint").symlink_to("../eslint/bin/eslint.js")
+    (bin_dir / "tsc").symlink_to("../eslint/bin/eslint.js")
+
+    entries = _scan(tmp_path)  # allow_hidden=[] → dotfile policy active
+    assert _entry_for(entries, bin_dir) is None, (
+        "A real .bin shim dir (only non-escaping symlinks) must stay readable so local CLIs run."
+    )
+    assert _entry_for(entries, bin_dir / "eslint") is None, "Shim must stay reachable."
+    assert _entry_for(entries, bin_dir / "tsc") is None, "Shim must stay reachable."
+    under = [e for e in entries if str(e.path).startswith(str(bin_dir) + os.sep)]
+    assert under == [], f"No shim under a readable .bin may be masked; got {under}."
+
+
+def test_dotdir_with_regular_file_is_not_shim_only_and_masked(tmp_path: Path) -> None:
+    """
+    The shim-only carve-out is symlink-gated: a hidden dir holding a
+    REGULAR FILE (real content, not a pointer) is masked as before. This
+    is the guard that the carve-out can never re-expose ``.aws/credentials``
+    or a stray secret file just because the dir is otherwise link-shaped.
+    """
+    bin_dir = tmp_path / ".bin"
+    bin_dir.mkdir()
+    (bin_dir / "greet").symlink_to("/usr/bin/env")  # non-escaping symlink
+    (bin_dir / "credentials").write_text("[default]\ntoken=hunter2\n")  # real content
+
+    entries = _scan(tmp_path)
+    entry = _entry_for(entries, bin_dir)
+    assert entry is not None and entry.kind == "dir", (
+        "A hidden dir with a regular file is NOT shim-only and must be masked."
+    )
+    under = [e for e in entries if str(e.path).startswith(str(bin_dir) + os.sep)]
+    assert under == [], "Masked dir is pruned; the regular file is hidden with it."
+
+
+def test_shim_dir_with_escaping_link_is_masked(tmp_path: Path) -> None:
+    """
+    A hidden dir containing even one ESCAPING symlink is NOT shim-only and
+    is masked — the carve-out never un-masks an escaping link (a
+    cross-store pnpm ``.bin`` whose shims point into an off-device store).
+    """
+    bin_dir = tmp_path / ".bin"
+    bin_dir.mkdir()
+    (bin_dir / "safe").symlink_to("/usr/bin/env")  # non-escaping
+    (bin_dir / "escape").symlink_to("/etc/hostname")  # escapes safe roots
+
+    entries = _scan(tmp_path)
+    entry = _entry_for(entries, bin_dir)
+    assert entry is not None and entry.kind == "dir", (
+        "A hidden dir with an escaping link must be masked, not carved out."
+    )
 
 
 def test_collapse_does_not_fire_below_threshold(tmp_path: Path) -> None:
@@ -612,6 +679,50 @@ def test_allow_hidden_dir_with_nested_farm_collapses_inside(tmp_path: Path) -> N
     assert any(str(e.path) == str(worktrees) for e in dir_masks_under_git), (
         f"The .git/worktrees farm must collapse to one dir mask; "
         f"got {[(e.path, e.kind) for e in entries]}"
+    )
+    per_link = [e for e in entries if str(e.path).startswith(str(worktrees) + os.sep)]
+    assert per_link == [], "Collapsed worktrees farm must not emit per-link masks."
+
+
+def test_allow_hidden_sparse_dir_never_collapses_but_interior_folds(tmp_path: Path) -> None:
+    """
+    P2-b: an ``allow_hidden`` directory itself must NEVER be the collapse
+    fold point, even when a dense interior farm DOMINATES its subtree.
+
+    Here ``.git`` has only a few readable files (a real bare-ish repo
+    invariant, not the 50-file cushion the older test manufactured) and a
+    dense ``.git/worktrees`` farm of >=100 escaping links. The farm makes
+    ``.git``'s subtree mask-dominated (>0.9), so the dominance guard ALONE
+    would let ``.git`` collapse — the allowlist exclusion is what keeps it
+    readable. The ordinary-named interior ``worktrees`` still folds.
+    """
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    # Only a few readable files — sparse, so masks dominate .git's subtree.
+    (git_dir / "config").write_text("[core]\n")
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+    (git_dir / "description").write_text("repo\n")
+    worktrees = git_dir / "worktrees"
+    worktrees.mkdir()
+    n = _SUBTREE_COLLAPSE_THRESHOLD + 20
+    for i in range(n):
+        (worktrees / f"wt_{i:05d}").symlink_to("/etc/hostname")
+
+    # Sanity: .git's subtree really is mask-dominated (guard would not
+    # have saved it) — so the assertion below tests the exclusion, not
+    # the dominance fraction.
+    assert n >= _COALESCE_DOMINANCE_FRACTION * (n + 3)
+
+    entries = _scan(tmp_path, allow_hidden=[".git"], overflow="unlimited")
+    assert _entry_for(entries, git_dir) is None, (
+        ".git (allow_hidden) must stay readable at the top even when a "
+        "dense interior farm dominates its subtree."
+    )
+    assert _entry_for(entries, git_dir / "config") is None, "git config stays readable."
+    # The interior farm still folds to a single dir mask.
+    wt_entry = _entry_for(entries, worktrees)
+    assert wt_entry is not None and wt_entry.kind == "dir", (
+        f".git/worktrees farm must still collapse; got {[(e.path, e.kind) for e in entries]}"
     )
     per_link = [e for e in entries if str(e.path).startswith(str(worktrees) + os.sep)]
     assert per_link == [], "Collapsed worktrees farm must not emit per-link masks."

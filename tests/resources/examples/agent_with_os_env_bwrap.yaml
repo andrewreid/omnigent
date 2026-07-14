@@ -128,6 +128,14 @@ os_env:
     # ``git status`` / ``git log``; add ".gitignore" if it needs to
     # respect ignore rules. Entries must be plain names — no ``/``,
     # no ``..``, no absolute paths (validated at spec parse time).
+    #
+    # WARNING: allowing a directory exposes its ordinary (non-dot) files
+    # to the helper. Allowing ".git" makes ``.git/config`` readable, and
+    # ``.git/config`` embeds credentials in any authenticated remote URL
+    # (``https://user:token@host/...``). This is intended (git needs its
+    # config) — but treat allowing a dir as consenting to expose its
+    # non-dot contents. Nested non-allowed dotfiles and escaping symlinks
+    # under the allowed dir stay masked.
     # cwd_allow_hidden: [".venv", ".git", ".gitignore"]
 
     # Optional: cap on the number of filesystem entries the recursive
@@ -136,7 +144,11 @@ os_env:
     # (targets outside the exposed roots). Real in-cwd content stays
     # readable and is not masked; there is no name-based special casing,
     # so a real npm/yarn ``node_modules`` (real package dirs) is walked
-    # and stays readable and runnable. A cross-store pnpm ``node_modules``
+    # and stays readable and runnable — its hidden ``.bin`` shim dir is
+    # kept readable by a narrow carve-out (a hidden dir whose entries are
+    # all non-escaping symlinks exposes only pointers into already-exposed
+    # packages), so ``npm test`` / ``npx`` / local CLIs still resolve
+    # their shims. A cross-store pnpm ``node_modules``
     # (each package an escaping symlink into an off-device store) is a
     # farm: to keep it from emitting thousands of masks, the walker
     # collapses any directory whose subtree is dominated by masks into a

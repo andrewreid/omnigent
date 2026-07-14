@@ -29,20 +29,29 @@ casing: a directory called ``node_modules`` is treated like any other.
 
 - A **real npm/yarn ``node_modules``** (real package directories, few
   or no escaping symlinks) is walked normally and stays readable, so
-  ``node app.js`` / ``npm test`` / local CLIs work.
+  ``node app.js`` / ``npm test`` / local CLIs work. Its
+  ``node_modules/.bin`` shim directory — hidden by name yet full of
+  non-escaping symlinks into sibling packages — is kept readable by a
+  narrow carve-out (:func:`_is_shim_only_dir`) so those shims stay
+  executable through the sandbox; a directory that holds any real file,
+  subdir, or escaping link is masked as before.
 - A **cross-store pnpm ``node_modules``** (where the content-addressable
   store lives on another filesystem, so each package is an escaping
   symlink into ``~/.local/share/pnpm/store``) is a farm of thousands of
   escaping symlinks. Same-store (hardlink) pnpm has NO escaping symlinks
   and is simply readable.
 
-Subtree collapse (bounded emission)
------------------------------------
+Subtree collapse (dense-farm folding)
+-------------------------------------
 
 Each :class:`MaskedEntry` becomes one mask token per backend, and bwrap
 has a hard ceiling of 9000 total argv entries, so a farm of tens of
 thousands of escaping symlinks would blow the command line if each were
-masked individually. The escaping symlinks of a cross-store pnpm are
+masked individually. This pass folds a *dense* farm to one mask; it does
+NOT globally bound the emitted count (many sibling subtrees each just
+under the threshold can still sum large — the backend's assembled-argv
+ceiling check is the fail-loud backstop for that). The escaping symlinks
+of a cross-store pnpm are
 *spread* — roughly one per ``.pnpm/<pkg>@<ver>/node_modules/`` directory
 — so a per-directory dominance test never fires; the density only shows
 up when aggregated over a subtree.
@@ -77,9 +86,12 @@ so nested non-allowed secrets (``.git`` interior ``.env`` / ``.aws`` /
 ``.ssh`` dotfiles, escaping symlinks) are masked as normal. The subtree
 collapse above still applies inside it, so a dense interior farm (e.g. a
 large ``.git/worktrees`` admin tree of escaping symlinks) collapses to a
-few masks rather than thousands. Because a readable directory like
-``.git`` carries lots of browsable content (loose objects, config,
-refs), the dominance guard keeps the directory itself from collapsing.
+few masks rather than thousands. The allowed dir ITSELF is explicitly
+excluded from the collapse candidate set, so it stays readable at the
+top level even when a dense interior farm dominates its subtree (a
+sparse ``.git`` with few readable files must not silently fold — the
+dominance guard alone would not save it). Only ordinary-named
+descendants such as ``.git/worktrees`` fold.
 
 Bounded traversal
 -----------------
@@ -199,10 +211,12 @@ def scan_cwd_mask_entries(
     also dominate the directory's readable content (see
     :data:`_COALESCE_DOMINANCE_FRACTION`) is replaced by a single
     ``kind="dir"`` mask, at the shallowest such directory on each branch
-    (never the scan root). This bounds the emitted mask count for a
-    cross-store pnpm ``node_modules`` (a spread farm of escaping
-    symlinks) while leaving a real, readable ``node_modules`` — which has
-    ~zero masks — untouched.
+    (never the scan root, never an ``allow_hidden`` dir). This folds a
+    dense cross-store pnpm ``node_modules`` (a spread farm of escaping
+    symlinks) to a single mask while leaving a real, readable
+    ``node_modules`` — which has ~zero masks — untouched. It handles
+    dense farms; it is not a global arg-count bound (the backend's
+    assembled-argv ceiling check is the true backstop).
 
     Walker termination is deterministic: ``follow_symlinks=False`` on the
     recursion check ensures symlink loops can't cause infinite descent.
@@ -254,6 +268,11 @@ def scan_cwd_mask_entries(
     # from real source.
     mask_count: dict[str, int] = defaultdict(int)
     readable_count: dict[str, int] = defaultdict(int)
+    # Directories whose basename is on ``allow_hidden``: kept out of the
+    # collapse candidate set so an allowed dir (e.g. ``.git``) can never
+    # BE the fold point, even when a dense interior farm dominates its
+    # subtree. Descendants (e.g. ``.git/worktrees``) may still collapse.
+    allowed_dirs: set[str] = set()
 
     stack: list[Path] = [cwd]
     entries_visited = 0
@@ -277,13 +296,35 @@ def scan_cwd_mask_entries(
                 break
 
             child_path = Path(child.path)
+            is_dir_nofollow = child.is_dir(follow_symlinks=False)
             should_mask = False
             if child.name.startswith(".") and child.name not in allow:
-                should_mask = True
+                # Dotfile policy would hide this entry. ONE carve-out keeps
+                # package tooling runnable: a hidden *directory* whose
+                # entries are ALL non-escaping symlinks — a real
+                # ``node_modules/.bin`` shim dir, whose links point at
+                # executables in already-exposed sibling packages — exposes
+                # no new content, only pointers to content the sandbox
+                # already grants. Leaving it readable is what lets
+                # ``npm test`` / ``npx`` / a direct local-CLI call resolve
+                # their shims through the sandbox. Anything else (a regular
+                # file like ``.aws/credentials``, a real subdir, or an
+                # escaping link such as a cross-store pnpm ``.bin``) fails
+                # the shim-only test and is masked exactly as before —
+                # escaping links are never un-masked.
+                if is_dir_nofollow and _is_shim_only_dir(child_path, safe_root_list):
+                    should_mask = False
+                else:
+                    should_mask = True
             elif child.is_symlink():
                 resolved_target = child_path.resolve(strict=False)
                 if not any(_is_within(resolved_target, root) for root in safe_root_list):
                     should_mask = True
+
+            # Record allow_hidden directories (readable at the top level)
+            # so the collapse pass never folds the allowed dir itself.
+            if is_dir_nofollow and child.name in allow:
+                allowed_dirs.add(str(child_path))
 
             if should_mask:
                 # ``is_dir`` follows symlinks by default — matches what
@@ -300,12 +341,12 @@ def scan_cwd_mask_entries(
             # allow_hidden dirs, so nested secrets are still masked); a
             # rogue symlink-to-dir is not followed. Everything else is a
             # readable leaf that contributes to the dominance guard.
-            if child.is_dir(follow_symlinks=False):
+            if is_dir_nofollow:
                 stack.append(child_path)
             else:
                 _increment_ancestors(readable_count, child_path, cwd)
 
-    entries = _collapse_farms(mask_records, mask_count, readable_count, root_key)
+    entries = _collapse_farms(mask_records, mask_count, readable_count, root_key, allowed_dirs)
 
     if truncated:
         _handle_scan_overflow(
@@ -342,24 +383,89 @@ def _increment_ancestors(counter: dict[str, int], path: Path, root: Path) -> Non
             break
 
 
+def _is_shim_only_dir(directory: Path, safe_roots: Sequence[Path]) -> bool:
+    """
+    Return whether *directory* contains ONLY non-escaping symlinks.
+
+    A real ``node_modules/.bin`` is a hidden directory full of symlinks
+    that point at executables in sibling packages (``eslint ->
+    ../eslint/bin/eslint.js``): every target resolves INSIDE an
+    already-exposed root, so exposing the directory leaks no content the
+    sandbox didn't already grant — only pointers to it. Keeping such a
+    directory readable (instead of masking it by dotfile policy) is what
+    lets ``npm test`` / ``npx`` / a direct local-CLI invocation reach
+    their shims through the sandbox.
+
+    The test is deliberately strict so the carve-out can NEVER re-expose
+    a secret:
+
+    - a **regular file** (``.aws/credentials``, a stray ``.env``) fails
+      it — that is real content, not a pointer;
+    - a **real subdirectory** fails it — it could hide anything;
+    - an **escaping symlink** (a cross-store pnpm ``.bin`` whose links
+      point into an off-device store) fails it — those are exactly the
+      links the escape defense exists to mask.
+
+    An empty directory returns ``False`` (nothing to keep runnable, so
+    the ordinary dotfile mask stands). A symlink whose target happens to
+    resolve onto a separately-masked path is still safe: that path keeps
+    its own mask, so dereferencing the pointer yields the mask, not the
+    secret.
+
+    :param directory: The hidden directory being considered for the
+        shim-only carve-out.
+    :param safe_roots: The already-exposed roots; a symlink whose
+        resolved target lies within any of them is non-escaping.
+    :returns: ``True`` only when *directory* is non-empty and every
+        direct entry is a non-escaping symlink.
+    """
+    try:
+        children = list(os.scandir(directory))
+    except OSError:
+        return False
+    if not children:
+        return False
+    for child in children:
+        if not child.is_symlink():
+            return False
+        resolved = Path(child.path).resolve(strict=False)
+        if not any(_is_within(resolved, root) for root in safe_roots):
+            return False
+    return True
+
+
 def _collapse_farms(
     mask_records: list[tuple[Path, MaskKind]],
     mask_count: dict[str, int],
     readable_count: dict[str, int],
     root_key: str,
+    allowed_dirs: set[str],
 ) -> list[MaskedEntry]:
     """
-    Replace dense mask farms with a single directory mask each.
+    Fold each dense mask farm into a single directory mask.
 
-    A directory ``D`` (never the scan *root_key*) is a collapse candidate
-    when its subtree holds at least :data:`_SUBTREE_COLLAPSE_THRESHOLD`
-    masks AND those masks dominate its browsable content
+    A directory ``D`` (never the scan *root_key*, never an
+    ``allow_hidden`` dir) is a collapse candidate when its subtree holds
+    at least :data:`_SUBTREE_COLLAPSE_THRESHOLD` masks AND those masks
+    dominate its browsable content
     (``masks >= _COALESCE_DOMINANCE_FRACTION * (masks + readable)``).
     Collapse fires at the SHALLOWEST candidate on each branch (a
     candidate with no candidate ancestor), so a spread farm collapses at
     the one directory that contains it rather than at each sub-cluster,
     and a directory of real source that merely contains a nested farm
     keeps its own files readable while the nested farm dir collapses.
+
+    This handles a *dense* farm (a cross-store pnpm ``node_modules``, a
+    large escaping-link admin tree) — it is NOT a global bound on the
+    emitted mask count. Many sibling subtrees that each sit just below
+    the threshold can still sum to a large argv; the assembled-argv
+    ceiling check in the backend (:func:`_check_bwrap_arg_ceiling`) is
+    the fail-loud backstop for that, not this pass.
+
+    ``allow_hidden`` directories are excluded from the candidate set so an
+    allowed dir (e.g. ``.git``) stays readable at the top level even when
+    a dense interior farm dominates its subtree; its descendants (e.g.
+    ``.git/worktrees``) are ordinary dirs and still collapse.
 
     Every individual mask under a collapse directory is dropped in favour
     of the single directory mask; masks outside all collapse directories
@@ -371,12 +477,16 @@ def _collapse_farms(
     :param readable_count: Per-directory subtree readable-leaf tally.
     :param root_key: ``str`` of the scan root; excluded from collapse so
         the whole working directory can never be hidden.
+    :param allowed_dirs: ``str`` paths of directories on ``allow_hidden``;
+        excluded from collapse candidates so an allowed dir is never the
+        fold point (descendants still may be).
     :returns: The final de-duplicated :class:`MaskedEntry` list.
     """
     candidates = {
         directory
         for directory, masks in mask_count.items()
         if directory != root_key
+        and directory not in allowed_dirs
         and masks >= _SUBTREE_COLLAPSE_THRESHOLD
         and masks >= _COALESCE_DOMINANCE_FRACTION * (masks + readable_count.get(directory, 0))
     }

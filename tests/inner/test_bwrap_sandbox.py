@@ -1220,6 +1220,66 @@ print(json.dumps(results))
 
 
 # ---------------------------------------------------------------------------
+# Local-CLI journey (real bwrap subprocess required)
+# ---------------------------------------------------------------------------
+
+
+@pytestmark_bwrap
+def test_local_cli_shim_actually_runs_through_sandbox(tmp_path: Path) -> None:
+    """
+    P2-a JOURNEY: a real ``node_modules/.bin`` shim EXECUTES end-to-end
+    through the bwrap sandbox — not just an argv assertion.
+
+    The shim is a relative (non-escaping) symlink into a sibling package,
+    exactly the shape npm/yarn create. The walker's shim-only carve-out
+    keeps ``.bin`` readable, so a shell spawning the local CLI by relative
+    path (what an ``npm test`` script does) succeeds. Without the
+    carve-out ``.bin`` would be tmpfs-masked, the shim would be
+    unreachable, and the shell would fail with "not found". Driving the
+    command proves the install stays RUNNABLE, not merely readable.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    nm = cwd / "node_modules"
+    # A real package that holds the executable the shim points at.
+    pkg_bin = nm / "greeter" / "bin"
+    pkg_bin.mkdir(parents=True)
+    script = pkg_bin / "greet.sh"
+    script.write_text("#!/bin/sh\necho hello-from-shim\n")
+    script.chmod(0o755)
+    # The .bin shim: a relative, non-escaping symlink into the package.
+    bin_dir = nm / ".bin"
+    bin_dir.mkdir()
+    (bin_dir / "greet").symlink_to("../greeter/bin/greet.sh")
+
+    backend = _make_backend()
+    policy = _make_policy(cwd)
+    # A shell running the local CLI by relative path — the PATH-free
+    # spawn pattern an ``npm test`` / ``npx`` invocation uses.
+    argv = backend.wrap_launcher_argv(
+        ["/bin/sh", "-c", "exec ./node_modules/.bin/greet"],
+        policy,
+        cwd,
+    )
+    completed = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        cwd=str(cwd),
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"local CLI shim failed to run through the sandbox "
+        f"(rc={completed.returncode}); stderr={completed.stderr[-400:]!r}. "
+        "A tmpfs mask over .bin would make the shim unreachable."
+    )
+    assert completed.stdout.strip() == "hello-from-shim", (
+        f"shim ran but produced unexpected output: {completed.stdout!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Rule-list invariants (no subprocess needed)
 # ---------------------------------------------------------------------------
 
