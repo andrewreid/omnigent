@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.inner._cwd_scan import (
-    _ESCAPING_SYMLINK_COALESCE_THRESHOLD,
+    _SUBTREE_COLLAPSE_THRESHOLD,
     MaskedEntry,
     scan_cwd_mask_entries,
 )
@@ -45,7 +45,6 @@ def _scan(
     safe_roots: list[Path] | None = None,
     max_entries: int = _DEFAULT_MAX,
     overflow: str = "error",
-    coalesce_names: list[str] | None = None,
 ) -> list[MaskedEntry]:
     """
     Thin wrapper that mirrors what each backend passes through.
@@ -69,33 +68,17 @@ def _scan(
         cap/overflow tests can assert on the raised :class:`OSError`;
         note this differs from the production default (``"warn"``),
         which is pinned in the spec-parser tests instead.
-    :param coalesce_names: Directory basenames masked wholesale (as a
-        single ``kind="dir"`` entry) and pruned when un-allowed.
-        ``None`` (the default) lets the walker apply its own default
-        (:data:`_DEFAULT_COALESCE_DIRS`); pass ``[]`` to disable the
-        named-dir coalesce for the plain-DFS contrast cases.
     :returns: List of :class:`MaskedEntry`.
     """
     roots = [cwd.resolve(strict=False), *_SYSTEM_SAFE_ROOTS]
     if safe_roots is not None:
         roots = safe_roots
-    # Only override the walker's default when the test asked to, so the
-    # common case still exercises the production default (node_modules).
-    if coalesce_names is None:
-        return scan_cwd_mask_entries(
-            cwd.resolve(strict=False),
-            allow_hidden=allow_hidden or [],
-            safe_roots=roots,
-            max_entries=max_entries,
-            overflow=overflow,
-        )
     return scan_cwd_mask_entries(
         cwd.resolve(strict=False),
         allow_hidden=allow_hidden or [],
         safe_roots=roots,
         max_entries=max_entries,
         overflow=overflow,
-        coalesce_names=coalesce_names,
     )
 
 
@@ -398,244 +381,261 @@ def test_overflow_unlimited_walks_full_tree(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Coalesced regenerable dep dirs (node_modules et al. masked wholesale)
+# Subtree collapse of escaping-symlink farms (target-agnostic, no names)
 # ---------------------------------------------------------------------------
 
 
-def _make_escaping_symlink_farm(directory: Path, count: int) -> None:
+def _make_spread_escaping_farm(node_modules: Path, packages: int) -> int:
     """
-    Fill *directory* with *count* symlinks that escape every safe root.
+    Build a cross-store pnpm-shaped ``node_modules``: escaping symlinks
+    SPREAD one-per-directory across a ``.pnpm`` store mirror, plus one
+    top-level package symlink each.
 
-    Each link points at ``/etc/hostname`` (a real file outside the
-    test's ``[cwd, /usr]`` safe roots) so the walker classifies it as an
-    escaping symlink — the same shape a pnpm ``node_modules/.pnpm`` store
-    presents. The directory is created if it does not exist.
+    Mirrors the real layout measured on a cross-filesystem pnpm store —
+    each ``.pnpm/<pkg>@1.0.0/node_modules/<pkg>`` is a single symlink to
+    ``/etc/hostname`` (a real file outside the test's ``[cwd, /usr]``
+    safe roots, so it counts as escaping), and ``node_modules/<pkg>`` is
+    another. No single directory holds enough escaping links to trip a
+    per-directory dominance test, so ONLY the subtree aggregate can.
 
-    :param directory: Directory to populate (created if missing).
-    :param count: Number of escaping symlinks to create.
+    :param node_modules: The ``node_modules`` dir to build under.
+    :param packages: Number of package versions to synthesise.
+    :returns: The total number of escaping symlinks created.
     """
-    directory.mkdir(parents=True, exist_ok=True)
-    target = Path("/etc/hostname")
-    for i in range(count):
-        (directory / f"link_{i:05d}").symlink_to(target)
+    escaping_target = Path("/etc/hostname")
+    pnpm = node_modules / ".pnpm"
+    total = 0
+    for i in range(packages):
+        pkg = f"pkg{i:04d}"
+        inner = pnpm / f"{pkg}@1.0.0" / "node_modules"
+        inner.mkdir(parents=True)
+        (inner / pkg).symlink_to(escaping_target)  # store-escaping link
+        total += 1
+        (node_modules / pkg).symlink_to(escaping_target)  # top-level link
+        total += 1
+    return total
 
 
-def test_coalesced_dep_dir_masked_as_single_dir_and_pruned(tmp_path: Path) -> None:
+def test_cross_store_pnpm_farm_collapses_to_one_mask(tmp_path: Path) -> None:
     """
-    A ``node_modules`` that is NOT on ``allow_hidden`` is masked as a
-    single ``kind="dir"`` entry and its subtree is pruned — the walker
-    never emits a separate entry for anything inside it, even a dotfile.
-
-    This is the core of the arg-explosion fix: whatever lives under a
-    regenerable dep dir collapses to one mask instead of one-per-child.
+    Contract 1: a cross-store pnpm ``node_modules`` — thousands of
+    escaping symlinks SPREAD one-per-dir — collapses to a SINGLE
+    ``kind="dir"`` mask via the subtree aggregate, so bwrap's 9000-arg
+    ceiling is never approached. No name-based rule is involved; the
+    collapse fires purely because escaping masks dominate the subtree.
     """
     node_modules = tmp_path / "node_modules"
     node_modules.mkdir()
-    (node_modules / ".npmrc").write_text("token=zzz")
-    (node_modules / "m1.txt").write_text("x")
-    (tmp_path / "regular.txt").write_text("x")
-
-    entries = _scan(tmp_path)
-    nm_entry = _entry_for(entries, node_modules)
-    assert nm_entry is not None and nm_entry.kind == "dir", (
-        "node_modules must be masked as a single directory entry."
-    )
-    nested = [e for e in entries if str(e.path).startswith(str(node_modules) + os.sep)]
-    assert nested == [], (
-        "The coalesced node_modules subtree must be pruned — no per-child "
-        f"masks. Got nested entries: {[e.path for e in nested]}"
-    )
-    # Sibling project content stays visible.
-    assert _entry_for(entries, tmp_path / "regular.txt") is None
-
-
-def test_coalesced_dep_dir_symlink_farm_emits_exactly_one_entry(tmp_path: Path) -> None:
-    """
-    A pnpm-shaped ``node_modules`` — thousands of escaping store links —
-    produces EXACTLY ONE :class:`MaskedEntry`, not one per link. This is
-    the concrete regression the fix targets: without coalescing this
-    farm would emit tens of thousands of masks and blow bwrap's
-    9000-arg ceiling. The subtree must not be visited past the dir.
-    """
-    farm = tmp_path / "node_modules" / ".pnpm"
-    _make_escaping_symlink_farm(farm, 500)
+    total = _make_spread_escaping_farm(node_modules, packages=120)
+    assert total >= _SUBTREE_COLLAPSE_THRESHOLD
 
     entries = _scan(tmp_path, overflow="unlimited")
+    nm_entry = _entry_for(entries, node_modules)
+    assert nm_entry is not None and nm_entry.kind == "dir", (
+        "The spread escaping farm must collapse to a single node_modules "
+        f"dir mask. Got {[(e.path, e.kind) for e in entries]}"
+    )
+    under = [e for e in entries if str(e.path).startswith(str(node_modules) + os.sep)]
+    assert under == [], f"Collapsed farm must emit no per-link masks; got {len(under)} nested."
+    assert len(entries) == 1, f"Whole farm should be one mask; got {len(entries)}."
+
+
+def test_real_npm_node_modules_stays_readable(tmp_path: Path) -> None:
+    """
+    Contract 2: a real npm/yarn ``node_modules`` (real package dirs, no
+    escaping symlinks) is NOT masked and its package content stays
+    readable, so project commands (``node app.js`` / local CLIs) work.
+    There is no name-based masking: the dir simply has ~zero masks and
+    never collapses. (A ``.bin`` dotdir would be masked like any hidden
+    dir — omitted here to keep the "readable package content" assertion
+    unambiguous; the CLI-target-under-.bin path is covered in the bwrap
+    re-overlay matrix.)
+    """
     node_modules = tmp_path / "node_modules"
-    nm_entry = _entry_for(entries, node_modules)
-    assert nm_entry is not None and nm_entry.kind == "dir", (
-        "node_modules must coalesce to a single dir mask before its symlink farm is ever walked."
-    )
-    under_nm = [e for e in entries if str(e.path).startswith(str(node_modules) + os.sep)]
-    assert under_nm == [], (
-        "No entry under the coalesced node_modules may be emitted; the "
-        f"symlink farm must be pruned unvisited. Got: {len(under_nm)} entries."
-    )
-    assert len(entries) == 1, (
-        f"The whole tree should collapse to one mask (node_modules). "
-        f"Got {len(entries)}: {[(e.path, e.kind) for e in entries]}"
-    )
-
-
-def test_allowed_dep_dir_is_readable_not_masked_and_not_walked(tmp_path: Path) -> None:
-    """
-    Operator opt-in wins: when ``node_modules`` is on ``allow_hidden``
-    it is left readable — NOT masked — and (per the allow_hidden rule)
-    NOT deep-walked, so its interior escaping symlinks are not masked
-    either. This preserves "allowed = readable" and keeps an allowed
-    dep dir from becoming a source of per-interior masks.
-    """
-    farm = tmp_path / "node_modules" / ".pnpm"
-    _make_escaping_symlink_farm(farm, 200)
-
-    entries = _scan(tmp_path, allow_hidden=["node_modules"], overflow="unlimited")
-    assert _entry_for(entries, tmp_path / "node_modules") is None, (
-        "An allow_hidden node_modules must be readable, not masked."
-    )
-    under_nm = [
-        e for e in entries if str(e.path).startswith(str(tmp_path / "node_modules") + os.sep)
-    ]
-    assert under_nm == [], (
-        "An allow_hidden dir must not be deep-walked; its interior "
-        f"escaping symlinks must not be masked. Got: {len(under_nm)} entries."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Generic symlink-farm collapse (Part 1 backstop, non-dep dirs)
-# ---------------------------------------------------------------------------
-
-
-def test_generic_symlink_farm_collapses_to_single_dir(tmp_path: Path) -> None:
-    """
-    A directory NOT in the coalesce set but dominated by escaping
-    symlinks (>= the threshold, >= the dominance fraction) is masked
-    once as a ``kind="dir"`` entry and pruned. Backstop for symlink
-    farms that aren't a known regenerable dep dir.
-    """
-    farm = tmp_path / "store"
-    _make_escaping_symlink_farm(farm, _ESCAPING_SYMLINK_COALESCE_THRESHOLD + 10)
+    for i in range(150):
+        pkg = node_modules / f"pkg{i:04d}"
+        pkg.mkdir(parents=True)
+        (pkg / "index.js").write_text("module.exports = {}\n")
+        (pkg / "package.json").write_text("{}\n")
+    # Relative (non-escaping) inter-package link, like real npm nesting.
+    (node_modules / "pkg0001" / "dep").symlink_to("../pkg0000")
 
     entries = _scan(tmp_path, overflow="unlimited")
-    farm_entry = _entry_for(entries, farm)
-    assert farm_entry is not None and farm_entry.kind == "dir", (
-        "A near-pure escaping-symlink farm must collapse to one dir mask."
-    )
-    under = [e for e in entries if str(e.path).startswith(str(farm) + os.sep)]
-    assert under == [], f"The collapsed farm must be pruned. Got nested: {[e.path for e in under]}"
+    assert _entry_for(entries, node_modules) is None, "A real npm node_modules must NOT be masked."
+    assert _entry_for(entries, node_modules / "pkg0000") is None
+    assert _entry_for(entries, node_modules / "pkg0000" / "index.js") is None
+    # No mask anywhere under it (no dotfiles, no escaping links).
+    under = [e for e in entries if str(e.path).startswith(str(node_modules) + os.sep)]
+    assert under == [], f"Real node_modules must stay fully readable; got {under}."
 
 
-def test_generic_collapse_does_not_fire_below_threshold(tmp_path: Path) -> None:
+def test_collapse_does_not_fire_below_threshold(tmp_path: Path) -> None:
     """
-    A handful of escaping symlinks (below the threshold) are masked
-    INDIVIDUALLY, not collapsed — the whole-dir collapse must not fire
-    for the ordinary "a few escaping links" case.
+    A handful of escaping symlinks (below the subtree threshold) are
+    masked INDIVIDUALLY, not collapsed — the collapse must not fire for
+    the ordinary "a few escaping links" case.
     """
     sub = tmp_path / "sub"
-    _make_escaping_symlink_farm(sub, 3)
+    sub.mkdir()
+    for i in range(3):
+        (sub / f"link_{i:05d}").symlink_to("/etc/hostname")
 
     entries = _scan(tmp_path, overflow="unlimited")
-    assert _entry_for(entries, sub) is None, (
-        "A dir with only a few escaping links must not be collapsed."
-    )
+    assert _entry_for(entries, sub) is None, "Few escaping links must not collapse the dir."
     for i in range(3):
-        link = sub / f"link_{i:05d}"
-        entry = _entry_for(entries, link)
+        entry = _entry_for(entries, sub / f"link_{i:05d}")
         assert entry is not None and entry.kind == "file", (
-            f"{link} must be masked individually below the collapse threshold."
+            "Each escaping link must be masked individually below the threshold."
         )
 
 
-def test_generic_collapse_respects_dominance_and_keeps_content_visible(tmp_path: Path) -> None:
+def test_collapse_respects_dominance_and_keeps_source_readable(tmp_path: Path) -> None:
     """
     A directory with many escaping symlinks but ALSO abundant readable
-    content (so links are below the dominance fraction) is NOT
-    collapsed: readable files stay visible and each link is masked
-    individually. Guards against over-masking browsable project trees.
+    source (so masks are below the dominance fraction) is NOT collapsed:
+    readable files stay visible and each link is masked individually.
+    Guards against hiding browsable project content wholesale.
     """
     mixed = tmp_path / "mixed"
     mixed.mkdir()
-    # Threshold escaping links, but an equal amount of readable files so
-    # links are only ~50% of children — under the dominance fraction.
-    _make_escaping_symlink_farm(mixed, _ESCAPING_SYMLINK_COALESCE_THRESHOLD)
-    for i in range(_ESCAPING_SYMLINK_COALESCE_THRESHOLD):
+    n = _SUBTREE_COLLAPSE_THRESHOLD + 10
+    for i in range(n):
+        (mixed / f"link_{i:05d}").symlink_to("/etc/hostname")
+    # Nine readable files per link → masks are ~10% of content, well under
+    # the 0.9 dominance fraction.
+    for i in range(n * 9):
         (mixed / f"src_{i:05d}.txt").write_text("readable")
 
     entries = _scan(tmp_path, overflow="unlimited")
     assert _entry_for(entries, mixed) is None, (
-        "A dir mixing readable content with links must not be hidden "
-        "wholesale — the dominance guard must keep it browsable."
+        "A dir where readable source dominates must not be collapsed."
     )
-    # A readable file stays visible; a link is still masked individually.
     assert _entry_for(entries, mixed / "src_00000.txt") is None
     link_entry = _entry_for(entries, mixed / "link_00000")
-    assert link_entry is not None and link_entry.kind == "file"
+    assert link_entry is not None and link_entry.kind == "file", (
+        "Below dominance, escaping links are masked individually."
+    )
 
 
-# ---------------------------------------------------------------------------
-# allow_hidden directories are readable, not deep-walked (Part 3)
-# ---------------------------------------------------------------------------
-
-
-def test_allow_hidden_dir_is_not_deep_walked_for_masking(tmp_path: Path) -> None:
+def test_collapse_fires_at_shallowest_dir_keeping_sibling_source(tmp_path: Path) -> None:
     """
-    An ``allow_hidden`` directory (e.g. ``.git`` when the operator sets
-    ``cwd_allow_hidden: [".git"]``) passes through readable and is NOT
-    descended into: an interior escaping symlink (mimicking a
-    ``.git/worktrees`` admin link) is left unmasked, so the allowed dir
-    never becomes a source of per-interior mask emits. A sibling
-    non-allowed dotfile must still be masked — the dotfile guarantee is
-    unchanged for entries that were not opted in.
+    Shallowest-collapse: a real source tree that merely CONTAINS a nested
+    farm keeps its own files readable — only the nested farm directory
+    collapses, not the ancestor source dir.
+
+    ``src`` holds readable source AND ``src/vendor/node_modules`` (a farm).
+    The farm is dominated only within ``vendor``/``node_modules``, not
+    within ``src`` (whose readable files dilute it), so collapse fires at
+    the farm, and ``src``'s own source stays visible.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(200):
+        (src / f"module_{i:04d}.js").write_text("export default 1\n")
+    node_modules = src / "vendor" / "node_modules"
+    node_modules.mkdir(parents=True)
+    _make_spread_escaping_farm(node_modules, packages=120)
+
+    entries = _scan(tmp_path, overflow="unlimited")
+    # src's own readable source is untouched.
+    assert _entry_for(entries, src / "module_0000.js") is None
+    assert _entry_for(entries, src) is None
+    # The nested farm collapses (at node_modules or its vendor parent).
+    collapse_dirs = [e for e in entries if e.kind == "dir"]
+    assert any(
+        str(node_modules) == str(e.path) or str(node_modules).startswith(str(e.path) + os.sep)
+        for e in collapse_dirs
+    ), f"Nested farm must collapse to a dir mask; got {[(e.path, e.kind) for e in entries]}"
+    # And nothing above the collapse point (no src collapse) hides source.
+    assert not any(str(e.path) == str(src) for e in entries)
+
+
+# ---------------------------------------------------------------------------
+# allow_hidden directories: readable at top, but walked for nested masks
+# ---------------------------------------------------------------------------
+
+
+def test_allow_hidden_dir_readable_but_nested_secrets_still_masked(tmp_path: Path) -> None:
+    """
+    Contract 3: an ``allow_hidden`` directory (e.g. ``.git``) is readable
+    at the top level (the dir itself is NOT masked), but is still WALKED
+    so non-allowed nested secrets are masked — no blanket-expose of
+    nested dotfiles.
     """
     git_dir = tmp_path / ".git"
-    wt = git_dir / "worktrees" / "wt1"
-    wt.mkdir(parents=True)
-    (wt / "gitdir").symlink_to("/etc/hostname")  # escapes cwd + /usr
-    (tmp_path / ".env").write_text("SECRET=1")
+    git_dir.mkdir()
+    (git_dir / "config").write_text("[core]\n")  # readable git config
+    # Nested secrets the operator did NOT allow — must be masked.
+    (git_dir / ".env").write_text("SECRET=1")
+    aws = git_dir / ".aws"
+    aws.mkdir()
+    (aws / "credentials").write_text("[default]\n")
+    (git_dir / "leak").symlink_to("/etc/hostname")  # nested escaping link
 
     entries = _scan(tmp_path, allow_hidden=[".git"])
-    assert _entry_for(entries, git_dir) is None, ".git (allowed) must be readable."
-    under_git = [e for e in entries if str(e.path).startswith(str(git_dir) + os.sep)]
-    assert under_git == [], (
-        "allow_hidden .git must not be deep-walked; its interior escaping "
-        f"symlinks must not be masked. Got: {[e.path for e in under_git]}"
+    assert _entry_for(entries, git_dir) is None, ".git (allowed) must be readable at top."
+    assert _entry_for(entries, git_dir / "config") is None, "git config stays readable."
+    env_entry = _entry_for(entries, git_dir / ".env")
+    assert env_entry is not None and env_entry.kind == "file", "Nested .env must be masked."
+    aws_entry = _entry_for(entries, aws)
+    assert aws_entry is not None and aws_entry.kind == "dir", "Nested .aws must be masked."
+    leak_entry = _entry_for(entries, git_dir / "leak")
+    assert leak_entry is not None and leak_entry.kind == "file", (
+        "Nested escaping symlink must be masked."
     )
-    # The non-allowed sibling dotfile is still masked.
-    env_entry = _entry_for(entries, tmp_path / ".env")
-    assert env_entry is not None and env_entry.kind == "file"
 
 
-# The dot-prefixed coalesce basenames. When NOT on ``allow_hidden`` the
-# dotfile rule masks + prunes them before the coalesce branch is
-# reached, so membership in the coalesce set is a no-op for them.
-_COALESCE_DOT_DIRS = [".venv", ".mypy_cache", ".codex-tmp"]
-
-
-@pytest.mark.parametrize("dotdir", _COALESCE_DOT_DIRS)
-def test_unallowed_coalesce_dot_dir_is_masked_not_walked(dotdir: str, tmp_path: Path) -> None:
+def test_allow_hidden_dir_with_nested_farm_collapses_inside(tmp_path: Path) -> None:
     """
-    When a coalesce dot-dir is NOT on ``allow_hidden``, the dotfile rule
-    masks it as a directory and prunes it (its contents never walked) —
-    membership in the coalesce set changes nothing here because the
-    dotfile decision runs first.
-
-    This guards the branch ordering: masking is decided before the
-    coalesce branch, so a name in the coalesce set can never be promoted
-    to "walked" while un-allowed.
+    Contract 4: coalescing applies WITHIN an allow_hidden dir. A dense
+    interior farm (mimicking a large ``.git/worktrees`` escaping-symlink
+    admin tree) collapses to a few masks instead of thousands, while the
+    allowed dir's own readable content keeps it from collapsing wholesale.
     """
-    cache = tmp_path / dotdir
-    cache.mkdir()
-    (cache / ".inner_secret").write_text("SECRET=1")
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    # Readable git content so .git itself is not dominated.
+    for i in range(50):
+        (git_dir / f"obj_{i:04d}").write_text("blob\n")
+    worktrees = git_dir / "worktrees"
+    worktrees.mkdir()
+    n = _SUBTREE_COLLAPSE_THRESHOLD + 20
+    for i in range(n):
+        (worktrees / f"wt_{i:05d}").symlink_to("/etc/hostname")
+
+    entries = _scan(tmp_path, allow_hidden=[".git"], overflow="unlimited")
+    assert _entry_for(entries, git_dir) is None, ".git must stay readable at top."
+    # The interior farm collapsed rather than emitting one mask per link.
+    dir_masks_under_git = [
+        e for e in entries if e.kind == "dir" and str(e.path).startswith(str(git_dir) + os.sep)
+    ]
+    assert any(str(e.path) == str(worktrees) for e in dir_masks_under_git), (
+        f"The .git/worktrees farm must collapse to one dir mask; "
+        f"got {[(e.path, e.kind) for e in entries]}"
+    )
+    per_link = [e for e in entries if str(e.path).startswith(str(worktrees) + os.sep)]
+    assert per_link == [], "Collapsed worktrees farm must not emit per-link masks."
+
+
+def test_unallowed_dotdir_is_masked_and_pruned(tmp_path: Path) -> None:
+    """
+    A non-allowed dot-directory is masked as a directory and pruned (its
+    contents never walked) — unchanged by the redesign. Guards that the
+    dotfile decision still runs before recursion.
+    """
+    for dotdir in (".venv", ".aws", ".ssh"):
+        cache = tmp_path / dotdir
+        cache.mkdir()
+        (cache / ".inner_secret").write_text("SECRET=1")
     entries = _scan(tmp_path)  # allow_hidden=[] → mask every dotfile
-    cache_entry = _entry_for(entries, cache)
-    assert cache_entry is not None and cache_entry.kind == "dir", (
-        f"Un-allowed {dotdir} must be masked as a directory, not walked."
-    )
-    nested = [e for e in entries if str(e.path).startswith(str(cache) + os.sep)]
-    assert nested == [], (
-        f"Walker descended into a masked {dotdir}; masking + pruning must "
-        f"win for an un-allowed dotdir. Got: {[e.path for e in nested]}"
-    )
+    for dotdir in (".venv", ".aws", ".ssh"):
+        cache = tmp_path / dotdir
+        cache_entry = _entry_for(entries, cache)
+        assert cache_entry is not None and cache_entry.kind == "dir", (
+            f"Un-allowed {dotdir} must be masked as a directory, not walked."
+        )
+        nested = [e for e in entries if str(e.path).startswith(str(cache) + os.sep)]
+        assert nested == [], f"Masked {dotdir} must be pruned; got {[e.path for e in nested]}"
 
 
 # ---------------------------------------------------------------------------

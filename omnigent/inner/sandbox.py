@@ -74,10 +74,12 @@ class SandboxPolicy:
         (:func:`omnigent.inner._cwd_scan.scan_cwd_mask_entries`), which
         decides which entries to mask; each backend then emits its own
         token (bwrap ``--tmpfs`` / ``--bind /dev/null``, seatbelt
-        ``(deny ... (subpath/literal ...))``). A basename in this list
-        is left readable and, for a directory, is NOT descended into
-        (its interior is not masked). ``None`` means the policy carries
-        no allowlist and the consuming backend applies its own default.
+        ``(deny ... (subpath/literal ...))``). A basename in this list is
+        left readable at the top level, but an allowed *directory* is
+        still WALKED so its non-allowed nested secrets (interior dotfiles
+        / escaping symlinks) are masked as normal. ``None`` means the
+        policy carries no allowlist and the consuming backend applies its
+        own default.
     :param cwd_hidden_scan_max_entries: Cap on filesystem entries the
         shared cwd walker visits, applied by both the bwrap and
         seatbelt backends. Pair with :attr:`cwd_hidden_scan_overflow`
