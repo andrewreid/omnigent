@@ -6322,6 +6322,75 @@ async def _validate_session_workspace_no_host(
         ) from exc
 
 
+async def _classify_and_resolve_create_workspace(
+    *,
+    body: SessionCreateRequest,
+    agent: Any,
+    agent_cache: AgentCache | None,
+    user_id: str | None,
+    request: Request,
+) -> str | None:
+    """Classify a JSON ``POST /v1/sessions`` topology and resolve its workspace.
+
+    A single classification pass over the create topologies, so the new
+    no-host canonical validation fires on EXACTLY ONE of them and is a
+    clean pass-through for the rest (each already handled elsewhere):
+
+    - ``workspace`` unset            -> ``None`` (nothing to resolve).
+    - ``host_id`` set                -> host-side validation via
+      ``host.stat`` (the workspace is a path on that host, not on the
+      server) — the pre-existing bound-session path.
+    - ``host_type`` "managed"        -> PASS THROUGH unchanged. The
+      workspace is a git repository URL the server clones into the
+      provisioned sandbox later; validating it as a local path would
+      wrongly reject the URL.
+    - external, no host_id, explicit -> the ONLY server-side canonical
+      no-host validation, and only when co-location is proven
+      (``OMNIGENT_LOCAL_COLOCATED_RUNNER``). A child of a remote
+      ``omnigent run --server`` session inherits a remote runner but has
+      no host_id; validating server-local would resolve the wrong
+      filesystem, so reject the override unless co-location is proven.
+
+    :param body: The validated create request.
+    :param agent: The bound agent (for its ``os_env.cwd`` boundary).
+    :param agent_cache: Cache for loading the agent spec.
+    :param user_id: Authenticated caller (host-ownership checks).
+    :param request: FastAPI request (carries the host registry/store).
+    :returns: The workspace string to store on the session row, or
+        ``None``.
+    :raises OmnigentError: ``INVALID_INPUT`` on a rejected override.
+    """
+    if body.workspace is None:
+        return None
+    if body.host_id is not None:
+        return await _validate_session_workspace(
+            user_id=user_id,
+            host_id=body.host_id,
+            workspace=body.workspace,
+            agent=agent,
+            agent_cache=agent_cache,
+            request=request,
+        )
+    if body.host_type == "managed":
+        # Repo-URL workspace for the managed clone path — pass through.
+        return body.workspace
+    # External, no host_id, explicit override.
+    if not local_colocated_runner_enabled():
+        raise OmnigentError(
+            "workspace override is only supported on a co-located "
+            "auto-spawned local server, not a remote --server target",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # Enforce path-safety so it cannot escape the agent's os_env.cwd
+    # boundary — the runner honors this stored workspace as the session's
+    # sandbox cwd/scan-root (app._session_runtime_cwd).
+    return await _validate_session_workspace_no_host(
+        workspace=body.workspace,
+        agent=agent,
+        agent_cache=agent_cache,
+    )
+
+
 @dataclass
 class _HostLaunchAttempt:
     """
@@ -12457,35 +12526,18 @@ async def _create_session_from_existing_agent(
                 if runner_owner is not None and runner_owner != user_id:
                     inherited_runner_id = None
 
-    # Workspace validation: if the caller is binding to a host,
-    # they must also pass a workspace, and the workspace must
-    # satisfy the agent's os_env.cwd boundary on that host (per
-    # designs/SESSION_WORKSPACE_SELECTION.md). Done before
-    # create_conversation so a bad workspace never produces a row.
-    # With git worktree creation, the validated path is the source
-    # repo; the worktree it produces becomes the stored workspace.
-    canonical_workspace: str | None = body.workspace
-    if body.host_id is not None:
-        canonical_workspace = await _validate_session_workspace(
-            user_id=user_id,
-            host_id=body.host_id,
-            workspace=body.workspace,
-            agent=agent,
-            agent_cache=agent_cache,
-            request=request,
-        )
-    elif body.workspace is not None:
-        # Explicit workspace override with no host to stat against
-        # (sub-agent spawn inheriting the parent runner's affinity, e.g.
-        # sys_session_create with `workspace`). Still enforce
-        # path-safety so it cannot escape the agent's os_env.cwd
-        # boundary — the runner honors this stored workspace as the
-        # session's sandbox cwd/scan-root (app._session_runtime_cwd).
-        canonical_workspace = await _validate_session_workspace_no_host(
-            workspace=body.workspace,
-            agent=agent,
-            agent_cache=agent_cache,
-        )
+    # Classify the create topology once and resolve the workspace to
+    # store. Done before create_conversation so a bad workspace never
+    # produces a row. With git worktree creation the validated path is
+    # the source repo; the worktree it produces becomes the stored
+    # workspace.
+    canonical_workspace: str | None = await _classify_and_resolve_create_workspace(
+        body=body,
+        agent=agent,
+        agent_cache=agent_cache,
+        user_id=user_id,
+        request=request,
+    )
 
     # Git worktree options (optional). Two modes on body.git:
     #  - create (default): make a worktree; it becomes the stored
@@ -12752,36 +12804,29 @@ def _create_session_from_bundle(
     # ``omnigent run`` uploads the operator's own bundle through this same
     # path, so custom handlers must keep working (the operator already has
     # code execution — the restriction would add no security there).
-    # Workspace override on the multipart/CLI path (``omnigent run
-    # --workspace``). Deny-by-default: the server-side canonical
-    # validation below (realpath on the SERVER filesystem) is only sound
-    # when the server shares the runner's filesystem, so honor a
-    # workspace ONLY on the co-located local no-host surface and REJECT
-    # it (fail-fast, before storing the bundle) on every other topology
-    # instead of validating against the wrong filesystem:
-    #   - host_id set  => the runner launches on a separate host; the
-    #     workspace is a path there, not on this server (FIX 1).
-    #   - server not proven co-located with the runner => its realpath
-    #     resolves the WRONG filesystem. Gate on
-    #     local_colocated_runner_enabled() (OMNIGENT_LOCAL_COLOCATED_RUNNER),
-    #     set ONLY by the auto-spawn-a-loopback-server paths that start
-    #     the server on the runner's own host/filesystem. NOT the auth
-    #     marker local_single_user_enabled(), which a remote auth-disabled
-    #     Docker container also sets (deploy/docker/entrypoint.py) — that
-    #     would validate against an unrelated server filesystem. Fails
-    #     closed on every deployed / remote / manually-started server.
-    if metadata.workspace is not None:
-        if metadata.host_id is not None:
-            raise OmnigentError(
-                "workspace override is not supported with host_id",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        if not local_colocated_runner_enabled():
-            raise OmnigentError(
-                "workspace override is only supported on a co-located "
-                "auto-spawned local server, not a remote --server target",
-                code=ErrorCode.INVALID_INPUT,
-            )
+    # Topology classification for a multipart-uploaded workspace. The
+    # server-side canonical validation (realpath on the SERVER fs) is
+    # sound ONLY when the server shares the runner's filesystem, so it
+    # fires on exactly ONE topology and is a pass-through for the rest
+    # (each of which already has its own handling):
+    #   - host_id set        => host-launch on a SEPARATE host; the path
+    #     is not on this server. Reject the override (do not persist an
+    #     unvalidated server path).
+    #   - co-located local   => OMNIGENT_LOCAL_COLOCATED_RUNNER set (the
+    #     auto-spawned loopback server shares the runner's fs) => the one
+    #     canonically-validated surface (below, after the spec loads).
+    #   - NOT co-located     => remote / manually-started server. The
+    #     workspace here is the implicit launch cwd that
+    #     _prepare_chat_session_via_daemon ALWAYS uploads (even without
+    #     --workspace); it must pass THROUGH to the existing host-runner
+    #     path, NOT be validated on the wrong filesystem. An EXPLICIT
+    #     --workspace against a remote server is rejected earlier at the
+    #     CLI, so it never reaches here.
+    if metadata.workspace is not None and metadata.host_id is not None:
+        raise OmnigentError(
+            "workspace override is not supported with host_id",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
     spec = validate_agent_bundle(
         bundle_bytes,
@@ -12792,9 +12837,10 @@ def _create_session_from_bundle(
     # Co-located no-host workspace: canonically validate it against the
     # uploaded agent's os_env.cwd boundary (same chokepoint as the JSON
     # spawn) before it is persisted and later becomes the harness sandbox
-    # cwd / scan-root. Reachable only after the deny-by-default gate
-    # above, so host_id is None and the server shares the runner's fs.
-    if metadata.workspace is not None:
+    # cwd / scan-root. host_id is already excluded above; the co-location
+    # token proves server fs == runner fs. Non-co-located servers skip
+    # this and pass the workspace through unchanged.
+    if metadata.workspace is not None and local_colocated_runner_enabled():
         from omnigent.server.routes._workspace_validation import (
             WorkspaceValidationError,
             validate_workspace_no_host,

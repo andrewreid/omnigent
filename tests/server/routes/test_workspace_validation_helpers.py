@@ -159,6 +159,28 @@ class TestValidateWorkspaceNoHost:
         with pytest.raises(WorkspaceValidationError, match="not an absolute path"):
             validate_workspace_no_host(workspace=str(repo), spec_cwd="~/work")
 
+    def test_dot_slash_subdir_present_is_accepted(self, tmp_path: Path) -> None:
+        """B4: os_env.cwd './src' requires <workspace>/src to exist."""
+        repo = tmp_path / "repo"
+        (repo / "src").mkdir(parents=True)
+        assert validate_workspace_no_host(
+            workspace=str(repo), spec_cwd="./src"
+        ) == os.path.realpath(str(repo))
+
+    def test_dot_slash_subdir_missing_is_rejected(self, tmp_path: Path) -> None:
+        """B4: a workspace missing the required './src' subdir is rejected."""
+        repo = tmp_path / "repo"
+        repo.mkdir()  # no src/ inside
+        with pytest.raises(WorkspaceValidationError, match="subdirectory 'src'"):
+            validate_workspace_no_host(workspace=str(repo), spec_cwd="./src")
+
+    def test_dot_slash_subdir_that_is_a_file_is_rejected(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "src").write_text("x")  # file, not dir
+        with pytest.raises(WorkspaceValidationError, match="subdirectory 'src'"):
+            validate_workspace_no_host(workspace=str(repo), spec_cwd="./src")
+
     def test_persisted_path_is_canonical_and_stable_under_runtime_resolve(
         self, tmp_path: Path
     ) -> None:

@@ -383,4 +383,21 @@ def validate_workspace_no_host(*, workspace: str, spec_cwd: str | None) -> str:
             raise WorkspaceValidationError(
                 f"workspace '{workspace}' resolves outside the agent's required path '{spec_cwd}'"
             )
+
+    # Step 6 (mirror the host validator): an ``os_env.cwd`` of the form
+    # ``./subdir`` imposes no containment boundary but REQUIRES that
+    # subdirectory to exist under the picked workspace, so reject a
+    # workspace that is missing it. Placeholders (``.`` / ``./`` / ``""``)
+    # name no subdir and are exempt.
+    if (
+        spec_cwd is not None
+        and spec_cwd.startswith("./")
+        and spec_cwd not in _RELATIVE_CWD_PLACEHOLDERS
+    ):
+        subdir = spec_cwd[2:]
+        subdir_path = os.path.join(canonical_workspace, subdir)
+        if not os.path.isdir(subdir_path):
+            raise WorkspaceValidationError(
+                f"agent expects subdirectory '{subdir}' which is not present at {workspace}"
+            )
     return canonical_workspace

@@ -6682,6 +6682,30 @@ def run(
             )
         resolved_workspace = str(ws_path)
 
+        # --workspace pins the sandbox cwd of a runner served by a
+        # CO-LOCATED auto-spawned local server, so it is only meaningful
+        # for a FRESH daemon-backed launch of a LOCAL agent against a
+        # local server. Every other dispatch shape either drops it
+        # silently (no-AGENT / --no-session -p / resume branches) or
+        # would validate against the wrong filesystem (remote --server),
+        # so FAIL LOUD here instead of running in the default workspace.
+        server_is_remote = server is not None and server != "" and _is_server_url(server)
+        if (
+            target is None
+            or _is_server_url(target)
+            or server_is_remote
+            or ephemeral
+            or resume is not None
+            or resume_latest
+            or fork_session_id is not None
+        ):
+            raise click.ClickException(
+                "--workspace is only supported when launching a local AGENT in a "
+                "fresh session against a co-located local server. It cannot be "
+                "combined with a remote --server, --no-session, --resume/--continue, "
+                "--fork, or a no-AGENT/direct-server launch."
+            )
+
     choice = _split_resume_value(resume)
     # Capture resume-safe CLI parts before dispatch mutates target,
     # harness, or model for no-AGENT launcher mode.
