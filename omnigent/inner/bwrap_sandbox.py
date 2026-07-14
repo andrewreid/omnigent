@@ -430,6 +430,16 @@ class BwrapSandboxBackend(SandboxBackend):
             )
         )
 
+        # Re-expose the exec target if a mask above shadowed it. The
+        # target can live UNDER cwd (e.g. ``cwd/node_modules/.bin/claude``),
+        # and the dotfile/coalesce mask may have just emitted a
+        # ``--tmpfs cwd/node_modules`` that hides it. Because later mounts
+        # win, re-binding the resolved target at its literal path AFTER
+        # the mask restores the exact path the launcher will exec without
+        # un-hiding the rest of the coalesced subtree.
+        if target is not None:
+            bwrap_args += _reexpose_target_after_mask(target, cwd_resolved, policy)
+
         # AF_UNIX control-socket masks. A denied socket
         # (e.g. the managed tmux control socket) lives inside a bound
         # write root — the instance ``private_dir`` — so the helper can
@@ -1067,6 +1077,50 @@ def _path_exists_lstat(path: Path) -> bool:
     return True
 
 
+def _reexpose_target_after_mask(target: str, cwd: Path, policy: SandboxPolicy) -> list[str]:
+    """
+    Return a bind that restores the exec *target* if a mask shadowed it.
+
+    The dotfile / escaping-symlink mask (and in particular the
+    coalesced ``--tmpfs <cwd>/node_modules`` that hides a symlink farm)
+    is emitted after the cwd bind, so a *target* living under a masked
+    subtree — e.g. ``cwd/node_modules/.bin/claude`` — would be hidden
+    before the launcher can exec it. bwrap layers later mounts on top of
+    earlier ones, so re-binding the resolved target at its literal path
+    AFTER the mask restores exactly that path (bwrap creates the
+    intermediate mountpoint inside the tmpfs) without re-exposing the
+    rest of the coalesced subtree.
+
+    The bind is only emitted when the target's literal path falls inside
+    a scope the mask actually walks (``cwd`` or a ``read_paths`` root);
+    a target under ``/usr`` etc. can never be shadowed, so nothing is
+    emitted for it. The bound source is the fully-resolved real file so
+    the literal path is a regular file the kernel can exec directly,
+    independent of any host symlink now hidden by the mask.
+
+    :param target: Absolute path to the binary the launcher will exec.
+    :param cwd: The helper's resolved working directory.
+    :param policy: Sandbox policy; its ``read_roots`` extend the set of
+        scopes a mask could have covered.
+    :returns: ``["--ro-bind-try", <real>, <dst>]`` when a re-overlay
+        is needed, else an empty list.
+    """
+    literal = Path(os.path.abspath(target))
+    scopes = [cwd, *(policy.read_roots or [])]
+    if not any(_is_within(literal, scope, resolve=False) for scope in scopes):
+        return []
+    # Emit at the same coordinate system the mask used: the walker masks
+    # paths under the resolved cwd, so re-bind at the literal basename
+    # under the parent's realpath (matching _ensure_executable_visible)
+    # rather than the un-resolved literal — otherwise a symlinked temp
+    # root (e.g. macOS /tmp -> /private/tmp) would place the overlay at a
+    # path the tmpfs never covered. The source is the fully-resolved real
+    # file so the destination is a regular file the kernel can exec.
+    dst = Path(os.path.realpath(str(literal.parent))) / literal.name
+    real = Path(os.path.realpath(target))
+    return ["--ro-bind-try", str(real), str(dst)]
+
+
 def _check_bwrap_arg_ceiling(bwrap_args: Sequence[str], cwd: Path) -> None:
     """
     Raise before exec if *bwrap_args* would exceed bwrap's arg ceiling.
@@ -1097,12 +1151,20 @@ def _check_bwrap_arg_ceiling(bwrap_args: Sequence[str], cwd: Path) -> None:
         f"bwrap's hard limit of {_BWRAP_MAX_ARGS} — bwrap would abort with "
         f"'Exceeded maximum number of arguments {_BWRAP_MAX_ARGS}' before "
         f"exec. Almost all of these come from the dotfile / escaping-symlink "
-        f"mask, so the likely culprit is a symlink-dense or regenerable "
-        f"directory under {cwd} (e.g. a pnpm node_modules or a large "
-        f".git/worktrees). Add it to os_env.sandbox.cwd_allow_hidden to leave "
-        f"it readable and unmasked, or tune os_env.sandbox."
-        f"cwd_hidden_scan_max_entries / cwd_hidden_scan_overflow to bound the "
-        f"scan."
+        f"mask, so the likely culprit is a symlink-dense directory under "
+        f"{cwd} (a symlink farm the coalescing didn't collapse) or an "
+        f"unusually broad read_paths grant. Safe remediations: narrow the "
+        f"os_env.sandbox.read_paths grant so fewer roots are walked; "
+        f"restructure or remove the offending directory so the walker's "
+        f"whole-dir coalescing applies to it; or, if the directory is on "
+        f"os_env.sandbox.cwd_allow_hidden purely to keep it readable, drop "
+        f"it from the allowlist so it coalesces to a single mask instead of "
+        f"being walked. NOTE: raising cwd_hidden_scan_max_entries cannot cure "
+        f"an argv overflow (it permits MORE masks, not fewer), and switching "
+        f"cwd_hidden_scan_overflow to 'warn'/'unlimited' only lowers the arg "
+        f"count by leaving entries UNMASKED — both EXPOSE directory contents "
+        f"to the sandboxed helper, so use them only as a deliberate exposure "
+        f"trade-off."
     )
 
 

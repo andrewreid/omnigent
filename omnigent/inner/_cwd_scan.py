@@ -349,7 +349,6 @@ def scan_cwd_mask_entries(
             # Directories the walk never finished: the one it was
             # mid-scan of (partial) plus everything still queued.
             not_scanned=list(stack),
-            coalesce_names=coalesce,
             entries_visited=entries_visited,
             masks_emitted=len(entries),
             logger=logger,
@@ -451,7 +450,6 @@ def _handle_scan_overflow(
     overflow: str,
     partial_dir: Path | None,
     not_scanned: Sequence[Path],
-    coalesce_names: set[str],
     entries_visited: int,
     masks_emitted: int,
     logger: logging.Logger,
@@ -473,8 +471,6 @@ def _handle_scan_overflow(
         cap tripped; ``None`` if it tripped at a directory boundary.
     :param not_scanned: Directories still queued that were never
         entered, e.g. ``[Path("/work/src")]``.
-    :param coalesce_names: Regenerable-dep basenames, e.g.
-        ``{"node_modules"}``; used only to flag entries in the summary.
     :param entries_visited: Total entries visited before stopping.
     :param masks_emitted: Number of mask entries produced so far.
     :param logger: The resolved logger to emit the CRITICAL warning on.
@@ -483,7 +479,6 @@ def _handle_scan_overflow(
     unfinished = _summarize_unfinished_dirs(
         partial_dir=partial_dir,
         not_scanned=not_scanned,
-        coalesce_names=coalesce_names,
     )
     message = (
         f"{scope_label} dotfile scan visited more than {max_entries} entries under "
@@ -524,44 +519,35 @@ def _summarize_unfinished_dirs(
     *,
     partial_dir: Path | None,
     not_scanned: Sequence[Path],
-    coalesce_names: set[str],
 ) -> str:
     """
     Build the human-readable "unfinished directories" clause for an
     overflow message.
 
-    Each directory is annotated with its state ("partially scanned"
-    for the one the walk was mid-scan of, "not scanned" for those it
-    never reached) and flagged when its basename is a known
-    regenerable-dep name (so the reader sees a likely culprit). Flagged
-    entries are listed first; the partially-scanned dir leads within
-    each group. The list is truncated to
+    Each directory is annotated with its state: "partially scanned" for
+    the one the walk was mid-scan of (listed first), "not scanned" for
+    those it never reached. The list is truncated to
     :data:`_MAX_UNFINISHED_DIRS_REPORTED` with a ``(+N more)`` suffix.
+
+    Note the walker's coalescing rules mask-and-prune regenerable dep
+    dirs / symlink farms / allow_hidden dirs before they are ever queued,
+    so those never appear here — an unfinished dir is always a plain
+    directory the cap stopped the walk inside of or before.
 
     :param partial_dir: The directory the walk was mid-``scandir`` of
         when the cap tripped. ``None`` when the cap tripped at a
         directory boundary (no dir is partial).
     :param not_scanned: Directories still queued that were never
         entered, e.g. ``[Path("/work/src")]``.
-    :param coalesce_names: Regenerable-dep basenames, e.g.
-        ``{"node_modules"}``. Used only to flag entries in the summary.
     :returns: A ``"; "``-joined summary string. Empty string when there
         is nothing to report (no partial dir and an empty *not_scanned*).
     """
-    # Sort key: flagged (0) before others (1); within a group, the
-    # partially-scanned dir (0) before not-scanned (1).
-    described: list[tuple[tuple[int, int], str]] = []
+    lines: list[str] = []
     if partial_dir is not None:
-        is_dep = partial_dir.name in coalesce_names
-        state = "partially scanned, deprioritized" if is_dep else "partially scanned"
-        described.append(((0 if is_dep else 1, 0), f"{partial_dir} ({state})"))
+        lines.append(f"{partial_dir} (partially scanned)")
     for path in not_scanned:
-        is_dep = path.name in coalesce_names
-        state = "not scanned, deprioritized" if is_dep else "not scanned"
-        described.append(((0 if is_dep else 1, 1), f"{path} ({state})"))
+        lines.append(f"{path} (not scanned)")
 
-    described.sort(key=lambda pair: pair[0])
-    lines = [text for _, text in described]
     shown = lines[:_MAX_UNFINISHED_DIRS_REPORTED]
     remainder = len(lines) - len(shown)
     summary = "; ".join(shown)

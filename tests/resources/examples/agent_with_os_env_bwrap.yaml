@@ -132,11 +132,15 @@ os_env:
 
     # Optional: cap on the number of filesystem entries the recursive
     # dotfile walker visits under cwd. The walker prunes at masked
-    # dot-directories so realistic projects fit well under the
-    # default; non-dot dirs that happen to be huge (``node_modules``,
-    # ``target``, ``dist``) DO count toward the cap. ``node_modules``
-    # is walked LAST so the budget masks the project's own dotfiles
-    # first. Default 50000 is enough for most repos.
+    # dot-directories AND coalesces whole directories instead of
+    # walking them: a regenerable dep dir (``node_modules``, ``.venv``,
+    # ``.mypy_cache``, ``.codex-tmp``) that isn't on cwd_allow_hidden,
+    # or any directory dominated by escaping symlinks, is masked as ONE
+    # entry and pruned — so a pnpm ``node_modules`` symlink farm costs
+    # a single entry/mask, not tens of thousands. A dir on
+    # cwd_allow_hidden is left readable and not descended into. Only
+    # plain non-coalesced dirs count toward the cap, so realistic
+    # projects fit well under the default (50000).
     # cwd_hidden_scan_max_entries: 100000
 
     # Optional: what to do when ``cwd_hidden_scan_max_entries`` is
@@ -144,8 +148,10 @@ os_env:
     # - "warn" (default): emit a logging warning naming the
     #   unfinished directories, stop scanning, and use the partial
     #   mask. Dotfiles past the cap remain visible — acceptable for a
-    #   trusted workspace where blocking every spawn (common with
-    #   ``node_modules``) is worse than a best-effort mask.
+    #   trusted workspace where blocking every spawn is worse than a
+    #   best-effort mask. (Coalescing collapses the big regenerable
+    #   trees, so the cap is now reached only by an unusually large
+    #   tree of plain directories.)
     # - "error": fail at spawn time with an actionable message naming
     #   both spec keys. Fail-Loud — use for untrusted source trees.
     # - "unlimited": ignore the cap and scan the full tree. O(N) on

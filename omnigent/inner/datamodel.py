@@ -544,21 +544,28 @@ class OSEnvSandboxSpec:
     # Maximum number of filesystem entries the shared dotfile/symlink
     # masker (used by both ``linux_bwrap`` and ``darwin_seatbelt``)
     # will visit while walking cwd. The walk prunes at masked
-    # dot-directories so realistic projects fit well under the
-    # default; ``node_modules``, ``target``, etc. that aren't
-    # dot-prefixed do count. Behaviour when the cap is reached is
-    # controlled by :attr:`cwd_hidden_scan_overflow`. Ignored by
-    # backends that don't do filesystem masking.
+    # dot-directories AND coalesces whole directories rather than
+    # walking them: a regenerable dep dir (``node_modules``, ``.venv``,
+    # ``.mypy_cache``, ``.codex-tmp``) that isn't on
+    # :attr:`cwd_allow_hidden`, or any directory dominated by escaping
+    # symlinks, is masked as a single entry and pruned — so a pnpm
+    # ``node_modules`` symlink farm contributes ONE entry, not tens of
+    # thousands. A directory on :attr:`cwd_allow_hidden` is left
+    # readable and not descended into. Only plain, non-coalesced
+    # directories consume the cap, so realistic projects fit well under
+    # the default. Behaviour when the cap is reached is controlled by
+    # :attr:`cwd_hidden_scan_overflow`. Ignored by backends that don't
+    # do filesystem masking.
     cwd_hidden_scan_max_entries: int = 50000
     # What to do when :attr:`cwd_hidden_scan_max_entries` is reached:
     # - ``"warn"`` (default): emit a logging warning, stop scanning, and
     #   return the partial mask. Dotfiles past the cap remain visible.
-    #   This is the default because realistic projects (notably ones
-    #   carrying a ``node_modules`` tree) routinely blow past the cap,
-    #   and a hard failure that blocks every spawn is worse than a
-    #   best-effort mask for the typical trusted-workspace case. The
-    #   walker deprioritizes ``node_modules`` so the budget is spent on
-    #   the rest of the tree first (see :mod:`omnigent.inner._cwd_scan`).
+    #   This is the default because a hard failure that blocks every
+    #   spawn is worse than a best-effort mask for the typical
+    #   trusted-workspace case. Because coalescing already collapses the
+    #   big regenerable trees (``node_modules`` etc.) to one entry each,
+    #   the cap is now reached only by an unusually large tree of plain
+    #   directories (see :mod:`omnigent.inner._cwd_scan`).
     # - ``"error"``: the resolver raises ``OSError`` so the user notices
     #   and tunes the limit explicitly. Fail-Loud — the right pick for
     #   untrusted source trees where an unmasked dotfile is a leak.
@@ -571,9 +578,8 @@ class OSEnvSandboxSpec:
     # - ``"warn"`` is an availability-over-security choice. Dotfiles
     #   past the cap remain readable by the sandboxed agent. If a
     #   credential file (``.aws/credentials``, ``.netrc``, ``.env``,
-    #   ``.ssh/id_*``) sits past the cap — e.g. checked into a
-    #   ``node_modules`` subtree, or planted by a compromised tool
-    #   call earlier in the session — the sandbox will NOT mask it.
+    #   ``.ssh/id_*``) sits past the cap — e.g. planted by a compromised
+    #   tool call earlier in the session — the sandbox will NOT mask it.
     #   The trade-off is acceptable when the operator knows the
     #   workspace doesn't carry secrets and a partial mask is
     #   preferable to an outright failure. A ``CRITICAL`` log line
@@ -582,10 +588,13 @@ class OSEnvSandboxSpec:
     # - ``"unlimited"`` removes the cap entirely. Safer from a
     #   masking standpoint (the whole tree is walked) but lets a
     #   malicious workspace bomb the resolver — a tarbomb with
-    #   millions of dot-files would burn CPU and emit a huge SBPL /
-    #   bwrap-arg list. The :data:`_MAX_PROFILE_BYTES` cap (256 KiB
-    #   on seatbelt) still fail-loud catches the runaway, but the
-    #   walker can spend minutes getting there.
+    #   millions of dot-files would burn CPU. Whole-dir coalescing keeps
+    #   symlink farms from emitting an unbounded mask list, but a tree
+    #   of millions of distinct plain dotfiles can still produce a large
+    #   SBPL / bwrap-arg list. The :data:`_MAX_PROFILE_BYTES` cap
+    #   (256 KiB on seatbelt) and the bwrap arg-ceiling check still
+    #   fail-loud catch the runaway, but the walker can spend minutes
+    #   getting there.
     #
     # The ``"warn"`` default favors availability for the common
     # trusted-workspace case. Switch to ``"error"`` for hostile inputs
