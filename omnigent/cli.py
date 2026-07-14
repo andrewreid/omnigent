@@ -6689,7 +6689,12 @@ def run(
         # silently (no-AGENT / --no-session -p / resume branches) or
         # would validate against the wrong filesystem (remote --server),
         # so FAIL LOUD here instead of running in the default workspace.
-        server_is_remote = server is not None and server != "" and _is_server_url(server)
+        # The ONLY server value compatible with --workspace is the local
+        # sentinel `--server ""` (auto-spawned co-located loopback) or no
+        # --server at all. Treat ANY other nonempty value as remote —
+        # NOT just http(s):// URLs, so a schemaless `--server host.tld`
+        # can't slip past the guard into remote startup.
+        server_is_remote = server is not None and server != ""
         if (
             target is None
             or _is_server_url(target)
