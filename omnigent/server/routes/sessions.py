@@ -155,6 +155,7 @@ from omnigent.server.auth import (
     RESERVED_USER_PUBLIC,
     AuthProvider,
     SharingMode,
+    local_colocated_runner_enabled,
     local_single_user_enabled,
     workspace_sharing_blocked,
 )
@@ -12760,22 +12761,25 @@ def _create_session_from_bundle(
     # instead of validating against the wrong filesystem:
     #   - host_id set  => the runner launches on a separate host; the
     #     workspace is a path there, not on this server (FIX 1).
-    #   - not a local single-user server => a remote state server is not
-    #     co-located with the (laptop) runner, so its realpath resolves
-    #     the wrong filesystem. local_single_user_enabled() is the
-    #     existing marker the managed local-spawn paths set for THE
-    #     user's own loopback server; deployed servers never set it, so
-    #     this fails closed there (FIX 2).
+    #   - server not proven co-located with the runner => its realpath
+    #     resolves the WRONG filesystem. Gate on
+    #     local_colocated_runner_enabled() (OMNIGENT_LOCAL_COLOCATED_RUNNER),
+    #     set ONLY by the auto-spawn-a-loopback-server paths that start
+    #     the server on the runner's own host/filesystem. NOT the auth
+    #     marker local_single_user_enabled(), which a remote auth-disabled
+    #     Docker container also sets (deploy/docker/entrypoint.py) — that
+    #     would validate against an unrelated server filesystem. Fails
+    #     closed on every deployed / remote / manually-started server.
     if metadata.workspace is not None:
         if metadata.host_id is not None:
             raise OmnigentError(
                 "workspace override is not supported with host_id",
                 code=ErrorCode.INVALID_INPUT,
             )
-        if not local_single_user_enabled():
+        if not local_colocated_runner_enabled():
             raise OmnigentError(
-                "workspace override is only supported on a co-located local server, "
-                "not a remote --server target",
+                "workspace override is only supported on a co-located "
+                "auto-spawned local server, not a remote --server target",
                 code=ErrorCode.INVALID_INPUT,
             )
 

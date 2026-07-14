@@ -6,9 +6,11 @@ every other topology (rather than validating against the wrong
 filesystem):
 
 - host_id set  -> reject (the runner launches on a separate host).
-- not a local single-user server -> reject (a remote state server is
-  not co-located with the runner, so server-side realpath would resolve
-  the wrong filesystem).
+- co-location NOT positively proven -> reject. The gate is the
+  ``OMNIGENT_LOCAL_COLOCATED_RUNNER`` token, set ONLY by the auto-spawn
+  loopback-server paths; a remote auth-disabled Docker server sets the
+  single-user AUTH marker but NOT this token, so it is rejected (its
+  realpath would resolve an unrelated filesystem).
 
 Only the co-located local case reaches the canonical
 ``validate_workspace_no_host`` check and is persisted.
@@ -46,8 +48,12 @@ def _meta(**kw: Any) -> SessionCreateMetadata:
 
 
 def test_workspace_with_host_id_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """FIX 1: a multipart workspace + host_id is refused, never persisted."""
-    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    """FIX 1: a multipart workspace + host_id is refused, never persisted.
+
+    Rejected even when co-located (token present) — host_id is a
+    separate-host launch regardless.
+    """
+    monkeypatch.setenv("OMNIGENT_LOCAL_COLOCATED_RUNNER", "1")
     with pytest.raises(OmnigentError) as ei:
         sessions._create_session_from_bundle(
             _STORE,  # conversation_store — never reached (gate fires first)
@@ -59,11 +65,17 @@ def test_workspace_with_host_id_is_rejected(monkeypatch: pytest.MonkeyPatch) -> 
     assert "host_id" in ei.value.message
 
 
-def test_workspace_on_non_colocated_server_is_rejected(
+def test_workspace_on_remote_docker_server_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """FIX 2: without the local single-user marker (remote server), reject."""
-    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
+    """
+    A remote auth-disabled Docker server sets the single-user AUTH marker
+    but NOT the co-location token, so a workspace override is rejected
+    rather than validated against the server's unrelated filesystem.
+    """
+    # Docker-style: auth marker on, co-location token absent.
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    monkeypatch.delenv("OMNIGENT_LOCAL_COLOCATED_RUNNER", raising=False)
     with pytest.raises(OmnigentError) as ei:
         sessions._create_session_from_bundle(
             _STORE,
@@ -72,18 +84,22 @@ def test_workspace_on_non_colocated_server_is_rejected(
             b"bundle-bytes",
         )
     assert ei.value.code == ErrorCode.INVALID_INPUT
-    assert "co-located local server" in ei.value.message
+    assert "co-located" in ei.value.message
 
 
 def test_colocated_local_workspace_is_validated_and_persisted(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """
-    FIX 2 (positive): a co-located local session with a valid workspace
-    still passes — canonically validated and persisted as the canonical
-    path (no regression for ``omnigent run --workspace`` locally).
+    Positive: an auto-spawned co-located local session (co-location
+    token present) with a valid workspace still passes — canonically
+    validated and persisted as the canonical path (no regression for
+    ``omnigent run --workspace`` locally). The single-user auth marker is
+    intentionally NOT set, proving the gate keys off co-location, not
+    auth posture.
     """
-    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    monkeypatch.setenv("OMNIGENT_LOCAL_COLOCATED_RUNNER", "1")
+    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
     repo = tmp_path / "repo"
     repo.mkdir()
 

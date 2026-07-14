@@ -3564,6 +3564,12 @@ def _start_local_server(
         # this lets the host tunnel re-own this machine's host_id across an
         # auth-mode flip without weakening the deployed multi-user boundary.
         "OMNIGENT_LOCAL_SINGLE_USER": "1",
+        # This spawned server shares THIS host's filesystem with the
+        # runner it serves, so server-side realpath refers to the same
+        # tree the runner sandboxes. Gates the `--workspace` override
+        # (see routes/sessions._create_session_from_bundle). Distinct
+        # from the auth marker above; remote Docker deploys never set it.
+        "OMNIGENT_LOCAL_COLOCATED_RUNNER": "1",
     }
     # Mirror create_auth_provider's resolution so this spawn path agrees
     # with the daemon path (host/local_server.py::ensure_local_omnigent_server):

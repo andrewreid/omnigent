@@ -631,6 +631,12 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
     # (header↔accounts changes the owner). Deployed multi-user servers never
     # set this, preserving the W2-class host-hijack boundary.
     child_env["OMNIGENT_LOCAL_SINGLE_USER"] = "1"
+    # This server is auto-spawned on the same host/filesystem as the
+    # runner it serves, so server-side realpath refers to the same tree
+    # the runner sandboxes. Gates the `--workspace` override (see
+    # routes/sessions._create_session_from_bundle). Distinct from the
+    # single-user auth marker above; remote Docker deploys never set it.
+    child_env["OMNIGENT_LOCAL_COLOCATED_RUNNER"] = "1"
     _accounts_mode = resolve_auth_source() == "accounts"
     if _accounts_mode:
         if "OMNIGENT_ACCOUNTS_COOKIE_SECRET" not in os.environ:

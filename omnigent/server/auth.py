@@ -57,6 +57,17 @@ _TRUTHY_STRINGS = ("1", "true", "yes")
 # routes/host_tunnel.py.
 _LOCAL_SINGLE_USER_ENV = "OMNIGENT_LOCAL_SINGLE_USER"
 
+# Set ONLY by the auto-spawn-a-loopback-server-for-``omnigent run`` paths
+# (host/local_server.py + chat.py), which start the state server on the
+# SAME host/filesystem as the runner they serve. Distinct from
+# _LOCAL_SINGLE_USER_ENV, which encodes auth posture ("no login") and IS
+# set by remote auth-disabled Docker containers (deploy/docker/
+# entrypoint.py). This one proves LOCAL-LOOPBACK CO-LOCATION: that
+# server-side filesystem paths (realpath) refer to the same filesystem
+# the runner will sandbox. Deployed / remote / manually-started servers
+# never set it, so co-location-gated features fail closed there.
+_LOCAL_COLOCATED_RUNNER_ENV = "OMNIGENT_LOCAL_COLOCATED_RUNNER"
+
 # Name of the trusted identity header read in header-auth mode.
 # Overridable so deploys behind a proxy that uses a different header
 # name (e.g. Cloudflare Access' ``Cf-Access-Authenticated-User-Email``)
@@ -183,6 +194,25 @@ def local_single_user_enabled() -> bool:
     :returns: ``True`` when the single-user marker is set and truthy.
     """
     return env_var_is_truthy(_LOCAL_SINGLE_USER_ENV)
+
+
+def local_colocated_runner_enabled() -> bool:
+    """Whether this state server is co-located with its runner.
+
+    Reads ``OMNIGENT_LOCAL_COLOCATED_RUNNER``, set ONLY by the
+    auto-spawn-a-loopback-server paths that start the server on the same
+    host/filesystem as the runner it serves (``omnigent run`` /
+    ``omnigent run --server ""``). Unlike
+    :func:`local_single_user_enabled` — which encodes auth posture and is
+    also set by remote auth-disabled Docker containers — this positively
+    proves LOCAL-LOOPBACK CO-LOCATION, so a feature that validates
+    runner-side paths against the SERVER filesystem (realpath) can trust
+    the two filesystems are the same. Deployed / remote / manually
+    started servers never set it, so it fails closed there.
+
+    :returns: ``True`` when the co-location token is set and truthy.
+    """
+    return env_var_is_truthy(_LOCAL_COLOCATED_RUNNER_ENV)
 
 
 def resolve_auth_header() -> str:
