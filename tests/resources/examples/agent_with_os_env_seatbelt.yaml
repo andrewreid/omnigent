@@ -133,8 +133,19 @@ os_env:
     # Optional: allow specific dotfile / dotdir basenames through the
     # recursive cwd dotfile mask. Default is [".venv"] so common
     # Python project layouts keep working. Matching is by basename at
-    # any depth. Entries must be plain names — no ``/``, no ``..``,
-    # no absolute paths (validated at spec parse time).
+    # any depth — ``.venv`` here exempts both ``cwd/.venv`` and
+    # ``cwd/services/api/.venv``. Add ".git" if the agent needs
+    # ``git status`` / ``git log``; add ".gitignore" if it needs to
+    # respect ignore rules. Entries must be plain names — no ``/``,
+    # no ``..``, no absolute paths (validated at spec parse time).
+    #
+    # WARNING: allowing a directory exposes its ordinary (non-dot) files
+    # to the helper. Allowing ".git" makes ``.git/config`` readable, and
+    # ``.git/config`` embeds credentials in any authenticated remote URL
+    # (``https://user:token@host/...``). This is intended (git needs its
+    # config) — but treat allowing a dir as consenting to expose its
+    # non-dot contents. Nested non-allowed dotfiles and escaping symlinks
+    # under the allowed dir stay masked.
     # cwd_allow_hidden: [".venv", ".git", ".gitignore"]
 
     # Optional: cap on the number of filesystem entries the recursive
