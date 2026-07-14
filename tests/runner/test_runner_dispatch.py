@@ -2032,7 +2032,6 @@ def test_clone_os_env_spec_preserves_all_sandbox_fields() -> None:
         "write_paths",
         "write_files",
         "cwd_allow_hidden",
-        "cwd_prune_dirs",
         "env_passthrough",
         "egress_rules",
     ):
@@ -2043,6 +2042,11 @@ def test_clone_os_env_spec_preserves_all_sandbox_fields() -> None:
             f"{name} must be a new list so later mutation of the clone "
             "does not leak into the original spec."
         )
+    # cwd_prune_dirs is an immutable tuple (normalized in
+    # OSEnvSandboxSpec.__post_init__), so it cannot be mutably shared —
+    # object identity is irrelevant. Assert value + immutability.
+    assert clone.sandbox.cwd_prune_dirs == ("node_modules", ".pnpm")
+    assert isinstance(clone.sandbox.cwd_prune_dirs, tuple)
 
 
 def test_effective_runner_os_env_defaults_when_spec_has_no_os_env(monkeypatch) -> None:

@@ -281,11 +281,8 @@ class BwrapSandboxBackend(SandboxBackend):
             write_files=write_files,
             allow_network=sandbox_spec.allow_network,
             cwd_allow_hidden=cwd_allow_hidden,
-            cwd_prune_dirs=(
-                list(sandbox_spec.cwd_prune_dirs)
-                if sandbox_spec.cwd_prune_dirs is not None
-                else None
-            ),
+            # Immutable tuple on both spec and policy — pass through.
+            cwd_prune_dirs=sandbox_spec.cwd_prune_dirs,
             cwd_hidden_scan_max_entries=sandbox_spec.cwd_hidden_scan_max_entries,
             cwd_hidden_scan_overflow=sandbox_spec.cwd_hidden_scan_overflow,
             env_passthrough=(

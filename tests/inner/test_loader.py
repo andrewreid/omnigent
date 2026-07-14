@@ -711,7 +711,7 @@ os_env:
         sb = agent.os_env.sandbox
         self.assertIsNotNone(sb)
         # Regression: loader used to silently drop this field (None).
-        self.assertEqual(sb.cwd_prune_dirs, ["node_modules", ".pnpm"])
+        self.assertEqual(sb.cwd_prune_dirs, ("node_modules", ".pnpm"))
 
     def test_load_agent_def_cwd_prune_dirs_absent_is_none(self):
         """Omitting ``cwd_prune_dirs`` leaves it ``None`` — no pruning."""

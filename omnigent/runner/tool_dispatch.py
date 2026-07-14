@@ -4824,9 +4824,9 @@ def _clone_os_env_spec(spec: Any) -> Any:
             cwd_allow_hidden=(
                 list(sandbox.cwd_allow_hidden) if sandbox.cwd_allow_hidden is not None else None
             ),
-            cwd_prune_dirs=(
-                list(sandbox.cwd_prune_dirs) if sandbox.cwd_prune_dirs is not None else None
-            ),
+            # cwd_prune_dirs is an immutable tuple (normalized in
+            # OSEnvSandboxSpec.__post_init__); replace carries it through
+            # safely — no defensive copy needed.
             env_passthrough=(
                 list(sandbox.env_passthrough) if sandbox.env_passthrough is not None else None
             ),

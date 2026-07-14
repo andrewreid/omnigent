@@ -611,7 +611,12 @@ class OSEnvSandboxSpec:
     # the dependency trees it never opens. Do NOT use this to hide
     # content an agent needs — a pruned directory is invisible to the
     # helper, exactly like any other mask.
-    cwd_prune_dirs: list[str] | None = None
+    #
+    # Immutable by construction: coerced to a ``tuple`` in
+    # ``__post_init__`` so every constructor / ``dataclasses.replace`` /
+    # spec-clone path produces an immutable field that cannot be aliased
+    # or mutated across clones. ``None`` stays ``None`` (no pruning).
+    cwd_prune_dirs: tuple[str, ...] | None = None
     # Environment-variable allowlist for the helper subprocess, beyond
     # the always-passed minimal default (PATH/HOME/USER/LANG/LC_*/etc.;
     # see :data:`omnigent.inner.os_env._DEFAULT_ENV_PASSTHROUGH`).
@@ -680,6 +685,15 @@ class OSEnvSandboxSpec:
     # credential and rejects placeholder leaks) and a backend that
     # hard-isolates the network (``linux_bwrap`` / ``darwin_seatbelt``).
     credential_proxy: CredentialProxySpec | None = None
+
+    def __post_init__(self) -> None:
+        # Coerce ``cwd_prune_dirs`` to an immutable tuple at every
+        # construction point (constructors, ``dataclasses.replace``, and
+        # the terminal / tool_dispatch spec clones all route through
+        # ``__init__``) so no clone can alias or mutate a shared list.
+        # ``None`` is preserved as "no pruning".
+        if self.cwd_prune_dirs is not None and not isinstance(self.cwd_prune_dirs, tuple):
+            self.cwd_prune_dirs = tuple(self.cwd_prune_dirs)
 
 
 @dataclass

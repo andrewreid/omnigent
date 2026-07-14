@@ -732,7 +732,7 @@ def _parse_terminal_env_spec(data: YamlData | str | bool | None) -> TerminalEnvS
     )
 
 
-def _parse_cwd_prune_dirs_legacy(raw: object) -> list[str] | None:
+def _parse_cwd_prune_dirs_legacy(raw: object) -> tuple[str, ...] | None:
     """
     Validate ``os_env.sandbox.cwd_prune_dirs`` on the legacy loader path.
 
@@ -744,9 +744,12 @@ def _parse_cwd_prune_dirs_legacy(raw: object) -> list[str] | None:
     match this loader's convention (the spec parser raises
     ``OmnigentError``; the rules enforced are identical).
 
+    Returns an immutable ``tuple`` to match
+    :attr:`OSEnvSandboxSpec.cwd_prune_dirs`.
+
     :param raw: Raw ``cwd_prune_dirs`` value from the YAML mapping, or
         ``None`` when absent.
-    :returns: The validated basename list, or ``None`` when absent (no
+    :returns: The validated basename tuple, or ``None`` when absent (no
         pruning — the dataclass default).
     :raises TypeError: If ``raw`` is not a list, or an entry is not a
         string.
@@ -772,7 +775,7 @@ def _parse_cwd_prune_dirs_legacy(raw: object) -> list[str] | None:
                 f"components (no separators or '.'/'..'): {entry!r}"
             )
         sanitized.append(entry)
-    return sanitized
+    return tuple(sanitized)
 
 
 def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandboxSpec:

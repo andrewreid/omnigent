@@ -109,7 +109,7 @@ def _make_policy(
         write_files=[],
         allow_network=allow_network,
         cwd_allow_hidden=allow_hidden,
-        cwd_prune_dirs=cwd_prune_dirs,
+        cwd_prune_dirs=tuple(cwd_prune_dirs) if cwd_prune_dirs is not None else None,
         egress_relay_port=egress_relay_port,
         egress_socket_path=egress_socket_path,
     )

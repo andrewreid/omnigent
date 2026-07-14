@@ -149,7 +149,13 @@ class SandboxPolicy:
     write_files: list[Path]
     allow_network: bool
     cwd_allow_hidden: list[str] | None = None
-    cwd_prune_dirs: list[str] | None = None
+    # Immutable by construction (see ``__post_init__``): every
+    # constructor / ``dataclasses.replace`` / clone path coerces this to
+    # a ``tuple``, so no clone can alias or mutate a shared list. ``None``
+    # stays ``None`` ("no pruning"); the backends read it as
+    # ``policy.cwd_prune_dirs or ()``, so ``None`` and ``()`` are
+    # equivalent downstream.
+    cwd_prune_dirs: tuple[str, ...] | None = None
     cwd_hidden_scan_max_entries: int = 50000
     cwd_hidden_scan_overflow: str = "warn"
     env_passthrough: list[str] | None = None
@@ -164,6 +170,17 @@ class SandboxPolicy:
     # non-secret synthetic payload over the config FD, and resolved
     # secrets never touch the policy that serialises into logs / dumps.
     credential_proxy: CredentialProxySpec | None = None
+
+    def __post_init__(self) -> None:
+        # Normalize ``cwd_prune_dirs`` to an immutable tuple at EVERY
+        # construction point — including ``dataclasses.replace`` and the
+        # ``with_additional_*`` / clone helpers, which all route through
+        # ``__init__``. This closes the mutable-list-aliasing defect
+        # class by construction: a clone can never share (or let a caller
+        # mutate) the source's prune list, regardless of what iterable
+        # the caller passed. ``None`` is preserved as "no pruning".
+        if self.cwd_prune_dirs is not None and not isinstance(self.cwd_prune_dirs, tuple):
+            self.cwd_prune_dirs = tuple(self.cwd_prune_dirs)
 
     def to_jsonable(self) -> dict[str, JsonValue]:
         result: dict[str, JsonValue] = {
@@ -216,9 +233,9 @@ class SandboxPolicy:
         if isinstance(cwd_allow_hidden_data, list):
             cwd_allow_hidden = [str(name) for name in cwd_allow_hidden_data]
         cwd_prune_dirs_data = data.get("cwd_prune_dirs")
-        cwd_prune_dirs: list[str] | None = None
+        cwd_prune_dirs: tuple[str, ...] | None = None
         if isinstance(cwd_prune_dirs_data, list):
-            cwd_prune_dirs = [str(name) for name in cwd_prune_dirs_data]
+            cwd_prune_dirs = tuple(str(name) for name in cwd_prune_dirs_data)
         # Narrow scan-cap fields defensively — ``data`` is a generic
         # JSON map that could carry any value at runtime even though
         # the spec parser already validated the source. The typed
@@ -438,9 +455,9 @@ def _clone_policy_with(
         cwd_allow_hidden=(
             list(policy.cwd_allow_hidden) if policy.cwd_allow_hidden is not None else None
         ),
-        cwd_prune_dirs=(
-            list(policy.cwd_prune_dirs) if policy.cwd_prune_dirs is not None else None
-        ),
+        # Immutable tuple (normalized in ``SandboxPolicy.__post_init__``);
+        # pass through directly — no defensive copy needed.
+        cwd_prune_dirs=policy.cwd_prune_dirs,
         cwd_hidden_scan_max_entries=policy.cwd_hidden_scan_max_entries,
         cwd_hidden_scan_overflow=policy.cwd_hidden_scan_overflow,
         env_passthrough=(

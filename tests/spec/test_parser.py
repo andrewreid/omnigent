@@ -1769,7 +1769,7 @@ def test_parse_os_env_sandbox_with_cwd_prune_dirs(tmp_path: Path) -> None:
     spec = parse(tmp_path)
     assert spec.os_env is not None
     assert spec.os_env.sandbox is not None
-    assert spec.os_env.sandbox.cwd_prune_dirs == ["node_modules", ".pnpm"]
+    assert spec.os_env.sandbox.cwd_prune_dirs == ("node_modules", ".pnpm")
 
 
 def test_parse_os_env_sandbox_cwd_prune_dirs_absent_is_none(tmp_path: Path) -> None:

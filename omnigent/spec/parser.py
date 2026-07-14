@@ -996,7 +996,7 @@ def _parse_cwd_allow_hidden(raw: object) -> list[str] | None:
     return sanitized
 
 
-def _parse_cwd_prune_dirs(raw: object) -> list[str] | None:
+def _parse_cwd_prune_dirs(raw: object) -> tuple[str, ...] | None:
     """
     Parse and validate the ``cwd_prune_dirs:`` field of
     ``os_env.sandbox``.
@@ -1007,9 +1007,13 @@ def _parse_cwd_prune_dirs(raw: object) -> list[str] | None:
     single-component discipline as :func:`_parse_cwd_allow_hidden` so a
     misconfigured spec can't express a traversal.
 
+    Returns an immutable ``tuple`` to match
+    :attr:`OSEnvSandboxSpec.cwd_prune_dirs`, which is normalized to a
+    tuple by construction.
+
     :param raw: Raw value from the YAML, e.g. ``["node_modules",
         ".pnpm"]``, or ``None`` when absent.
-    :returns: List of validated basenames, or ``None`` when ``raw`` is
+    :returns: Tuple of validated basenames, or ``None`` when ``raw`` is
         ``None`` (no pruning — the default).
     :raises OmnigentError: If ``raw`` isn't a list, contains a
         non-string / empty entry, or contains an entry with a path
@@ -1042,7 +1046,7 @@ def _parse_cwd_prune_dirs(raw: object) -> list[str] | None:
                 code=ErrorCode.INVALID_INPUT,
             )
         sanitized.append(entry)
-    return sanitized
+    return tuple(sanitized)
 
 
 _CWD_HIDDEN_SCAN_OVERFLOW_MODES = ("error", "warn", "unlimited")
