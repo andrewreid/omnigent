@@ -540,6 +540,18 @@ class OSEnvSandboxSpec:
     # here (``".aws"``, ``".ssh"``, etc.) is the explicit opt-in
     # path for granting credential dotdirs through a ``read_paths``
     # entry.
+    #
+    # OPERATOR WARNING: allowing a directory exposes its ORDINARY
+    # (non-dot) files to the sandboxed helper — the allow just lifts the
+    # dotfile mask on the directory itself, it does not re-scan the
+    # directory's plain contents. Allowing ``".git"`` therefore makes
+    # ``.git/config`` readable, and ``.git/config`` embeds credentials in
+    # any authenticated remote URL (``https://user:token@host/...``). That
+    # is intended — git genuinely needs its config, and masking it would
+    # defeat the opt-in — but treat allowing a dir as consenting to expose
+    # its non-dot files. Nested NON-allowed dotfiles (a ``.git`` interior
+    # ``.env`` / ``.aws`` / ``.ssh``) and escaping symlinks under the
+    # allowed dir stay masked.
     cwd_allow_hidden: list[str] | None = None
     # Maximum number of filesystem entries the shared dotfile/symlink
     # masker (used by both ``linux_bwrap`` and ``darwin_seatbelt``)
@@ -548,7 +560,11 @@ class OSEnvSandboxSpec:
     # (targets outside the exposed roots) — so real in-cwd content stays
     # readable and is NOT masked. There is no name-based special casing:
     # a real npm/yarn ``node_modules`` (real package dirs, no escaping
-    # symlinks) stays readable, while a cross-store pnpm ``node_modules``
+    # symlinks) stays readable AND runnable — its hidden ``.bin`` shim
+    # directory is kept readable by a narrow carve-out (a hidden dir whose
+    # entries are all non-escaping symlinks exposes only pointers into
+    # already-exposed packages), so ``npm test`` / ``npx`` / local CLIs
+    # resolve their shims. A cross-store pnpm ``node_modules``
     # (each package an escaping symlink into a store on another
     # filesystem) is a farm. To keep such a farm from emitting tens of
     # thousands of masks, the walker collapses any directory whose
