@@ -1462,52 +1462,313 @@ def test_arg_ceiling_allows_normal_arg_counts() -> None:
     _check_bwrap_arg_ceiling(normal, Path("/work"))
 
 
-def test_target_under_coalesced_node_modules_survives_mask(tmp_path: Path) -> None:
+@dataclass
+class _ReexposeCase:
     """
-    P1 regression: an exec ``target`` living under a coalesced dep dir
-    (``cwd/node_modules/.bin/<x>``) must remain reachable in the
-    assembled argv — the coalesce ``--tmpfs <cwd>/node_modules`` must NOT
-    shadow it. bwrap layers later mounts on top, so the target re-overlay
-    has to appear AFTER the tmpfs for the path to survive.
+    A single target-re-expose scenario for the parametrized regression.
 
-    This is the argv-order case the scanner-only tests missed: the walker
-    correctly coalesces node_modules, but that same tmpfs would hide the
-    binary the launcher exec's unless it is re-bound afterwards.
+    :param cwd: Working directory passed to :meth:`wrap_launcher_argv`.
+    :param target: Absolute exec-target path (the binary the launcher
+        will exec).
+    :param policy: Sandbox policy (controls read_roots / allow_hidden).
+    :param cover_dst: The resolved directory the walker coalesces to a
+        single ``--tmpfs`` that would shadow the target, or ``None`` when
+        no mask covers the target (the allow_hidden case).
+    :param realpath_differs: ``True`` when the target's lexical parent
+        differs from its realpath parent, so the re-overlay destination
+        must be the realpath-based path (not the lexical one).
     """
-    node_modules = tmp_path / "node_modules"
-    bin_dir = node_modules / ".bin"
-    bin_dir.mkdir(parents=True)
-    target = bin_dir / "claude"
-    target.write_text("#!/bin/sh\n")
-    target.chmod(0o755)
 
+    cwd: Path
+    target: str
+    policy: SandboxPolicy
+    cover_dst: str | None
+    realpath_differs: bool
+
+
+def _make_escaping_symlink_farm(directory: Path, count: int) -> None:
+    """
+    Fill *directory* with *count* symlinks that escape every safe root.
+
+    Each points at ``/etc/hostname`` — a real file outside the bwrap
+    safe-root set (``/usr``, ``/tmp``, cwd, ...) — so the walker
+    classifies the directory as an escaping-symlink farm and coalesces
+    it, exactly like a pnpm ``.pnpm`` store.
+
+    :param directory: Directory to populate (created if missing).
+    :param count: Number of escaping symlinks to create.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    for i in range(count):
+        (directory / f"link_{i:05d}").symlink_to("/etc/hostname")
+
+
+def _build_reexpose_case(shape: str, tmp_path: Path) -> _ReexposeCase:
+    """
+    Build the filesystem + policy for one target-re-expose *shape*.
+
+    Covers the edge matrix the implementation must handle: a regular
+    target under a named-coalesced ``node_modules``; a symlink target; a
+    nested coalesced dir; a generic symlink-farm-coalesced dir (not
+    named ``node_modules``); a target whose lexical parent differs from
+    its realpath parent; a target reached via an external ``read_paths``
+    mask; and a target under an ``allow_hidden`` dir (no mask emitted).
+
+    :param shape: One of the parametrized shape keys.
+    :param tmp_path: Pytest tempdir the tree is built under.
+    :returns: The assembled :class:`_ReexposeCase`.
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+
+    def _reg_target(path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\n")
+        path.chmod(0o755)
+        return path
+
+    if shape == "regular_named":
+        target = _reg_target(cwd / "node_modules" / ".bin" / "claude")
+        return _ReexposeCase(
+            cwd,
+            str(target),
+            _make_policy(cwd),
+            str(Path(os.path.realpath(str(cwd / "node_modules")))),
+            False,
+        )
+
+    if shape == "symlink":
+        # Target is itself an escaping symlink into an external real file.
+        (cwd / "node_modules" / ".bin").mkdir(parents=True)
+        link = cwd / "node_modules" / ".bin" / "claude"
+        link.symlink_to("/etc/hostname")
+        return _ReexposeCase(
+            cwd,
+            str(link),
+            _make_policy(cwd),
+            str(Path(os.path.realpath(str(cwd / "node_modules")))),
+            False,
+        )
+
+    if shape == "nested":
+        target = _reg_target(cwd / "a" / "b" / "node_modules" / ".bin" / "tool")
+        return _ReexposeCase(
+            cwd,
+            str(target),
+            _make_policy(cwd),
+            str(Path(os.path.realpath(str(cwd / "a" / "b" / "node_modules")))),
+            False,
+        )
+
+    if shape == "generic_farm":
+        farm = cwd / "store"
+        _make_escaping_symlink_farm(farm, 150)
+        target = _reg_target(farm / "tool")
+        return _ReexposeCase(
+            cwd,
+            str(target),
+            _make_policy(cwd),
+            str(Path(os.path.realpath(str(farm)))),
+            False,
+        )
+
+    if shape == "realpath_parent":
+        # ``current`` is a symlink to the real release dir, so the
+        # target's lexical parent (.../current/...) differs from its
+        # realpath parent (.../v1.2/...). The walker descends the real
+        # path and coalesces .../v1.2/node_modules.
+        real_release = cwd / "proj" / "v1.2"
+        _reg_target(real_release / "node_modules" / ".bin" / "tool")
+        (cwd / "proj" / "current").symlink_to(real_release)
+        lexical_target = cwd / "proj" / "current" / "node_modules" / ".bin" / "tool"
+        return _ReexposeCase(
+            cwd,
+            str(lexical_target),
+            _make_policy(cwd),
+            str(Path(os.path.realpath(str(real_release / "node_modules")))),
+            True,
+        )
+
+    if shape == "read_paths":
+        # Target lives under an external read_paths root, not under cwd.
+        ext = tmp_path / "ext"
+        target = _reg_target(ext / "node_modules" / ".bin" / "tool")
+        return _ReexposeCase(
+            cwd,
+            str(target),
+            _make_policy(cwd, read_roots=[ext]),
+            str(Path(os.path.realpath(str(ext / "node_modules")))),
+            False,
+        )
+
+    if shape == "allow_hidden":
+        # node_modules on allow_hidden → readable, NOT masked. The
+        # re-overlay is still emitted (harmless) and nothing is shadowed.
+        target = _reg_target(cwd / "node_modules" / ".bin" / "tool")
+        return _ReexposeCase(
+            cwd,
+            str(target),
+            _make_policy(cwd, allow_hidden=["node_modules"]),
+            None,
+            False,
+        )
+
+    raise AssertionError(f"unknown shape {shape!r}")
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "regular_named",
+        "symlink",
+        "nested",
+        "generic_farm",
+        "realpath_parent",
+        "read_paths",
+        "allow_hidden",
+    ],
+)
+def test_target_reexpose_survives_mask_across_shapes(shape: str, tmp_path: Path) -> None:
+    """
+    P1 regression matrix: an exec ``target`` living under a coalesced /
+    masked subtree must stay reachable in the assembled argv, and the
+    re-overlay must be an EXACT-FILE read-only bind — never re-exposing
+    siblings or lifting the surrounding tmpfs.
+
+    For each shape assert (a) ordering: the target re-overlay index is
+    AFTER the covering ``--tmpfs`` (later bwrap mount wins), and
+    (b) exact-file exposure: the overlay is a single ``--ro-bind-try``
+    of the resolved regular file at the launcher-reached (realpath) path,
+    and it is the ONLY mount under the coalesced dir after the mask.
+    """
+    case = _build_reexpose_case(shape, tmp_path)
     backend = _make_backend()
-    policy = _make_policy(tmp_path)
     argv = backend.wrap_launcher_argv(
         [sys.executable, "-c", "pass"],
-        policy,
-        tmp_path,
-        target=str(target),
+        case.policy,
+        case.cwd,
+        target=case.target,
     )
 
-    tmpfs_dest = str(node_modules.resolve(strict=False))
-    target_literal = str(target.resolve(strict=False))
+    # The launcher-reached path: literal basename under the parent's
+    # realpath — exactly what _reexpose_target_after_mask emits.
+    expected_dst = os.path.join(
+        os.path.realpath(os.path.dirname(case.target)),
+        os.path.basename(case.target),
+    )
 
-    # The whole node_modules is coalesced to a single --tmpfs.
-    tmpfs_idx = _last_index(argv, tmpfs_dest, after_token="--tmpfs")
-    assert tmpfs_idx is not None, (
-        f"node_modules must be coalesced to a --tmpfs mask. argv tail: {argv[-30:]}"
+    overlays = [m for m in _mount_destinations(argv) if m[3] == expected_dst]
+    assert len(overlays) == 1, (
+        f"[{shape}] target must be re-exposed by exactly one mount at "
+        f"{expected_dst}; got {overlays}. argv tail: {argv[-30:]}"
     )
-    # The target is re-bound at its literal path AFTER the tmpfs, so the
-    # later mount wins and the exec path is not shadowed.
-    target_idx = _last_index(argv, target_literal, after_token="--ro-bind-try")
-    assert target_idx is not None, (
-        f"Target {target_literal} must be re-bound after the mask. argv tail: {argv[-30:]}"
+    o_idx, o_verb, o_src, _ = overlays[0]
+    assert o_verb == "--ro-bind-try", (
+        f"[{shape}] re-overlay must be a read-only file bind, got {o_verb!r}."
     )
-    assert target_idx > tmpfs_idx, (
-        "Target re-overlay must come AFTER the node_modules tmpfs so the "
-        f"later mount wins (tmpfs at {tmpfs_idx}, target at {target_idx})."
+    assert o_src is not None and os.path.isfile(o_src) and not os.path.islink(o_src), (
+        f"[{shape}] re-overlay source must be the resolved regular file, got {o_src!r}."
     )
+
+    if case.realpath_differs:
+        lexical = os.path.abspath(case.target)
+        assert expected_dst != lexical, "[realpath_parent] test setup should differ"
+        # The overlay dest must be the realpath path, not the lexical one.
+        assert _last_index(argv, lexical, after_token="--ro-bind-try") is None, (
+            f"[{shape}] re-overlay must target the realpath path {expected_dst}, "
+            f"not the lexical path {lexical}."
+        )
+
+    if case.cover_dst is not None:
+        cover_idx = _last_index(argv, case.cover_dst, after_token="--tmpfs")
+        assert cover_idx is not None, (
+            f"[{shape}] covering dir {case.cover_dst} must coalesce to a "
+            f"--tmpfs mask. argv tail: {argv[-30:]}"
+        )
+        assert o_idx > cover_idx, (
+            f"[{shape}] target re-overlay ({o_idx}) must come AFTER the "
+            f"covering tmpfs ({cover_idx}) so the later mount wins."
+        )
+        under = _dsts_under(argv, case.cover_dst, after_idx=cover_idx)
+        assert [(verb, dst) for _, verb, _, dst in under] == [("--ro-bind-try", expected_dst)], (
+            f"[{shape}] only the target file may be re-exposed under the "
+            f"coalesced dir after the mask; got {under}."
+        )
+    else:
+        # allow_hidden: dir stays readable, so no tmpfs shadows it and the
+        # re-overlay (redundant but harmless) is the only mount under it.
+        nm_dir = os.path.dirname(os.path.dirname(expected_dst))  # .../node_modules
+        assert _last_index(argv, nm_dir, after_token="--tmpfs") is None, (
+            f"[{shape}] an allow_hidden dir must NOT be tmpfs-masked."
+        )
+        under = _dsts_under(argv, nm_dir, after_idx=-1)
+        assert [(verb, dst) for _, verb, _, dst in under] == [("--ro-bind-try", expected_dst)], (
+            f"[{shape}] only the target file may be bound under the allow_hidden dir; got {under}."
+        )
+
+
+def _mount_destinations(argv: list[str]) -> list[tuple[int, str, str | None, str]]:
+    """
+    Parse *argv* into ``(index, verb, src, dst)`` mount tuples.
+
+    Steps over each mount option's operands so a following value (e.g. a
+    ``--setenv`` payload) can't be misread as a mount, and stops at the
+    ``--`` that terminates bwrap options. ``src`` is ``None`` for
+    destination-only verbs (``--tmpfs`` / ``--proc`` / ``--dev``).
+
+    :param argv: The assembled bwrap argv.
+    :returns: One tuple per mount, in argv order.
+    """
+    bind_verbs = {
+        "--bind",
+        "--bind-try",
+        "--ro-bind",
+        "--ro-bind-try",
+        "--dev-bind",
+        "--dev-bind-try",
+    }
+    dst_only_verbs = {"--tmpfs", "--proc", "--dev", "--mqueue", "--dir"}
+    out: list[tuple[int, str, str | None, str]] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            break
+        if tok in bind_verbs and i + 2 < len(argv):
+            out.append((i, tok, argv[i + 1], argv[i + 2]))
+            i += 3
+            continue
+        if tok in dst_only_verbs and i + 1 < len(argv):
+            out.append((i, tok, None, argv[i + 1]))
+            i += 2
+            continue
+        i += 1
+    return out
+
+
+def _dsts_under(
+    argv: list[str], prefix: str, *, after_idx: int
+) -> list[tuple[int, str, str | None, str]]:
+    """
+    Return mounts whose destination equals or lives under *prefix* and
+    whose argv index is strictly greater than *after_idx*.
+
+    Used to assert that after a coalescing ``--tmpfs``, the ONLY mount
+    re-exposing anything under the coalesced directory is the single
+    target-file overlay (no siblings, no re-expansion of the subtree).
+
+    :param argv: The assembled bwrap argv.
+    :param prefix: The coalesced directory path.
+    :param after_idx: Only mounts after this index are considered.
+    :returns: Matching ``(index, verb, src, dst)`` tuples.
+    """
+    res: list[tuple[int, str, str | None, str]] = []
+    for idx, verb, src, dst in _mount_destinations(argv):
+        if idx <= after_idx:
+            continue
+        if dst == prefix or dst.startswith(prefix + os.sep):
+            res.append((idx, verb, src, dst))
+    return res
 
 
 def _last_index(argv: list[str], path: str, *, after_token: str) -> int | None:
