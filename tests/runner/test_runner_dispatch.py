@@ -6058,6 +6058,34 @@ async def test_sys_session_create_workspace_rejected_with_config_path() -> None:
     assert "agent_id mode only" in json.loads(output)["error"]
 
 
+@pytest.mark.asyncio
+async def test_sys_session_create_empty_workspace_with_config_path_is_normalized() -> None:
+    """
+    P2: an empty/whitespace ``workspace`` is normalized to absent, so
+    ``{"config_path": ..., "workspace": ""}`` is NOT flagged as the
+    agent_id-only conflict — it proceeds as an ordinary config_path
+    launch (here failing later on config resolution, never on the
+    workspace conflict).
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "helper.yaml", "workspace": "  "}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert "agent_id mode only" not in json.loads(output).get("error", "")
+
+
 def test_sys_session_create_schema_exposes_optional_workspace() -> None:
     """
     The tool schema advertises an optional string ``workspace`` and

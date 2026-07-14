@@ -6256,14 +6256,14 @@ async def _validate_session_workspace_no_host(
     This is the sub-agent-spawn case (e.g. ``sys_session_create`` with
     a ``workspace`` override): the child inherits the parent runner's
     host affinity, so there is no separate host to send ``host.stat``
-    frames to. Enforces only the host-independent path-safety rules —
-    absolute path plus containment within the agent's absolute
-    ``os_env.cwd`` boundary — via
+    frames to. Delegates to the single canonical-containment chokepoint
     :func:`omnigent.server.routes._workspace_validation.validate_workspace_no_host`,
-    so a spawned session cannot pin its sandbox cwd/scan-root outside
-    the grounding directory the agent allows. The path's existence is
-    left to the runner, which resolves and sandboxes it when it reads
-    the stored workspace back.
+    which requires the path to be an existing directory and asserts
+    CANONICAL (``realpath``, symlinks resolved) containment within the
+    agent's absolute ``os_env.cwd`` boundary — so a spawned session
+    cannot pin its sandbox cwd/scan-root outside the grounding directory
+    the agent allows, even via a symlink. Returns the canonical path
+    that is stored.
 
     :param workspace: Caller-supplied absolute path, e.g.
         ``"/home/andrew/projects/timesheets"``.
@@ -12756,6 +12756,31 @@ def _create_session_from_bundle(
         enforce_handler_allowlist=not local_single_user_enabled(),
     )
     assert spec.name is not None
+
+    # Close the sibling entry point: a workspace uploaded on the
+    # multipart/CLI path (``omnigent run --workspace``) must clear the
+    # SAME canonical-containment check as the JSON no-host spawn before
+    # it is persisted and later becomes the harness sandbox cwd /
+    # scan-root. Only the no-host case is validated here (host_id set =>
+    # the workspace is a path on a remote host, canonicalized there via
+    # host.stat, not on the server's filesystem).
+    if metadata.workspace is not None and metadata.host_id is None:
+        from omnigent.server.routes._workspace_validation import (
+            WorkspaceValidationError,
+            validate_workspace_no_host,
+        )
+
+        os_env = getattr(spec, "os_env", None)
+        spec_cwd = getattr(os_env, "cwd", None) if os_env is not None else None
+        try:
+            canonical_ws = validate_workspace_no_host(
+                workspace=metadata.workspace, spec_cwd=spec_cwd
+            )
+        except WorkspaceValidationError as exc:
+            raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
+        # Store the canonical (symlink-resolved) path so downstream
+        # consumers sandbox exactly what was validated.
+        metadata = metadata.model_copy(update={"workspace": canonical_ws})
 
     agent_id = generate_agent_id()
     agent_bundle_location = bundle_location(agent_id, bundle_bytes)

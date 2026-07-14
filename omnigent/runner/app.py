@@ -8599,6 +8599,44 @@ def create_runner_app(
             return Path(workspace.strip()).expanduser().resolve()
         return runner_workspace.resolve() if runner_workspace is not None else None
 
+    # ``spec`` is a resolved AgentSpec / sub-agent spec. The runner
+    # already treats specs opaquely as Any at this layer (cf.
+    # _session_spec_cache, _unwrap_resolved_spec); we only read
+    # os_env.cwd via getattr.
+    def _guard_launch_cwd(cwd: Path | None, spec: Any) -> Path | None:  # type: ignore[explicit-any]
+        """Refuse a sandbox cwd that escapes the spec's ``os_env.cwd`` boundary.
+
+        Defense-in-depth at the point of use: the session workspace is
+        canonically containment-checked when it is persisted, but this
+        re-checks the RESOLVED cwd against the RESOLVED boundary the
+        instant before the harness spawns — closing any TOCTOU window (a
+        boundary-internal symlink swapped after validation) and any
+        persistence path that might reach here unvalidated. ``cwd`` is
+        already ``Path.resolve()``d by :func:`_session_runtime_cwd`, so
+        both sides are canonical (symlinks resolved) and the comparison
+        is sound. Fails CLOSED — an escape raises rather than silently
+        handing the escaped directory to bwrap as the sandbox root /
+        dotfile-scan root.
+
+        A relative / unset ``os_env.cwd`` (``.`` / ``./`` / ``""`` /
+        ``None`` / ``./subdir``) imposes no boundary, matching the
+        server-side validator, so it is a no-op for those agents
+        (including Patricia's ``cwd: .``).
+        """
+        if cwd is None:
+            return None
+        os_env = getattr(spec, "os_env", None)
+        boundary = getattr(os_env, "cwd", None) if os_env is not None else None
+        if boundary is None or boundary in ("", ".", "./") or boundary.startswith("./"):
+            return cwd
+        resolved_boundary = Path(boundary).expanduser().resolve()
+        if cwd != resolved_boundary and not cwd.is_relative_to(resolved_boundary):
+            raise RuntimeError(
+                f"refusing to launch: session workspace {cwd} escapes the agent's "
+                f"os_env.cwd boundary {resolved_boundary}"
+            )
+        return cwd
+
     async def _resolve_session_fs_registry(
         session_id: str,
     ) -> FilesystemRegistry | None:
@@ -8843,7 +8881,7 @@ def create_runner_app(
                 spec,
                 harness_name,
                 workdir=_resolved_spec_workdir(spec_entry),
-                cwd=await _session_runtime_cwd(session_id),
+                cwd=_guard_launch_cwd(await _session_runtime_cwd(session_id), spec),
             )
             if harness_name == "claude-native" and spawn_env is None:
                 from omnigent.claude_native_bridge import (
@@ -13623,7 +13661,7 @@ def create_runner_app(
                 cached_spec,
                 harness_name,
                 workdir=cached_spec_workdir,
-                cwd=await _session_runtime_cwd(conv),
+                cwd=_guard_launch_cwd(await _session_runtime_cwd(conv), cached_spec),
                 # Apply the per-session /model override so it actually
                 # changes the model on the SDK harnesses (not just the
                 # readout). Forwarded by the Omnigent server in the message body.

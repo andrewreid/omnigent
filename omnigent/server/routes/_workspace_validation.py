@@ -312,40 +312,55 @@ def validate_workspace_no_host(*, workspace: str, spec_cwd: str | None) -> str:
     """
     Validate an explicit workspace pick when there is NO host to stat.
 
-    Used for a sub-agent spawn that carries an explicit ``workspace``
-    but no ``host_id``: the child inherits the parent runner's host
-    affinity, so there is no separate host connection to send
-    ``host.stat`` frames to. The server therefore cannot confirm the
-    path exists or resolve symlinks; it enforces only the
-    host-independent path-safety rules so a spawned session cannot pin
-    its sandbox cwd/scan-root outside the boundary the agent allows:
+    The single canonical-containment chokepoint for every session-create
+    path that sets a workspace WITHOUT a ``host_id`` — a sub-agent spawn
+    that inherits the parent runner's affinity, and the daemon-backed
+    ``omnigent run`` / multipart upload. There is no separate host to
+    send ``host.stat`` frames to, so the server canonicalizes and stats
+    on ITS OWN filesystem. This is sound because these no-host paths are
+    co-located: the runner that later opens the sandbox shares the
+    server's filesystem (the local daemon topology, and Patricia's
+    launch case). The enforced rules:
 
     - the workspace must be an absolute path (``~`` and relative paths
       are rejected — the server never expands ``~``);
+    - the workspace must EXIST and be a directory. Existence is required
+      precisely so ``realpath`` can resolve every symlink component;
+      a not-yet-existing workspace is rejected rather than accepted on a
+      partially-resolved (and thus bypassable) path;
     - when the agent pins an *absolute* ``os_env.cwd`` boundary, the
-      workspace must be that directory or a subdirectory of it. The
-      comparison is lexical on :func:`os.path.normpath`-normalized
-      paths, so ``..`` segments are collapsed first and cannot escape
-      the boundary.
+      **canonical** (``realpath``, symlinks resolved) workspace must be
+      that directory or a subdirectory of it. Containment is checked on
+      realpaths, NOT on lexical ``normpath`` output — a symlink such as
+      ``/repo/link -> /home/user`` lexically looks contained but escapes
+      once resolved, and the runner resolves it (``Path.resolve()``)
+      before handing it to the sandbox. Lexical-only containment was the
+      P1 symlink-bypass hole this closes.
 
     Relative agent cwds (``"."`` / ``"./"`` / ``""`` / ``None`` and the
     ``./subdir`` form) impose no boundary — matching
-    :func:`validate_workspace`. Existence and ``./subdir`` presence
-    checks that require a live host are intentionally skipped; the
-    runner resolves and sandboxes the path when it reads it back.
+    :func:`validate_workspace` — so any existing absolute directory is
+    accepted (Patricia's ``cwd: .`` case).
 
     :param workspace: Caller-supplied absolute path, e.g.
         ``"/home/andrew/projects/timesheets"``.
     :param spec_cwd: The bound agent's ``os_env.cwd`` as written in the
         YAML (or ``None`` when the agent has no ``os_env`` block).
-    :returns: The normalized workspace path to store on the session row.
+    :returns: The canonical (realpath) workspace path to store on the
+        session row — symlinks already resolved, so downstream consumers
+        (and the runner) sandbox exactly what was validated.
     :raises WorkspaceValidationError: On a relative/tilde workspace, a
-        non-absolute agent boundary, or a workspace outside that
-        boundary.
+        missing / non-directory workspace, a non-absolute agent
+        boundary, a missing boundary, or a canonical workspace outside
+        that boundary.
     """
     if not workspace.startswith("/"):
         raise WorkspaceValidationError("workspace must be an absolute path starting with /")
-    canonical_workspace = os.path.normpath(workspace)
+    if not os.path.exists(workspace):
+        raise WorkspaceValidationError(f"workspace path does not exist: {workspace}")
+    canonical_workspace = os.path.realpath(workspace)
+    if not os.path.isdir(canonical_workspace):
+        raise WorkspaceValidationError(f"workspace path is not a directory: {workspace}")
     if not _is_relative_cwd(spec_cwd):
         # spec_cwd pins a boundary (``./subdir`` is treated as
         # boundary-less by _is_relative_cwd). Without a host we cannot
@@ -357,9 +372,15 @@ def validate_workspace_no_host(*, workspace: str, spec_cwd: str | None) -> str:
                 "cannot validate workspace containment without a host: agent's "
                 f"os_env.cwd '{spec_cwd}' is not an absolute path"
             )
-        canonical_boundary = os.path.normpath(boundary)
+        if not os.path.exists(boundary):
+            raise WorkspaceValidationError(
+                f"agent's required path '{spec_cwd}' does not exist on the server"
+            )
+        canonical_boundary = os.path.realpath(boundary)
+        # Canonical containment: both sides are realpaths, so a symlink
+        # inside the boundary that points outside it is caught here.
         if not _is_subpath_of(canonical_workspace, canonical_boundary):
             raise WorkspaceValidationError(
-                f"workspace '{workspace}' is outside the agent's required path '{spec_cwd}'"
+                f"workspace '{workspace}' resolves outside the agent's required path '{spec_cwd}'"
             )
     return canonical_workspace

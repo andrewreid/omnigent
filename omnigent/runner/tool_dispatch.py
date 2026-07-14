@@ -2203,7 +2203,14 @@ async def _execute_session_create(
                 )
             }
         )
+    # Normalize an empty / whitespace-only workspace to None at the
+    # boundary so every downstream ``is not None`` check (the
+    # config_path conflict below, the omit-when-None body logic) treats
+    # it uniformly as "unset" — otherwise ``{"workspace": ""}`` slipped
+    # past the conflict check while also being dropped from the body.
     workspace = args.get("workspace")
+    if not isinstance(workspace, str) or not workspace.strip():
+        workspace = None
     if has_config_path:
         # The workspace override binds a stored session workspace that
         # the server validates against the target agent's os_env.cwd;
@@ -2211,7 +2218,7 @@ async def _execute_session_create(
         # validates on its own multipart path. Rather than silently drop
         # the override there, fail loud so the caller re-launches the
         # (already-registered) agent by agent_id with the workspace.
-        if isinstance(workspace, str) and workspace:
+        if workspace is not None:
             return json.dumps(
                 {
                     "error": (
