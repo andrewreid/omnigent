@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import subprocess
 from collections.abc import Callable
 from typing import Any, TypeAlias
 
@@ -628,6 +629,130 @@ def read_only_os(
     return _evaluate
 
 
+# ``gh pr create`` in any of its forms — one of the two remote-mutating commands
+# this gate guards (``git push`` is the other, via ``_push_severity``). Same
+# whole-command search blast_radius uses for its gh patterns (a safety net
+# against the obvious case, not a shell parser).
+_PR_CREATE_RE: re.Pattern[str] = re.compile(r"\bgh\b.*\bpr\s+create\b")
+
+
+def _reviewed_head(sentinel: str) -> str | None:
+    """
+    Return the reviewed commit SHA the sentinel records, or ``None``.
+
+    :param sentinel: Path to the review-passed marker, e.g.
+        ``".polly/review-passed"`` (relative to the worker's cwd).
+    :returns: The stripped SHA the marker holds, or ``None`` when the marker
+        is absent, unreadable, or empty.
+    """
+    try:
+        with open(os.path.expanduser(sentinel), encoding="utf-8") as fh:
+            sha = fh.read().strip()
+    except OSError:
+        return None
+    return sha or None
+
+
+def _current_head() -> str | None:
+    """
+    Return the worktree's current ``HEAD`` SHA, or ``None`` if undeterminable.
+
+    Runs ``git rev-parse HEAD`` in the process cwd — for a worker that is its
+    own worktree. Only called on a push / PR-create command (rare), so the
+    subprocess cost is negligible.
+
+    :returns: The 40-char HEAD SHA, or ``None`` when git cannot resolve it.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = proc.stdout.strip()
+    return sha if proc.returncode == 0 and sha else None
+
+
+def require_pr_review(
+    *,
+    sentinel: str = ".polly/review-passed",
+    deny_reason: str = (
+        "review-before-pr: the current commit has not passed cross-vendor review, so "
+        "`git push` / `gh pr create` is blocked. Commit to your branch and report back; "
+        "polly reviews your local diff and, once it is clean, records the reviewed commit "
+        "in the review-passed sentinel and tells you to push / open the PR."
+    ),
+    stale_reason: str = (
+        "review-before-pr: HEAD has moved since the last review, so this push / PR-open "
+        "is blocked. The sentinel approves a specific reviewed commit; a newer commit "
+        "owes a fresh cross-review before it reaches the remote. Report the new commit "
+        "and wait for polly to re-review it."
+    ),
+) -> Callable[[_Json, _Json], _Json]:
+    """
+    Factory: gate ``git push`` / ``gh pr create`` on a per-commit review marker.
+
+    Enforces review-before-pr at the mechanism layer on an implementer worker.
+    A shell call that pushes the branch (``git push``, any form) or opens a PR
+    (``gh pr create``) is DENIED unless *sentinel* records the CURRENT ``HEAD``
+    SHA — checked relative to the worker's cwd (its worktree) unless the path is
+    absolute. polly writes the reviewed SHA into the sentinel only after the
+    branch diff passes cross-vendor review, so the worker cannot push or open a
+    PR on unreviewed code even if its prompt or a stray instruction tells it to.
+    Because the marker names a specific commit, a NEW fix commit (HEAD moves)
+    invalidates it — the fix owes a fresh review before it can be pushed, which
+    is exactly the review-bot-loop path. Non-remote commands — reads, tests,
+    local ``git commit`` — are ALLOWED; pair with :func:`blast_radius` for shell
+    blast-radius bounds.
+
+    When ``HEAD`` cannot be resolved (a non-repo cwd, git absent), the gate
+    falls back to marker PRESENCE: an existing marker allows, an absent one
+    denies. That degrades to the presence check rather than false-denying a
+    legitimate push in a broken-git environment.
+
+    :param sentinel: Path to the review-passed marker, checked relative to the
+        worker's cwd (its worktree) unless absolute, e.g.
+        ``".polly/review-passed"``.
+    :param deny_reason: Reason surfaced when no reviewed commit is recorded.
+    :param stale_reason: Reason surfaced when the recorded commit != current HEAD.
+    :returns: An evaluator ``fn(event, config)`` returning a V0 decision.
+    """
+
+    def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
+        """
+        Deny a push / PR-open unless the sentinel approves the current HEAD.
+
+        :param event: V0 ``tool_call`` event for a shell tool.
+        :param config: Runtime config dict (unused).
+        :returns: DENY for an ungated / stale push or PR-open, ALLOW otherwise.
+        """
+        args = _tool_call(event, {"sys_os_shell", "Bash", "bash"})
+        if args is None:
+            return _ALLOW
+        command = args.get("command")
+        if not isinstance(command, str):
+            return _ALLOW
+        statements = _shell_statements(command)
+        is_remote_mutation = _PR_CREATE_RE.search(command) or any(
+            _push_severity(stmt) is not None for stmt in statements
+        )
+        if not is_remote_mutation:
+            return _ALLOW
+        reviewed = _reviewed_head(sentinel)
+        if reviewed is None:
+            return _decision("DENY", f"{deny_reason} (blocked: {command!r})")
+        head = _current_head()
+        if head is not None and reviewed != head:
+            return _decision("DENY", f"{stale_reason} (blocked: {command!r})")
+        return _ALLOW
+
+    return _evaluate
+
+
 # ── Registry ─────────────────────────────────────────────────────────────────
 
 POLICY_REGISTRY: list[dict[str, Any]] = [
@@ -668,5 +793,14 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "description": "Denies every file-mutating tool (sys_os_write/edit, Claude/Codex "
         "native Write/Edit/MultiEdit, and Pi native write/edit) so a report-only agent "
         "can read and run shell but never change code",
+    },
+    {
+        "handler": "omnigent.policies.builtins.orchestration.require_pr_review",
+        "kind": "factory",
+        "name": "Gate Push/PR-Open on Cross-Vendor Review",
+        "description": "Blocks `git push` and `gh pr create` on an implementer worker "
+        "until a review-passed sentinel records the current HEAD, so code reaches the "
+        "remote only after that commit passed cross-vendor review (review-before-pr); a "
+        "new fix commit invalidates the marker until it is re-reviewed",
     },
 ]
