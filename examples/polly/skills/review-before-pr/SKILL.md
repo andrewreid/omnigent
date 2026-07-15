@@ -25,8 +25,10 @@ something to review against.
    its own worktree/branch with `purpose: "implement"`, and state EXPLICITLY in
    the task packet: *drive the task to green, commit to the branch, but do NOT
    run `gh pr create` / open a PR yet — report your branch name + a summary; I
-   will tell you when to open the PR.* The worker still pushes its branch to the
-   remote (so the diff is fetchable) but stops short of opening the PR.
+   will tell you when to push and open the PR.* The worker COMMITS to its branch
+   but does NOT push it — review runs on the LOCAL worktree diff, so no
+   pre-review push is needed, and the mechanism gate blocks a worker `git push`
+   until that commit is marked review-passed anyway.
 2. **Gates.** Run the repo's FULL deterministic validator set yourself against
    the branch via `sys_os_shell` — not only tests / lint / typecheck, but every
    spec / traceability / governance validator the repo defines (discover them
@@ -57,10 +59,19 @@ something to review against.
 4. **Loop on blocking issues.** Each blocking issue → fix-task back to the SAME
    implementer conversation (same worktree/branch). Re-run gates, re-review.
    Repeat until gates are green AND zero blocking issues remain.
-5. **Only now open the PR.** Instruct the SAME implementer (it is the only
-   party that opens PRs — a reviewer's stray edits must never reach the
-   deliverable) to open the PR for its already-reviewed branch. The PR body
-   should note it passed cross-vendor review (reviewer vendor + verdict).
+5. **Only now release to the remote — record the reviewed commit first.** A
+   worker `git push` and `gh pr create` are both blocked at the mechanism layer
+   (`require_pr_review` policy) until the `.polly/review-passed` marker records
+   the worker's CURRENT commit, so FIRST write it yourself — ONLY now that gates
+   are green and zero blocking issues remain:
+   `sys_os_shell("mkdir -p .worktrees/<task_id>/.polly && git -C .worktrees/<task_id> rev-parse HEAD > .worktrees/<task_id>/.polly/review-passed")`.
+   THEN instruct the SAME implementer (it is the only party that pushes and opens
+   PRs — a reviewer's stray edits must never reach the deliverable) to push its
+   branch and open the PR for its already-reviewed commit. The PR body should
+   note it passed cross-vendor review (reviewer vendor + verdict). The marker
+   names the exact reviewed commit — never write it before the branch is clean,
+   and never for a commit you have not reviewed; a later fix commit invalidates
+   it until you re-review.
 6. Record the PR URL in the registry and mark the task ready for the human to
    merge. **polly does NOT merge** — the human does.
 
@@ -152,6 +163,20 @@ first pass and the pre-PR review has the taxonomy to check against. The review c
 never out-scope the contract it is handed, so a narrow contract makes this blind
 spot recur round after round. See `cross-review` → "Input-domain coverage" and
 "The review can never out-scope its contract".
+
+## The mechanism gate (defense in depth)
+This ordering is also enforced at the runner policy layer, so it holds even if a
+worker's own prompt or a stray instruction says "push" or "open a PR". Each
+implementer child carries the `require_pr_review` policy, which DENIES a worker
+`git push` AND `gh pr create` unless the `.polly/review-passed` marker records
+that worker's CURRENT commit (HEAD SHA). polly writes the marker (step 5) only
+after gates are green and cross-review is clean — so prose discipline and the
+mechanism agree: no marker for this commit, nothing reaches the remote. Because
+the marker names a specific commit, this covers the review-bot loop too: a fix
+commit moves HEAD, invalidates the marker, and is blocked from being pushed to
+the open PR until it is re-reviewed and re-marked. polly itself is NOT gated (it
+guards the worker children); in the direct-authoring path polly pushes and opens
+its own reviewed PR directly, with the different-vendor review as the control.
 
 ## Notes
 - This flips the older "implementer opens its own PR immediately, then we

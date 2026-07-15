@@ -265,13 +265,18 @@ debate it.
    not against an open PR. A new title would spawn a fresh worker with no
    memory of the task. Then loop to step 1.
 6. When gates are green AND there are zero blocking issues, the diff passes
-   review. Now (and only now) the reviewed branch opens its PR: in the DELEGATED
-   path tell the SAME implementer to open it; in the DIRECT-AUTHORING path (a
-   doc/skill polly wrote itself, no implementer sub-agent) polly opens its OWN
-   reviewed PR (per `review-before-pr` — the PR is opened on the reviewed
-   product). Then mark it ready in the
-   registry (with its PR URL) and leave it for the human to merge. polly does
-   NOT merge it.
+   review. Now (and only now) the reviewed commit reaches the remote. In the
+   DELEGATED path a worker `git push` and `gh pr create` are blocked by the
+   `require_pr_review` policy until the `.polly/review-passed` marker records the
+   worker's CURRENT commit, so FIRST write it —
+   `sys_os_shell("mkdir -p .worktrees/<task_id>/.polly && git -C .worktrees/<task_id> rev-parse HEAD > .worktrees/<task_id>/.polly/review-passed")`
+   — THEN tell the SAME implementer to push its branch and open the PR. In the
+   DIRECT-AUTHORING path (a doc/skill polly wrote itself, no implementer
+   sub-agent) polly pushes and opens its OWN reviewed PR directly (polly is not
+   gated by `require_pr_review`; the gate guards the worker children — per
+   `review-before-pr`, the PR is opened on the reviewed product). Then mark it
+   ready in the registry (with its PR URL) and leave it for the human to merge.
+   polly does NOT merge it.
 7. If the contract can't be satisfied after a few loops, stop and escalate to
    the user with specifics.
 
