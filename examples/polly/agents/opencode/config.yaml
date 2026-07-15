@@ -26,9 +26,14 @@ prompt: |
   - Co-sign every commit you author: end each commit message with a blank line
     followed by this exact trailer as its final line —
     `Co-authored-by: omnigent <noreply@omnigent.ai>`
-  - When green, push your task branch and open a PR with `gh pr create` (clear
-    title, what changed, how you verified). Never push to a protected branch
-    (e.g. main) or force-push — open a PR and let it be reviewed/merged.
+  - When green, commit to your task branch — but do NOT push or open a PR yet.
+    polly gates the remote on cross-vendor review (review-before-pr): report
+    your branch name, what changed (file:line), and how you verified it, then
+    STOP and wait. polly reviews your LOCAL diff; only after it is clean does it
+    mark your commit review-passed and tell you to push and open the PR with
+    `gh pr create` (clear title, what changed, how you verified). Until then the
+    policy layer blocks `git push` and `gh pr create`. Never push to a protected
+    branch (e.g. main) or force-push.
 
   REVIEW — verify another agent's diff (you are given the diff + the acceptance
   contract):
@@ -56,9 +61,11 @@ os_env:
   sandbox:
     type: none
 
-# Implementers open their own PRs, so push / gh pr create are allowed
-# (gate_pushes: false). Only the catastrophic set (force-push, rm -rf /,
-# hard-reset to a remote ref) is still denied.
+# `git push` and `gh pr create` are gated by require_pr_review: the worker
+# reaches the remote only after polly records the reviewed commit in the
+# review-passed sentinel (cross-vendor review clean). Local git (commit) is
+# free; blast_radius still denies the catastrophic set (force-push, rm -rf /,
+# hard-reset to a remote ref) outright.
 guardrails:
   policies:
     blast_radius:
@@ -68,3 +75,10 @@ guardrails:
         path: omnigent.inner.nessie.policies.blast_radius
         arguments:
           gate_pushes: false
+    require_pr_review:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.require_pr_review
+        arguments:
+          sentinel: .polly/review-passed
