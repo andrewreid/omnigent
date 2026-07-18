@@ -402,3 +402,72 @@ dropped siblings the external whole-PR bot then finds LATER, one per round.
   reviewer edit never reaches the deliverable.
 - Non-blocking issues / suggestions go in the registry as follow-ups; they
   don't block the PR.
+
+
+## Every round runs the full battery — closure parity + the recurrence stop-gate
+
+The two passes (and, for a doc/ADR/spec diff, the two doc passes) are not only
+for the FIRST review of a change. A re-review / closure round runs the
+**identical** battery — [FOCUSED] + [WIDE] across all four axes +
+[SELF-CONSISTENCY] + [GOVERNANCE] — never a narrowed "just confirm these N
+blockers are closed" dispatch. Narrowing the closure prompt is exactly how a
+fix's own siblings leak out one round at a time: the reviewer's WIDE pass keeps
+finding the next instance because the FIX was point-scoped even though the
+review nominally was not. Give every closure dispatch the same full mandate as
+the first, and label all passes in the report each time.
+
+**Recurrence stop-gate (hard, not advisory).** The FIRST time the same defect
+class recurs at a NEW site — whether a later internal round or an external-bot
+round surfaces it — STOP point-fixing. Do NOT push another single-site patch.
+Instead, in the SAME round:
+1. Escalate the FIX to whole-surface class-closure: grep the class's shape
+   across the ENTIRE parcel (source + tests + docs + generated/published
+   artifacts) and fix-or-justify EVERY site.
+2. Escalate the REVIEW mandate to a whole-repo same-class audit: instruct the
+   reviewer to enumerate every remaining site of that class and report each,
+   and treat "zero remaining" as the bar to push.
+A class that has recurred once will recur again until it is closed AS a class;
+the stop-gate makes "close the class" mandatory. (Distinguish from an
+architectural-debate escalation — a recurring class with an unambiguous fix is
+incomplete APPLICATION of an agreed fix, not a design fork; close it, do not
+debate it.)
+
+**Enumerate the class in the FIRST dispatch.** For any change that renames or
+redefines a term, status, field, or invariant, the DEFAULT reviewer mandate
+must already carry "name the defect class this change belongs to and enumerate
+every sibling in ONE pass" — do not wait for a recurrence to add it. The first
+review of an invariant-touching diff is the cheapest place to close the class.
+
+## Deterministic coupling checks + the repo's coupling manifest (discover, never hardcode)
+
+Two WIDE axes are only as strong as the repo's machine-checkable inputs.
+DISCOVER and RUN them; treat a missing one as a repo gap to RAISE, never as
+license to bake a repo's specifics into this (portable) skill.
+
+- **Dependency / traceability-index coherence is a DETERMINISTIC GATE, not
+  reviewer judgment.** If the repo maintains a requirement or dependency index
+  (a requirements index, a task DAG, a traceability map), its coherence belongs
+  in the gate set of Procedure step 2: no dangling reference, no cycle, and
+  every prerequisite a requirement's PROSE implies is present in its machine
+  dependency edges. Run the repo's own index validator. If the repo has no
+  cycle / prerequisite-completeness check, FLAG it as a repo gap (raise it
+  against the repo) and have the reviewer cover it by hand until the repo ships
+  the validator. Never encode the repo's index schema here.
+- **Coupled-artifact fan-out is driven by the repo's COUPLING MANIFEST.** The
+  Coupled-artifact sweep already says to LEARN the repo's code<->artifact
+  coupling rules from its own governance docs; make that a first-class hook.
+  The repo should expose a coupling manifest (change-kind -> obligated
+  artifacts) in its contributor / spec-governance docs — e.g. "a new model
+  field obligates its model doc, the domain model, the bounding/validation
+  rule, and every ADR that enumerates the model"; "a new requirement obligates
+  its heading, its index row, and every ADR / architecture 'depicted
+  requirements' list that enumerates siblings"; "a status or dependency change
+  obligates every dependent's edge". When the manifest is present, propagate to
+  every artifact it lists. When it is absent or incomplete, fall back to
+  discovery (grep the doc tree) AND raise the missing manifest entry as a repo
+  gap. The manifest CONTENT is the repo's; this skill only mandates consulting
+  it.
+
+Both keep the skill portable: the PROCESS rule lives here; the repo's specifics
+(the validator script, the manifest content) live in the repo and are
+DISCOVERED, never absorbed.
