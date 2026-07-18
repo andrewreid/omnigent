@@ -218,8 +218,8 @@ guarantees the bot finds the dropped siblings later, one per round.
 6. **Green gates + zero blocking = passes review; only now does the commit reach
    the remote.** Delegated: `git push`/`gh pr create` are blocked by
    `require_pr_review` until the marker records the CURRENT commit — write it
-   (`mkdir -p .worktrees/<id>/.polly && git -C .worktrees/<id> rev-parse HEAD >
-   .worktrees/<id>/.polly/review-passed`) THEN tell the SAME implementer to push
+   (`mkdir -p .worktrees/<task_id>/.polly && git -C .worktrees/<task_id> rev-parse HEAD >
+   .worktrees/<task_id>/.polly/review-passed`) THEN tell the SAME implementer to push
    its branch and open the PR. Direct-authoring: polly (not gated by
    `require_pr_review`) pushes and opens its OWN reviewed PR. Mark it ready in the
    registry with the PR URL and leave it for the human. **polly does NOT merge.**
