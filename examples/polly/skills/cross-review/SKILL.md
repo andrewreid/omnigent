@@ -70,8 +70,8 @@ ALSO run two more passes on the doc files, labelled:
   the parallel bug).
 - **Whole-parcel grep (round 1)** — when the change renames/redefines a
   term/status/concept/claim, grep the ENTIRE parcel (source + tests + docs +
-  generated/published artifacts) for the OLD term and fix-or-justify each hit
-  THIS round.
+  generated/published artifacts) for the OLD term AND its old semantics (catch a redefinition whose
+  vocabulary is unchanged) and fix-or-justify each hit THIS round.
 - **Env-dependent claims** — static configs/docs assert only intrinsic truths;
   flag any "resolves at X / reachable via Y / this provider answers" (deployment
   facts, not file properties).
@@ -197,12 +197,12 @@ guarantees the bot finds the dropped siblings later, one per round.
    `sys_session_send(agent=…, title="review-<slug>", args={purpose:"review",
    input:"<diff> + <contract>. Run [FOCUSED] then [WIDE] across all four axes —
    blast-radius (callers, consumer/event ripple, parallel surfaces, test-surface,
-   whole-parcel grep for a renamed term, env-dependent claims, claim completeness
+   whole-parcel grep for a renamed term/semantics, env-dependent claims, claim completeness
    incl. unchanged-asserting claims); sibling-class (name the class + every
    untouched site); input-domain (full taxonomy incl. legacy/nested/overlap/
    none-match); coupled-artifact (each obligated non-code artifact + its prose).
-   If the diff includes docs, ALSO run [SELF-CONSISTENCY] + [GOVERNANCE]. Report a
-   line per item; do not edit."})`. Give the diff + adjacency, withhold the
+   If the diff includes docs, ALSO run [SELF-CONSISTENCY] + [GOVERNANCE]. Classify each
+   finding blocking / non-blocking / suggestion, one line per item; do not edit."})`. Give the diff + adjacency, withhold the
    implementer's transcript/worktree, permit repo read. Emit the dispatch in the
    SAME turn you decide to review (never end a turn on an announcement with no
    tool call — that dropped turn stalls the run); then end your turn and collect
@@ -213,8 +213,8 @@ guarantees the bot finds the dropped siblings later, one per round.
    re-send to the SAME implementer conversation (reuse its `agent`+`title`, or
    `session_id`, `purpose:"implement"`) so it keeps its worktree/branch. Direct-
    authoring: polly revises the prose itself, re-runs the gates + all applicable
-   passes, and re-dispatches the review. Same loop, only the fixer differs. Then
-   loop to step 1.
+   passes, and re-dispatches the review. Same loop, only the fixer differs. Log each blocking issue as a
+   fix-task in the registry scoped to the same worktree. Then loop to step 1.
 6. **Green gates + zero blocking = passes review; only now does the commit reach
    the remote.** Delegated: `git push`/`gh pr create` are blocked by
    `require_pr_review` until the marker records the CURRENT commit — write it
