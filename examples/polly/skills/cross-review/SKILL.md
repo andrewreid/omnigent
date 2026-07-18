@@ -49,12 +49,12 @@ ALSO run two more passes on the doc files, labelled:
 2. **Sibling-class** — where else does this SAME defect shape exist that the diff
    did NOT touch? parallel modules/handlers/routes, other callers of the same
    helper/pattern. (See class-closure below.)
-3. **Input-domain** — when the diff touches a function that MAPS inputs to
+3. **Input-domain coverage** — when the diff touches a function that MAPS inputs to
    decisions (classifier/parser/mapper/router/dispatcher/normalizer/error-handler),
    enumerate the FULL input taxonomy, not only the shapes the diff exercised.
-   (See adversarial depth below.)
+   (See "Match review depth to the surface" below.)
 4. **Coupled-artifact** — which NON-CODE artifacts must move in lockstep for this
-   change KIND, and did they? (See coupled artifacts below.)
+   change KIND, and did they? (See "Coupled-artifact sweep" below.)
 
 ### WIDE walk-list — report a hit or "clear" per item
 - **All callers** of every changed symbol — flag sites that should have changed
@@ -80,7 +80,7 @@ ALSO run two more passes on the doc files, labelled:
   claim left by a removal, an overreaching new claim, or a false "still X / no
   change to Y."
 
-## Adversarial depth — enumerate the space, check each member
+## Match review depth to the surface — adversarial depth, enumerate the space
 Match DEPTH to the surface. On a rich surface the WIDE pass goes ADVERSARIAL — a
 confirmatory pass confirms only the cells the contract named and is blind to the
 rest (the "bot found another edge → patch → re-review → next edge" grind). Same
@@ -137,7 +137,7 @@ change — don't wait for a recurrence. Ready-to-paste reviewer mandate:
 > same helper/pattern — and report each site the fix did NOT cover. A fix that
 > closes the flagged site but leaves siblings is INCOMPLETE.
 
-## Coupled artifacts — gate the mechanical, review the judgment
+## Coupled-artifact sweep — gate the mechanical, review the judgment
 A functional change usually OBLIGATES paired non-code updates; skipping them is a
 blocking finding the external bot WILL raise. Discover the repo's OWN
 code↔artifact coupling from its governance docs (`AGENTS.md` / `CONTRIBUTING` /
@@ -194,7 +194,7 @@ guarantees the bot finds the dropped siblings later, one per round.
 3. **Dispatch a DIFFERENT-vendor reviewer** (`claude_code` / `codex` / `opencode`
    / `cursor` / `hermes` / `pi`, vendor ≠ the author's), task-based title
    (`review-<slug>`, never the vendor name):
-   `sys_session_send(agent=…, title="review-<slug>", args={purpose:"review",
+   `sys_session_send(agent=…, title="review-<task_slug>", args={purpose: "review",
    input:"<diff> + <contract>. Run [FOCUSED] then [WIDE] across all four axes —
    blast-radius (callers, consumer/event ripple, parallel surfaces, test-surface,
    whole-parcel grep for a renamed term/semantics, env-dependent claims, claim completeness
@@ -204,22 +204,21 @@ guarantees the bot finds the dropped siblings later, one per round.
    If the diff includes docs, ALSO run [SELF-CONSISTENCY] + [GOVERNANCE]. Classify each
    finding blocking / non-blocking / suggestion, one line per item; do not edit."})`. Give the diff + adjacency, withhold the
    implementer's transcript/worktree, permit repo read. Emit the dispatch in the
-   SAME turn you decide to review (never end a turn on an announcement with no
+   SAME turn you decide to review (never end a turn having only announced, with no
    tool call — that dropped turn stalls the run); then end your turn and collect
-   the report via `sys_read_inbox` (use `sys_session_get_history` only to debug an
+   the structured report with `sys_read_inbox` (use `sys_session_get_history` only to debug an
    empty/unclear result).
 4. The reviewer SURFACES issues; it never edits and never opens a PR.
 5. **Each blocking issue loops back to the fixer on the SAME branch.** Delegated:
    re-send to the SAME implementer conversation (reuse its `agent`+`title`, or
-   `session_id`, `purpose:"implement"`) so it keeps its worktree/branch. Direct-
+   `session_id`, `purpose: "implement"`) so it keeps its worktree/branch. Direct-
    authoring: polly revises the prose itself, re-runs the gates + all applicable
    passes, and re-dispatches the review. Same loop, only the fixer differs. Log each blocking issue as a
    fix-task in the registry scoped to the same worktree. Then loop to step 1.
 6. **Green gates + zero blocking = passes review; only now does the commit reach
    the remote.** Delegated: `git push`/`gh pr create` are blocked by
    `require_pr_review` until the marker records the CURRENT commit — write it
-   (`mkdir -p .worktrees/<task_id>/.polly && git -C .worktrees/<task_id> rev-parse HEAD >
-   .worktrees/<task_id>/.polly/review-passed`) THEN tell the SAME implementer to push
+   (`mkdir -p .worktrees/<task_id>/.polly && git -C .worktrees/<task_id> rev-parse HEAD > .worktrees/<task_id>/.polly/review-passed`) THEN tell the SAME implementer to push
    its branch and open the PR. Direct-authoring: polly (not gated by
    `require_pr_review`) pushes and opens its OWN reviewed PR. Mark it ready in the
    registry with the PR URL and leave it for the human. **polly does NOT merge.**
