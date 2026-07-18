@@ -177,9 +177,13 @@ make.
 ## Recurrence rule
 If a LATER review round, or an external-bot round, surfaces the SAME class at a
 NEW site, that is proof the prior review was delta-scoped, not class-scoped.
-Respond by WIDENING, immediately: escalate the FIX from a point-fix to a
-whole-surface class-closure, and the REVIEW mandate from delta-scoped to a
-whole-repo same-class audit.
+Respond by WIDENING, immediately — as a hard STOP gate, not advice: on the
+FIRST such recurrence, stop point-fixing and do NOT push another single-site
+patch. Escalate the FIX from a point-fix to a whole-surface class-closure (grep
+the class's shape across the ENTIRE parcel — source + tests + docs +
+generated/published artifacts — and fix-or-justify EVERY site), and the REVIEW
+mandate from delta-scoped to a whole-repo same-class audit, with "zero
+remaining" as the bar to push.
 
 Distinguish this from an architectural-debate escalation (see `pr-bot-loop`). A
 debate resolves a genuine design FORK — two defensible directions, no
@@ -403,7 +407,6 @@ dropped siblings the external whole-PR bot then finds LATER, one per round.
 - Non-blocking issues / suggestions go in the registry as follow-ups; they
   don't block the PR.
 
-
 ## Every round runs the full battery — closure parity + the recurrence stop-gate
 
 The two passes (and, for a doc/ADR/spec diff, the two doc passes) are not only
@@ -416,21 +419,12 @@ finding the next instance because the FIX was point-scoped even though the
 review nominally was not. Give every closure dispatch the same full mandate as
 the first, and label all passes in the report each time.
 
-**Recurrence stop-gate (hard, not advisory).** The FIRST time the same defect
-class recurs at a NEW site — whether a later internal round or an external-bot
-round surfaces it — STOP point-fixing. Do NOT push another single-site patch.
-Instead, in the SAME round:
-1. Escalate the FIX to whole-surface class-closure: grep the class's shape
-   across the ENTIRE parcel (source + tests + docs + generated/published
-   artifacts) and fix-or-justify EVERY site.
-2. Escalate the REVIEW mandate to a whole-repo same-class audit: instruct the
-   reviewer to enumerate every remaining site of that class and report each,
-   and treat "zero remaining" as the bar to push.
-A class that has recurred once will recur again until it is closed AS a class;
-the stop-gate makes "close the class" mandatory. (Distinguish from an
-architectural-debate escalation — a recurring class with an unambiguous fix is
-incomplete APPLICATION of an agreed fix, not a design fork; close it, do not
-debate it.)
+**Recurrence is a hard stop (see `## Recurrence rule`).** The FIRST same-class
+recurrence at a new site — internal round or external-bot round — forces
+whole-surface class-closure plus a whole-repo same-class audit before any
+further push, never another single-site patch. That section is the single
+source of truth for the stop-gate; this closure-parity rule is why it fires so
+often when closure rounds are narrowed.
 
 **Enumerate the class in the FIRST dispatch.** For any change that renames or
 redefines a term, status, field, or invariant, the DEFAULT reviewer mandate
