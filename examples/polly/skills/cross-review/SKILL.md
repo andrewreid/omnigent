@@ -5,463 +5,231 @@ description: Verify a candidate diff (an implementer's, or a doc/skill polly aut
 
 # cross-review — independent verification
 
-Whoever authored the change — an implementer sub-agent, or polly itself for a
-directly-authored doc/skill — never signs off on its own work; a
-different-vendor model does, and review is a sub-agent that returns a structured
-report, not a transcript anyone needs to read through.
+The author never signs off on its own work — an implementer sub-agent, or polly
+for a directly-authored doc/skill. A DIFFERENT-vendor sub-agent reviews and
+returns a structured report (not a transcript anyone reads through).
+**Independence = a different vendor + withholding the implementer's
+transcript/worktree — NOT denying repo read.** The sibling-class and
+coupled-artifact sweeps REQUIRE a clean checkout to grep, so always permit repo
+read, and give the reviewer the changed surface plus its adjacency (callers,
+sibling surfaces, the target type) — not just the raw hunk.
 
-Every review runs TWO passes, ALWAYS, in one reviewer dispatch:
-- **[FOCUSED]** — diff-vs-contract: "does this change do what it claims, against
-  the acceptance contract?" This is the narrow, confirmatory pass.
-- **[WIDE]** — wide-angle sweep: "what ELSE does this change touch that the diff
-  does not show?" This is the pass that catches the failures a diff-local
-  reviewer is structurally blind to. It carries FOUR mandatory axes, not one —
-  see below.
+## The battery — every review, every round
+One reviewer dispatch runs BOTH passes, ALWAYS, each labelled in its report. A
+re-review / closure round runs the **identical** battery — never a narrowed
+"just confirm these N blockers are closed" dispatch. That narrowing is exactly
+how a fix's own siblings leak out one round at a time: the WIDE pass keeps
+finding the next instance because the FIX was point-scoped even though the
+review nominally was not.
 
-These are not "confirmatory review, with adversarial as an occasional
-escalation". Both passes run on every review. The WIDE pass MAY fast-exit with
-an explicit "no blast radius — nothing else touches this" verdict when that is
-genuinely true, but it is NEVER skipped. Skipping the wide pass is exactly how a
-one-line fix becomes a multi-round whack-a-mole: the stragglers the diff didn't
-show surface one at a time, each its own review round. Match the review DEPTH to
-the surface (rich surfaces get an ADVERSARIAL wide pass — see below), but the two
-passes themselves are not optional.
+- **[FOCUSED]** — diff vs contract: does the change satisfy its acceptance
+  contract? The narrow pass; enough alone only for isolated, low-state changes.
+- **[WIDE]** — what ELSE does this touch that the diff does not show? FOUR
+  mandatory axes (below). MAY fast-exit a genuinely-empty axis in one line ("no
+  blast radius"), but is NEVER skipped — skipping it turns a one-line fix into
+  multi-round whack-a-mole.
 
-## The two passes — label them in the reviewer's report
-Instruct the reviewer to structure its report under both headings so you can see
-each pass ran:
+When the diff INCLUDES any doc / ADR / spec file (prose-only OR mixed code+docs),
+ALSO run two more passes on the doc files, labelled:
+- **[SELF-CONSISTENCY]** — does the document contradict ITSELF? [FOCUSED] audits
+  each claim in isolation, so two mutually-contradictory claims can each "pass."
+  Read the doc whole; reconcile its consequences / scope / non-goals against its
+  own decision and any evidence it cites; hunt STALE scope a later edit
+  superseded but never removed.
+- **[GOVERNANCE]** — does it obey the repo's OWN doc conventions? Load the repo's
+  ADR/spec governance (lifecycle e.g. Proposed→Accepted→Superseded; a decision
+  registry/index that must stay in sync; numbering / status / cross-ref rules)
+  and verify conformance — a premature status flip, a skipped lifecycle state, an
+  index copy disagreeing with the doc it points at, a status drifting between
+  copies.
 
-**[FOCUSED] — diff vs contract.** The narrow pass. Reviewer gets the diff + the
-acceptance contract and answers whether the change satisfies the contract. Enough
-on its own only for isolated, low-state changes.
+### The four WIDE axes
+1. **Blast-radius** — who CONSUMES the changed contract? callers, event
+   consumers, generated-client mirrors, anything that decodes the changed payload.
+2. **Sibling-class** — where else does this SAME defect shape exist that the diff
+   did NOT touch? parallel modules/handlers/routes, other callers of the same
+   helper/pattern. (See class-closure below.)
+3. **Input-domain** — when the diff touches a function that MAPS inputs to
+   decisions (classifier/parser/mapper/router/dispatcher/normalizer/error-handler),
+   enumerate the FULL input taxonomy, not only the shapes the diff exercised.
+   (See adversarial depth below.)
+4. **Coupled-artifact** — which NON-CODE artifacts must move in lockstep for this
+   change KIND, and did they? (See coupled artifacts below.)
 
-**[WIDE] — wide-angle sweep.** The wide pass carries FOUR axes, and the
-reviewer must answer ALL FOUR as mandatory questions — the diff-local view
-covers only the first:
-- **Downstream blast-radius** — who CONSUMES the contract this diff changed?
-  (callers, event consumers, generated-client mirrors, anything that decodes the
-  changed payload). This is the classic ripple axis.
-- **Sibling-class sweep** — where else does this SAME defect shape exist that the
-  diff did NOT touch? (parallel modules/handlers/routes running the same logic,
-  other callers of the same helper/pattern). See "Is the finding a one-off or an
-  instance of a class?" below.
-- **Input-domain sweep** — when the diff touches a function that MAPS inputs to
-  decisions (classifier, parser, mapper, router, dispatcher, normalizer,
-  error/exception handler), enumerate the FULL input taxonomy it must accept, not
-  only the shapes the diff exercised. See "Input-domain coverage" below.
-- **Coupled-artifact / traceability sweep** — for this change KIND, which
-  NON-CODE artifacts must move in lockstep, and did they? (docs, spec, schema,
-  traceability index, config reference). See "Coupled-artifact sweep" below.
+### WIDE walk-list — report a hit or "clear" per item
+- **All callers** of every changed symbol — flag sites that should have changed
+  to match but didn't.
+- **Consumer / event ripple** — event consumers of anything emitted/renamed;
+  generated-client mirrors of a changed API shape.
+- **Parallel surfaces** — a fix on one surface MUST hit every surface running the
+  same logic; grep the twin, don't re-read the changed one. Canonical pairs:
+  client-render ↔ server/SSR loader; read path ↔ its cached/materialized twin;
+  API handler ↔ generated-client mirror. Fixed one, left the twin = blocking.
+- **Test-surface** — tests must exercise EVERY surface the change touches;
+  single-surface coverage of a multi-surface change is a gap (a green suite hides
+  the parallel bug).
+- **Whole-parcel grep (round 1)** — when the change renames/redefines a
+  term/status/concept/claim, grep the ENTIRE parcel (source + tests + docs +
+  generated/published artifacts) for the OLD term and fix-or-justify each hit
+  THIS round.
+- **Env-dependent claims** — static configs/docs assert only intrinsic truths;
+  flag any "resolves at X / reachable via Y / this provider answers" (deployment
+  facts, not file properties).
+- **Claim completeness** — audit EVERY claim about named files/workflows/config:
+  REMOVED, ADDED, and anything asserted UNCHANGED. A partial audit misses a stale
+  claim left by a removal, an overreaching new claim, or a false "still X / no
+  change to Y."
 
-The reviewer must WALK this checklist and report a line per item (a hit, or
-"clear"):
-- **All callers of every changed function/symbol.** Enumerate them. Flag sites
-  that SHOULD have changed to match but didn't.
-- **Consumer / event ripple.** Event-type consumers of anything the change emits
-  or renames; generated-client mirrors of a changed API shape; anything
-  downstream that decodes the changed payload.
-- **PARALLEL SURFACES.** A fix on one surface MUST be applied to every surface
-  running the same logic. Grep the sibling surface — do not just re-read the
-  changed one. Canonical pairs: client-render ↔ server/SSR loader/prefetch; a
-  read path ↔ its cached / materialized twin; an API handler ↔ its
-  generated-client mirror. If the change fixed one and left the twin untouched,
-  that is a blocking finding.
-- **TEST-SURFACE coverage.** Tests must exercise EVERY surface the change touches
-  (e.g. the component AND the route-loader), not just the convenient one. A green
-  suite that hits only one surface HIDES the bug on the parallel one — treat
-  single-surface coverage of a multi-surface change as a gap.
-- **ROUND-1 WHOLE-PARCEL GREP.** When the change renames or redefines a term,
-  status, concept, or claim, grep the ENTIRE parcel — source + tests + docs +
-  generated/published artifacts — for the OLD term/semantics. Classify every hit
-  and fix-or-justify each, in THIS round. A vocab/claim change reviewed only near
-  the diff guarantees multi-round whack-a-mole as stragglers surface one at a
-  time.
-- **ENV-DEPENDENT CLAIMS.** Static example configs and docs must assert only
-  intrinsic truths, never environment-dependent facts. Flag any "resolves at X
-  login / reachable via Y / routes through Z / this provider answers" claim — the
-  auth path, model reachability, and which provider resolves are deployment
-  facts, not properties of the file.
-- **CLAIM COMPLETENESS.** When the diff makes claims about named files,
-  workflows, or config, audit EVERY such claim — what is REMOVED, what is ADDED,
-  AND anything the diff asserts is UNCHANGED — not a convenient spot-check. A
-  partial audit catches one direction and misses its twins: a stale claim left
-  behind by a removal, a fresh claim that overreaches what it added, or an
-  "unchanged / still X / no change to Y" assertion that is itself false against
-  the actual code/config. Enumerate all of them; verify each.
+## Adversarial depth — enumerate the space, check each member
+Match DEPTH to the surface. On a rich surface the WIDE pass goes ADVERSARIAL — a
+confirmatory pass confirms only the cells the contract named and is blind to the
+rest (the "bot found another edge → patch → re-review → next edge" grind). Same
+discipline, two kinds of code:
+- **Rich/stateful surface** (serializers, form↔payload round-trips, state
+  machines, derivations over many input states — loaded×edited × valid/invalid/
+  empty × per-line/aggregate × present/absent refs): change the mandate from
+  "verify the fix" to "find the states that break" — enumerate the state space,
+  attack the cells the contract did not name, demand the FULL list in one pass.
+- **Mapping function** (the pure-function twin): enumerate the FULL input
+  taxonomy — every shape/variant, every branched field (incl. alternate/legacy
+  names for the same meaning), nested/wrapped/chained inputs, the ORDERING of
+  overlapping matches (a broad early match short-circuiting a specific later one),
+  and the none-match fall-through. An unhandled, mis-ordered, or silently-dropped
+  shape is BLOCKING.
+- **Allowlist, not denylist** — when the fix is itself an enumeration, enumerate
+  the KNOWN-GOOD and route anything unrecognized to the safe/strict branch. A
+  denylist is fail-OPEN (every future sibling is a fresh hole; the loop never
+  converges); an allowlist is fail-CLOSED (converges by construction). If a fix
+  enumerates the BAD cases to reject, flag it.
+- **Front-run the external bot** — prefer running the adversarial pass on the
+  SAME engine as the external reviewer (`codex`) so its whole class of findings
+  lands in the FAST internal loop, not the slow PR loop (see `pr-bot-loop`).
+  Still a DIFFERENT vendor from the author.
 
-When the wide pass finds genuinely nothing across the whole checklist, it says so
-in one line and moves on. It does not get skipped to save a dispatch.
+The cheapest place to close a state-space bug is the implementer's FIRST pass:
+the acceptance contract for a rich surface should name the state-space axes and
+require an invariant / round-trip matrix test as a delivered artifact.
 
-## When the diff INCLUDES a doc / ADR / spec artifact — two more mandatory passes
-The two passes above are tuned for a CODE diff: claim-vs-code and blast radius.
-Whenever the diff INCLUDES a documentation / ADR / spec file — a prose-only diff
-OR a mixed code+docs diff — those are necessary but NOT sufficient for the doc
-files: a prose artifact fails in ways a code-centric lens is structurally blind
-to. Run BOTH of the following in ADDITION to [FOCUSED] and [WIDE], on the doc
-files, and label them in the reviewer's report:
+## Class-closure + the recurrence stop-gate
+Before scoping any fix to its flagged site, ask: one-off or class? A typo, wrong
+constant, or copy-paste slip is a one-off — fix it and move on. A fix whose shape
+generalizes ("X not re-checked on retry", "schema omits an outcome code", "value
+not normalized before compare") is a CLASS: the fix AND the review must enumerate
+and cover EVERY instance across the repo (grep the pattern), not just the flagged
+site. A point-fix + delta-scoped review provably cannot pre-empt siblings — the
+external whole-PR bot re-scans and finds the next one, one wasted round per site.
 
-**[SELF-CONSISTENCY] — does the document contradict ITSELF?** The [FOCUSED] pass
-audits each claim against its source IN ISOLATION, so two mutually-contradictory
-claims can each individually "pass" while directly contradicting each other. This
-pass reads the document as a whole and reconciles it against itself: do its stated
-consequences / scope / non-goals match its own decision and any evidence it cites
-(a spike, a finding, a benchmark it references)? Reconcile statements introduced
-across MULTIPLE edit passes — hunt STALE scope left behind when a later edit
-superseded an earlier claim but the earlier wording was never removed. A document
-that is internally inconsistent is wrong even when every individual claim traces to
-a real source.
+**Recurrence = hard STOP gate.** The FIRST time a later round (internal or
+external-bot) surfaces the SAME class at a NEW site — proof the prior review was
+delta-scoped — STOP point-fixing; do NOT push another single-site patch. In the
+SAME round escalate the FIX to whole-surface class-closure (grep the whole parcel
+— source + tests + docs + generated artifacts — and fix-or-justify EVERY site)
+and the REVIEW to a whole-repo same-class audit, with "zero remaining" as the bar
+to push. Distinct from an architectural debate (see `pr-bot-loop`): a debate
+resolves a genuine design FORK; a recurring class with an unambiguous fix is
+incomplete APPLICATION of an agreed fix — close it, don't debate it.
 
-**[GOVERNANCE] — does the change obey the repo's OWN doc conventions?** Load the
-repository's own documentation / ADR / spec governance — an ADR lifecycle (e.g.
-Proposed → Accepted → Superseded), any decision registry / index that must stay in
-sync with the documents it lists, numbering / status / cross-reference rules — and
-verify the change CONFORMS. Flag a status transition applied prematurely (e.g.
-marked Accepted before the gate that accepts it), a new document that skips a
-required lifecycle state, a registry / index copy that disagrees with the document
-it points at, or a duplicated status that drifts between copies. The repo's own
-rules are the contract here; the diff must not violate them.
-
-These two passes are as mandatory for a doc artifact as [WIDE] is for code: run
-both, label both, fast-exit a pass in one line only when it genuinely finds
-nothing. A doc/ADR/spec diff that skips them is not reviewed.
-
-## Is the finding a one-off or an instance of a class?
-Before treating any fix as scoped to its flagged site, ask whether it addresses a
-REPEATABLE pattern or a single one-off. A typo, a single wrong constant, a
-one-line copy-paste slip is a one-off — fix the site and move on. But a fix whose
-shape generalizes — "X not re-checked on retry", "schema omits an outcome code",
-"error mis-classified by rule Y", "value not normalized before compare" — is an
-instance of a CLASS, and must be treated as CLASS-CLOSURE: the fix task AND the
-review must enumerate and cover EVERY instance of that class across the codebase,
-found by grepping the pattern, not just the one flagged site.
-
-A point-fix plus a delta-scoped review provably CANNOT pre-empt siblings: the
-review only looked at the changed hunk, so a sibling the diff never touched was
-never in view. An external whole-PR reviewer re-scans the whole surface and finds
-the class at the next untouched site — one wasted round per site, indefinitely.
-Close the class in one pass instead.
-
-Ready-to-paste reviewer-mandate line (hand this to the reviewer whenever a fix
-looks like a class instance):
+Enumerate the class in the FIRST dispatch for any term/status/field/invariant
+change — don't wait for a recurrence. Ready-to-paste reviewer mandate:
 
 > Name the defect class this fix addresses. Enumerate every OTHER site matching
-> that class's shape — sibling routes, parallel handlers/modules, other callers
-> of the same helper/pattern — and report each site the fix did NOT cover. A fix
-> that closes the flagged site but leaves siblings is INCOMPLETE.
+> its shape — sibling routes, parallel handlers/modules, other callers of the
+> same helper/pattern — and report each site the fix did NOT cover. A fix that
+> closes the flagged site but leaves siblings is INCOMPLETE.
 
-## Coupled-artifact sweep
+## Coupled artifacts — gate the mechanical, review the judgment
 A functional change usually OBLIGATES paired non-code updates; skipping them is a
-blocking finding the external bot WILL raise. The reviewer must:
-1. Read the repo's OWN contributor / spec-governance docs — an `AGENTS.md`, a
-   `CONTRIBUTING`, a spec or docs tree — to LEARN that repo's code↔artifact
-   coupling rules. Discover them; do not assume a fixed list.
-2. For each coupling APPLICABLE to this diff's change kind, verify the paired
-   artifact was updated AND that its human-facing PROSE actually reflects the new
-   behavior — not merely that the file was touched.
+blocking finding the external bot WILL raise. Discover the repo's OWN
+code↔artifact coupling from its governance docs (`AGENTS.md` / `CONTRIBUTING` /
+spec tree) — do not assume a fixed list. Repo-agnostic coupling KINDS (the repo
+names the actual files): config/env knob ⇒ ops/config reference; requirement-
+bearing code/tests ⇒ traceability tags + requirement index; new API status/code
+⇒ API/OpenAPI schema; architectural decision ⇒ ADR + its index; pinned-line-
+shifting test edits ⇒ the baseline.
 
-Generic, repo-agnostic examples of coupling KINDS (a repo's own docs say which
-apply and name the actual files):
-- a new / changed configuration or env knob ⇒ its operations / config reference.
-- requirement-bearing code or tests ⇒ the repo's traceability tags + requirement
-  index.
-- a new API response status / code ⇒ the API schema / OpenAPI description.
-- an architectural or interface decision ⇒ an ADR + its index.
-- test edits that shift a pinned line ⇒ the pinned-line baseline.
+Split by determinism:
+- **Mechanical half → the GATE** (Procedure step 2, zero reviewer cost): does the
+  tag exist, is the index current, is the baseline in sync. This INCLUDES
+  **dependency / traceability-index coherence** — if the repo maintains a
+  requirement or dependency index (a DAG, a traceability map), verify no dangling
+  reference, no cycle, and every prerequisite a requirement's PROSE implies is
+  present in its machine dependency edges. Run the repo's own validator; if the
+  repo has no cycle / prereq-completeness check, FLAG it as a repo gap and cover
+  it by hand meanwhile. Never encode the repo's index schema here.
+- **Judgment half → the reviewer**: does the artifact's PROSE actually describe
+  the new behavior (not merely that the file was touched).
 
-Split the labor by determinism: the MECHANICAL half — does the tag exist, is the
-index current, is the baseline in sync — belongs in the GATE (a validator proves
-it, at zero reviewer cost, per Procedure step 2). Only the JUDGMENT half — does
-the artifact's PROSE correctly describe the new behavior — is the reviewer's to
-make.
+**Coupling-manifest hook.** The repo should expose a coupling manifest
+(change-kind → obligated artifacts) in its governance docs — e.g. "a new model
+field obligates its model doc + domain model + bounding rule + every ADR that
+enumerates the model"; "a new requirement obligates its heading + index row +
+every ADR / architecture 'depicted-requirements' list"; "a status or dependency
+change obligates every dependent's edge." Present → propagate to every listed
+artifact; absent/incomplete → fall back to grep AND raise the missing entry as a
+repo gap. The manifest CONTENT and the validator SCRIPT live in the repo and are
+DISCOVERED; this portable skill only mandates consulting them, never hardcodes a
+repo's specifics.
 
-## Recurrence rule
-If a LATER review round, or an external-bot round, surfaces the SAME class at a
-NEW site, that is proof the prior review was delta-scoped, not class-scoped.
-Respond by WIDENING, immediately — as a hard STOP gate, not advice: on the
-FIRST such recurrence, stop point-fixing and do NOT push another single-site
-patch. Escalate the FIX from a point-fix to a whole-surface class-closure (grep
-the class's shape across the ENTIRE parcel — source + tests + docs +
-generated/published artifacts — and fix-or-justify EVERY site), and the REVIEW
-mandate from delta-scoped to a whole-repo same-class audit, with "zero
-remaining" as the bar to push.
-
-Distinguish this from an architectural-debate escalation (see `pr-bot-loop`). A
-debate resolves a genuine design FORK — two defensible directions, no
-unambiguous answer. A recurring class with an unambiguous fix is NOT a fork: it
-is incomplete APPLICATION of an already-agreed fix. Close the class; do not
-debate it.
+## Author the contract wide (upstream of review)
+The reviewer checks the delta against the contract it was handed — any dimension
+the contract omits, the review starts BLIND on, and the blind spot recurs round
+after round. Before dispatching, the contract must itself enumerate: (a) for a
+mapping function, the INPUT TAXONOMY (shapes, branched/legacy fields, nested
+inputs, overlap ordering, none-match fall-through); (b) the COUPLED non-code
+artifacts for this change kind. A contract naming only happy-path shapes
+guarantees the bot finds the dropped siblings later, one per round.
 
 ## Procedure
-1. Get the task's diff. Per `review-before-pr`, review runs BEFORE a PR exists,
-   so take the branch diff: `git -C .worktrees/<task_id> diff main...HEAD`. Use
-   `gh pr diff <pr>` only for a pre-existing PR you did not just create.
-2. Run the deterministic gates first — but run EVERY deterministic check the
-   repo defines, not only tests / lint / typecheck. Discover the full validator
-   set from the repo itself: its `package.json` scripts, any `scripts/` or
-   `tools/` directory, and its contributor / spec-governance docs. That set
-   routinely includes spec / traceability / governance validators beyond the
-   usual three — a requirement-index checker, a traceability-tag linter, a
-   pinned-line baseline verifier, a schema/contract validator. Run them all via
-   `sys_os_shell`. A functional change that fails ANY repo validator — a missing
-   traceability tag, a stale requirement/spec index, a drifted pinned-line
-   baseline — is a RED gate: send it back to the fixer to drive green first —
-   the implementer for delegated work, or polly itself revising a
-   directly-authored artifact — and don't involve the reviewer yet. These deterministic couplings are
-   caught here for free, with ZERO reviewer tokens — never spend a reviewer on a
-   defect a validator already names.
-3. Dispatch a DIFFERENT-vendor sub-agent as reviewer: pick any AVAILABLE worker
-   whose vendor differs from the AUTHOR's — the implementer for delegated work,
-   or polly's own Claude-family model for a directly-authored artifact —
-   `claude_code`, `codex`,
-   `opencode`, `cursor`, `hermes`, or `pi` (e.g. Claude built it → any of
-   `codex` / `opencode` / `cursor` / `hermes` / `pi`, and so on). Use a
-   task-based title such as `review-auth-refactor`, never the raw vendor name:
-   `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"pi", title="review-<task_slug>",
-   args={purpose: "review", input: "<the diff> + <the acceptance contract>. Run
-   BOTH passes and report under both headings: [FOCUSED] diff-vs-contract, then
-   [WIDE] wide-angle sweep across all FOUR axes — (1) downstream blast-radius
-   (callers, consumer/event ripple, parallel surfaces, test-surface coverage,
-   whole-parcel grep for any renamed term, env-dependent claims, claim
-   completeness — audit removed, added, AND unchanged-asserting claims); (2)
-   sibling-class sweep (name the defect class, enumerate every un-touched site
-   matching its shape); (3) input-domain sweep (for any changed classifier,
-   parser, mapper, router, dispatcher, normalizer, or error/exception handler,
-   enumerate the full input taxonomy —
-   all input shapes, alternate/legacy field names, nested/wrapped/chained forms,
-   overlap/ordering so a broad match does not short-circuit a more-specific one,
-   and the none-match fall-through; report any unhandled input shape as blocking);
-   (4) coupled-artifact sweep (read the repo's contributor /
-   spec-governance docs, verify each non-code artifact this change kind obligates
-   was updated and its prose reflects the new behavior) — report a line per item.
-   PLUS: whenever the diff INCLUDES a doc/ADR/spec artifact (prose-only OR mixed
-   code+docs), ALSO run [SELF-CONSISTENCY] (does the doc contradict itself / carry
-   stale scope from an earlier edit pass?) and [GOVERNANCE] (does it obey the
-   repo's own ADR/spec lifecycle, numbering, and registry-sync rules?) on the doc
-   files. Report blocking / non-blocking / suggestions. Do not edit code."})`. Give it the diff
-   as text and bar the implementer's WORKTREE and REASONING (its transcript) —
-   but the sibling-class, coupled-artifact, and doc self-consistency sweeps
-   REQUIRE the reviewer to grep for siblings and read the FULL final files (a
-   stale contradiction often lives OUTSIDE the diff hunk), so explicitly PERMIT it
-   to read a clean checkout of the repo. Independence = a different vendor +
-   withholding the implementer's transcript/worktree, NOT denying repo read. For the WIDE pass the
-   reviewer needs enough context to trace ripple: give it the changed surface
-   plus its adjacency (callers, sibling surfaces, the type it targets), not just
-   the raw hunk. Fetch the diff and emit the
-   `sys_session_send` call in the SAME turn you decide to review — never end a
-   turn having only announced "I'll load cross-review and fetch the diff" with
-   no tool call (that dropped turn stalls the run; nothing dispatches and no
-   inbox wake arrives). Once the reviewer dispatch is in flight, end your turn;
-   collect the inbox-delivered structured report with `sys_read_inbox` when it
-   returns. Use `sys_session_get_history` only to debug an empty or unclear
-   review result.
-4. The reviewer SURFACES issues; it does not fix them.
-5. For each **blocking** issue: add a fix-task to the registry scoped to the
-   same worktree, and send the concrete fixes back to the SAME implementer
-   conversation via `sys_session_send` — reuse the original implementer's
-   `agent` + `title` (or address it by `session_id`) with
-   `purpose: "implement"`, so the worker keeps its worktree/branch context and
-   pushes the fixes to the SAME branch. (This is the DELEGATED path.) In the
-   DIRECT-AUTHORING path there is NO implementer sub-agent — polly authored the
-   artifact itself — so polly revises the prose DIRECTLY, re-runs the gates and
-   all applicable review passes, and re-dispatches the different-vendor review;
-   the loop is identical, only the fixer differs. No PR exists yet — review runs
-   pre-PR (per `review-before-pr`), so blocking issues loop back on the BRANCH,
-   not against an open PR. A new title would spawn a fresh worker with no
-   memory of the task. Then loop to step 1.
-6. When gates are green AND there are zero blocking issues, the diff passes
-   review. Now (and only now) the reviewed commit reaches the remote. In the
-   DELEGATED path a worker `git push` and `gh pr create` are blocked by the
-   `require_pr_review` policy until the `.polly/review-passed` marker records the
-   worker's CURRENT commit, so FIRST write it —
-   `sys_os_shell("mkdir -p .worktrees/<task_id>/.polly && git -C .worktrees/<task_id> rev-parse HEAD > .worktrees/<task_id>/.polly/review-passed")`
-   — THEN tell the SAME implementer to push its branch and open the PR. In the
-   DIRECT-AUTHORING path (a doc/skill polly wrote itself, no implementer
-   sub-agent) polly pushes and opens its OWN reviewed PR directly (polly is not
-   gated by `require_pr_review`; the gate guards the worker children — per
-   `review-before-pr`, the PR is opened on the reviewed product). Then mark it
-   ready in the registry (with its PR URL) and leave it for the human to merge.
-   polly does NOT merge it.
-7. If the contract can't be satisfied after a few loops, stop and escalate to
-   the user with specifics.
-
-## Match review DEPTH to the surface — the wide pass goes adversarial
-The two passes above always run. On a rich surface the WIDE pass is not just a
-blast-radius walk — it must go ADVERSARIAL. A confirmatory-only pass confirms
-exactly the cells the contract lists and is BLIND to every state nobody
-enumerated. On a **combinatorially-rich surface** — serializers,
-form↔payload round-trips, state machines, derivations/classifiers whose output
-depends on many input states (loaded vs edited × valid/invalid/empty inputs ×
-per-line vs aggregate flags × present/absent references) — the contract can only name
-a handful of states, so a confirmatory pass keeps signing off diffs that the external
-Codex bot's whole-state-space reasoning then breaks LATER, one edge per round. That
-"bot found another edge → patch → re-review → bot found the next" grind is a
-confirmatory review that should have been ADVERSARIAL.
-
-Classify the surface BEFORE dispatching the reviewer. If it is rich, deepen the
-WIDE pass into a full adversarial state-space attack:
-- **Widen the reviewer's context.** Give it the changed surface PLUS its adjacency
-  (the read / serialize / validate functions around the diff, the type it targets,
-  the consumers) — not just the raw hunk. Independence comes from a DIFFERENT vendor
-  and withholding the implementer's transcript/worktree, NOT from starving the
-  reviewer of context — a clean repo checkout for the sibling-class and
-  coupled-artifact sweeps is permitted and expected.
-- **Change the mandate.** Not "verify the fix" but "find the states that break":
-  instruct it to ENUMERATE the state space of the surface and ATTACK the cells the
-  contract did not name — "list every combination of {axes}; for each, does
-  load→edit→serialize round-trip correctly? which combinations silently drop,
-  mis-write, or wrongly block?". Mirror the external bot.
-- **Demand the FULL list in one pass.** The reviewer surfaces every issue it can find
-  now, exhaustively — not a trickle that becomes N rounds.
-- **Front-run the external bot.** Prefer running this adversarial pass on the SAME
-  engine as the external reviewer (`codex`) so its whole class of findings lands in
-  the FAST internal loop instead of the slow PR loop (see `pr-bot-loop` → front-run
-  the bot). Keep it a DIFFERENT vendor from the author (the implementer, or polly
-  for a directly-authored artifact).
-
-The cheapest place to close a state-space bug is the implementer's FIRST pass: pair
-this with `review-before-pr` — the acceptance contract for a rich surface must name
-the state-space axes and require an invariant / round-trip matrix test as a delivered
-artifact, so the surface is built right once instead of hardened reactively.
-
-## Input-domain coverage — the pure-function analogue of the state-space attack
-The state-space attack above enumerates the STATES of a stateful surface. Its
-pure-function twin enumerates the INPUT SHAPES of a mapping function, and it runs
-as a peer WIDE-pass axis whenever the diff touches one — the same move applied to a
-different kind of code.
-
-When a change touches a function that MAPS inputs to decisions — a classifier,
-parser, mapper, router, dispatcher, normalizer, or error/exception handler —
-enumerate the FULL input taxonomy it must accept, not only the shapes the diff
-exercised. Cover: every distinct input shape/variant; every field or property the
-function may branch on (including alternate/legacy field names carrying the same
-meaning); nested or wrapped inputs (a cause/inner chain, envelope, or union
-member); and the ORDERING of overlapping matches (a broad early match that
-short-circuits before a more-specific later branch). Verify every branch of the
-decision tree, and verify what happens for an input that matches NONE. A function
-that handles the common shape but drops a sibling shape, mis-orders an overlapping
-match, or falls through silently on an unrecognized shape is a BLOCKING finding.
-State the taxonomy explicitly and check each member against the code.
-
-Both axes are the same discipline — "enumerate the space, then check each member" —
-applied to different kinds of code: state-space = the states of a stateful surface;
-input-domain = the input shapes of a mapping function. A diff looks correct
-precisely because the shape it dropped is never in the diff; only enumerating the
-whole taxonomy surfaces the gap.
-
-**Shape an enumeration fix as an allowlist, not a denylist.** When the fix for a
-sibling / input-domain class is itself an ENUMERATION, prefer an ALLOWLIST —
-enumerate the KNOWN-GOOD cases and route anything unrecognized to the safe/strict
-branch — over an EXCLUDE-LIST / denylist that enumerates the known-bad. A denylist
-is fail-OPEN: every new or future sibling nobody enumerated slips through as a
-fresh hole, so the review/fix loop cannot converge — each round just finds the next
-un-excluded sibling. An allowlist is fail-CLOSED: it converges by construction,
-since any unrecognized case falls to the safe branch without having had to be
-foreseen. Reviewer cue: if a fix enumerates the BAD cases to reject, flag it — ask
-whether an allowlist of the good cases would close the class instead of chasing
-siblings one at a time.
-
-## The review can never out-scope its contract — author the contract wide
-The reviewer checks the DELTA against the acceptance contract it was handed, so any
-dimension the contract omits is a dimension the review starts BLIND on. The
-reviewer's ceiling is the contract: however diligent the review, a narrow contract
-makes the blind spot recur round after round. This is upstream of review — a
-discipline for whoever AUTHORS the acceptance contract BEFORE dispatching the
-reviewer, not something the reviewer can recover on its own.
-
-Before dispatching, the contract must itself enumerate:
-1. **For a mapping function** (classifier, parser, mapper, router, dispatcher,
-   normalizer, error/exception handler) — the INPUT TAXONOMY the function must
-   cover: every shape/variant, every field it branches on (including
-   alternate/legacy names carrying the same meaning), nested/wrapped inputs, the
-   ordering of overlapping matches, and the none-match fall-through. If the contract
-   omits the taxonomy, the reviewer inherits the omission — the input-domain axis
-   has nothing to check the delta against.
-2. **The coupled non-code artifacts** that must move in lockstep with this change
-   kind (discovered from the repo's OWN contributor / spec-governance docs — see
-   "Coupled-artifact sweep").
-
-Write the contract WIDE so the review can be wide. A contract that names only the
-shapes the happy path exercises guarantees the review keeps signing off diffs whose
-dropped siblings the external whole-PR bot then finds LATER, one per round.
+1. **Diff.** Review runs BEFORE a PR (per `review-before-pr`): take the branch
+   diff `git -C .worktrees/<task_id> diff main...HEAD` (`gh pr diff <pr>` only for
+   a pre-existing PR you did not just create).
+2. **Gates first — ALL of them.** Run EVERY deterministic check the repo defines,
+   not just test/lint/typecheck: discover the full set from `package.json`
+   scripts, any `scripts/`/`tools/` dir, and governance docs — often a
+   requirement-index checker, traceability-tag linter, pinned-line baseline,
+   schema/contract and index-coherence validator. Any RED gate goes back to the
+   fixer (implementer, or polly for a directly-authored artifact) to drive green
+   BEFORE the reviewer is involved — zero reviewer tokens on a defect a validator
+   already names.
+3. **Dispatch a DIFFERENT-vendor reviewer** (`claude_code` / `codex` / `opencode`
+   / `cursor` / `hermes` / `pi`, vendor ≠ the author's), task-based title
+   (`review-<slug>`, never the vendor name):
+   `sys_session_send(agent=…, title="review-<slug>", args={purpose:"review",
+   input:"<diff> + <contract>. Run [FOCUSED] then [WIDE] across all four axes —
+   blast-radius (callers, consumer/event ripple, parallel surfaces, test-surface,
+   whole-parcel grep for a renamed term, env-dependent claims, claim completeness
+   incl. unchanged-asserting claims); sibling-class (name the class + every
+   untouched site); input-domain (full taxonomy incl. legacy/nested/overlap/
+   none-match); coupled-artifact (each obligated non-code artifact + its prose).
+   If the diff includes docs, ALSO run [SELF-CONSISTENCY] + [GOVERNANCE]. Report a
+   line per item; do not edit."})`. Give the diff + adjacency, withhold the
+   implementer's transcript/worktree, permit repo read. Emit the dispatch in the
+   SAME turn you decide to review (never end a turn on an announcement with no
+   tool call — that dropped turn stalls the run); then end your turn and collect
+   the report via `sys_read_inbox` (use `sys_session_get_history` only to debug an
+   empty/unclear result).
+4. The reviewer SURFACES issues; it never edits and never opens a PR.
+5. **Each blocking issue loops back to the fixer on the SAME branch.** Delegated:
+   re-send to the SAME implementer conversation (reuse its `agent`+`title`, or
+   `session_id`, `purpose:"implement"`) so it keeps its worktree/branch. Direct-
+   authoring: polly revises the prose itself, re-runs the gates + all applicable
+   passes, and re-dispatches the review. Same loop, only the fixer differs. Then
+   loop to step 1.
+6. **Green gates + zero blocking = passes review; only now does the commit reach
+   the remote.** Delegated: `git push`/`gh pr create` are blocked by
+   `require_pr_review` until the marker records the CURRENT commit — write it
+   (`mkdir -p .worktrees/<id>/.polly && git -C .worktrees/<id> rev-parse HEAD >
+   .worktrees/<id>/.polly/review-passed`) THEN tell the SAME implementer to push
+   its branch and open the PR. Direct-authoring: polly (not gated by
+   `require_pr_review`) pushes and opens its OWN reviewed PR. Mark it ready in the
+   registry with the PR URL and leave it for the human. **polly does NOT merge.**
+7. Contract unsatisfiable after a few loops → stop and escalate to the human with
+   specifics.
 
 ## Notes
-- Cross-review requires a reviewer from a DIFFERENT vendor than the author (the
-  implementer for delegated work, or polly's own model family for a
-  directly-authored artifact), so it needs at least two AVAILABLE workers (per
-  polly's roster preflight). If
-  only one worker — or only one vendor that can review this author's PR —
-  is available on the machine, you CANNOT run independent cross-vendor review:
-  don't dispatch a reviewer that can't boot, say so explicitly, and pull in the
-  human at the plan gate.
-- Give the reviewer the diff + contract, and bar the implementer's transcript
-  and worktree — that reasoning-independence is the whole point. This does NOT
-  mean starving it of repo read: the sibling-class and coupled-artifact sweeps
-  need a clean checkout to grep siblings and inspect the docs/spec tree, so
-  PERMIT that. Independence = a different vendor + withholding the implementer's
-  transcript/worktree, NOT denying repo read.
-- Review is a coding sub-agent (`claude_code`/`codex`/`opencode`/`cursor`/`hermes`/`pi`) dispatched with
-  `purpose: "review"` — a DIFFERENT vendor from the one that built the diff. It
-  reports issues and never edits; the reviewer NEVER opens a PR (in the delegated
-  path the implementer opens it; in the direct-authoring path polly does), so a stray
-  reviewer edit never reaches the deliverable.
-- Non-blocking issues / suggestions go in the registry as follow-ups; they
-  don't block the PR.
-
-## Every round runs the full battery — closure parity + the recurrence stop-gate
-
-The two passes (and, for a doc/ADR/spec diff, the two doc passes) are not only
-for the FIRST review of a change. A re-review / closure round runs the
-**identical** battery — [FOCUSED] + [WIDE] across all four axes +
-[SELF-CONSISTENCY] + [GOVERNANCE] — never a narrowed "just confirm these N
-blockers are closed" dispatch. Narrowing the closure prompt is exactly how a
-fix's own siblings leak out one round at a time: the reviewer's WIDE pass keeps
-finding the next instance because the FIX was point-scoped even though the
-review nominally was not. Give every closure dispatch the same full mandate as
-the first, and label all passes in the report each time.
-
-**Recurrence is a hard stop (see `## Recurrence rule`).** The FIRST same-class
-recurrence at a new site — internal round or external-bot round — forces
-whole-surface class-closure plus a whole-repo same-class audit before any
-further push, never another single-site patch. That section is the single
-source of truth for the stop-gate; this closure-parity rule is why it fires so
-often when closure rounds are narrowed.
-
-**Enumerate the class in the FIRST dispatch.** For any change that renames or
-redefines a term, status, field, or invariant, the DEFAULT reviewer mandate
-must already carry "name the defect class this change belongs to and enumerate
-every sibling in ONE pass" — do not wait for a recurrence to add it. The first
-review of an invariant-touching diff is the cheapest place to close the class.
-
-## Deterministic coupling checks + the repo's coupling manifest (discover, never hardcode)
-
-Two WIDE axes are only as strong as the repo's machine-checkable inputs.
-DISCOVER and RUN them; treat a missing one as a repo gap to RAISE, never as
-license to bake a repo's specifics into this (portable) skill.
-
-- **Dependency / traceability-index coherence is a DETERMINISTIC GATE, not
-  reviewer judgment.** If the repo maintains a requirement or dependency index
-  (a requirements index, a task DAG, a traceability map), its coherence belongs
-  in the gate set of Procedure step 2: no dangling reference, no cycle, and
-  every prerequisite a requirement's PROSE implies is present in its machine
-  dependency edges. Run the repo's own index validator. If the repo has no
-  cycle / prerequisite-completeness check, FLAG it as a repo gap (raise it
-  against the repo) and have the reviewer cover it by hand until the repo ships
-  the validator. Never encode the repo's index schema here.
-- **Coupled-artifact fan-out is driven by the repo's COUPLING MANIFEST.** The
-  Coupled-artifact sweep already says to LEARN the repo's code<->artifact
-  coupling rules from its own governance docs; make that a first-class hook.
-  The repo should expose a coupling manifest (change-kind -> obligated
-  artifacts) in its contributor / spec-governance docs — e.g. "a new model
-  field obligates its model doc, the domain model, the bounding/validation
-  rule, and every ADR that enumerates the model"; "a new requirement obligates
-  its heading, its index row, and every ADR / architecture 'depicted
-  requirements' list that enumerates siblings"; "a status or dependency change
-  obligates every dependent's edge". When the manifest is present, propagate to
-  every artifact it lists. When it is absent or incomplete, fall back to
-  discovery (grep the doc tree) AND raise the missing manifest entry as a repo
-  gap. The manifest CONTENT is the repo's; this skill only mandates consulting
-  it.
-
-Both keep the skill portable: the PROCESS rule lives here; the repo's specifics
-(the validator script, the manifest content) live in the repo and are
-DISCOVERED, never absorbed.
+- Needs ≥2 AVAILABLE workers — a reviewer of a DIFFERENT vendor than the author
+  (per polly's roster preflight). If only one worker, or only one vendor that can
+  review this author, is bootable, you CANNOT run cross-vendor review: say so
+  explicitly, don't dispatch a reviewer that can't boot, and pull the human in at
+  the plan gate.
+- Non-blocking issues / suggestions → registry follow-ups; they don't block the PR.
