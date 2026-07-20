@@ -7333,7 +7333,9 @@ async def test_setup_base_exception_does_not_leave_active_turn(
             executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
         )
 
-    def _raising_build(spec: object, *, workdir: object = None) -> dict[str, str]:
+    def _raising_build(
+        spec: object, *, cwd: object = None, workdir: object = None
+    ) -> dict[str, str]:
         del spec, workdir
         # A BaseException that is NOT an Exception subclass, raised inside the
         # background setup phase (after the 202).
