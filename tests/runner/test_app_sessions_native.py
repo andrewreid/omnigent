@@ -8963,11 +8963,12 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
         # DELETE clears ``_session_histories`` and pops the queue from
         # ``_session_event_queues``, so reading after delete would
         # always see empty.
-        captured_history = list(_session_histories_ref.get("conv_native_int", []))
-        queue = app.state.session_event_queues.get("conv_native_int")
+        captured_history = list(_session_histories_ref.get("664449321754215750a1d43e89fca21e", []))
+        queue = app.state.session_event_queues.get("664449321754215750a1d43e89fca21e")
         assert queue is not None, (
             "Session creation should have initialized the event queue "
-            "for ``conv_native_int``; ``app.state.session_event_queues`` is "
+            "for ``664449321754215750a1d43e89fca21e``; "
+            "``app.state.session_event_queues`` is "
             "missing the entry, so we couldn't drain it to verify the "
             "interrupt handler did not enqueue a synthesized idle."
         )
@@ -9230,8 +9231,8 @@ async def test_events_interrupt_on_native_session_503_skips_cleanup_when_inject_
             json={"type": "interrupt"},
         )
 
-        captured_history = list(_session_histories_ref.get("conv_native_int_fail", []))
-        queue = app.state.session_event_queues.get("conv_native_int_fail")
+        captured_history = list(_session_histories_ref.get("57ac398df7e3972b95ddba8d6109f396", []))
+        queue = app.state.session_event_queues.get("57ac398df7e3972b95ddba8d6109f396")
         assert queue is not None, (
             "Session creation should have initialized the event queue; "
             "the failure path still needs the queue to exist so we can "
@@ -10784,8 +10785,8 @@ async def test_events_stop_session_on_native_kills_tmux_and_publishes_idle(
             json={"type": "stop_session"},
         )
 
-        captured_history = list(_session_histories_ref.get("conv_native_stop", []))
-        queue = app.state.session_event_queues.get("conv_native_stop")
+        captured_history = list(_session_histories_ref.get("1fb90dd3b9d3f24e2356ace505314db1", []))
+        queue = app.state.session_event_queues.get("1fb90dd3b9d3f24e2356ace505314db1")
         assert queue is not None, (
             "Session creation should have initialized the event queue "
             "for ``1fb90dd3b9d3f24e2356ace505314db1``; without it ``_publish_event`` had "
@@ -11049,7 +11050,7 @@ async def test_events_stop_session_on_native_returns_503_when_kill_fails(
             json={"type": "stop_session"},
         )
 
-        queue = app.state.session_event_queues.get("conv_native_stop_fail")
+        queue = app.state.session_event_queues.get("baabd23def56efdbe0b84b9c924aa6a6")
         assert queue is not None
         queued_events: list[dict[str, Any]] = []
         while not queue.empty():
