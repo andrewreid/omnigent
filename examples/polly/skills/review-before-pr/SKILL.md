@@ -170,12 +170,18 @@ spot recur round after round. See `cross-review` → "Input-domain coverage" and
 "The review can never out-scope its contract".
 
 ## Carry a defect-class ledger across the whole run
-Every blocking finding that survives to a fix names a DEFECT CLASS — a shape, not
-an incident ("a decision taken before the lock that guards it is re-validated",
-"a call's status ignored because the calling context suppresses errors", "a value
-assigned inside a subshell so the caller never observes it"). Those classes are
-the most reusable thing a review round produces, and they are usually latent in
-the NEXT task too: same repo, same language, same idioms, often the same file.
+Some blocking findings are one-offs (a typo, a wrong constant) and carry nothing
+forward — `cross-review` → "Class-closure" decides which is which. The ones
+classified as a CLASS name a SHAPE rather than an incident, and that shape is the
+most reusable thing a review round produces: it is usually latent in the NEXT
+task too, because the repo, language, and idioms have not changed. Ledger the
+classes only.
+
+Write each entry as the shape, in the vocabulary of THIS repo's stack, phrased so
+it can be checked against a diff — "a guarded value read before the guard that
+protects it is re-established", "a failure signal the calling context discards",
+"a change made in a scope the caller cannot observe". The generic examples here
+are illustrative only; the real entries come from this run's own findings.
 
 Keep a running ledger of them for the whole run (the registry is a fine home) and
 spend it twice:
