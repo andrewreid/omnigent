@@ -213,7 +213,19 @@ demote a severity judgment — how much defence-in-depth a surface deserves,
 whether a rare race matters here, how much polish a low-stakes artifact earns.
 
 **THE NON-DEMOTABLE SET (canonical — this is the ONE place it is enumerated).**
-No criticality, bar, or disposition anywhere in these skills may demote:
+Read the RULE first, then the list. THE RULE: criticality moves severity
+JUDGMENT only. It NEVER waives a rule these skills state as mandatory — anything
+written as MUST / ALWAYS / NEVER / "is blocking" is non-demotable whether or not
+it appears below. That covers, among others, the full identical review battery
+including the prose lenses; whole-parcel round-one closure and claim
+completeness; allowlist-not-denylist when a fix is itself an enumeration; the
+conflicting-requirements STOP condition; the rich-surface contract requirements;
+re-review after a substantive post-review edit; independent review of prose and
+skills polly authored directly; verification-ceiling disclosure; the bot-loop
+disposition and clean-bill criteria; and review-before-push / marker discipline.
+The list below is NOT that whole set and does not try to be — it enumerates the
+FINDING-level gates most often argued down in practice, so a reviewer packet has
+something concrete to paste:
 1. a fix applied to one surface but not every parallel surface running the same
    logic;
 2. tests that exercise only one of the several surfaces a change touches;
@@ -224,9 +236,11 @@ No criticality, bar, or disposition anywhere in these skills may demote:
 5. the recurrence STOP gate — the same class surfacing at a NEW site;
 6. a coupled artifact the repo's own governance obligates;
 7. a RED deterministic gate.
-These are correctness and convergence, not severity taste. Everywhere else that
-needs this concept REFERENCES this list — never restates it, because three
-copies drift into three different rules. If you think criticality should waive
+These are correctness and convergence, not severity taste. The list is
+illustrative of the RULE, not a boundary on it: a mandatory rule absent from
+these seven is still non-demotable. Everywhere else that needs this concept
+REFERENCES this section — never restates it, because three copies drift into
+three different rules. If you think criticality should waive
 one, that is a question for the human, not a call to make in a mandate.
 
 "Non-blocking" means CLOSED FOR THIS GATE — it does not hold the PR closed — but

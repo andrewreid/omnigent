@@ -1,6 +1,6 @@
 ---
 name: review-before-pr
-description: polly's standing quality gate — an implementer must NOT open a PR until its diff has PASSED cross-vendor review. Work happens on a worktree branch; gates + independent different-vendor review run against that branch diff; blocking issues loop back to the same implementer; only when gates are green AND zero blocking issues remain does the implementer open the PR. The PR is opened on an already-reviewed product. polly never merges; the human does.
+description: polly's standing quality gate — an implementer must NOT open a PR until its diff has PASSED cross-vendor review. Work happens on a worktree branch; gates + independent different-vendor review run against that branch diff; blocking issues loop back to the same implementer (unless the human ratifies cutting the requirement behind one); only when gates are green AND zero blocking issues remain does the implementer open the PR. The PR is opened on an already-reviewed product. polly never merges; the human does.
 ---
 
 # review-before-pr — the PR is the reviewed product, not the draft
