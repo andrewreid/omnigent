@@ -18,10 +18,15 @@ dependency).
    args={purpose: "implement", input: "<task + acceptance contract +
    worktree path>"})`. Use a short task-based title such as `auth-refactor` or
    `fix-sse-error`, never the raw vendor name. State the scope and that it must
-   work only inside `.worktrees/<task_id>`. From the second task onward, include
-   the run's defect-class ledger in the contract (see `review-before-pr` →
-   "Carry a defect-class ledger across the whole run") — parallel tasks in one
-   repo reintroduce each other's classes. The worker drives the task to green
+   work only inside `.worktrees/<task_id>`. Include a SNAPSHOT of the run's
+   defect-class ledger as it stands when the wave is dispatched (see
+   `review-before-pr` → "Carry a defect-class ledger across the whole run").
+   Within one parallel wave the ledger cannot grow — no task's review has
+   returned yet — so it propagates BETWEEN waves, not between siblings of the
+   same wave. When a review DOES surface a new class while siblings are still
+   running, send it to each in-flight worker as a follow-up message on its
+   existing conversation ("new known hazard; check your diff against it") rather
+   than waiting for the next wave. The worker drives the task to green
    and COMMITS to its branch, but MUST NOT push or open a PR yet (see
    `review-before-pr`) — it reports its branch name + summary and waits. Review
    runs on the local branch diff; the branch is pushed and the PR opened only

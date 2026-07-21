@@ -208,12 +208,26 @@ State it as two lists, never as an adjective:
   inputs no caller can produce. Demote these to non-blocking follow-ups instead
   of letting them hold the PR closed.
 
-A finding correctly rated non-blocking under the agreed bar is DONE, not debt to
-grind on later; re-opening it contradicts the bar you set. And watch the SHAPE of
-successive rounds: when each new round returns only findings below the agreed
-bar, the surface is finished — say so to the human explicitly instead of opening
-another round. (Findings that keep BRANCHING above the bar are the opposite
-signal — see `pr-bot-loop` → structural escalation.)
+**The bar moves the JUDGMENT calls, never the hard gates.** Criticality may
+demote a severity judgment — how much defence-in-depth a surface deserves, how
+much coverage is enough, whether a rare race matters here. It may NEVER demote
+the structural gates this skill states absolutely, whatever the artifact:
+a fix applied to one surface and not its parallel twin; an unhandled,
+mis-ordered, or silently-dropped input shape in a mapping function; the
+recurrence STOP gate (same class at a new site); a coupled artifact the repo's
+own governance obligates; a RED deterministic gate. Those stay blocking at every
+criticality — they are correctness and convergence, not severity taste. If you
+think criticality should waive one, that is a question for the human, not a call
+to make in the mandate.
+
+"Non-blocking" means CLOSED FOR THIS GATE — it does not hold the PR closed — but
+still RECORDED as a registry follow-up, never silently discarded (see Notes).
+Don't re-litigate it later in the same run: re-opening a finding you correctly
+demoted contradicts the bar you set. And watch the SHAPE of successive rounds:
+when each new round returns only findings below the agreed bar, the surface is
+finished — say so to the human explicitly instead of opening another round.
+(Findings that keep BRANCHING ABOVE the bar are the opposite signal — see
+`pr-bot-loop` → "Deciding structural vs small (classify first, then escalate)".)
 
 ## Author the contract wide (upstream of review)
 The reviewer checks the delta against the contract it was handed — any dimension
@@ -267,16 +281,28 @@ REQUIREMENTS ARE A STOP CONDITION — report and wait, never silently pick a win
    ADJUDICATE, do not accept, any self-graded claim attached to the change
    (a mutation score, 'that mutant is equivalent', 'no siblings exist',
    'covered by test X') — check it against the code and report a refuted claim
-   as a finding. Apply the BLOCKING BAR I state below, not a default
-   production-grade one. Classify each
+   as a finding. Apply THIS blocking bar, not a default production-grade one —
+   BLOCKING for this artifact: <IS list>; NOT blocking here: <IS-NOT list>; the
+   non-demotable structural gates (parallel-surface, input-domain, recurrence,
+   coupled-artifact, red deterministic gate) remain blocking regardless.
+   Classify each
    finding blocking / non-blocking / suggestion, one line per item; do not edit."})`. Give the diff + adjacency, withhold the
-   implementer's transcript/worktree, permit repo read. Emit the dispatch in the
+   implementer's transcript/worktree, permit repo read. FILL both bar
+   placeholders from the criticality agreed at the plan gate before sending —
+   a packet dispatched with `<IS list>` / `<IS-NOT list>` still in it tells the
+   reviewer to apply a bar it was never given, which is worse than stating none. Emit the dispatch in the
    SAME turn you decide to review (never end a turn having only announced, with no
    tool call — that dropped turn stalls the run); then end your turn and collect
    the structured report with `sys_read_inbox` (use `sys_session_get_history` only to debug an
    empty/unclear result).
 4. The reviewer SURFACES issues; it never edits and never opens a PR.
-5. **Each blocking issue loops back to the fixer on the SAME branch.** Delegated:
+5. **Each blocking issue loops back to the fixer on the SAME branch** — with ONE
+   exception: where the blocking issue traces to a REQUIREMENT that is itself the
+   defect, do not dispatch another fix round. Take a CUT recommendation to the
+   human (see "When the REQUIREMENT is the defect, propose a CUT"); a
+   human-ratified cut closes the finding by DELETING the requirement, and the
+   revised contract governs the next round. Never self-ratify the cut, and never
+   silently drop a blocking issue you merely disagree with. Delegated:
    re-send to the SAME implementer conversation (reuse its `agent`+`title`, or
    `session_id`, `purpose: "implement"`) so it keeps its worktree/branch. Direct-
    authoring: polly revises the prose itself, re-runs the gates + all applicable
