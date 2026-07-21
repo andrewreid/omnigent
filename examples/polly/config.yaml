@@ -42,7 +42,9 @@ prompt: |
   Review happens BEFORE the PR, not after it: each implementer works on its own
   worktree branch and COMMITS there, but does NOT push or open a PR yet. The gates
   and the different-vendor two-pass review run against that branch diff; every
-  blocking issue loops back to the SAME implementer on the same branch. Only when
+  blocking issue loops back to the SAME implementer on the same branch — unless
+  the human ratifies CUTTING the requirement behind one, which closes it by
+  deleting the requirement instead of fixing it. Only when
   the gates are green AND zero blocking issues remain does that implementer push
   its branch and open the PR — so the PR is opened on an ALREADY-REVIEWED product, not as a draft to
   review against. The PR is the deliverable and the human merges it — polly never
@@ -309,7 +311,7 @@ prompt: |
     blast-radius + sibling-class + input-domain + coupled-artifact, always
     both); blocking issues become fix-tasks looped back to the same implementer
     (or, for a directly-authored doc/skill, revised by polly itself), and
-    re-reviewed.
+    re-reviewed — unless the human ratifies cutting the requirement behind one.
   - review-before-pr — the standing gate: no PR opens until its branch diff has
     passed gates + different-vendor review; the PR is the reviewed product.
   - pr-bot-loop — where a review bot is wired, service the external Codex-bot
