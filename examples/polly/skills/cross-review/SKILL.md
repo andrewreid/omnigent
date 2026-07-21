@@ -191,6 +191,11 @@ guarantees the bot finds the dropped siblings later, one per round.
    fixer (implementer, or polly for a directly-authored artifact) to drive green
    BEFORE the reviewer is involved — zero reviewer tokens on a defect a validator
    already names.
+   If a pytest result's count must be recorded or reconciled, collect ground
+   truth with `python -m pytest --collect-only -q <same files>` against the
+   exact file set/command/commit the implementer reported. Never use
+   `grep -c 'def test_'` as a pytest count: it counts functions, not collected
+   cases, and misses parametrized case expansion.
 3. **Dispatch a DIFFERENT-vendor reviewer** (`claude_code` / `codex` / `opencode`
    / `cursor` / `hermes` / `pi`, vendor ≠ the author's), task-based title
    (`review-<slug>`, never the vendor name):
