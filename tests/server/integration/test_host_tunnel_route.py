@@ -479,7 +479,7 @@ async def test_replaced_connection_cleanup_does_not_offline_new_connection(
         create_host_tunnel_router(
             registry,
             store,
-            on_host_disconnect=lambda host_id: _record_disconnect(disconnects, host_id),
+            on_host_disconnect=lambda host_id, owner: _record_disconnect(disconnects, host_id),
         ),
         prefix="/v1",
     )
