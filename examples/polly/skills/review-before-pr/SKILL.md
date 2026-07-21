@@ -1,6 +1,6 @@
 ---
 name: review-before-pr
-description: polly's standing quality gate — an implementer must NOT open a PR until its diff has PASSED cross-vendor review. Work happens on a worktree branch; gates + independent different-vendor review run against that branch diff; blocking issues loop back to the same implementer; only when gates are green AND zero blocking issues remain does the implementer open the PR. The PR is opened on an already-reviewed product. polly never merges; the human does.
+description: polly's standing quality gate — an implementer must NOT open a PR until its diff has PASSED cross-vendor review. Work happens on a worktree branch; gates + independent different-vendor review run against that branch diff; blocking issues loop back to the same implementer (unless the human ratifies cutting the requirement behind one); only when gates are green AND zero blocking issues remain does the implementer open the PR. The PR is opened on an already-reviewed product. polly never merges; the human does.
 ---
 
 # review-before-pr — the PR is the reviewed product, not the draft
@@ -28,7 +28,12 @@ something to review against.
    will tell you when to push and open the PR.* The worker COMMITS to its branch
    but does NOT push it — review runs on the LOCAL worktree diff, so no
    pre-review push is needed, and the mechanism gate blocks a worker `git push`
-   until that commit is marked review-passed anyway.
+   until that commit is marked review-passed anyway. State in the same packet
+   that CONFLICTING REQUIREMENTS ARE A STOP CONDITION: if two lines of the
+   contract cannot both hold, the worker REPORTS the conflict and waits — it must
+   never silently satisfy the literal requirement and drop the other, which
+   launders a contract bug into a code bug nobody attributes correctly (see
+   `cross-review` → "Author the contract wide").
 2. **Gates.** Run the repo's FULL deterministic validator set yourself against
    the branch via `sys_os_shell` — not only tests / lint / typecheck, but every
    spec / traceability / governance validator the repo defines (discover them
@@ -58,7 +63,12 @@ something to review against.
    issues; it never edits.
 4. **Loop on blocking issues.** Each blocking issue → fix-task back to the SAME
    implementer conversation (same worktree/branch). Re-run gates, re-review.
-   Repeat until gates are green AND zero blocking issues remain.
+   Repeat until gates are green AND zero blocking issues remain. ONE exception:
+   where a blocking issue traces to a REQUIREMENT that is itself the defect, a
+   HUMAN-RATIFIED cut closes it by deleting the requirement rather than fixing
+   it (see `cross-review` → "When the REQUIREMENT is the defect, propose a
+   CUT"). polly never self-ratifies that, and never silently drops a blocker it
+   merely disagrees with.
 5. **Only now release to the remote — record the reviewed commit first.** A
    worker `git push` and `gh pr create` are both blocked at the mechanism layer
    (`require_pr_review` policy) until the `.polly/review-passed` marker records
@@ -163,6 +173,59 @@ first pass and the pre-PR review has the taxonomy to check against. The review c
 never out-scope the contract it is handed, so a narrow contract makes this blind
 spot recur round after round. See `cross-review` → "Input-domain coverage" and
 "The review can never out-scope its contract".
+
+## Carry a defect-class ledger across the whole run
+Some blocking findings are one-offs (a typo, a wrong constant) and carry nothing
+forward — `cross-review` → "Class-closure" decides which is which. The ones
+classified as a CLASS name a SHAPE rather than an incident, and that shape is the
+most reusable thing a review round produces: it is usually latent in the NEXT
+task too, because the repo, language, and idioms have not changed. Ledger the
+classes only.
+
+Write each entry in the vocabulary of THIS repo's own stack, and phrase it as
+something CHECKABLE against a diff rather than as a description of the incident
+it came from: name the construct, the property that must hold, and the condition
+under which it silently does not. Deliberately no examples here — the entries
+come from this run's own findings, and a portable skill that ships a worked list
+just teaches the last run's defects to the next repo.
+
+Keep a running ledger of them for the whole run (the registry is a fine home) and
+spend it twice:
+- **In every later implement contract** — list the classes found so far as
+  "known hazards in this codebase; check your diff against each before reporting
+  done". This lowers the cost of a known class; it does not license skipping any
+  later gate — the recurrence STOP gate still applies if one resurfaces.
+- **In every later review mandate** — hand the reviewer the same list as an
+  explicit named sweep, IN ADDITION to (never instead of) the WIDE axes.
+
+Carry it across TASKS, not merely rounds within one task: a class found in task
+1's review is exactly what task 2 is about to reintroduce. Classes are
+repo-shaped and idiom-shaped, so they do not transfer between repos — build the
+ledger fresh per run and let it die with the run.
+
+## Name the verification ceiling — and defer what this host cannot exercise
+Green gates do not mean the changed path RAN. A path can be structurally
+unreachable on the machine polly orchestrates from — it branches on a
+platform-specific interface, needs services or hardware absent here, or requires
+a privileged / networked environment the host denies — so the local run exercises
+a DIFFERENT branch than the target environment, and the suite is green about the
+wrong thing.
+
+Find that ceiling EARLY, not at PR time. When a task's changed surface may be
+environment-dependent, require the investigating explore to report that path's
+host-portability (see `investigate`), and require the implementer to state which
+behaviours its tests actually EXECUTED versus asserted against stubs.
+
+Then be explicit about the gap rather than implying coverage:
+- Where the real seam cannot run here, prefer stubbing the seam and asserting the
+  DECISIONS around it — that is a genuine gate on the logic and it is honest
+  about what it does not prove.
+- Put the un-exercised items in the PR body as an explicit deferred-verification
+  checklist, and mark any timing / performance / behavioural claim with NO
+  runtime evidence as unverified. An estimate must never read as a measurement.
+- Hand that checklist to the human as the plan for a session on a capable
+  environment — a known checklist is worth far more than rediscovering the gaps
+  there.
 
 ## The mechanism gate (defense in depth)
 This ordering is also enforced at the runner policy layer, so it holds even if a

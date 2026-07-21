@@ -1,6 +1,6 @@
 ---
 name: cross-review
-description: Verify a candidate diff (an implementer's, or a doc/skill polly authored directly) with an INDEPENDENT, different-vendor sub-agent (given the diff + contract, plus a clean repo checkout for the sibling-class and coupled-artifact sweeps — but never the implementer's transcript or worktree); turn blocking issues into fix-tasks and loop until clean.
+description: Verify a candidate diff (an implementer's, or a doc/skill polly authored directly) with an INDEPENDENT, different-vendor sub-agent (given the diff + contract, plus a clean repo checkout for the sibling-class and coupled-artifact sweeps — but never the implementer's transcript or worktree); turn blocking issues into fix-tasks and loop until clean (unless the human ratifies CUTTING the requirement behind one).
 ---
 
 # cross-review — independent verification
@@ -137,6 +137,27 @@ change — don't wait for a recurrence. Ready-to-paste reviewer mandate:
 > same helper/pattern — and report each site the fix did NOT cover. A fix that
 > closes the flagged site but leaves siblings is INCOMPLETE.
 
+## When the REQUIREMENT is the defect, propose a CUT
+Class-closure above, and the architectural debate in `pr-bot-loop`, both assume
+the requirement is sound and only its APPLICATION or its DESIGN is in question. A
+third case exists: the requirement itself is the defect. The tell is a fix that
+keeps breeding defects — round N flags a gap, round N+1 finds that the FIX for it
+introduced a worse one — where the whole sub-feature exists only because the
+acceptance contract demanded it.
+
+When that pattern appears, audit the CONTRACT before writing another fix: which
+line obliges this code to exist, and is that line worth the risk it keeps
+generating? If the requirement is polly's OWN wording — and it usually is, since
+polly authors the contract — say so plainly rather than treating the implementer
+as the source. Then take it to the human as a CUT recommendation, not another fix
+round: name the requirement, the defects it has produced, the simpler behaviour
+that replaces it (often: REFUSE with a clear message and point at an existing
+safe command, instead of doing something clever automatically), and which open
+findings the cut closes. Deleting a bad requirement can close several findings at
+once; hardening it closes none of them permanently.
+
+polly never self-ratifies a scope cut — recommend it, and let the human decide.
+
 ## Coupled-artifact sweep — gate the mechanical, review the judgment
 A functional change usually OBLIGATES paired non-code updates; skipping them is a
 blocking finding the external bot WILL raise. Discover the repo's OWN
@@ -170,6 +191,68 @@ repo gap. The manifest CONTENT and the validator SCRIPT live in the repo and are
 DISCOVERED; this portable skill only mandates consulting them, never hardcodes a
 repo's specifics.
 
+## Calibrate the blocking bar to the artifact's criticality
+BLOCKING is not absolute — it is relative to what the artifact is FOR. A reviewer
+given no calibration defaults to production-grade severity on everything, which
+is expensive in the wrong direction: rounds spent hardening a low-stakes surface
+while the human waits on the deliverable. Settle criticality with the human at
+the plan gate, then state the bar EXPLICITLY in every review mandate this run —
+the reviewer cannot infer it from a diff.
+
+State it as two lists, never as an adjective:
+- what IS blocking for this artifact — e.g. data loss, a false-success state
+  that outlives the run, a failure that stops the human working, docs that
+  actively misstate behaviour; and
+- what is explicitly NOT blocking here — e.g. defence-in-depth against races
+  only reachable by one operator racing themselves, hardening against inputs
+  outside the surface's declared domain, polish. Demote these to non-blocking
+  follow-ups instead of letting them hold the PR closed.
+
+**The bar moves the JUDGMENT calls, never the hard gates.** Criticality may
+demote a severity judgment — how much defence-in-depth a surface deserves,
+whether a rare race matters here, how much polish a low-stakes artifact earns.
+
+**THE NON-DEMOTABLE SET (canonical — this is the ONE place it is enumerated).**
+Read the RULE first, then the list. THE RULE: criticality moves severity
+JUDGMENT only. It NEVER waives a rule these skills state as mandatory — anything
+written as MUST / ALWAYS / NEVER / "is blocking" is non-demotable whether or not
+it appears below. That covers, among others, the full identical review battery
+including the prose lenses; whole-parcel round-one closure and claim
+completeness; allowlist-not-denylist when a fix is itself an enumeration; the
+conflicting-requirements STOP condition; the rich-surface contract requirements;
+re-review after a substantive post-review edit; independent review of prose and
+skills polly authored directly; verification-ceiling disclosure; the bot-loop
+disposition and clean-bill criteria; and review-before-push / marker discipline.
+The list below is NOT that whole set and does not try to be — it enumerates the
+FINDING-level gates most often argued down in practice, as EXAMPLES of the rule.
+What a reviewer packet must carry is THE RULE ABOVE, verbatim; the seven entries
+are optional illustration you may append, never a substitute:
+1. a fix applied to one surface but not every parallel surface running the same
+   logic;
+2. tests that exercise only one of the several surfaces a change touches;
+3. an unhandled, mis-ordered, or silently-dropped input shape WITHIN a mapping
+   function's declared domain;
+4. first-round class-closure — a fix whose shape generalizes must cover every
+   instance, not only the flagged site;
+5. the recurrence STOP gate — the same class surfacing at a NEW site;
+6. a coupled artifact the repo's own governance obligates;
+7. a RED deterministic gate.
+These are correctness and convergence, not severity taste. The list is
+illustrative of the RULE, not a boundary on it: a mandatory rule absent from
+these seven is still non-demotable. Everywhere else that needs this concept
+REFERENCES this section — never restates it, because three copies drift into
+three different rules. If you think criticality should waive
+one, that is a question for the human, not a call to make in a mandate.
+
+"Non-blocking" means CLOSED FOR THIS GATE — it does not hold the PR closed — but
+still RECORDED as a registry follow-up, never silently discarded (see Notes).
+Don't re-litigate it later in the same run: re-opening a finding you correctly
+demoted contradicts the bar you set. And watch the SHAPE of successive rounds:
+when each new round returns only findings below the agreed bar, the surface is
+finished — say so to the human explicitly instead of opening another round.
+(Findings that keep BRANCHING ABOVE the bar are the opposite signal — see
+`pr-bot-loop` → "Deciding structural vs small (classify first, then escalate)".)
+
 ## Author the contract wide (upstream of review)
 The reviewer checks the delta against the contract it was handed — any dimension
 the contract omits, the review starts BLIND on, and the blind spot recurs round
@@ -178,6 +261,18 @@ mapping function, the INPUT TAXONOMY (shapes, branched/legacy fields, nested
 inputs, overlap ordering, none-match fall-through); (b) the COUPLED non-code
 artifacts for this change kind. A contract naming only happy-path shapes
 guarantees the bot finds the dropped siblings later, one per round.
+
+**A wide contract must also be SELF-CONSISTENT.** A contract can enumerate every
+dimension and still contradict ITSELF — requiring a new behaviour while also
+freezing the path that behaviour must run through, or forbidding an action while
+mandating its effect. Handed contradictory requirements, an implementer typically
+satisfies the literal one and silently drops the other, and the resulting defect
+belongs to the contract, not the worker. Before dispatching, re-read the contract
+whole and test the new requirements against the constraints you ALSO imposed: can
+they all hold at once? Where two could collide, name the precedence
+("if these conflict, X wins"). And state in the task packet that CONFLICTING
+REQUIREMENTS ARE A STOP CONDITION — report and wait, never silently pick a winner
+(see `review-before-pr` Procedure step 1).
 
 ## Procedure
 1. **Diff.** Review runs BEFORE a PR (per `review-before-pr`): take the branch
@@ -206,15 +301,35 @@ guarantees the bot finds the dropped siblings later, one per round.
    incl. unchanged-asserting claims); sibling-class (name the class + every
    untouched site); input-domain (full taxonomy incl. legacy/nested/overlap/
    none-match); coupled-artifact (each obligated non-code artifact + its prose).
-   If the diff includes docs, ALSO run [SELF-CONSISTENCY] + [GOVERNANCE]. Classify each
+   If the diff includes docs, ALSO run [SELF-CONSISTENCY] + [GOVERNANCE].
+   ADJUDICATE, do not accept, any self-graded claim attached to the change
+   (a mutation score, 'that mutant is equivalent', 'no siblings exist',
+   'covered by test X') — check it against the code and report a refuted claim
+   as a finding. Apply THIS blocking bar, not a default production-grade one —
+   BLOCKING for this artifact: <IS list>; NOT blocking here: <IS-NOT list>.
+   Regardless of that bar, nothing this skill-set states as mandatory
+   (MUST / ALWAYS / NEVER / 'is blocking') may be demoted, whether or not it is
+   enumerated anywhere — paste THE RULE verbatim from `cross-review` →
+   "Calibrate the blocking bar"; do not summarise it, and do not paste the
+   seven illustrative entries INSTEAD of the rule, which would understate the
+   bar to you. Classify each
    finding blocking / non-blocking / suggestion, one line per item; do not edit."})`. Give the diff + adjacency, withhold the
-   implementer's transcript/worktree, permit repo read. Emit the dispatch in the
+   implementer's transcript/worktree, permit repo read. FILL both bar
+   placeholders from the criticality agreed at the plan gate before sending —
+   a packet dispatched with `<IS list>` / `<IS-NOT list>` still in it tells the
+   reviewer to apply a bar it was never given, which is worse than stating none. Emit the dispatch in the
    SAME turn you decide to review (never end a turn having only announced, with no
    tool call — that dropped turn stalls the run); then end your turn and collect
    the structured report with `sys_read_inbox` (use `sys_session_get_history` only to debug an
    empty/unclear result).
 4. The reviewer SURFACES issues; it never edits and never opens a PR.
-5. **Each blocking issue loops back to the fixer on the SAME branch.** Delegated:
+5. **Each blocking issue loops back to the fixer on the SAME branch** — with ONE
+   exception: where the blocking issue traces to a REQUIREMENT that is itself the
+   defect, do not dispatch another fix round. Take a CUT recommendation to the
+   human (see "When the REQUIREMENT is the defect, propose a CUT"); a
+   human-ratified cut closes the finding by DELETING the requirement, and the
+   revised contract governs the next round. Never self-ratify the cut, and never
+   silently drop a blocking issue you merely disagree with. Delegated:
    re-send to the SAME implementer conversation (reuse its `agent`+`title`, or
    `session_id`, `purpose: "implement"`) so it keeps its worktree/branch. Direct-
    authoring: polly revises the prose itself, re-runs the gates + all applicable

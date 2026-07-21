@@ -18,7 +18,16 @@ dependency).
    args={purpose: "implement", input: "<task + acceptance contract +
    worktree path>"})`. Use a short task-based title such as `auth-refactor` or
    `fix-sse-error`, never the raw vendor name. State the scope and that it must
-   work only inside `.worktrees/<task_id>`. The worker drives the task to green
+   work only inside `.worktrees/<task_id>`. Include a SNAPSHOT of the run's
+   defect-class ledger as it stands when the wave is dispatched (see
+   `review-before-pr` → "Carry a defect-class ledger across the whole run").
+   Each wave's contract carries the ledger as it stood at DISPATCH; a wave's own
+   reviews land later, so the snapshot handed to a wave never grows mid-wave.
+   Propagation is therefore by two routes, not one: the next wave's contract
+   carries the updated ledger, AND a class discovered while siblings are still
+   running goes to each in-flight worker as a follow-up message on its existing
+   conversation ("new known hazard; check your diff against it") rather than
+   waiting for that next wave. The worker drives the task to green
    and COMMITS to its branch, but MUST NOT push or open a PR yet (see
    `review-before-pr`) — it reports its branch name + summary and waits. Review
    runs on the local branch diff; the branch is pushed and the PR opened only
@@ -31,8 +40,9 @@ dependency).
    calls and their announcement go in the same turn. Dispatch the whole
    parallel-safe set, THEN (and only then) END YOUR TURN. Do not poll.
 3. Each sub-agent runs autonomously and notifies you through the inbox when it
-   finishes. Collect its structured result with `sys_read_inbox` and record the
-   PR URL in the registry. If the inbox result is empty/unclear, inspect that
+   finishes. Collect its structured result with `sys_read_inbox` and record its
+   BRANCH + commit in the registry — there is no PR URL yet, and there will not
+   be one until the diff passes review (step 5). If the inbox result is empty/unclear, inspect that
    worker conversation with `sys_session_get_history` before deciding what to do
    next.
 4. Send each finished task's BRANCH DIFF through `cross-review` — before any PR

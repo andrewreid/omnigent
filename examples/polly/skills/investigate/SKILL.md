@@ -24,7 +24,11 @@ repository-specific technical question.
    the dispatch that CREATES the session — a send that continues an existing
    title rejects it).
    Tell the worker to edit nothing and return file,
-   command, URL, or line evidence. Emit these `sys_session_send` calls in the
+   command, URL, or line evidence. When the question touches a path that may be
+   environment-dependent, ALSO require it to report that path's
+   HOST-PORTABILITY — can the path even execute on this machine, and which
+   branch runs here versus in the target environment (see `review-before-pr` →
+   "Name the verification ceiling"). Emit these `sys_session_send` calls in the
    SAME turn — do not end a turn having only said you will dispatch.
 3. End your turn AFTER the dispatch tool calls are in flight (never before).
    Do not inspect files, logs, terminals, docs, or connector output yourself
