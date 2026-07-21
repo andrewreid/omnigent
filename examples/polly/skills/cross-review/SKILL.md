@@ -1,6 +1,6 @@
 ---
 name: cross-review
-description: Verify a candidate diff (an implementer's, or a doc/skill polly authored directly) with an INDEPENDENT, different-vendor sub-agent (given the diff + contract, plus a clean repo checkout for the sibling-class and coupled-artifact sweeps — but never the implementer's transcript or worktree); turn blocking issues into fix-tasks and loop until clean.
+description: Verify a candidate diff (an implementer's, or a doc/skill polly authored directly) with an INDEPENDENT, different-vendor sub-agent (given the diff + contract, plus a clean repo checkout for the sibling-class and coupled-artifact sweeps — but never the implementer's transcript or worktree); turn blocking issues into fix-tasks and loop until clean (unless the human ratifies CUTTING the requirement behind one).
 ---
 
 # cross-review — independent verification
@@ -204,21 +204,30 @@ State it as two lists, never as an adjective:
   that outlives the run, a failure that stops the human working, docs that
   actively misstate behaviour; and
 - what is explicitly NOT blocking here — e.g. defence-in-depth against races
-  only reachable by one operator racing themselves, nice-to-have coverage,
-  inputs no caller can produce. Demote these to non-blocking follow-ups instead
-  of letting them hold the PR closed.
+  only reachable by one operator racing themselves, hardening against inputs
+  outside the surface's declared domain, polish. Demote these to non-blocking
+  follow-ups instead of letting them hold the PR closed.
 
 **The bar moves the JUDGMENT calls, never the hard gates.** Criticality may
-demote a severity judgment — how much defence-in-depth a surface deserves, how
-much coverage is enough, whether a rare race matters here. It may NEVER demote
-the structural gates this skill states absolutely, whatever the artifact:
-a fix applied to one surface and not its parallel twin; an unhandled,
-mis-ordered, or silently-dropped input shape in a mapping function; the
-recurrence STOP gate (same class at a new site); a coupled artifact the repo's
-own governance obligates; a RED deterministic gate. Those stay blocking at every
-criticality — they are correctness and convergence, not severity taste. If you
-think criticality should waive one, that is a question for the human, not a call
-to make in the mandate.
+demote a severity judgment — how much defence-in-depth a surface deserves,
+whether a rare race matters here, how much polish a low-stakes artifact earns.
+
+**THE NON-DEMOTABLE SET (canonical — this is the ONE place it is enumerated).**
+No criticality, bar, or disposition anywhere in these skills may demote:
+1. a fix applied to one surface but not every parallel surface running the same
+   logic;
+2. tests that exercise only one of the several surfaces a change touches;
+3. an unhandled, mis-ordered, or silently-dropped input shape WITHIN a mapping
+   function's declared domain;
+4. first-round class-closure — a fix whose shape generalizes must cover every
+   instance, not only the flagged site;
+5. the recurrence STOP gate — the same class surfacing at a NEW site;
+6. a coupled artifact the repo's own governance obligates;
+7. a RED deterministic gate.
+These are correctness and convergence, not severity taste. Everywhere else that
+needs this concept REFERENCES this list — never restates it, because three
+copies drift into three different rules. If you think criticality should waive
+one, that is a question for the human, not a call to make in a mandate.
 
 "Non-blocking" means CLOSED FOR THIS GATE — it does not hold the PR closed — but
 still RECORDED as a registry follow-up, never silently discarded (see Notes).
@@ -282,10 +291,10 @@ REQUIREMENTS ARE A STOP CONDITION — report and wait, never silently pick a win
    (a mutation score, 'that mutant is equivalent', 'no siblings exist',
    'covered by test X') — check it against the code and report a refuted claim
    as a finding. Apply THIS blocking bar, not a default production-grade one —
-   BLOCKING for this artifact: <IS list>; NOT blocking here: <IS-NOT list>; the
-   non-demotable structural gates (parallel-surface, input-domain, recurrence,
-   coupled-artifact, red deterministic gate) remain blocking regardless.
-   Classify each
+   BLOCKING for this artifact: <IS list>; NOT blocking here: <IS-NOT list>.
+   Regardless of that bar, the NON-DEMOTABLE SET stays blocking — paste it
+   verbatim from `cross-review` → "Calibrate the blocking bar"; do not
+   summarise or re-derive it. Classify each
    finding blocking / non-blocking / suggestion, one line per item; do not edit."})`. Give the diff + adjacency, withhold the
    implementer's transcript/worktree, permit repo read. FILL both bar
    placeholders from the criticality agreed at the plan gate before sending —

@@ -63,7 +63,12 @@ something to review against.
    issues; it never edits.
 4. **Loop on blocking issues.** Each blocking issue → fix-task back to the SAME
    implementer conversation (same worktree/branch). Re-run gates, re-review.
-   Repeat until gates are green AND zero blocking issues remain.
+   Repeat until gates are green AND zero blocking issues remain. ONE exception:
+   where a blocking issue traces to a REQUIREMENT that is itself the defect, a
+   HUMAN-RATIFIED cut closes it by deleting the requirement rather than fixing
+   it (see `cross-review` → "When the REQUIREMENT is the defect, propose a
+   CUT"). polly never self-ratifies that, and never silently drops a blocker it
+   merely disagrees with.
 5. **Only now release to the remote — record the reviewed commit first.** A
    worker `git push` and `gh pr create` are both blocked at the mechanism layer
    (`require_pr_review` policy) until the `.polly/review-passed` marker records
@@ -177,17 +182,19 @@ most reusable thing a review round produces: it is usually latent in the NEXT
 task too, because the repo, language, and idioms have not changed. Ledger the
 classes only.
 
-Write each entry as the shape, in the vocabulary of THIS repo's stack, phrased so
-it can be checked against a diff — "a guarded value read before the guard that
-protects it is re-established", "a failure signal the calling context discards",
-"a change made in a scope the caller cannot observe". The generic examples here
-are illustrative only; the real entries come from this run's own findings.
+Write each entry in the vocabulary of THIS repo's own stack, and phrase it as
+something CHECKABLE against a diff rather than as a description of the incident
+it came from: name the construct, the property that must hold, and the condition
+under which it silently does not. Deliberately no examples here — the entries
+come from this run's own findings, and a portable skill that ships a worked list
+just teaches the last run's defects to the next repo.
 
 Keep a running ledger of them for the whole run (the registry is a fine home) and
 spend it twice:
 - **In every later implement contract** — list the classes found so far as
   "known hazards in this codebase; check your diff against each before reporting
-  done". A class costs a review round the first time and nothing thereafter.
+  done". This lowers the cost of a known class; it does not license skipping any
+  later gate — the recurrence STOP gate still applies if one resurfaces.
 - **In every later review mandate** — hand the reviewer the same list as an
   explicit named sweep, IN ADDITION to (never instead of) the WIDE axes.
 
