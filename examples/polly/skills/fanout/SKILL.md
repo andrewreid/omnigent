@@ -18,7 +18,10 @@ dependency).
    args={purpose: "implement", input: "<task + acceptance contract +
    worktree path>"})`. Use a short task-based title such as `auth-refactor` or
    `fix-sse-error`, never the raw vendor name. State the scope and that it must
-   work only inside `.worktrees/<task_id>`. The worker drives the task to green
+   work only inside `.worktrees/<task_id>`. From the second task onward, include
+   the run's defect-class ledger in the contract (see `review-before-pr` →
+   "Carry a defect-class ledger across the whole run") — parallel tasks in one
+   repo reintroduce each other's classes. The worker drives the task to green
    and COMMITS to its branch, but MUST NOT push or open a PR yet (see
    `review-before-pr`) — it reports its branch name + summary and waits. Review
    runs on the local branch diff; the branch is pushed and the PR opened only

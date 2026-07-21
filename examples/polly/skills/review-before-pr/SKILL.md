@@ -28,7 +28,12 @@ something to review against.
    will tell you when to push and open the PR.* The worker COMMITS to its branch
    but does NOT push it — review runs on the LOCAL worktree diff, so no
    pre-review push is needed, and the mechanism gate blocks a worker `git push`
-   until that commit is marked review-passed anyway.
+   until that commit is marked review-passed anyway. State in the same packet
+   that CONFLICTING REQUIREMENTS ARE A STOP CONDITION: if two lines of the
+   contract cannot both hold, the worker REPORTS the conflict and waits — it must
+   never silently satisfy the literal requirement and drop the other, which
+   launders a contract bug into a code bug nobody attributes correctly (see
+   `cross-review` → "Author the contract wide").
 2. **Gates.** Run the repo's FULL deterministic validator set yourself against
    the branch via `sys_os_shell` — not only tests / lint / typecheck, but every
    spec / traceability / governance validator the repo defines (discover them
@@ -163,6 +168,51 @@ first pass and the pre-PR review has the taxonomy to check against. The review c
 never out-scope the contract it is handed, so a narrow contract makes this blind
 spot recur round after round. See `cross-review` → "Input-domain coverage" and
 "The review can never out-scope its contract".
+
+## Carry a defect-class ledger across the whole run
+Every blocking finding that survives to a fix names a DEFECT CLASS — a shape, not
+an incident ("a decision taken before the lock that guards it is re-validated",
+"a call's status ignored because the calling context suppresses errors", "a value
+assigned inside a subshell so the caller never observes it"). Those classes are
+the most reusable thing a review round produces, and they are usually latent in
+the NEXT task too: same repo, same language, same idioms, often the same file.
+
+Keep a running ledger of them for the whole run (the registry is a fine home) and
+spend it twice:
+- **In every later implement contract** — list the classes found so far as
+  "known hazards in this codebase; check your diff against each before reporting
+  done". A class costs a review round the first time and nothing thereafter.
+- **In every later review mandate** — hand the reviewer the same list as an
+  explicit named sweep, IN ADDITION to (never instead of) the WIDE axes.
+
+Carry it across TASKS, not merely rounds within one task: a class found in task
+1's review is exactly what task 2 is about to reintroduce. Classes are
+repo-shaped and idiom-shaped, so they do not transfer between repos — build the
+ledger fresh per run and let it die with the run.
+
+## Name the verification ceiling — and defer what this host cannot exercise
+Green gates do not mean the changed path RAN. A path can be structurally
+unreachable on the machine polly orchestrates from — it branches on a
+platform-specific interface, needs services or hardware absent here, or requires
+a privileged / networked environment the host denies — so the local run exercises
+a DIFFERENT branch than the target environment, and the suite is green about the
+wrong thing.
+
+Find that ceiling EARLY, not at PR time. When a task's changed surface may be
+environment-dependent, require the investigating explore to report that path's
+host-portability (see `investigate`), and require the implementer to state which
+behaviours its tests actually EXECUTED versus asserted against stubs.
+
+Then be explicit about the gap rather than implying coverage:
+- Where the real seam cannot run here, prefer stubbing the seam and asserting the
+  DECISIONS around it — that is a genuine gate on the logic and it is honest
+  about what it does not prove.
+- Put the un-exercised items in the PR body as an explicit deferred-verification
+  checklist, and mark any timing / performance / behavioural claim with NO
+  runtime evidence as unverified. An estimate must never read as a measurement.
+- Hand that checklist to the human as the plan for a session on a capable
+  environment — a known checklist is worth far more than rediscovering the gaps
+  there.
 
 ## The mechanism gate (defense in depth)
 This ordering is also enforced at the runner policy layer, so it holds even if a
