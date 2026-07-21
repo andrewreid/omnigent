@@ -34,8 +34,10 @@ Once PRESENT is established (or the human confirms), proceed:
      reply naming it as an accepted limitation, record it as a registry
      follow-up, and state it in the docs wherever a reader would otherwise be
      misled. A legitimate disposition, not a dodge — but tightly bounded:
-     (a) it may NEVER absorb anything in the NON-DEMOTABLE SET (see
-     `cross-review` → "Calibrate the blocking bar" for the canonical list);
+     (a) it may NEVER absorb anything these skills state as mandatory
+     (MUST / ALWAYS / NEVER / 'is blocking'), enumerated or not — see
+     `cross-review` → "Calibrate the blocking bar" for the governing RULE, of
+     which its seven entries are only examples;
      (b) a P1 accepted this way needs the HUMAN's explicit agreement, not
      polly's; and (c) it applies ONLY to findings needing NO repository change.
      The moment accepting one obliges an edit — a doc line so a reader is not

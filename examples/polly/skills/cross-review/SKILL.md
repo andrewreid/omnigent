@@ -224,8 +224,9 @@ re-review after a substantive post-review edit; independent review of prose and
 skills polly authored directly; verification-ceiling disclosure; the bot-loop
 disposition and clean-bill criteria; and review-before-push / marker discipline.
 The list below is NOT that whole set and does not try to be — it enumerates the
-FINDING-level gates most often argued down in practice, so a reviewer packet has
-something concrete to paste:
+FINDING-level gates most often argued down in practice, as EXAMPLES of the rule.
+What a reviewer packet must carry is THE RULE ABOVE, verbatim; the seven entries
+are optional illustration you may append, never a substitute:
 1. a fix applied to one surface but not every parallel surface running the same
    logic;
 2. tests that exercise only one of the several surfaces a change touches;
@@ -306,9 +307,12 @@ REQUIREMENTS ARE A STOP CONDITION — report and wait, never silently pick a win
    'covered by test X') — check it against the code and report a refuted claim
    as a finding. Apply THIS blocking bar, not a default production-grade one —
    BLOCKING for this artifact: <IS list>; NOT blocking here: <IS-NOT list>.
-   Regardless of that bar, the NON-DEMOTABLE SET stays blocking — paste it
-   verbatim from `cross-review` → "Calibrate the blocking bar"; do not
-   summarise or re-derive it. Classify each
+   Regardless of that bar, nothing this skill-set states as mandatory
+   (MUST / ALWAYS / NEVER / 'is blocking') may be demoted, whether or not it is
+   enumerated anywhere — paste THE RULE verbatim from `cross-review` →
+   "Calibrate the blocking bar"; do not summarise it, and do not paste the
+   seven illustrative entries INSTEAD of the rule, which would understate the
+   bar to you. Classify each
    finding blocking / non-blocking / suggestion, one line per item; do not edit."})`. Give the diff + adjacency, withhold the
    implementer's transcript/worktree, permit repo read. FILL both bar
    placeholders from the criticality agreed at the plan gate before sending —
