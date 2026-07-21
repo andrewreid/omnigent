@@ -207,12 +207,42 @@ guarantees the bot finds the dropped siblings later, one per round.
    untouched site); input-domain (full taxonomy incl. legacy/nested/overlap/
    none-match); coupled-artifact (each obligated non-code artifact + its prose).
    If the diff includes docs, ALSO run [SELF-CONSISTENCY] + [GOVERNANCE]. Classify each
-   finding blocking / non-blocking / suggestion, one line per item; do not edit."})`. Give the diff + adjacency, withhold the
+   finding blocking / non-blocking / suggestion, one line per item. Open your
+   report with the battery-completeness checklist below, one line per axis,
+   BEFORE any findings. Do not edit."})`. Give the diff + adjacency, withhold the
    implementer's transcript/worktree, permit repo read. Emit the dispatch in the
    SAME turn you decide to review (never end a turn having only announced, with no
    tool call — that dropped turn stalls the run); then end your turn and collect
    the structured report with `sys_read_inbox` (use `sys_session_get_history` only to debug an
-   empty/unclear result).
+   empty/unclear result). **Reject a report missing the checklist** — re-dispatch
+   the SAME battery rather than accepting an unlabelled or partial pass; do not
+   read a bare "looks good" as a completed review.
+
+### Battery-completeness checklist (mandatory, every dispatch, every round)
+A narrowed re-review — "just confirm these N findings are fixed" — is the single
+biggest cause of multi-round whack-a-mole: it reads as thorough in the moment but
+silently omits most of the required battery coverage, so each round only ever re-checks
+what the LAST round already found, and siblings leak out one discovery at a time
+(this happened for real: a bot-loop re-review dispatch was scoped to "verify
+these bot comments," and the same suppression predicate took 3 separate rounds to
+close instead of one adversarial pass). Guard against it structurally, not just by
+remembering: every reviewer report — FIRST dispatch and EVERY re-review, PR-bot-
+prompted or not — must open with this checklist, one line each, "run — clear" or
+"run — N findings," never "skipped" or absent:
+```
+[FOCUSED] diff vs contract
+[WIDE-1] blast-radius
+[WIDE-2] sibling-class
+[WIDE-3] input-domain
+[WIDE-4] coupled-artifact
+[SELF-CONSISTENCY] (docs only, else "n/a")
+[GOVERNANCE] (docs only, else "n/a")
+```
+If a returned report is missing this header, or shows fewer than the applicable
+lines, treat it as an INCOMPLETE review, not a clean bill — re-dispatch the full
+battery. This applies with equal force when reacting to an external review bot's
+findings mid-loop (see `pr-bot-loop`): servicing bot comments is never grounds to
+narrow the dispatch to "confirm these are fixed."
 4. The reviewer SURFACES issues; it never edits and never opens a PR.
 5. **Each blocking issue loops back to the fixer on the SAME branch.** Delegated:
    re-send to the SAME implementer conversation (reuse its `agent`+`title`, or
