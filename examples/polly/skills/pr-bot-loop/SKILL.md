@@ -1,6 +1,6 @@
 ---
 name: pr-bot-loop
-description: Drive the GitHub Codex-review-bot feedback loop on a PR you pushed — but ONLY where a review bot is actually wired (detect presence as a tri-state first). Arm a timer for the delayed bot review, reply in-thread to each finding (fix or pushback with rationale), re-request review, and after 3 straight rounds of small bugs escalate to a claude-vs-codex architectural debate. Loop until a clean bill, then disarm timers.
+description: Drive the GitHub Codex-review-bot feedback loop on a PR you pushed — but ONLY where a review bot is actually wired (detect presence as a tri-state first). Arm a timer for the delayed bot review, reply in-thread to each finding (fix, pushback with rationale, already-fixed, or accept-and-document), re-request review, and after 3 straight rounds of small bugs escalate to a claude-vs-codex architectural debate. Loop until a clean bill, then disarm timers.
 ---
 
 # pr-bot-loop — close the external review-bot loop on a PR
