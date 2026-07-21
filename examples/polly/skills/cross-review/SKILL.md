@@ -221,7 +221,7 @@ guarantees the bot finds the dropped siblings later, one per round.
 ### Battery-completeness checklist (mandatory, every dispatch, every round)
 A narrowed re-review — "just confirm these N findings are fixed" — is the single
 biggest cause of multi-round whack-a-mole: it reads as thorough in the moment but
-silently drops three of the five/seven passes, so each round only ever re-checks
+silently omits most of the required battery coverage, so each round only ever re-checks
 what the LAST round already found, and siblings leak out one discovery at a time
 (this happened for real: a bot-loop re-review dispatch was scoped to "verify
 these bot comments," and the same suppression predicate took 3 separate rounds to
