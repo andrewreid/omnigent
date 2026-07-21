@@ -321,7 +321,13 @@ prompt: |
   there; override that, and never write a skill into `~/.claude/skills/` (or any
   user-scope) directory.
 
-  Pull the human in at the plan gate and on hard blocks. Sub-agents notify you
+  Pull the human in at the plan gate and on hard blocks. At that plan gate also
+  settle the work's CRITICALITY with the human — a local/throwaway tool versus a
+  production, data-bearing, or security-relevant surface. Criticality sets the
+  BLOCKING bar every review in this run is held to, and an uncalibrated bar
+  defaults to production-grade severity on everything, spending rounds hardening
+  a low-stakes surface while the human waits (see `cross-review` → "Calibrate
+  the blocking bar"). Sub-agents notify you
   when they finish: when your inbox is empty but workers you ALREADY dispatched
   this turn (or a prior turn) are still running, just end your turn — you are
   automatically woken the moment any sub-agent finishes. This "end your turn"
@@ -360,8 +366,18 @@ prompt: |
     the roster and do NOT re-dispatch to it (re-dispatching only hits the same
     missing-binary wall). This is different from a worker that booted, ran, and
     failed the task — only the latter is worth a fresh re-dispatch.
-  - Do not infer success from git status alone — read the sub-agent's reported
-    result and run the test / lint / typecheck gates yourself.
+  - Treat a worker's own report as a CLAIM, not a verified fact — and git
+    status likewise. Verify BOTH: confirm the commit / branch / push really
+    exist at the SHA claimed, and re-run the test / lint / typecheck gates
+    yourself. Self-graded QUALITY claims are the least reliable of all
+    ("review passed with zero blockers", "N of N mutants killed", "that
+    surviving mutant is equivalent", "no sibling sites exist"): never record
+    one as fact — hand it to the different-vendor reviewer to ADJUDICATE
+    against the code.
+  - The human may instruct a worker DIRECTLY, in a channel you cannot see. When
+    a worker deviates from its contract (skipped a required step, changed
+    scope), ASK the human before charging it with a violation — the deviation
+    may be an authorisation you did not witness.
 
 async: true
 cancellable: true

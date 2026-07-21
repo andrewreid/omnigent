@@ -137,6 +137,27 @@ change — don't wait for a recurrence. Ready-to-paste reviewer mandate:
 > same helper/pattern — and report each site the fix did NOT cover. A fix that
 > closes the flagged site but leaves siblings is INCOMPLETE.
 
+## When the REQUIREMENT is the defect, propose a CUT
+Class-closure above, and the architectural debate in `pr-bot-loop`, both assume
+the requirement is sound and only its APPLICATION or its DESIGN is in question. A
+third case exists: the requirement itself is the defect. The tell is a fix that
+keeps breeding defects — round N flags a gap, round N+1 finds that the FIX for it
+introduced a worse one — where the whole sub-feature exists only because the
+acceptance contract demanded it.
+
+When that pattern appears, audit the CONTRACT before writing another fix: which
+line obliges this code to exist, and is that line worth the risk it keeps
+generating? If the requirement is polly's OWN wording — and it usually is, since
+polly authors the contract — say so plainly rather than treating the implementer
+as the source. Then take it to the human as a CUT recommendation, not another fix
+round: name the requirement, the defects it has produced, the simpler behaviour
+that replaces it (often: REFUSE with a clear message and point at an existing
+safe command, instead of doing something clever automatically), and which open
+findings the cut closes. Deleting a bad requirement can close several findings at
+once; hardening it closes none of them permanently.
+
+polly never self-ratifies a scope cut — recommend it, and let the human decide.
+
 ## Coupled-artifact sweep — gate the mechanical, review the judgment
 A functional change usually OBLIGATES paired non-code updates; skipping them is a
 blocking finding the external bot WILL raise. Discover the repo's OWN
@@ -170,6 +191,30 @@ repo gap. The manifest CONTENT and the validator SCRIPT live in the repo and are
 DISCOVERED; this portable skill only mandates consulting them, never hardcodes a
 repo's specifics.
 
+## Calibrate the blocking bar to the artifact's criticality
+BLOCKING is not absolute — it is relative to what the artifact is FOR. A reviewer
+given no calibration defaults to production-grade severity on everything, which
+is expensive in the wrong direction: rounds spent hardening a low-stakes surface
+while the human waits on the deliverable. Settle criticality with the human at
+the plan gate, then state the bar EXPLICITLY in every review mandate this run —
+the reviewer cannot infer it from a diff.
+
+State it as two lists, never as an adjective:
+- what IS blocking for this artifact — e.g. data loss, a false-success state
+  that outlives the run, a failure that stops the human working, docs that
+  actively misstate behaviour; and
+- what is explicitly NOT blocking here — e.g. defence-in-depth against races
+  only reachable by one operator racing themselves, nice-to-have coverage,
+  inputs no caller can produce. Demote these to non-blocking follow-ups instead
+  of letting them hold the PR closed.
+
+A finding correctly rated non-blocking under the agreed bar is DONE, not debt to
+grind on later; re-opening it contradicts the bar you set. And watch the SHAPE of
+successive rounds: when each new round returns only findings below the agreed
+bar, the surface is finished — say so to the human explicitly instead of opening
+another round. (Findings that keep BRANCHING above the bar are the opposite
+signal — see `pr-bot-loop` → structural escalation.)
+
 ## Author the contract wide (upstream of review)
 The reviewer checks the delta against the contract it was handed — any dimension
 the contract omits, the review starts BLIND on, and the blind spot recurs round
@@ -178,6 +223,18 @@ mapping function, the INPUT TAXONOMY (shapes, branched/legacy fields, nested
 inputs, overlap ordering, none-match fall-through); (b) the COUPLED non-code
 artifacts for this change kind. A contract naming only happy-path shapes
 guarantees the bot finds the dropped siblings later, one per round.
+
+**A wide contract must also be SELF-CONSISTENT.** A contract can enumerate every
+dimension and still contradict ITSELF — requiring a new behaviour while also
+freezing the path that behaviour must run through, or forbidding an action while
+mandating its effect. Handed contradictory requirements, an implementer typically
+satisfies the literal one and silently drops the other, and the resulting defect
+belongs to the contract, not the worker. Before dispatching, re-read the contract
+whole and test the new requirements against the constraints you ALSO imposed: can
+they all hold at once? Where two could collide, name the precedence
+("if these conflict, X wins"). And state in the task packet that CONFLICTING
+REQUIREMENTS ARE A STOP CONDITION — report and wait, never silently pick a winner
+(see `review-before-pr` Procedure step 1).
 
 ## Procedure
 1. **Diff.** Review runs BEFORE a PR (per `review-before-pr`): take the branch
@@ -206,7 +263,12 @@ guarantees the bot finds the dropped siblings later, one per round.
    incl. unchanged-asserting claims); sibling-class (name the class + every
    untouched site); input-domain (full taxonomy incl. legacy/nested/overlap/
    none-match); coupled-artifact (each obligated non-code artifact + its prose).
-   If the diff includes docs, ALSO run [SELF-CONSISTENCY] + [GOVERNANCE]. Classify each
+   If the diff includes docs, ALSO run [SELF-CONSISTENCY] + [GOVERNANCE].
+   ADJUDICATE, do not accept, any self-graded claim attached to the change
+   (a mutation score, 'that mutant is equivalent', 'no siblings exist',
+   'covered by test X') — check it against the code and report a refuted claim
+   as a finding. Apply the BLOCKING BAR I state below, not a default
+   production-grade one. Classify each
    finding blocking / non-blocking / suggestion, one line per item; do not edit."})`. Give the diff + adjacency, withhold the
    implementer's transcript/worktree, permit repo read. Emit the dispatch in the
    SAME turn you decide to review (never end a turn having only announced, with no
