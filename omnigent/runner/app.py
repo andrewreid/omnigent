@@ -6635,6 +6635,46 @@ def _resolved_spec_workdir(entry: Any) -> Path | None:
     return entry.workdir if isinstance(entry, ResolvedSpec) else None
 
 
+def _sub_agent_bundle_dir(
+    parent_workdir: Path | None,
+    sub_agent_name: str,
+) -> Path | None:
+    """
+    Locate a sub-agent's own directory inside a materialized bundle.
+
+    A sub-agent session must not inherit the parent bundle root as its
+    workdir: the root carries the PARENT's ``skills/`` and ``tools/``
+    (exposed via ``--plugin-dir`` / ``CODEX_HOME`` /
+    ``HARNESS_*_BUNDLE_DIR``), which the child must not see. The child's
+    bundle root is its own ``agents/<name>/`` directory — names are
+    unique across the tree, so the walk over nested ``agents/`` dirs
+    finds at most one match.
+
+    :param parent_workdir: The parent bundle's materialized root, or
+        ``None`` when the parent spec has no on-disk bundle.
+    :param sub_agent_name: The sub-agent's spec name, e.g.
+        ``"claude_code"``.
+    :returns: The sub-agent's own directory, or ``None`` (no bundle
+        skills/tools) when it has no on-disk directory, e.g. a
+        synthesized spec.
+    """
+    if parent_workdir is None:
+        return None
+    pending = [parent_workdir]
+    while pending:
+        agents_dir = pending.pop() / "agents"
+        if not agents_dir.is_dir():
+            continue
+        candidate = agents_dir / sub_agent_name
+        if candidate.is_dir():
+            return candidate
+        try:
+            pending.extend(d for d in agents_dir.iterdir() if d.is_dir())
+        except OSError:
+            continue
+    return None
+
+
 def _resolved_workdir_for_spec(spec: Any, fallback: Path | None) -> Path | None:
     """Return the bundle workdir for a possibly wrapped spec entry."""
     return _resolved_spec_workdir(spec) or fallback
@@ -8834,9 +8874,15 @@ def create_runner_app(
                 _sub_spec = _find_spec_by_name(spec, _sa_name_assign)
                 if _sub_spec is not None:
                     spec = _sub_spec
+                    # The child's workdir is its OWN agents/<name>/ dir, never
+                    # the parent bundle root — the root carries the parent's
+                    # skills, which the child must not inherit.
+                    _sub_workdir = _sub_agent_bundle_dir(
+                        _resolved_spec_workdir(spec_entry), _sa_name_assign
+                    )
                     spec_entry = (
-                        ResolvedSpec(spec=spec, workdir=_resolved_spec_workdir(spec_entry))
-                        if _resolved_spec_workdir(spec_entry) is not None
+                        ResolvedSpec(spec=spec, workdir=_sub_workdir)
+                        if _sub_workdir is not None
                         else spec
                     )
             harness_name = spec.executor.config.get("harness") or spec.executor.type
@@ -13681,6 +13727,9 @@ def create_runner_app(
             sub_spec = _find_spec_by_name(cached_spec, _sa_name)
             if sub_spec is not None:
                 cached_spec = sub_spec
+                # Child workdir = its own agents/<name>/ dir, never the
+                # parent bundle root (see _sub_agent_bundle_dir).
+                cached_spec_workdir = _sub_agent_bundle_dir(cached_spec_workdir, _sa_name)
                 _session_spec_cache[conv] = (
                     ResolvedSpec(spec=cached_spec, workdir=cached_spec_workdir)
                     if cached_spec_workdir is not None
@@ -17482,7 +17531,11 @@ def create_runner_app(
                 if parent_spec is not None:
                     sub_spec = _find_spec_by_name(parent_spec, sub_agent_name)
                     if sub_spec is not None:
-                        workdir = _resolved_spec_workdir(spec_entry)
+                        # Child workdir = its own agents/<name>/ dir, never the
+                        # parent bundle root (see _sub_agent_bundle_dir).
+                        workdir = _sub_agent_bundle_dir(
+                            _resolved_spec_workdir(spec_entry), sub_agent_name
+                        )
                         spec_entry = (
                             ResolvedSpec(spec=sub_spec, workdir=workdir)
                             if workdir is not None
@@ -18961,6 +19014,9 @@ async def _resolve_harness_config(
                 sub_spec = _find_spec_by_name(spec, sub_agent_name)
                 if sub_spec is not None:
                     spec = sub_spec
+                    # Child workdir = its own agents/<name>/ dir, never the
+                    # parent bundle root (see _sub_agent_bundle_dir).
+                    workdir = _sub_agent_bundle_dir(workdir, sub_agent_name)
             harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
             harness = canonicalize_harness(harness) or harness
             spawn_env = _build_spawn_env_from_spec(

@@ -5,6 +5,10 @@ description: polly's standing quality gate — an implementer must NOT open a PR
 
 # review-before-pr — the PR is the reviewed product, not the draft
 
+**Audience: polly ONLY.** Like `cross-review`, this is orchestration policy —
+never hand it to a worker; workers get their marching orders in their task
+prompts.
+
 Standing policy for ALL implementation work (applies to `fanout`,
 `cross-review`, and any one-off implement task). The Pull Request is a
 DELIVERABLE, not a scratchpad: it must be opened only AFTER the diff has passed
@@ -41,21 +45,12 @@ something to review against.
 3. **Cross-review the branch diff** (see `cross-review`): collect the diff with
    `git -C .worktrees/<task_id> diff main...HEAD` (there is NO PR to
    `gh pr diff` yet), and dispatch a DIFFERENT-vendor reviewer with the diff +
-   acceptance contract. EVERY review runs BOTH passes — [FOCUSED] diff-vs-contract
-   AND [WIDE] wide-angle sweep across all FOUR mandatory axes (see `cross-review`
-   → "[WIDE] — wide-angle sweep"): (1) downstream blast-radius (callers,
-   consumer/event ripple, parallel surfaces, test-surface coverage, whole-parcel
-   grep for any renamed term, env-dependent claims); (2) sibling-class sweep (name
-   the defect class, enumerate every un-touched site matching its shape); (3)
-   input-domain sweep (for any changed classifier, parser, mapper, router,
-   dispatcher, normalizer, or error/exception handler, enumerate the full input
-   taxonomy it must accept — all input shapes, alternate/legacy field names,
-   nested/wrapped forms, overlap/ordering, and the none-match fall-through); (4)
-   coupled-artifact sweep (verify each non-code artifact this change kind obligates
-   was updated and its prose reflects the new behavior). The wide pass may
-   fast-exit "no blast radius" on an axis but is NEVER skipped — skipping it is
-   what turns one fix into N reactive rounds. Reviewer reports
-   issues; it never edits.
+   acceptance contract + the REVIEWER MANDATE block from `cross-review`,
+   pasted verbatim. The mandate is the single source of truth for the review
+   battery — [FOCUSED] diff-vs-contract plus the [WIDE] sweep across all four
+   axes (blast-radius, sibling-class, input-domain, coupled-artifact) — so do
+   not restate or narrow it per dispatch. Reviewer reports issues; it never
+   edits.
 4. **Loop on blocking issues.** Each blocking issue → fix-task back to the SAME
    implementer conversation (same worktree/branch). Re-run gates, re-review.
    Repeat until gates are green AND zero blocking issues remain.
@@ -161,8 +156,8 @@ for the same meaning, nested/wrapped inputs, the ordering of overlapping matches
 and the none-match fall-through — so the implementer covers the whole domain on the
 first pass and the pre-PR review has the taxonomy to check against. The review can
 never out-scope the contract it is handed, so a narrow contract makes this blind
-spot recur round after round. See `cross-review` → "Input-domain coverage" and
-"The review can never out-scope its contract".
+spot recur round after round. See the input-domain axis of the REVIEWER MANDATE
+and "Author the contract wide" in `cross-review`.
 
 ## The mechanism gate (defense in depth)
 This ordering is also enforced at the runner policy layer, so it holds even if a
