@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from omnigent.runner.app import _sub_agent_bundle_dir
 
 
@@ -51,3 +53,39 @@ def test_sub_agent_bundle_dir_missing_child_is_none(tmp_path: Path) -> None:
 
 def test_sub_agent_bundle_dir_none_parent_is_none() -> None:
     assert _sub_agent_bundle_dir(None, "claude_code") is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_harness_config_uses_child_bundle_dir(tmp_path: Path) -> None:
+    """The harness-HTTP swap path must thread the CHILD's bundle dir.
+
+    Regression for the cache-miss/reconnect paths: the sub-agent spec swap
+    kept the parent workdir, so SDK workers received HARNESS_*_BUNDLE_DIR
+    pointing at the parent bundle and its skills leaked in.
+    """
+    from omnigent.runner.app import ResolvedSpec, _resolve_harness_config
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+    bundle = _make_bundle(tmp_path)
+    child = AgentSpec(
+        spec_version=1,
+        name="claude_code",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+    parent = AgentSpec(
+        spec_version=1,
+        name="polly",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        sub_agents=[child],
+    )
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        return ResolvedSpec(spec=parent, workdir=bundle)
+
+    _, spawn_env = await _resolve_harness_config(
+        agent_id="ag_polly",
+        spec_resolver=resolver,
+        sub_agent_name="claude_code",
+    )
+    assert spawn_env is not None
+    assert spawn_env["HARNESS_CLAUDE_SDK_BUNDLE_DIR"] == str(bundle / "agents" / "claude_code")
