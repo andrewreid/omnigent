@@ -1,0 +1,407 @@
+# Native-harness idle poll CPU
+
+Design for the two load-proportional poll loops that dominate runner CPU on a
+host running many concurrent native sessions:
+
+- **#2702** — `TerminalInstance._idle_watch_loop_threaded`: one daemon thread
+  per live terminal, fork+exec'ing tmux twice per tick.
+- **#3000** — `forward_claude_transcript_to_session`: one asyncio task per live
+  session, re-reading the whole bridge state on every tick.
+
+Acceptance bar: **an idle session must cost near zero.** Both costs scale with
+live terminals / live sessions, so they multiply exactly under sub-agent
+fan-out.
+
+Out of scope, deliberately: #2703 (YAML re-parse), #1349 (idle native session
+reaping), #2421 (ownerless tree leak). See "Interaction with adjacent issues".
+
+## 1. Mechanisms as they exist today
+
+### 1.1 Terminal idle watcher (#2702)
+
+`TerminalInstance.start_idle_watcher_thread` spawns one daemon thread named
+`terminal-idle-<name>-<key>`. Each tick (`omnigent/inner/terminal.py:1627`):
+
+1. `stop_event.wait(interval)` — the poll sleep.
+2. `_capture_pane_for_idle_or_none()` → `subprocess.run(tmux … capture-pane)`.
+3. `_pane_is_dead()` → `subprocess.run(tmux … list-panes -F '#{pane_dead}')`.
+4. `_IdleDetector.tick(snapshot)` — pure diff/marker state machine.
+5. Fires `on_activity` / `on_idle` / `on_exit`.
+
+Two `subprocess.run` calls per tick. `_tmux_base_cmd()` uses the bare string
+`"tmux"`, so `execvp` walks `PATH` — the issue's `strace` shows **4 `execve`
+per invocation, 3 of them `ENOENT`**.
+
+Two watcher configurations exist (`omnigent/runner/resource_registry.py:1111`):
+
+| watcher | interval | idle threshold | callbacks |
+|---|---|---|---|
+| generic terminal | 1.0 s | 10.0 s | `on_activity`, `on_exit` |
+| claude-native agent terminal | 0.2 s | 1.0 s | `on_activity`, `on_idle`, `on_exit` |
+
+The asyncio sibling `_idle_watch_loop` has **no production caller** (only
+`close()` stops it, and tests drive it). It is left alone apart from inheriting
+the resolved tmux path.
+
+#### Latency consumers
+
+| consumer | source | budget |
+|---|---|---|
+| `session.terminal.activity` pulse (web activity badge) | `_on_activity` → `activity_publisher` | web keeps the badge lit for 1.5 s (`ACTIVE_OUTPUT_WINDOW_MS`); already throttled to 1 emit/s by `_TERMINAL_ACTIVITY_EMIT_MIN_INTERVAL_SECONDS` |
+| session `running` status (Agents panel) | `_on_activity` → `status_publisher` | human-visible; sub-second desirable at turn start |
+| session `idle` status | `_on_idle` → `status_publisher` | fires on the 1.0 s threshold; also memoised for exit classification (`_set_session_status_memo`) |
+| terminal exit lifecycle | `_on_exit` → `_handle_terminal_exit` | seconds-scale is fine; it publishes a lifecycle event and cleans up |
+
+The critical observation: **the `running` edge that users actually notice is
+turn start, and turn start is initiated by the runner itself** (`send()` writes
+to the pane). The runner therefore already knows when to expect output — it
+does not have to discover it by polling.
+
+### 1.2 Claude transcript forwarder (#3000)
+
+`forward_claude_transcript_to_session` (`omnigent/claude_native_forwarder.py:794`)
+polls every `_DEFAULT_POLL_INTERVAL_S = 0.25` and, per tick, re-reads the bridge
+state from scratch and runs ~10 independent scans. Measured locally with
+cProfile on 4 idle sessions at fan-out 6: **~20 `open()` and ~17
+`asyncio.to_thread` dispatches per session per tick**. The thread-pool
+dispatches (future creation, context copy, lock traffic) are as expensive as
+the I/O.
+
+Everything the loop consumes is a file:
+
+| file | writer | shape |
+|---|---|---|
+| `bridge.json` | bridge setup | atomic replace |
+| `state.json` | hooks (`record_hook_event`) | atomic replace |
+| `hooks.jsonl` | hooks | append-only |
+| `context.json` | statusLine wrapper | atomic replace |
+| `message_deltas.jsonl` | message-display hook | append-only |
+| `<transcript>.jsonl` | Claude Code | append-only |
+| `<session>/subagents/agent-*.jsonl` + `.meta.json` | Claude Code | append/create |
+
+Plus the forwarder's own cursors (`*_forwarder.json`), which only change when
+the forwarder did work.
+
+#### Latency consumers
+
+| consumer | budget |
+|---|---|
+| assistant-text deltas → live streaming in the web transcript | **tightest**: this is what makes streaming feel live. Must stay at the current 0.25 s. |
+| transcript items, tool calls/results | same tick as deltas |
+| turn-start `running` / turn-end `idle` status edges | sub-second |
+| session cost + model mirror (feeds cost-budget policy gating) | sub-second within a turn |
+| sub-agent status | 5 s quiescence heuristic already |
+
+Because streaming latency is non-negotiable, **the poll interval cannot back
+off.** The tick body has to get cheap instead.
+
+## 2. Strategies considered
+
+### #2702
+
+| strategy | verdict |
+|---|---|
+| **A. tmux control mode (`tmux -CC`) `%output` notifications** | Rejected. Each terminal has its *own* tmux server, so this is one persistent control client process **per terminal** plus a reader thread. On the reported host that is ~42 new processes — the tax moved, not removed. Also gives raw output bytes, not rendered pane content, so the marker track (`_IDLE_MARKER_SUBSTRINGS`) would need a separate renderer. |
+| **B. `pipe-pane -o 'cat >> file'`** | Rejected for the same reason: tmux spawns a shell per pane. Also raw bytes, not rendered cells. |
+| **C. `/proc/<pane_pid>/stat` CPU-time pre-filter** | Rejected. Linux-only (the repo runs on macOS too), needs the pane's process *tree* (the agent is a grandchild of `pane_pid`), and walking `/proc` per tick is its own cost. |
+| **D. Cheaper ticks + adaptive backoff** | **Chosen.** Three independent, composable reductions, all portable: resolve the tmux binary once (4 `execve` → 1); merge the two tmux invocations into one command sequence (2 fork+exec → 1); back the interval off after sustained quiescence, with an explicit wake. |
+
+Strategy D's three parts multiply: `8 execve/tick → 1 execve/tick`, then
+`5 ticks/s → 0.5 ticks/s` for the claude-native watcher.
+
+### #3000
+
+| strategy | verdict |
+|---|---|
+| **A. Interval backoff (0.25 → 1 → 5 s)** | Rejected as the primary fix. It buys idle CPU by directly spending streaming latency — the one budget that cannot move. |
+| **B. Tear the forwarder down on `Stop`** | Rejected. `Stop` is not terminal: the user resumes the same session in the same pane, and the tail must be live when they do. This is the issue's own open question; the chosen fix makes it moot (a stopped harness writes nothing, so it costs nothing) without gambling on lifecycle semantics. It also stays clear of #1349's reaping decision. |
+| **C. Memoise the individual file reads** | Partial. Kills the `_read_json_file` / `pathlib` share but leaves the ~17 `to_thread` dispatches and the ~10 scans. |
+| **D. Gate the whole tick body behind a cheap change-detector** | **Chosen.** Keep ticking at 0.25 s — *zero* added latency — but make a no-change tick cost one `scandir` + a handful of `stat`s instead of the full body. |
+
+## 3. Chosen design
+
+### 3.1 One mechanism or two?
+
+**Two.** They share a diagnosis (unconditional per-unit polling) but not a
+remedy, because their per-tick work has opposite shapes:
+
+- The forwarder's inputs are **files**, so "did anything change?" is answerable
+  for ~1% of the cost of the tick itself. Gate the work, keep the rate.
+- The terminal watcher's input is **rendered tmux pane state**, which has no
+  cheap out-of-band change signal short of spawning a per-pane process. There
+  is nothing to gate on, so the rate has to move.
+
+Forcing one abstraction over both would mean either paying a process per pane
+(to give the terminal a file-like signal) or spending streaming latency (to give
+the forwarder a backoff). Both are worse than two small, local fixes.
+
+### 3.2 #2702 — cheaper ticks + post-idle backoff
+
+**(a) Resolve the tmux binary once.** Module-level `functools.cache` over
+`shutil.which("tmux")`, falling back to the bare name so the failure message is
+unchanged when tmux is absent. Cuts `execve` 4 → 1 per invocation. No behaviour
+change.
+
+**(b) Merge the pane-dead probe into the capture.** One tmux command sequence:
+
+```
+tmux -S <sock> -f /dev/null display-message -p -t main '#{pane_dead}' \; capture-pane -t main -p -e
+```
+
+Verified against tmux 3.6b: live pane prints `0\n<pane>`, dead pane (under
+`remain-on-exit`) prints `1\n<pane>` and still exits 0, vanished server exits 1.
+Halves fork+exec per tick, and removes a real race — today the pane can die
+between the capture and the probe, so the snapshot and the liveness verdict come
+from different instants.
+
+**(c) Post-idle interval backoff.** Per tick:
+
+```
+changed        → interval = base                     (activity: full rate)
+quiescent ≥ idle_threshold → interval = min(interval × 2, max_interval)
+otherwise      → interval unchanged
+```
+
+`max_interval = min(base × 10, 5.0)` → 2.0 s for the claude-native watcher
+(base 0.2), 5.0 s for generic terminals (base 1.0).
+
+**The false-idle invariant.** Backoff only grows once the pane has been
+unchanged for at least the detector's own idle threshold — i.e. *after* the idle
+edge has already fired. Consequences:
+
+- Backoff can never make the idle edge fire **early**: `_IdleDetector` compares
+  wall-clock (`time.monotonic()`) against the threshold, not tick counts, so
+  sampling less often can only delay a decision, never advance it.
+- Backoff can never make idle fire **when it shouldn't**: a session that is
+  working repaints its pane, every tick sees a change, the interval stays at
+  base, and the growth branch is never reached.
+- What backoff *can* cost is a late `running` edge — the idle→running
+  transition, bounded by `max_interval`.
+
+**The wake path** collapses that cost for every case a user actually notices.
+A new per-watcher `threading.Event` is set by:
+
+- `TerminalInstance.send()` — the runner writing a turn into the pane.
+- `TerminalInstance.note_client_interaction()` — attach/detach, focus, mouse,
+  keystroke, resize from the web terminal.
+- `_stop_idle_watcher_thread()` — so teardown does not wait out a backed-off
+  sleep.
+
+The sleep is split so a wake storm cannot become a fork storm:
+
+```
+phase 1: stop_event.wait(base_interval)          # mandatory, un-wakeable floor
+phase 2: wake_event.wait(interval - base)        # only the extra backoff is skippable
+```
+
+Poll rate is therefore capped at `1/base` no matter how many wakes arrive — a
+user dragging the mouse over an attached terminal cannot drive tmux faster than
+today's rate. Phase 1 keeps the `close()` join window bounded by `base` exactly
+as it is today; phase 2 is interrupted by the same `wake_event` that stop sets.
+
+Residual (accepted, called out below): a pane parked on a permission prompt with
+a blinking spinner changes every tick, so it never backs off. That session is
+"idle" to a human but not to the pane, and treating it as backoff-eligible would
+just oscillate (each backed-off sample sees a different spinner frame → reset).
+
+### 3.3 #3000 — change-detector gate, unchanged interval
+
+Per tick, before the body:
+
+```
+fingerprint = scandir(bridge_dir) + stat(transcript) + scandir(subagents_dir)
+              → {name: (st_mtime_ns, st_size, st_ino)}
+```
+
+`st_ino` is what makes this airtight: `_write_json_file` writes a temp file and
+`os.replace`s it, so every state write lands a **new inode**. Append-only files
+(`hooks.jsonl`, `message_deltas.jsonl`, transcripts) always grow `st_size`. A
+same-size, same-nanosecond, same-inode rewrite is the only blind spot, and no
+writer here can produce one.
+
+Run the full body when **any** of:
+
+1. the fingerprint changed (or this is the first tick — no baseline yet), **or**
+2. fewer than `_IDLE_SETTLE_SECONDS = 8.0` have passed since the last change —
+   the settle window that lets purely time-based transitions complete, **or**
+3. a retry tracker or the cost-retry backoff has a post due, **or**
+4. `_IDLE_RESYNC_SECONDS = 10.0` have passed since the last full body — a
+   belt-and-braces resync that bounds the damage of any blind spot.
+
+The settle window is sized against the in-process deadlines that fire with no
+file change:
+
+| deadline | value | covered by |
+|---|---|---|
+| assistant item held for deltas | 2.0 s | settle window |
+| sub-agent idle quiescence | 5.0 s | settle window |
+| HTTP post retry | 1–30 s | explicit tracker check (3) |
+| cost post retry | backoff | explicit `cost_retry_not_before` check (3) |
+
+**Latency impact: none.** The poll interval is untouched, and any change to any
+input file is seen on the very next 0.25 s tick.
+
+### 3.4 Blast radius, kill switches, observability
+
+| knob | default | effect when disabled |
+|---|---|---|
+| `OMNIGENT_TERMINAL_IDLE_POLL_BACKOFF=0` | enabled | watcher polls at the fixed base interval, exactly as today |
+| `OMNIGENT_CLAUDE_FORWARDER_IDLE_GATE=0` | enabled | forwarder runs the full body every tick, exactly as today |
+
+Both are read once per loop start, so a restart picks up a change. Neither
+switch touches the tmux-path resolution or the merged probe — those are pure
+cost reductions with no behavioural surface, so they carry no switch.
+
+Field diagnosability: the watcher logs at debug when it enters and leaves
+backoff (with the interval), and the forwarder logs at debug when the gate
+first engages after a quiet period. A regression therefore shows up as either
+"gate never engages" (no CPU win) or "gate engaged while a turn was live"
+(a bug), both visible in the runner log without a rebuild.
+
+### 3.5 Platform reach
+
+Everything used is portable: `shutil.which`, `subprocess.run`, `threading.Event`,
+`os.scandir`, `os.stat`. `st_ino` and `st_mtime_ns` are meaningful on both APFS
+and ext4. No `inotify`, no `kqueue`, no `/proc`. There is no degraded path to
+fall back to because there is no platform-specific path.
+
+## 4. Measurement
+
+`dev/benchmarks/native_poll_cpu.py`, two scenarios, both holding everything
+genuinely idle (no turns, no pane output, no transcript growth):
+
+```bash
+uv run python -m dev.benchmarks.native_poll_cpu terminal --terminals 8 --seconds 30
+uv run python -m dev.benchmarks.native_poll_cpu forwarder --sessions 8 --seconds 30 --fanout 6
+```
+
+The terminal scenario launches real tmux terminals and reports `RUSAGE_CHILDREN`
+(the tmux processes) as well as `RUSAGE_SELF`, plus a tmux-invocation count. The
+forwarder scenario runs real forwarder tasks against a local sink server and
+reports `RUSAGE_SELF`.
+
+Both scenarios take a `--warmup` that runs before the measurement window opens,
+defaulting past each loop's settle period. Without it the window captures the
+tail of the last activity burst instead of steady-state idle, which understates
+the win by roughly 3x.
+
+### Results
+
+Unmodified `main` vs this branch, macOS 27 / M-series, Python 3.12.13, 8 units,
+30 s window, everything idle:
+
+| scenario | before | after | factor |
+|---|---|---|---|
+| terminal, poll 0.2 s | **5.49 %** of a core / terminal | **0.37 %** | **15x** |
+| terminal, tmux invocations | 8.82 /s / terminal | 0.47 /s | **19x** |
+| terminal, `execve` (4 per invocation → 1) | ~35 /s / terminal | 0.47 /s | **75x** |
+| forwarder, no fan-out | **0.73 %** of a core / session | **0.11 %** | **6.8x** |
+| forwarder, fan-out 6 | **1.53 %** of a core / session | **0.13 %** | **12x** |
+
+Extrapolating to the reported host (~20 sessions with fan-out): the forwarder
+alone goes from ~31 % of a core to ~2.5 %, and 16 live terminals from ~88 % to
+~5.9 %. That is consistent with the 20-25 %/runner attributed to each loop in
+the issues.
+
+The forwarder's residual is now dominated by the fingerprint itself
+(~59 µs/tick, ~66 % of what is left) plus the bare asyncio wake at 4 Hz. Both
+are the irreducible cost of *not* backing the interval off, which is what keeps
+streaming latency unchanged.
+
+## 5. Interaction with adjacent issues
+
+- **#2703** (YAML re-parse during fan-out) — disjoint code path
+  (agent-bundle loading, not the poll loops). No overlap.
+- **#1349** (idle native sessions never reaped) — **closed**. This change
+  deliberately does *not* reap anything. It makes an un-reaped idle session
+  cheap, which lowers the urgency of reaping but does not substitute for it: the
+  memory a reaper reclaims is untouched here.
+- **#2421** (ownerless tree leak) — no new processes or threads are created, so
+  nothing new can be orphaned. The one adjacency is teardown: a backed-off
+  watcher must not linger past `close()`, which is why stop sets the wake event
+  (§3.2). Reviewed explicitly in Phase 3.
+- **#2702's own "amplifier" note** — terminals kept alive via
+  `keep_alive_after_exit` inflate the watcher count. Unaddressed here (it is the
+  #2421/#1349 teardown gap), but each such watcher now costs ~1 % of what it did.
+
+## 6. Explicitly not covered
+
+- Reaping or capping live terminals / sessions (#1349, #2421).
+- The codex / cursor / other native forwarders. They have the same shape and
+  the same fix would apply, but each has its own state files and cursor
+  semantics; landing one at a time keeps the blast radius reviewable.
+- The permission-prompt spinner case (§3.2), which keeps a watcher at full rate.
+- `_idle_watch_loop` (asyncio) backoff — no production caller.
+- Replacing polling with true eventing. Every eventing option costs a process or
+  a thread per unit, which is the thing being removed.
+
+## 7. What the adversarial review caught
+
+Reviewed as a hostile reader after the code landed; four findings changed the
+implementation.
+
+1. **A failing endpoint would have disabled the gate entirely.** The first cut
+   held the gate open whenever any retry was *scheduled* (`has_pending()`) or
+   `cost_retry_not_before` was non-zero. Those are set on failure and cleared
+   only on success, so a permanently rejecting cost or events endpoint would
+   have pinned every session at full-rate polling — the exact regression the
+   change exists to prevent, triggered by an outage. Now the check is
+   *due*, not *scheduled*: `has_due_retry(now)` and
+   `0 < cost_retry_not_before <= now`.
+2. **A client-interaction wake would not have reset the backoff.** Pane changes
+   inside the client-interaction window are deliberately suppressed
+   (`suppress_activity`), so the change path could not reset the interval for
+   exactly the case the wake exists to serve. `_wait_next_idle_tick` now
+   reports whether it was woken and the loop resets the interval on that.
+3. **A wake storm could have become a fork storm.** `note_client_interaction`
+   fires on every keystroke and mouse event. A single interruptible sleep would
+   have let a user dragging the mouse drive tmux at input frequency. The sleep
+   is now split: an un-interruptible `base_interval` floor, then the
+   skippable backoff remainder. Poll rate is capped at the base rate by
+   construction.
+4. **A backed-off watcher could have lingered past teardown** — the
+   ownerless-thread shape #2421 describes. `_stop_idle_watcher_thread` now sets
+   the wake event alongside the stop event, and
+   `test_threaded_idle_watcher_backoff_stops_promptly` asserts the thread is
+   dead when the stop call returns.
+
+Also fixed in review: `_tmux_executable` was cached for the process lifetime,
+which would have returned a stale binary if `PATH` changed; it is now keyed on
+`PATH`. `_capture_pane_for_idle_or_none` was renamed to
+`_capture_pane_state_or_none` to match its new `(pane_dead, pane)` return, and a
+docstring reference to the deleted `_pane_is_dead` was repointed.
+
+Both test suites were mutation-checked: a fingerprint blinded to transcript
+growth fails the two gate tests, and a backoff that grows without waiting for
+post-idle quiescence fails
+`test_threaded_idle_watcher_slow_output_never_reads_idle`.
+
+## 8. Residual risks
+
+1. **Late `running` edge on autonomous pane output.** A terminal that starts
+   producing output with no preceding `send()` or client interaction is noticed
+   up to `max_interval` late (2 s claude-native, 5 s generic). Turn start,
+   typing, and attach are all wake-triggered, so this only affects output that
+   originates entirely inside the pane after ≥1 idle threshold of silence.
+2. **Fingerprint blind spot.** A same-inode, same-size, same-`mtime_ns` rewrite
+   would be missed for up to `_IDLE_RESYNC_SECONDS`. No current writer can
+   produce one; the resync bounds it regardless.
+3. **Settle window is a constant, not a derivation.** If a future time-based
+   transition longer than 8 s is added to the forwarder body without a matching
+   deadline check, it would be delayed to the next resync. Mitigated by the
+   constant carrying a comment naming what it must cover.
+4. **Late `running` under slow sustained output.** A pane that changes less
+   often than its idle threshold already reads idle between changes (existing
+   detector semantics, unchanged). Backoff additionally delays the following
+   `running` edge by up to the ceiling. Bounded at 2 s claude-native / 5 s
+   generic.
+5. **A backed-off watcher reports a pane exit up to one interval late.** Only
+   reachable for a pane that dies after ≥1 idle threshold of silence — i.e. a
+   kill or crash, not a clean end-of-turn exit, which repaints first and so is
+   seen at base rate.
+6. **Merged tmux probe changes one error path.** Previously a failing
+   `list-panes` was treated as "pane alive"; now a failing sequence is treated
+   as "server gone" and fires `on_exit`. Both commands target the same session,
+   so they succeed and fail together in practice, but a tmux that could fail
+   `display-message` while serving `capture-pane` would report an exit one
+   interval early.

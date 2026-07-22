@@ -220,6 +220,32 @@ _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
 # ``agent-<id>.jsonl`` transcript.
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
 _DEFAULT_POLL_INTERVAL_S = 0.25
+
+# Idle gating for the poll loop. The interval above is deliberately NOT backed
+# off — it is what makes streamed assistant text feel live — so instead a tick
+# whose inputs are all byte-identical to the previous tick skips the scan work
+# and costs one directory scan plus a handful of stats.
+#
+# Seconds of unchanged inputs before gating kicks in. Must comfortably exceed
+# every transition inside the loop body that fires on a timer rather than on a
+# file change: the assistant-item delta hold
+# (:data:`_ASSISTANT_ITEM_DELTA_HOLD_S`, 2s) and sub-agent idle quiescence
+# (:data:`_SUBAGENT_IDLE_QUIESCENCE_S`, 5s). Retries are longer but are checked
+# explicitly, so they do not constrain this.
+_IDLE_SETTLE_SECONDS = 8.0
+
+# Longest a gated loop goes without running the full body regardless of the
+# fingerprint. Purely a safety net: it bounds the damage of any change the
+# fingerprint cannot see.
+_IDLE_RESYNC_SECONDS = 10.0
+
+# Set to a falsy value to run the full body on every tick, restoring the
+# pre-gating behaviour without a rollback.
+_IDLE_GATE_ENV_VAR = "OMNIGENT_CLAUDE_FORWARDER_IDLE_GATE"
+
+# One ``(st_mtime_ns, st_size, st_ino)`` triple per watched path.
+_BridgeFingerprint = dict[str, tuple[int, int, int]]
+
 _POST_TIMEOUT_S = 10.0
 _MAX_SEEN_SOURCE_IDS = 2000
 _CURSOR_FINGERPRINT_BYTES = 256
@@ -651,6 +677,21 @@ class _PostRetryTracker:
             return None
         return remaining
 
+    def has_due_retry(self, now: float) -> bool:
+        """
+        Report whether any key's retry is due to be attempted now.
+
+        The poll loop consults this before skipping an unchanged tick: a
+        scheduled retry fires on a timer, not on a file change, so a gate
+        that only watched the transcript would strand it. Keys whose backoff
+        has not elapsed deliberately do *not* count — during a sustained
+        outage those would otherwise pin the loop at full rate forever.
+
+        :param now: Current monotonic time, e.g. ``time.monotonic()``.
+        :returns: ``True`` when at least one key is ready for another attempt.
+        """
+        return any(entry.next_attempt_at <= now for entry in self._entries.values())
+
     def clear(self, key: str) -> None:
         """
         Remove retry state for a successfully handled event.
@@ -703,6 +744,118 @@ class _PostRetryTracker:
             exhausted=False,
             permanent=permanent,
         )
+
+
+def _idle_gate_enabled() -> bool:
+    """
+    Report whether the poll loop may skip ticks whose inputs are unchanged.
+
+    :returns: ``True`` unless :envvar:`OMNIGENT_CLAUDE_FORWARDER_IDLE_GATE` is
+        set to a falsy value (``"0"``, ``"false"``, ``"no"``, ``"off"``).
+    """
+    raw = os.environ.get(_IDLE_GATE_ENV_VAR)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _scan_into_fingerprint(directory: Path, prefix: str, out: _BridgeFingerprint) -> None:
+    """
+    Stamp every visible entry of *directory* into a fingerprint.
+
+    Dot-prefixed names are skipped: the bridge's atomic writer creates
+    ``.<name>.<rand>.tmp`` scratch files, and letting those churn the
+    fingerprint would defeat the gate on every state write.
+
+    :param directory: Directory to scan, e.g. the bridge dir.
+    :param prefix: Namespace for the keys, e.g. ``"bridge/"``.
+    :param out: Fingerprint mapping to update in place.
+    :returns: None.
+    """
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                try:
+                    info = entry.stat()
+                except OSError:
+                    continue
+                out[prefix + entry.name] = (info.st_mtime_ns, info.st_size, info.st_ino)
+    except OSError:
+        return
+
+
+def _bridge_input_fingerprint(
+    bridge_dir: Path,
+    transcript_path: Path | None,
+    subagents_dir: Path | None,
+) -> _BridgeFingerprint:
+    """
+    Snapshot every file the poll loop reads, cheaply enough to do every tick.
+
+    Inode is part of the triple because the bridge writes its JSON state via
+    a temp file plus ``os.replace``, so every write lands a new inode even
+    when the size and timestamp would look unchanged. Append-only files
+    (hook events, message deltas, transcripts) always grow their size. Between
+    them there is no writer here that can mutate an input invisibly.
+
+    The whole bridge directory is scanned rather than a list of known names so
+    a file added to the bridge later is covered without anyone remembering to
+    update this.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param transcript_path: Transcript last resolved by the loop, or ``None``
+        before hooks have reported one.
+    :param subagents_dir: The transcript's ``subagents/`` directory, resolved
+        by the caller so it is not rebuilt on every tick. ``None`` when there
+        is no transcript yet.
+    :returns: Fingerprint of the loop's inputs.
+    """
+    fingerprint: _BridgeFingerprint = {}
+    _scan_into_fingerprint(bridge_dir, "bridge/", fingerprint)
+    if transcript_path is not None:
+        try:
+            info = transcript_path.stat()
+        except OSError:
+            pass
+        else:
+            fingerprint["transcript"] = (info.st_mtime_ns, info.st_size, info.st_ino)
+    if subagents_dir is not None:
+        _scan_into_fingerprint(subagents_dir, "subagent/", fingerprint)
+    return fingerprint
+
+
+def _forwarder_tick_is_needed(
+    *,
+    now: float,
+    last_change_at: float,
+    last_full_poll_at: float,
+    retry_trackers: tuple[_PostRetryTracker, ...],
+    dedupe: _ForwardDedupeState,
+) -> bool:
+    """
+    Decide whether this tick must run the full forwarding body.
+
+    Called only after the inputs were found byte-identical to the previous
+    tick, so the question is purely "is there time-based work outstanding?".
+
+    :param now: Current monotonic time.
+    :param last_change_at: Monotonic time an input last changed.
+    :param last_full_poll_at: Monotonic time the body last ran.
+    :param retry_trackers: Every retry tracker the loop owns.
+    :param dedupe: Dedupe state carrying the cost-post retry gate.
+    :returns: ``True`` when the body must run.
+    """
+    if now - last_change_at < _IDLE_SETTLE_SECONDS:
+        return True
+    if now - last_full_poll_at >= _IDLE_RESYNC_SECONDS:
+        return True
+    # Due, not merely scheduled: a cost endpoint that keeps rejecting would
+    # otherwise hold the gate open permanently.
+    if 0.0 < dedupe.cost_retry_not_before <= now:
+        return True
+    return any(tracker.has_due_retry(now) for tracker in retry_trackers)
 
 
 async def forward_claude_transcript_to_session(
@@ -787,12 +940,46 @@ async def forward_claude_transcript_to_session(
     task_subjects: dict[str, str] = {}
     task_statuses: dict[str, str] = {}
     task_order: list[str] = []
+    # Idle gating: a tick whose on-disk inputs are byte-identical to the
+    # previous tick has nothing to forward, so it skips the ~20 file reads and
+    # ~10 scans the body would otherwise redo. The poll interval is untouched,
+    # so any change is still picked up on the very next tick.
+    gate_enabled = _idle_gate_enabled()
+    fingerprint: _BridgeFingerprint | None = None
+    known_transcript_path: Path | None = None
+    known_subagents_dir: Path | None = None
+    last_input_change_at = time.monotonic()
+    last_full_poll_at = 0.0
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
         while True:
             try:
+                if gate_enabled:
+                    now = time.monotonic()
+                    current = _bridge_input_fingerprint(
+                        bridge_dir, known_transcript_path, known_subagents_dir
+                    )
+                    if fingerprint is None or current != fingerprint:
+                        fingerprint = current
+                        last_input_change_at = now
+                    elif not _forwarder_tick_is_needed(
+                        now=now,
+                        last_change_at=last_input_change_at,
+                        last_full_poll_at=last_full_poll_at,
+                        retry_trackers=(
+                            item_retries,
+                            status_retries,
+                            subagent_start_retries,
+                            subagent_item_retries,
+                            subagent_status_retries,
+                        ),
+                        dedupe=dedupe,
+                    ):
+                        await asyncio.sleep(poll_interval_s)
+                        continue
+                    last_full_poll_at = now
                 current_session_id = read_active_session_id(bridge_dir) or session_id
                 if hook_state is None:
                     hook_state = await _ensure_hook_state(
@@ -895,6 +1082,15 @@ async def forward_claude_transcript_to_session(
                         bridge_dir=bridge_dir,
                     )
                 transcript_path = read_transcript_path(bridge_dir)
+                # Remembered so the next tick's fingerprint covers the
+                # transcript and its sub-agent dir without re-deriving either.
+                if transcript_path != known_transcript_path:
+                    known_transcript_path = transcript_path
+                    known_subagents_dir = (
+                        _subagents_dir_for_transcript(transcript_path)
+                        if transcript_path is not None
+                        else None
+                    )
                 if transcript_path is not None:
                     state = await _ensure_state_for_transcript(
                         bridge_dir=bridge_dir,
