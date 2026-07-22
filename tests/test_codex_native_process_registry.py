@@ -468,6 +468,88 @@ def test_legacy_sigtermed_entry_without_snapshot_drops_after_leader_exit(
     assert _registry_payload(path) == []
 
 
+def test_escalation_handles_child_forked_from_sigterm_handler(tmp_path: Path, monkeypatch) -> None:
+    """A child forked by the leader's SIGTERM handler never escapes silently.
+
+    The pre-TERM snapshot cannot contain it. Where the platform can pin
+    the group (pidfd), escalation group-kills it; elsewhere the entry must
+    be RETAINED (group still populated, ownership unprovable) rather than
+    dropped as "gone" while the child lives.
+    """
+    import os as os_mod
+    import subprocess
+    import sys
+    import time as time_mod
+
+    path = tmp_path / "registry.json"
+    tag = "tag-latefork"
+    leader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, signal, subprocess, sys, time\n"
+                "def on_term(_sig, _frame):\n"
+                "    subprocess.Popen([sys.executable, '-c', "
+                "'import os, signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print(os.getpid(), flush=True); time.sleep(120)'])\n"
+                "    time.sleep(0.2)\n"
+                "    os._exit(0)\n"
+                "signal.signal(signal.SIGTERM, on_term)\n"
+                "print('ready', flush=True)\n"
+                "time.sleep(120)\n"
+            ),
+            registry.codex_native_session_tag_cmdline_arg(tag),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    child_pid: int | None = None
+    try:
+        assert leader.stdout is not None
+        assert leader.stdout.readline().strip() == "ready"
+        registry.register_codex_native_process(
+            pid=leader.pid,
+            pgid=leader.pid,
+            session_tag=tag,
+            owner_lock_path=None,
+            registry_path=path,
+        )
+
+        assert registry.reconcile_codex_native_process_registry(registry_path=path) == 1
+        child_pid = int(leader.stdout.readline().strip())
+        assert leader.wait(timeout=10) is not None
+        assert registry._pid_alive(child_pid), "handler child should outlive the leader"
+
+        monkeypatch.setattr(registry, "_SIGKILL_GRACE_S", 0.0)
+        if hasattr(os_mod, "pidfd_open"):
+            # Pinned pgid: escalation group-kills the late fork; the entry
+            # drains once the group is verifiably empty.
+            deadline = time_mod.monotonic() + 5.0
+            while _registry_payload(path) and time_mod.monotonic() < deadline:
+                registry.reconcile_codex_native_process_registry(registry_path=path)
+                time_mod.sleep(0.05)
+            assert not registry._pid_alive(child_pid), "late-forked child leaked"
+            assert _registry_payload(path) == []
+        else:
+            # No pin available: the entry must be retained — dropping it
+            # here is exactly the silent leak this regression guards.
+            registry.reconcile_codex_native_process_registry(registry_path=path)
+            assert len(_registry_payload(path)) == 1
+            assert registry._pid_alive(child_pid)
+    finally:
+        import contextlib
+
+        if child_pid is not None:
+            with contextlib.suppress(OSError):
+                os_mod.kill(child_pid, signal.SIGKILL)
+        if leader.poll() is None:
+            leader.kill()
+        leader.wait(timeout=10)
+
+
 def test_end_to_end_spares_owned_process_and_reaps_after_owner_death(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -1197,8 +1197,9 @@ async def test_orphan_sweep_escalates_to_sigkill(
     monkeypatch.setattr(pm_mod, "_ORPHAN_SIGTERM_GRACE_S", 0)
     monkeypatch.setattr(pm_mod, "_ORPHAN_KILL_VERIFY_TIMEOUT_S", 0.0)
     monkeypatch.setattr(pm_mod, "_pids_holding_socket", fake_pids_holding_socket)
-    monkeypatch.setattr(pm_mod, "_holder_member_identities", lambda _pid: {12345: "id-a"})
+    monkeypatch.setattr(pm_mod, "_holder_group_snapshot", lambda _pid: (54321, {12345: "id-a"}))
     monkeypatch.setattr(pm_mod._proc, "process_identity_state", lambda _pid, _ident: "match")
+    monkeypatch.setattr(pm_mod._proc, "group_member_identities", lambda _pgid: None)
     monkeypatch.setattr(pm_mod._proc, "kill_verified", fake_kill_verified)
     monkeypatch.setattr(pm_mod.os, "getpgid", fake_getpgid)
     monkeypatch.setattr(pm_mod.os, "killpg", fake_killpg)
@@ -1209,7 +1210,9 @@ async def test_orphan_sweep_escalates_to_sigkill(
 
     confirmed = await pm_mod._kill_orphan_runners(instance_dir)
 
-    assert killed_group == [(54321, signal.SIGTERM)]
+    # SIGTERM via the tree signal, then the anchored atomic group SIGKILL
+    # alongside the per-member verified kill.
+    assert killed_group == [(54321, signal.SIGTERM), (54321, signal.SIGKILL)]
     assert killed_member == [(12345, signal.SIGKILL)]
     # The (mocked) member never died, so termination is unverified and the
     # caller must retain the instance dir as retry metadata.
@@ -1285,6 +1288,127 @@ async def test_orphan_sweep_kills_whole_detached_harness_tree(
                     os.kill(pid, signal.SIGKILL)
         if leader.poll() is None:
             leader.wait(timeout=10)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX sessions/lsof")
+@pytest.mark.skipif(shutil.which("lsof") is None, reason="lsof required")
+async def test_orphan_sweep_catches_child_forked_from_sigterm_handler(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child forked by the leader's SIGTERM handler is still reaped.
+
+    The static pre-TERM snapshot cannot contain it; only the post-grace
+    group rescan/merge plus the atomic group SIGKILL can. The child also
+    ignores SIGTERM, so nothing but that group kill removes it.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    monkeypatch.setattr(pm_mod, "_ORPHAN_SIGTERM_GRACE_S", 0.5)
+
+    instance_dir = short_tmp_parent / "ap-dead"
+    instance_dir.mkdir(mode=0o700)
+    (instance_dir / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    sock = instance_dir / "conv-x.sock"
+
+    leader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, signal, subprocess, sys, time\n"
+                f"fd = open({str(sock)!r}, 'w')\n"
+                "def on_term(_sig, _frame):\n"
+                "    subprocess.Popen([sys.executable, '-c', "
+                "'import os, signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print(os.getpid(), flush=True); time.sleep(120)'])\n"
+                "    time.sleep(0.2)\n"
+                "    os._exit(0)\n"
+                "signal.signal(signal.SIGTERM, on_term)\n"
+                "print('ready', flush=True)\n"
+                "time.sleep(120)\n"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    child_pid: int | None = None
+    try:
+        assert leader.stdout is not None
+        assert leader.stdout.readline().strip() == "ready"
+
+        sweep_task = asyncio.create_task(pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent))
+        # The handler prints the late-forked child's pid, then the leader
+        # exits; reap it so death verification can see it gone.
+        child_pid = int((await asyncio.to_thread(leader.stdout.readline)).strip())
+        await asyncio.to_thread(leader.wait, 10)
+        swept = await sweep_task
+
+        assert swept == 1
+        assert not instance_dir.exists()
+        deadline = time.monotonic() + 5.0
+        while _pid_alive(child_pid) and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        assert not _pid_alive(child_pid), "late-forked child survived the sweep"
+    finally:
+        for pid in [child_pid, leader.pid]:
+            if pid is not None:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+        if leader.poll() is None:
+            leader.wait(timeout=10)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX sessions")
+async def test_orphan_sweep_kills_from_persisted_state_after_holder_exit(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persisted reap state drives the kill once lsof sees no holder.
+
+    Models the second-pass scenario: the socket-holding leader is gone,
+    lsof returns nothing, but a recorded TERM-ignoring member survives.
+    The persisted identities must anchor the group kill and gate dir
+    removal — function-local tracking would have deleted the dir blind.
+    """
+    import json as json_mod
+
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    monkeypatch.setattr(pm_mod, "_ORPHAN_SIGTERM_GRACE_S", 0.1)
+
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)",
+        ],
+        start_new_session=True,
+    )
+    try:
+        identity = pm_mod._proc.process_start_identity(child.pid)
+        assert identity is not None
+        instance_dir = short_tmp_parent / "ap-dead"
+        instance_dir.mkdir(mode=0o700)
+        (instance_dir / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+        (instance_dir / pm_mod._REAP_STATE_FILE).write_text(
+            json_mod.dumps({str(child.pid): {str(child.pid): identity}}),
+            encoding="utf-8",
+        )
+
+        sweep_task = asyncio.create_task(pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent))
+        await asyncio.to_thread(child.wait, 10)
+        swept = await sweep_task
+
+        assert swept == 1
+        assert not instance_dir.exists()
+        assert child.poll() is not None, "recorded member must be killed from state"
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
 
 
 async def test_harness_subprocess_is_spawned_as_session_leader(
@@ -1367,7 +1491,7 @@ async def test_orphan_sweep_keeps_dir_when_group_snapshot_fails(
         raise AssertionError("an unverifiable tree must not be signaled")
 
     monkeypatch.setattr(pm_mod, "_pids_holding_socket", lookup)
-    monkeypatch.setattr(pm_mod, "_holder_member_identities", lambda _pid: None)
+    monkeypatch.setattr(pm_mod, "_holder_group_snapshot", lambda _pid: None)
     monkeypatch.setattr(pm_mod, "_signal_pid_tree", must_not_signal)
 
     dead = short_tmp_parent / "ap-dead"
