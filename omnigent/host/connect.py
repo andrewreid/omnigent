@@ -167,6 +167,32 @@ _RUNNER_WATCH_INTERVAL_S = 0.5
 # syscall, so 2s keeps zombie lifetime short at negligible cost.
 _ORPHAN_REAP_INTERVAL_S = 2.0
 
+# Cadence of the active ownerless-tree sweep (:meth:`_ownerless_sweep_loop`).
+# Unlike the zombie drain above, a pass may fork tmux/lsof/ps helpers, so it
+# runs at a much lower frequency; leaked trees accrue over hours, not seconds.
+_OWNERLESS_SWEEP_INTERVAL_S = 60.0
+
+# Bound for one harness instance-dir sweep pass. Its lsof probes carry no
+# timeout of their own, and a wedged filesystem must not stall the loop.
+_OWNERLESS_SWEEP_TIMEOUT_S = 120.0
+
+# Kill-switch: set to ``0`` (or ``false``/``off``/``no``) to disable the
+# active ownerless-tree sweep. Zombie draining and the spawn-time /
+# runner-startup sweeps are unaffected.
+_OWNERLESS_SWEEP_ENV_VAR = "OMNIGENT_HOST_OWNERLESS_SWEEP"
+
+
+def _ownerless_sweep_enabled() -> bool:
+    """Whether the periodic ownerless-tree sweep should run.
+
+    :returns: ``False`` only when :data:`_OWNERLESS_SWEEP_ENV_VAR` is set
+        to an explicit off value; unset or anything else enables it.
+    """
+    value = os.environ.get(_OWNERLESS_SWEEP_ENV_VAR)
+    if value is None:
+        return True
+    return value.strip().lower() not in {"0", "false", "off", "no"}
+
 
 def _install_child_subreaper() -> bool:
     """Make this process reap orphaned descendants (Linux only).
@@ -702,6 +728,9 @@ class HostProcess:
         self._watcher_tasks: set[asyncio.Task[None]] = set()
         # Strong ref to the orphan-reaper task (see :meth:`_orphan_reaper_loop`).
         self._reaper_task: asyncio.Task[None] | None = None
+        # Strong ref to the active ownerless-tree sweep task
+        # (see :meth:`_ownerless_sweep_loop`).
+        self._ownerless_sweep_task: asyncio.Task[None] | None = None
         # Number of host-owned ``subprocess`` operations (e.g. the git worktree
         # commands in :mod:`omnigent.host.git_worktree`) currently in flight.
         # The orphan reaper skips its sweep while this is >0 so it never
@@ -896,6 +925,89 @@ class HostProcess:
             if handle.proc.pid == pid:
                 return handle
         return None
+
+    async def _ownerless_sweep_loop(self) -> None:
+        """Periodically kill live process trees whose owner is provably gone.
+
+        The zombie drain (:meth:`_orphan_reaper_loop`) only harvests children
+        that already exited. A runner that dies uncleanly (SIGKILL, OOM,
+        crash) leaves its detached session scaffolding — codex app-server
+        process groups, per-session tmux servers with their start-on-attach
+        waiters, SDK harness subprocesses — *alive* and reparented here,
+        where nothing else ever kills it: each family's own sweep runs only
+        at spawn or runner startup, so an otherwise idle host accumulates
+        live orphans indefinitely. This loop re-runs those sweeps on a
+        timer, starting with an immediate pass so trees adopted across a
+        host restart are cleared at boot.
+
+        Every family gates on its own owner-liveness marker (kernel-released
+        flock, owner-pid file, ``AP_PID`` sentinel) — never on idleness — so
+        a live owned session is never touched.
+
+        :returns: None. Runs until cancelled on shutdown.
+        """
+        while True:
+            try:
+                await self._sweep_ownerless_trees_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — the sweep must never die on a stray error
+                _logger.debug("ownerless-tree sweep failed", exc_info=True)
+            await asyncio.sleep(_OWNERLESS_SWEEP_INTERVAL_S)
+
+    async def _sweep_ownerless_trees_once(self) -> None:
+        """Run one pass of every per-family ownerless-tree sweep.
+
+        Families are independent: a failure in one is logged and never
+        blocks the others. The whole pass holds :meth:`_host_subprocess_op`
+        because the family sweeps fork helpers (tmux/lsof/ps) as direct
+        children of this host — the zombie reaper must not steal their exit
+        statuses mid-``wait()``. The blocking family sweeps run in a worker
+        thread so a slow pass never stalls the event loop.
+
+        :returns: None.
+        """
+        from omnigent.codex_native_process_registry import (
+            reconcile_codex_native_process_registry,
+        )
+        from omnigent.inner.terminal import reap_orphaned_terminals
+        from omnigent.runtime.harnesses.process_manager import (
+            sweep_orphaned_instance_dirs,
+        )
+
+        with self._host_subprocess_op():
+            try:
+                signaled = await asyncio.to_thread(reconcile_codex_native_process_registry)
+                if signaled:
+                    _logger.info(
+                        "ownerless sweep: signaled %d codex-native process group(s)",
+                        signaled,
+                    )
+            except Exception:  # noqa: BLE001 — best-effort per family
+                _logger.warning("codex-native ownerless sweep failed", exc_info=True)
+            try:
+                reaped = await asyncio.to_thread(reap_orphaned_terminals)
+                if reaped:
+                    _logger.info(
+                        "ownerless sweep: reaped %d orphaned terminal tmux server(s)",
+                        reaped,
+                    )
+            except Exception:  # noqa: BLE001 — best-effort per family
+                _logger.warning("terminal ownerless sweep failed", exc_info=True)
+            try:
+                # A timed-out pass may cancel mid-kill, leaving a runner
+                # SIGTERMed but not yet SIGKILLed; the next pass finishes it.
+                swept = await asyncio.wait_for(
+                    sweep_orphaned_instance_dirs(),
+                    timeout=_OWNERLESS_SWEEP_TIMEOUT_S,
+                )
+                if swept:
+                    _logger.info(
+                        "ownerless sweep: cleaned %d orphaned harness instance dir(s)",
+                        swept,
+                    )
+            except Exception:  # noqa: BLE001 — best-effort per family
+                _logger.warning("harness instance-dir ownerless sweep failed", exc_info=True)
 
     def _alive_runner_ids(self) -> list[str]:
         """Return IDs of runners that are still alive.
@@ -1814,6 +1926,15 @@ class HostProcess:
         self._reaper_task = asyncio.create_task(
             self._orphan_reaper_loop(), name="host-orphan-reaper"
         )
+        # The active sweep is keyed on on-disk owner markers, not on the
+        # subreaper: it works (and is needed) even where reparenting does
+        # not apply, e.g. macOS.
+        if _ownerless_sweep_enabled():
+            self._ownerless_sweep_task = asyncio.create_task(
+                self._ownerless_sweep_loop(), name="host-ownerless-sweep"
+            )
+        else:
+            _logger.info("ownerless-tree sweep disabled via %s", _OWNERLESS_SWEEP_ENV_VAR)
         backoff = _RECONNECT_BASE_S
         try:
             while True:
@@ -1888,6 +2009,9 @@ class HostProcess:
             if self._reaper_task is not None:
                 self._reaper_task.cancel()
                 self._reaper_task = None
+            if self._ownerless_sweep_task is not None:
+                self._ownerless_sweep_task.cancel()
+                self._ownerless_sweep_task = None
             self._cleanup_runners()
             # Final drain: _cleanup_runners has just reaped the tracked
             # runners via Popen, so any of their still-orphaned tool

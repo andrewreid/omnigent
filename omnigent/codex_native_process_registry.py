@@ -8,9 +8,10 @@ import logging
 import os
 import signal
 import subprocess
+import time
 import uuid
 from collections.abc import Generator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from omnigent.codex_native_state import _codex_native_state_root
@@ -24,6 +25,11 @@ _logger = logging.getLogger(__name__)
 _REGISTRY_FILE = "process-registry.json"
 _OWNER_LOCK_DIR = "process-owners"
 _TAG_ARG_PREFIX = "omnigent_crash_teardown_tag="
+# Grace between the reconciliation pass that SIGTERMs an ownerless process
+# group and a later pass escalating to SIGKILL. Long enough for codex to
+# flush rollout state; short enough that a TERM-ignoring child dies on the
+# next periodic sweep rather than surviving indefinitely.
+_SIGKILL_GRACE_S = 10.0
 
 
 @dataclass(frozen=True)
@@ -38,6 +44,9 @@ class CodexNativeProcessEntry:
     :param owner_lock_path: Lock file held by the parent while it owns
         the child. If the lock is still held during reconciliation, the
         child is a live sibling and must not be reaped.
+    :param sigterm_at: Wall-clock time a reconciliation pass SIGTERMed
+        this entry's process group, or ``None`` if never signaled. A
+        later pass escalates to SIGKILL once the grace has elapsed.
     """
 
     pid: int
@@ -45,6 +54,7 @@ class CodexNativeProcessEntry:
     tmux_session_name: str | None
     session_tag: str
     owner_lock_path: str | None = None
+    sigterm_at: float | None = None
 
 
 @dataclass
@@ -181,32 +191,64 @@ def unregister_codex_native_process(
         _write_registry(path, entries)
 
 
-def reconcile_codex_native_process_registry(*, registry_path: Path | None = None) -> None:
+def reconcile_codex_native_process_registry(*, registry_path: Path | None = None) -> int:
     """
     Reap crash-leftover native Codex children recorded by prior runs.
 
-    PID reuse is guarded by requiring the live process command line to
-    still contain the entry's unique session tag before killing anything.
+    An entry is reapable only when its launcher's owner lock is no longer
+    held (the kernel releases the flock on any launcher death) and the
+    live process still carries the entry's unique session tag on its
+    command line (guards against PID reuse). A reapable process group is
+    SIGTERMed first and its entry kept; a later pass escalates to SIGKILL
+    once :data:`_SIGKILL_GRACE_S` has elapsed, so a child that ignores or
+    wedges on SIGTERM cannot outlive reconciliation.
 
     :param registry_path: Test override for the registry file path.
-    :returns: None.
+    :returns: Number of process groups signaled this pass.
     """
     path = registry_path or codex_native_process_registry_path()
+    signaled = 0
     with _registry_lock(path):
+        now = time.time()
         survivors: list[CodexNativeProcessEntry] = []
         for entry in _read_registry(path):
             if _owner_lock_held(entry.owner_lock_path):
                 survivors.append(entry)
                 continue
-            if not _pid_alive(entry.pid):
+            if not _pid_alive(entry.pid) or not _process_cmdline_has_tag(
+                entry.pid, entry.session_tag
+            ):
+                # Process already gone (or its pid reused by an unrelated
+                # process): drop the entry, sweep any leftover tmux session.
+                _reap_tmux_session(entry.tmux_session_name)
                 continue
-            if not _process_cmdline_has_tag(entry.pid, entry.session_tag):
-                continue
-            if not _terminate_process_group(entry.pgid):
+            if entry.sigterm_at is None:
+                if _signal_process_group(entry.pgid, signal.SIGTERM):
+                    _logger.info(
+                        "SIGTERMed ownerless codex-native process group %d (pid %d)",
+                        entry.pgid,
+                        entry.pid,
+                    )
+                    signaled += 1
+                    entry = replace(entry, sigterm_at=now)
+                # Keep the entry either way: a failed signal retries on the
+                # next pass, a delivered one is re-checked for escalation.
                 survivors.append(entry)
                 continue
-            _reap_tmux_session(entry.tmux_session_name)
+            if now - entry.sigterm_at < _SIGKILL_GRACE_S:
+                survivors.append(entry)
+                continue
+            if _signal_process_group(entry.pgid, signal.SIGKILL):
+                _logger.warning(
+                    "ownerless codex-native process group %d survived SIGTERM; SIGKILLed",
+                    entry.pgid,
+                )
+                signaled += 1
+                _reap_tmux_session(entry.tmux_session_name)
+            else:
+                survivors.append(entry)
         _write_registry(path, survivors)
+    return signaled
 
 
 @contextlib.contextmanager
@@ -290,6 +332,7 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
     session_tag = item.get("session_tag")
     tmux_session_name = item.get("tmux_session_name")
     owner_lock_path = item.get("owner_lock_path")
+    sigterm_at = item.get("sigterm_at")
     if not isinstance(pid, int) or pid <= 0:
         return None
     if not isinstance(pgid, int) or pgid <= 0:
@@ -300,12 +343,15 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
         tmux_session_name = None
     if owner_lock_path is not None and not isinstance(owner_lock_path, str):
         owner_lock_path = None
+    if not isinstance(sigterm_at, (int, float)) or isinstance(sigterm_at, bool):
+        sigterm_at = None
     return CodexNativeProcessEntry(
         pid=pid,
         pgid=pgid,
         tmux_session_name=tmux_session_name,
         session_tag=session_tag,
         owner_lock_path=owner_lock_path,
+        sigterm_at=float(sigterm_at) if sigterm_at is not None else None,
     )
 
 
@@ -373,10 +419,10 @@ def _process_cmdline(pid: int) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
-def _terminate_process_group(pgid: int) -> bool:
+def _signal_process_group(pgid: int, sig: signal.Signals) -> bool:
     if os.name == "posix":
         try:
-            os.killpg(pgid, signal.SIGTERM)
+            os.killpg(pgid, sig)
         except ProcessLookupError:
             return True
         except (PermissionError, OSError):

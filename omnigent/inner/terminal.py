@@ -782,8 +782,12 @@ def reap_orphaned_terminals() -> int:
     """
     if not _tmux_available():
         return 0
+    try:
+        entries = list(_terminals_tmp_root().glob(f"{_TERMINAL_DIR_PREFIX}*"))
+    except OSError:
+        return 0
     reaped = 0
-    for entry in _terminals_tmp_root().glob(f"{_TERMINAL_DIR_PREFIX}*"):
+    for entry in entries:
         try:
             pid = int((entry / _OWNER_PID_FILENAME).read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
@@ -791,7 +795,12 @@ def reap_orphaned_terminals() -> int:
         if _process_alive(pid):
             continue
         socket_path = entry / "tmux.sock"
-        if socket_path.exists():
+        try:
+            has_socket = socket_path.exists()
+        except OSError:
+            # Foreign-owned dir on a shared host — not ours to reap.
+            continue
+        if has_socket:
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                 subprocess.run(
                     ["tmux", "-S", str(socket_path), "kill-server"],
