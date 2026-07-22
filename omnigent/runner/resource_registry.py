@@ -365,6 +365,32 @@ class SessionResourceRegistry:
         """
         self._terminal_exit_publisher = publisher
 
+    def wake_session_terminal_watchers(self, session_id: str) -> None:
+        """Pull this session's idle watchers back to their base poll interval.
+
+        Native harnesses inject a turn through the bridge, from the harness
+        process — not through :meth:`TerminalInstance.send` in the runner — so
+        the pane watcher gets no in-process signal that a turn is starting.
+        For the native agent terminals in
+        :meth:`_start_terminal_activity_watcher`'s status set, that watcher is
+        the *only* source of the session's running/idle status, so a quiesced
+        watcher would report ``idle`` for up to its backed-off interval into a
+        turn the user just sent. The runner calls this as it begins dispatching
+        a turn, which is the earliest point it knows output is coming.
+
+        Safe to call for any session: terminals with no watcher, or one already
+        at its base interval, are unaffected.
+
+        :param session_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: None.
+        """
+        registry = self._terminal_registry
+        if registry is None:
+            return
+        for entry in registry.list_for_conversation(session_id):
+            entry.instance.wake_idle_watcher()
+
     async def wait_for_terminal_exit_cleanup(self) -> None:
         """Await the scheduled terminal-exit cleanup to completion so its
         ``session.resource.deleted`` publish is observable without polling.

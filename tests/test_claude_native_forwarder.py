@@ -7459,3 +7459,50 @@ def test_forwarder_tick_is_needed_on_the_periodic_resync() -> None:
         retry_trackers=(),
         dedupe=forwarder._ForwardDedupeState(),
     )
+
+
+def test_bridge_input_fingerprint_sees_a_new_subagent_before_its_transcript(
+    tmp_path: Path,
+) -> None:
+    """
+    A sub-agent's meta file moves the fingerprint even though it is not stat'ed.
+
+    Only ``agent-*.jsonl`` is stat'ed — every sub-agent ever spawned stays on
+    disk, so stat'ing the write-once meta files too would double the per-tick
+    syscalls at high fan-out. Their *arrival* must still open the gate: Claude
+    can write the meta before the transcript, and that meta is what registers
+    the sub-agent.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents = tmp_path / "subagents"
+    subagents.mkdir()
+    before = forwarder._bridge_input_fingerprint(bridge_dir, None, subagents)
+
+    (subagents / "agent-1.meta.json").write_text('{"agent_id": "1"}', encoding="utf-8")
+
+    assert forwarder._bridge_input_fingerprint(bridge_dir, None, subagents) != before
+
+
+def test_bridge_input_fingerprint_sees_subagent_transcript_growth(tmp_path: Path) -> None:
+    """
+    Appends to a sub-agent transcript still move the fingerprint.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents = tmp_path / "subagents"
+    subagents.mkdir()
+    transcript = subagents / "agent-1.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    before = forwarder._bridge_input_fingerprint(bridge_dir, None, subagents)
+
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write("{}\n")
+
+    assert forwarder._bridge_input_fingerprint(bridge_dir, None, subagents) != before

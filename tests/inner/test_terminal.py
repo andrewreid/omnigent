@@ -1598,3 +1598,134 @@ def test_apply_utf8_locale_default_noop_on_windows(
     _apply_utf8_locale_default(env)
     assert "LC_ALL" not in env
     assert env["LANG"] == ""
+
+
+def test_idle_detector_reports_notified_only_after_the_edge() -> None:
+    """
+    ``idle_notified`` tracks the episode the backoff decision keys off.
+
+    The watcher grows its poll interval only while this is set, so the flag
+    must be False until the edge fires and must clear again on new output.
+
+    :returns: None.
+    """
+    detector = terminal_mod._IdleDetector(idle_threshold_s=0.05)
+    assert detector.idle_notified is False
+
+    detector.tick("frame-a")
+    assert detector.idle_notified is False
+
+    time.sleep(0.06)
+    assert detector.tick("frame-a") is True
+    assert detector.idle_notified is True
+
+    # New output re-arms the episode.
+    detector.tick("frame-b")
+    assert detector.idle_notified is False
+
+
+def test_threaded_idle_watcher_backoff_does_not_delay_the_idle_edge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Backoff follows the idle edge; it never pushes the edge out.
+
+    The loop's clock starts when the watcher starts, the detector's when it
+    takes its first snapshot. Timing backoff off a second, loop-side counter
+    lets the interval grow one tick BEFORE the edge, which delays the very
+    ``idle`` it is supposed to trail. An aggressive growth factor makes that
+    delay unmissable.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_FACTOR", 10.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_MAX_MULTIPLE", 1000.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_MAX_INTERVAL_SECONDS", 60.0)
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    instance._capture_pane_state_or_none = lambda: (False, "quiet")  # type: ignore[method-assign]
+    went_idle = threading.Event()
+
+    started = time.monotonic()
+    instance.start_idle_watcher_thread(
+        on_idle=went_idle.set,
+        idle_threshold_s=0.5,
+        poll_interval_s=0.05,
+    )
+    try:
+        assert went_idle.wait(timeout=5.0)
+        elapsed = time.monotonic() - started
+    finally:
+        instance._stop_idle_watcher_thread()
+
+    # The edge is due one poll after the 0.5s threshold. Growing the interval
+    # before the edge would push the next poll to 0.5s and land it past 1.0s.
+    assert elapsed < 0.8, f"idle edge delayed by backoff: {elapsed:.2f}s"
+
+
+def test_threaded_idle_watcher_wake_holds_base_rate_through_slow_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A wake pins the base interval long enough for the expected output to land.
+
+    The runner wakes the watcher when it starts dispatching a turn, but spec
+    resolution, harness dispatch and injection all happen after that — and can
+    outlast the idle threshold. Without a grace window the watcher would ramp
+    straight back up during setup and miss the output it was woken for.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_WAKE_GRACE_SECONDS", 5.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_FACTOR", 100.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_MAX_MULTIPLE", 1000.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_MAX_INTERVAL_SECONDS", 60.0)
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    polled = threading.Semaphore(0)
+
+    def _capture() -> tuple[bool, str]:
+        polled.release()
+        return False, "quiet"
+
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
+    instance.start_idle_watcher_thread(
+        on_activity=lambda: None,
+        on_idle=lambda: None,
+        idle_threshold_s=0.1,
+        poll_interval_s=0.05,
+    )
+    try:
+        # Quiesce, then jump to a deep interval in one growth step.
+        assert polled.acquire(timeout=2.0)
+        time.sleep(0.5)
+        while polled.acquire(blocking=False):
+            pass
+        assert not polled.acquire(timeout=0.5)
+
+        instance.wake_idle_watcher()
+        # The pane stays quiet — as it does during turn setup — so only the
+        # grace keeps the watcher at base rate. Well past the 0.1s idle
+        # threshold, it must still be polling.
+        time.sleep(1.0)
+        while polled.acquire(blocking=False):
+            pass
+        assert polled.acquire(timeout=0.5), "watcher re-ramped during the wake grace"
+    finally:
+        instance._stop_idle_watcher_thread()

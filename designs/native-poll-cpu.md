@@ -165,9 +165,12 @@ otherwise      → interval unchanged
 `max_interval = min(base × 10, 5.0)` → 2.0 s for the claude-native watcher
 (base 0.2), 5.0 s for generic terminals (base 1.0).
 
-**The false-idle invariant.** Backoff only grows once the pane has been
-unchanged for at least the detector's own idle threshold — i.e. *after* the idle
-edge has already fired. Consequences:
+**The false-idle invariant.** Backoff only grows once `_IdleDetector` reports
+`idle_notified` — i.e. strictly *after* the edge has fired. It is read off the
+detector rather than re-timed in the loop on purpose: the loop's clock starts
+when the watcher starts and the detector's when it takes its first snapshot, so
+a loop-side quiescence timer runs one tick ahead and lets the interval grow
+*before* the edge it is supposed to trail, delaying that edge. Consequences:
 
 - Backoff can never make the idle edge fire **early**: `_IdleDetector` compares
   wall-clock (`time.monotonic()`) against the threshold, not tick counts, so
@@ -181,11 +184,28 @@ edge has already fired. Consequences:
 **The wake path** collapses that cost for every case a user actually notices.
 A new per-watcher `threading.Event` is set by:
 
-- `TerminalInstance.send()` — the runner writing a turn into the pane.
+- `_publish_turn_status(conv, "running")` in the runner, via
+  `SessionResourceRegistry.wake_session_terminal_watchers` — **the turn-start
+  hook that matters.** Native harnesses do *not* reach the pane through
+  `TerminalInstance.send`: the executor calls `inject_user_message` from the
+  harness process, which drives tmux over the socket directly, so the runner's
+  watcher sees nothing in-process. `_publish_turn_status` is the one point
+  every dispatch path passes through — background turns, continuation turns,
+  the recovery path, and the streaming branch that never reaches
+  `_run_turn_bg`. The wake runs *before* that function's native-harness
+  suppression, because the harnesses whose status edge is terminal-owned are
+  exactly the ones that need it.
+- `TerminalInstance.send()` — the runner typing into a pane directly (tool-
+  driven terminals).
 - `TerminalInstance.note_client_interaction()` — attach/detach, focus, mouse,
   keystroke, resize from the web terminal.
 - `_stop_idle_watcher_thread()` — so teardown does not wait out a backed-off
   sleep.
+
+A wake says output is *coming*, not that it has arrived, and turn setup can
+outlast the idle threshold. So a wake also pins the base interval for
+`_IDLE_POLL_WAKE_GRACE_SECONDS` (15 s); without it the watcher would ramp back
+up during spec resolution and miss the output it was woken for.
 
 The sleep is split so a wake storm cannot become a fork storm:
 
@@ -252,11 +272,19 @@ Both are read once per loop start, so a restart picks up a change. Neither
 switch touches the tmux-path resolution or the merged probe — those are pure
 cost reductions with no behavioural surface, so they carry no switch.
 
-Field diagnosability: the watcher logs at debug when it enters and leaves
-backoff (with the interval), and the forwarder logs at debug when the gate
-first engages after a quiet period. A regression therefore shows up as either
-"gate never engages" (no CPU win) or "gate engaged while a turn was live"
-(a bug), both visible in the runner log without a rebuild.
+Field diagnosability, at `DEBUG`, one line per transition rather than per tick:
+
+| where | logged when |
+|---|---|
+| `_idle_watch_loop_threaded` | the interval grows a step (`pane quiescent; poll a -> b`) |
+| `_idle_watch_loop_threaded` | a pane change collapses it back to base (`pane changed`) |
+| `_idle_watch_loop_threaded` | a wake collapses it back to base (`idle watcher woken`) |
+| `forward_claude_transcript_to_session` | the gate first starts skipping (`idle; skipping unchanged polls`) |
+| `forward_claude_transcript_to_session` | the gate re-opens (`resumed`) |
+
+A regression therefore shows up as either "never engages" (no CPU win) or
+"engaged while a turn was live" (a bug), both visible in the runner log without
+a rebuild.
 
 ### 3.5 Platform reach
 
@@ -287,23 +315,43 @@ the win by roughly 3x.
 
 ### Results
 
-Unmodified `main` vs this branch, macOS 27 / M-series, Python 3.12.13, 8 units,
-30 s window, everything idle:
+Pre-change source vs this branch, macOS 27 / M-series, Python 3.12.13, 30 s
+window, everything idle:
 
 | scenario | before | after | factor |
 |---|---|---|---|
-| terminal, poll 0.2 s | **5.49 %** of a core / terminal | **0.37 %** | **15x** |
-| terminal, tmux invocations | 8.82 /s / terminal | 0.47 /s | **19x** |
-| terminal, `execve` (4 per invocation → 1) | ~35 /s / terminal | 0.47 /s | **75x** |
-| forwarder, no fan-out | **0.73 %** of a core / session | **0.11 %** | **6.8x** |
-| forwarder, fan-out 6 | **1.53 %** of a core / session | **0.13 %** | **12x** |
+| terminal, poll 0.2 s (8 terminals) | **6.17 %** of a core / terminal | **0.42 %** | **15x** |
+| terminal, tmux invocations | 8.57 /s / terminal | 0.50 /s | **17x** |
+| terminal, `execve` (4 per invocation → 1) | ~34 /s / terminal | 0.50 /s | **69x** |
+| forwarder, no fan-out (8 sessions) | **0.71 %** of a core / session | **0.12 %** | **6.1x** |
+| forwarder, fan-out 6 (8 sessions) | **1.47 %** of a core / session | **0.15 %** | **9.9x** |
+| forwarder, fan-out 100 (4 sessions) | **7.05 %** of a core / session | **0.65 %** | **10.9x** |
 
 Extrapolating to the reported host (~20 sessions with fan-out): the forwarder
-alone goes from ~31 % of a core to ~2.5 %, and 16 live terminals from ~88 % to
-~5.9 %. That is consistent with the 20-25 %/runner attributed to each loop in
+alone goes from ~29 % of a core to ~3 %, and 16 live terminals from ~99 % to
+~6.7 %. That is consistent with the 20-25 %/runner attributed to each loop in
 the issues.
 
-The forwarder's residual is now dominated by the fingerprint itself
+### High-fan-out budget
+
+Forwarder CPU stays **proportional to accumulated fan-out**: every sub-agent
+transcript a session has ever produced stays on disk and is stat'ed on every
+tick. Only the sibling `agent-*.meta.json` files are exempt — they are read
+once at discovery and never re-read, so the fingerprint records their names
+without stat'ing them, which halves the per-tick syscalls. The
+`_UNSTATTED_ENTRY` placeholder keeps a new sub-agent's arrival visible even
+when its meta file lands before its transcript.
+
+The remaining proportionality is inherent to a change-detector that must
+notice growth in any of those files, and the shape is unchanged from before —
+the constant is ~11x smaller. Budget to plan against: **~0.65 % of a core per
+idle session at fan-out 100**, i.e. a session with 100 accumulated sub-agents
+costs about as much as four fan-out-6 sessions. Removing that would require
+knowing which sub-agents can no longer produce output, and the 5 s quiescence
+heuristic that marks them idle is not that — a sub-agent inside a long tool
+call reads idle and then resumes, so skipping it would strand its output.
+
+The forwarder's residual at low fan-out is dominated by the fingerprint itself
 (~59 µs/tick, ~66 % of what is left) plus the bare asyncio wake at 4 Hz. Both
 are the irreducible cost of *not* backing the interval off, which is what keeps
 streaming latency unchanged.
@@ -376,6 +424,37 @@ growth fails the two gate tests, and a backoff that grows without waiting for
 post-idle quiescence fails
 `test_threaded_idle_watcher_slow_output_never_reads_idle`.
 
+### 7.1 Second round — cross-vendor review
+
+1. **The turn-start wake never fired for native turns (blocking).** It was hung
+   off `TerminalInstance.send`, but native harnesses inject through the bridge
+   from the *harness process* (`claude_native_executor` →
+   `inject_user_message`), which drives tmux over the socket and never touches
+   the runner's instance. For the eight harnesses whose status edge is
+   terminal-owned, that watcher is the *only* running/idle source, so an
+   ordinary chat turn could start inside a backed-off sleep and the session
+   would keep reporting `idle`. Moved to `_publish_turn_status(…, "running")`,
+   which every dispatch path passes through — including the streaming branch
+   that never reaches `_run_turn_bg`, an additional gap found while fixing
+   this. Covered by an integration test through the real
+   registry→watcher→publisher chain, plus an end-to-end test that POSTs a turn
+   at the runner and asserts the wake reached the terminal.
+2. **Backoff could delay the idle edge it was supposed to trail.** The loop
+   timed quiescence from watcher start while the detector timed it from its
+   first snapshot, so growth could fire one tick early. Growth now keys off
+   `_IdleDetector.idle_notified`. The mutation test reproduces the original
+   defect exactly: the edge lands at 1.05 s instead of 0.55 s.
+3. **Fingerprint cost proportional to accumulated fan-out.** Halved by not
+   stat'ing the write-once `agent-*.meta.json` files while still recording
+   their names, and the residual is now measured and published as a budget
+   (§4) rather than left implicit.
+4. **Design promised transition logging that did not exist.** Implemented in
+   both loops (§3.4).
+
+Also added in this round: a wake grace window, without which the wake fixed in
+(1) would have been undone by the watcher re-ramping during turn setup — the
+wake marks output as *expected*, and setup can outlast the idle threshold.
+
 ## 8. Residual risks
 
 1. **Late `running` edge on autonomous pane output.** A terminal that starts
@@ -405,3 +484,10 @@ post-idle quiescence fails
    so they succeed and fail together in practice, but a tmux that could fail
    `display-message` while serving `capture-pane` would report an exit one
    interval early.
+7. **Idle CPU still scales with accumulated fan-out** — ~0.65 % of a core per
+   idle session at 100 sub-agents (§4). Down ~11x, but not flat.
+8. **The turn-start wake fires for every session, not only native ones.** It is
+   a no-op for a session with no terminals or no watcher, but it does walk that
+   session's terminal list on every turn-start status edge. At the registry
+   sizes involved (a handful of terminals per session) that is a dict lookup
+   and a short loop.
