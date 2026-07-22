@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import shutil
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -129,7 +131,7 @@ def test_threaded_idle_watcher_reports_terminal_exit(tmp_path: Path) -> None:
     )
     exited = threading.Event()
 
-    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: None  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(
         on_exit=exited.set,
@@ -138,6 +140,193 @@ def test_threaded_idle_watcher_reports_terminal_exit(tmp_path: Path) -> None:
 
     assert exited.wait(timeout=1.0)
     assert instance.running is False
+
+
+def test_threaded_idle_watcher_wake_pulls_a_backed_off_watcher_forward(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``wake_idle_watcher`` cuts short a backed-off sleep so activity is seen fast.
+
+    A quiesced watcher may be sleeping for many base intervals. Without the
+    wake path, a turn typed into the pane would not be noticed until that sleep
+    expired, so the session would read ``idle`` while it was already working.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_MAX_INTERVAL_SECONDS", 30.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_MAX_MULTIPLE", 1000.0)
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    polled = threading.Semaphore(0)
+    pane = {"text": "quiet"}
+
+    def _capture() -> tuple[bool, str]:
+        polled.release()
+        return False, pane["text"]
+
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
+    activity = threading.Event()
+    instance.start_idle_watcher_thread(
+        on_activity=activity.set,
+        idle_threshold_s=0.0,
+        poll_interval_s=0.02,
+    )
+    try:
+        # Let the watcher settle: with a zero idle threshold every quiet tick
+        # doubles the interval, so the gap grows past a second within a couple
+        # of seconds of wall clock.
+        deadline = time.monotonic() + 15.0
+        while polled.acquire(timeout=1.0):
+            if time.monotonic() > deadline:
+                pytest.fail("watcher never backed off")
+        # The tick whose sleep outran the probe above may still be in flight;
+        # consume it so the window below starts from a fresh backed-off sleep.
+        polled.acquire(timeout=5.0)
+        assert not polled.acquire(timeout=0.5)
+
+        pane["text"] = "working"
+        instance.wake_idle_watcher()
+        assert activity.wait(timeout=2.0)
+    finally:
+        instance._stop_idle_watcher_thread()
+
+
+def test_threaded_idle_watcher_slow_output_never_reads_idle(tmp_path: Path) -> None:
+    """
+    A slow trickle of output keeps the watcher at its base rate and never idles.
+
+    This is the false-idle guard: a pane that changes less often than the poll
+    interval but more often than the idle threshold must neither fire ``on_idle``
+    nor let the interval grow, or a working session would be reported idle and
+    its next burst noticed late.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    :returns: None.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    polls = itertools.count()
+    state = {"frame": 0, "changed_at": time.monotonic()}
+
+    def _capture() -> tuple[bool, str]:
+        next(polls)
+        now = time.monotonic()
+        if now - state["changed_at"] >= 0.15:
+            state["changed_at"] = now
+            state["frame"] += 1
+        return False, f"frame {state['frame']}"
+
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
+    went_idle = threading.Event()
+    instance.start_idle_watcher_thread(
+        on_activity=lambda: None,
+        on_idle=went_idle.set,
+        idle_threshold_s=0.5,
+        poll_interval_s=0.02,
+    )
+    try:
+        time.sleep(2.0)
+    finally:
+        instance._stop_idle_watcher_thread()
+
+    assert not went_idle.is_set()
+    # Base rate is 50 polls/s; allow generous slack for a loaded CI box, but a
+    # watcher that had backed off would land in the single digits.
+    assert next(polls) >= 40
+
+
+def test_threaded_idle_watcher_backoff_stops_promptly(tmp_path: Path) -> None:
+    """
+    A backed-off watcher still exits on ``close`` instead of lingering.
+
+    A daemon thread that outlives its terminal is exactly the ownerless-process
+    shape we do not want to introduce, so teardown must not wait out a
+    multi-second backoff sleep.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    :returns: None.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    polled = threading.Semaphore(0)
+
+    def _capture() -> tuple[bool, str]:
+        polled.release()
+        return False, "quiet"
+
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
+    instance.start_idle_watcher_thread(
+        on_activity=lambda: None,
+        idle_threshold_s=0.0,
+        poll_interval_s=0.02,
+    )
+    for _ in range(10):
+        assert polled.acquire(timeout=2.0)
+    thread = instance._idle_thread
+    assert thread is not None
+
+    instance._stop_idle_watcher_thread()
+    assert not thread.is_alive()
+
+
+def test_threaded_idle_watcher_backoff_can_be_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The env kill-switch pins the watcher at its base interval.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setenv(terminal_mod._IDLE_POLL_BACKOFF_ENV_VAR, "0")
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    polled = threading.Semaphore(0)
+
+    def _capture() -> tuple[bool, str]:
+        polled.release()
+        return False, "quiet"
+
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
+    instance.start_idle_watcher_thread(
+        on_activity=lambda: None,
+        idle_threshold_s=0.0,
+        poll_interval_s=0.02,
+    )
+    try:
+        # Without backoff the watcher keeps its base rate forever; 20 ticks at
+        # 20ms is well inside the timeout, but would take ~seconds if the
+        # interval had been allowed to grow.
+        for _ in range(20):
+            assert polled.acquire(timeout=1.0)
+    finally:
+        instance._stop_idle_watcher_thread()
 
 
 def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(tmp_path: Path) -> None:
@@ -154,9 +343,9 @@ def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(tmp_path: Path) -> N
         running=True,
     )
     exited = threading.Event()
-    snapshots = iter(["\x1b[31mstartup failed\x1b[0m\ntry config", None])
+    snapshots = iter([(False, "\x1b[31mstartup failed\x1b[0m\ntry config"), None])
 
-    instance._capture_pane_for_idle_or_none = lambda: next(snapshots)  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: next(snapshots)  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(
         on_exit=exited.set,
@@ -209,8 +398,7 @@ def test_threaded_idle_watcher_reports_exit_on_dead_pane(tmp_path: Path) -> None
     )
     exited = threading.Event()
     # capture-pane still succeeds (server alive); the pane is dead.
-    instance._capture_pane_for_idle_or_none = lambda: "claude exited: boom\nbye"  # type: ignore[method-assign]
-    instance._pane_is_dead = lambda: True  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: (True, "claude exited: boom\nbye")  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
 

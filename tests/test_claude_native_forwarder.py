@@ -8,6 +8,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -7120,3 +7121,341 @@ def test_is_subagent_delivery_not_confirmed_classifier() -> None:
     assert forwarder._is_subagent_delivery_not_confirmed(no_status) is False
     assert forwarder._is_subagent_delivery_not_confirmed(no_body) is False
     assert forwarder._is_subagent_delivery_not_confirmed(httpx.ConnectError("boom")) is False
+
+
+def _user_record(uuid: str, text: str) -> str:
+    """
+    Build one transcript user record.
+
+    :param uuid: Record uuid, e.g. ``"user-1"``.
+    :param text: Message text, e.g. ``"hello"``.
+    :returns: A JSON line (no trailing newline).
+    """
+    return json.dumps({"type": "user", "uuid": uuid, "message": {"role": "user", "content": text}})
+
+
+def _seed_idle_session(tmp_path: Path) -> tuple[Path, Path]:
+    """
+    Lay down a bridge dir plus a one-turn transcript that has already stopped.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: ``(bridge_dir, transcript_path)``.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(_user_record("user-1", "first") + "\n", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    return bridge_dir, transcript_path
+
+
+def _count_full_polls(monkeypatch: pytest.MonkeyPatch) -> Callable[[], int]:
+    """
+    Instrument the loop so tests can see how often the full body ran.
+
+    ``read_transcript_path`` runs exactly once per full body and never on a
+    gated tick, so counting it distinguishes "polled and did the work" from
+    "polled and skipped".
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: Callable returning the number of full bodies so far.
+    """
+    calls = {"n": 0}
+    original = forwarder.read_transcript_path
+
+    def _counting(bridge_dir: Path) -> Path | None:
+        calls["n"] += 1
+        return original(bridge_dir)
+
+    monkeypatch.setattr(forwarder, "read_transcript_path", _counting)
+    return lambda: calls["n"]
+
+
+@pytest.mark.asyncio
+async def test_forwarder_gate_settles_when_idle_then_wakes_on_new_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An idle session stops doing per-tick work, and new output is still prompt.
+
+    Both halves matter: gating that never engages buys nothing, and gating
+    that misses an append would strand the transcript. The append is made
+    after the loop has demonstrably settled, so this exercises the wake path,
+    not just the skip path.
+
+    :param tmp_path: Per-test temp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(forwarder, "_IDLE_SETTLE_SECONDS", 0.05)
+    # High enough that the periodic resync cannot be mistaken for the gate
+    # failing to engage.
+    monkeypatch.setattr(forwarder, "_IDLE_RESYNC_SECONDS", 60.0)
+    bridge_dir, transcript_path = _seed_idle_session(tmp_path)
+    full_polls = _count_full_polls(monkeypatch)
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_gate",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        first = await _get_recorded_item_request(server)
+        assert first["body"]["data"]["item_data"]["content"][0]["text"] == "first"
+
+        # Let the gate engage, then measure a quiet window. Ungated this would
+        # be ~40 full bodies; gated it should be a small handful.
+        await asyncio.sleep(0.4)
+        before = full_polls()
+        await asyncio.sleep(0.4)
+        while_idle = full_polls() - before
+        assert while_idle <= 5, f"gate did not engage: {while_idle} full polls while idle"
+
+        # New output must still be picked up on the very next tick.
+        with transcript_path.open("a", encoding="utf-8") as handle:
+            handle.write(_user_record("user-2", "second") + "\n")
+        second = await _get_recorded_item_request(server, timeout_s=5.0)
+        assert second["body"]["data"]["item_data"]["content"][0]["text"] == "second"
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_forwarder_gate_forwards_every_record_of_a_slow_trickle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A slow drip of transcript records is forwarded in full, none skipped.
+
+    The gate settles between records, so each append has to re-open it. A gate
+    that latched shut, or that only re-checked on the periodic resync, would
+    drop or badly delay records here.
+
+    :param tmp_path: Per-test temp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(forwarder, "_IDLE_SETTLE_SECONDS", 0.02)
+    monkeypatch.setattr(forwarder, "_IDLE_RESYNC_SECONDS", 60.0)
+    bridge_dir, transcript_path = _seed_idle_session(tmp_path)
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_trickle",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        assert (await _get_recorded_item_request(server))["body"]["data"]["item_data"]["content"][
+            0
+        ]["text"] == "first"
+        for index in range(6):
+            # Longer than the settle window, so the gate closes between writes.
+            await asyncio.sleep(0.12)
+            with transcript_path.open("a", encoding="utf-8") as handle:
+                handle.write(_user_record(f"drip-{index}", f"drip {index}") + "\n")
+            request = await _get_recorded_item_request(server, timeout_s=5.0)
+            assert request["body"]["data"]["item_data"]["content"][0]["text"] == f"drip {index}"
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_forwarder_gate_can_be_disabled_by_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The kill-switch restores a full body on every tick.
+
+    :param tmp_path: Per-test temp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setenv(forwarder._IDLE_GATE_ENV_VAR, "0")
+    monkeypatch.setattr(forwarder, "_IDLE_SETTLE_SECONDS", 0.05)
+    monkeypatch.setattr(forwarder, "_IDLE_RESYNC_SECONDS", 60.0)
+    bridge_dir, _transcript_path = _seed_idle_session(tmp_path)
+    full_polls = _count_full_polls(monkeypatch)
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_nogate",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        await _get_recorded_item_request(server)
+        await asyncio.sleep(0.4)
+        before = full_polls()
+        await asyncio.sleep(0.4)
+        assert full_polls() - before >= 10
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+
+def test_bridge_input_fingerprint_sees_an_in_place_same_size_rewrite(tmp_path: Path) -> None:
+    """
+    A rewrite that keeps the byte count still changes the fingerprint.
+
+    Size alone would miss a same-length edit; the mtime and inode in the
+    triple are what make the detector safe for the bridge's small JSON state
+    files, which are replaced wholesale on every hook event.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    state = bridge_dir / "state.json"
+    state.write_text('{"a":1}', encoding="utf-8")
+    before = forwarder._bridge_input_fingerprint(bridge_dir, None, None)
+
+    # Same length, different content, written the way the bridge writes it.
+    replacement = bridge_dir / "state.json.new"
+    replacement.write_text('{"a":2}', encoding="utf-8")
+    os.replace(replacement, state)
+
+    assert forwarder._bridge_input_fingerprint(bridge_dir, None, None) != before
+
+
+def test_bridge_input_fingerprint_ignores_atomic_write_scratch_files(tmp_path: Path) -> None:
+    """
+    Dot-prefixed temp files must not churn the fingerprint.
+
+    The bridge's atomic writer creates ``.<name>.<rand>.tmp`` next to its
+    target. Counting those would re-open the gate on every write for no
+    reason.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "state.json").write_text("{}", encoding="utf-8")
+    before = forwarder._bridge_input_fingerprint(bridge_dir, None, None)
+
+    (bridge_dir / ".state.json.abc123.tmp").write_text("{}", encoding="utf-8")
+
+    assert forwarder._bridge_input_fingerprint(bridge_dir, None, None) == before
+
+
+def test_forwarder_tick_is_needed_while_a_retry_is_outstanding() -> None:
+    """
+    A pending retry keeps the loop working even with no file change.
+
+    Retries fire on a timer, so a gate that only watched the transcript would
+    leave a failed post permanently unsent.
+
+    :returns: None.
+    """
+    tracker = forwarder._PostRetryTracker()
+    dedupe = forwarder._ForwardDedupeState()
+    # Retry deadlines are stamped from the real monotonic clock, so anchor the
+    # synthetic "now" to it rather than an arbitrary constant.
+    settled = {
+        "now": time.monotonic(),
+        "last_change_at": 0.0,
+        "last_full_poll_at": time.monotonic(),
+    }
+    assert not forwarder._forwarder_tick_is_needed(
+        now=settled["now"],
+        last_change_at=settled["last_change_at"],
+        last_full_poll_at=settled["last_full_poll_at"],
+        retry_trackers=(tracker,),
+        dedupe=dedupe,
+    )
+
+    # A retry that is scheduled but not yet due must NOT hold the gate open —
+    # a sustained outage would otherwise pin the loop at full rate forever.
+    tracker.record_failure("item:1", httpx.ConnectError("boom"))
+    assert not forwarder._forwarder_tick_is_needed(
+        now=settled["now"],
+        last_change_at=settled["last_change_at"],
+        last_full_poll_at=settled["last_full_poll_at"],
+        retry_trackers=(tracker,),
+        dedupe=dedupe,
+    )
+    # ...but once it comes due, the body has to run.
+    assert forwarder._forwarder_tick_is_needed(
+        now=settled["now"] + forwarder._HTTP_POST_RETRY_MAX_DELAY_S + 1.0,
+        last_change_at=settled["last_change_at"],
+        last_full_poll_at=settled["now"] + forwarder._HTTP_POST_RETRY_MAX_DELAY_S + 1.0,
+        retry_trackers=(tracker,),
+        dedupe=dedupe,
+    )
+
+    tracker.clear("item:1")
+    dedupe.cost_retry_not_before = settled["now"] - 1.0
+    assert forwarder._forwarder_tick_is_needed(
+        now=settled["now"],
+        last_change_at=settled["last_change_at"],
+        last_full_poll_at=settled["last_full_poll_at"],
+        retry_trackers=(tracker,),
+        dedupe=dedupe,
+    )
+    dedupe.cost_retry_not_before = settled["now"] + 5.0
+    assert not forwarder._forwarder_tick_is_needed(
+        now=settled["now"],
+        last_change_at=settled["last_change_at"],
+        last_full_poll_at=settled["last_full_poll_at"],
+        retry_trackers=(tracker,),
+        dedupe=dedupe,
+    )
+
+
+def test_forwarder_tick_is_needed_on_the_periodic_resync() -> None:
+    """
+    The resync floor runs the body even when nothing looks like it changed.
+
+    :returns: None.
+    """
+    assert forwarder._forwarder_tick_is_needed(
+        now=1000.0,
+        last_change_at=0.0,
+        last_full_poll_at=1000.0 - forwarder._IDLE_RESYNC_SECONDS,
+        retry_trackers=(),
+        dedupe=forwarder._ForwardDedupeState(),
+    )
