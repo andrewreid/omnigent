@@ -28,6 +28,15 @@ own siblings leak out one round at a time: the wide pass keeps finding the
 next instance because the FIX was point-scoped even though the review
 nominally was not.
 
+A returned report must OPEN with the mandate's battery-completeness
+checklist. Missing or partial checklist = INCOMPLETE review, not a clean
+bill — re-dispatch the full battery; never read a bare "looks good" as a
+completed review. This applies with equal force when servicing an external
+review bot's findings mid-loop (see `pr-bot-loop`): bot comments are never
+grounds to narrow the dispatch to "confirm these are fixed". (Real incident:
+a re-review scoped to "verify these bot comments" let one defect class take
+three bot rounds to close instead of one adversarial pass.)
+
 ## REVIEWER MANDATE — paste this block VERBATIM into every review dispatch
 The dispatch `input` = the diff + the acceptance contract + this block,
 unedited. It is self-contained on purpose: the reviewer works from its task
@@ -120,9 +129,18 @@ numbering / status / cross-ref rules) and verify conformance — a premature
 status flip, a skipped lifecycle state, an index copy disagreeing with the
 doc it points at.
 
-Report format: classify each finding blocking / non-blocking / suggestion,
-one line per item, each with file:line evidence and its pass label. Your
-final message is the report; the orchestrator routes everything else.
+Report format: OPEN with the battery-completeness checklist — one line per
+pass, "run — clear" or "run — N findings", never "skipped" or absent:
+  [FOCUSED] diff vs contract
+  [WIDE-1] blast-radius
+  [WIDE-2] sibling-class
+  [WIDE-3] input-domain
+  [WIDE-4] coupled-artifact
+  [SELF-CONSISTENCY] (docs only, else "n/a")
+  [GOVERNANCE] (docs only, else "n/a")
+Then classify each finding blocking / non-blocking / suggestion, one line
+per item, each with file:line evidence and its pass label. Your final
+message is the report; the orchestrator routes everything else.
 ```
 
 ## Match review depth to the surface — orchestrator side
