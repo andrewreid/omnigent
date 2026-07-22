@@ -471,11 +471,13 @@ def test_legacy_sigtermed_entry_without_snapshot_drops_after_leader_exit(
 def test_escalation_handles_child_forked_from_sigterm_handler(tmp_path: Path, monkeypatch) -> None:
     """A child forked by the leader's SIGTERM handler never escapes silently.
 
-    The pre-TERM snapshot cannot contain it. Where the platform can pin
-    the group (pidfd), escalation group-kills it; elsewhere the entry must
-    be RETAINED (group still populated, ownership unprovable) rather than
-    dropped as "gone" while the child lives.
+    The pre-TERM snapshot cannot contain it, so the post-TERM anchored
+    rescan must capture it (the leader, still alive in its handler,
+    anchors the group) and a later pass group-kills it. Were the rescan
+    to miss, the entry must be retained — not dropped as "gone" while the
+    child lives.
     """
+    import contextlib
     import os as os_mod
     import subprocess
     import sys
@@ -494,7 +496,7 @@ def test_escalation_handles_child_forked_from_sigterm_handler(tmp_path: Path, mo
                 "'import os, signal, time; "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
                 "print(os.getpid(), flush=True); time.sleep(120)'])\n"
-                "    time.sleep(0.2)\n"
+                "    time.sleep(0.3)\n"
                 "    os._exit(0)\n"
                 "signal.signal(signal.SIGTERM, on_term)\n"
                 "print('ready', flush=True)\n"
@@ -518,30 +520,25 @@ def test_escalation_handles_child_forked_from_sigterm_handler(tmp_path: Path, mo
             registry_path=path,
         )
 
+        # SIGTERM pass: the anchored post-TERM rescan records the child
+        # the handler forks while the leader still anchors the group.
         assert registry.reconcile_codex_native_process_registry(registry_path=path) == 1
         child_pid = int(leader.stdout.readline().strip())
         assert leader.wait(timeout=10) is not None
         assert registry._pid_alive(child_pid), "handler child should outlive the leader"
+        (payload,) = _registry_payload(path)
+        recorded = {pid for pid, _start in payload["members"]}
+        assert child_pid in recorded, "post-TERM rescan missed the handler's fork"
 
+        # Escalation passes drain the recorded child and then the entry.
         monkeypatch.setattr(registry, "_SIGKILL_GRACE_S", 0.0)
-        if hasattr(os_mod, "pidfd_open"):
-            # Pinned pgid: escalation group-kills the late fork; the entry
-            # drains once the group is verifiably empty.
-            deadline = time_mod.monotonic() + 5.0
-            while _registry_payload(path) and time_mod.monotonic() < deadline:
-                registry.reconcile_codex_native_process_registry(registry_path=path)
-                time_mod.sleep(0.05)
-            assert not registry._pid_alive(child_pid), "late-forked child leaked"
-            assert _registry_payload(path) == []
-        else:
-            # No pin available: the entry must be retained — dropping it
-            # here is exactly the silent leak this regression guards.
+        deadline = time_mod.monotonic() + 5.0
+        while _registry_payload(path) and time_mod.monotonic() < deadline:
             registry.reconcile_codex_native_process_registry(registry_path=path)
-            assert len(_registry_payload(path)) == 1
-            assert registry._pid_alive(child_pid)
+            time_mod.sleep(0.05)
+        assert not registry._pid_alive(child_pid), "late-forked child leaked"
+        assert _registry_payload(path) == []
     finally:
-        import contextlib
-
         if child_pid is not None:
             with contextlib.suppress(OSError):
                 os_mod.kill(child_pid, signal.SIGKILL)

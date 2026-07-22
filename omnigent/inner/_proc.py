@@ -258,31 +258,29 @@ def group_member_identities(pgid: int) -> dict[int, str] | None:
         return None
     members: dict[int, str] = {}
     for pid in pids:
-        # Identity → membership → identity: a stable identity across the
-        # membership check proves the verdict applies to this incarnation,
-        # so a pid recycled mid-scan cannot bind a stranger to the list.
-        try:
-            first = repr(psutil.Process(pid).create_time())
-        except psutil.NoSuchProcess:
-            continue
-        except (psutil.Error, OSError):
-            return None  # exists but unreadable — snapshot incomplete
+        # Membership → identity → membership: non-members (gone, foreign,
+        # unreadable) are skipped without touching their identity, so a
+        # stranger can never poison the snapshot; the re-check after the
+        # identity read proves the identity belongs to the incarnation
+        # that is (still) in the group, so a pid recycled mid-scan cannot
+        # bind an unrelated process to the kill list.
         try:
             if _getpgid_fn(pid) != pgid:
                 continue
-        except ProcessLookupError:
-            continue  # exited mid-scan — definitively not a member anymore
         except OSError:
-            return None  # membership unknowable — snapshot incomplete
+            continue  # gone or not ours to inspect — not a member of ours
         try:
-            second = repr(psutil.Process(pid).create_time())
+            identity = repr(psutil.Process(pid).create_time())
         except psutil.NoSuchProcess:
-            continue
+            continue  # exited between the group check and the identity read
         except (psutil.Error, OSError):
-            return None
-        if second != first:
-            continue  # recycled across the check — not provably a member
-        members[pid] = first
+            return None  # a confirmed member is unreadable — fail closed
+        try:
+            if _getpgid_fn(pid) != pgid:
+                continue
+        except OSError:
+            continue
+        members[pid] = identity
     return members or None
 
 

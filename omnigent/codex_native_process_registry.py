@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Generator
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Literal
 
 from omnigent.codex_native_state import _codex_native_state_root
 from omnigent.inner import _proc
@@ -192,7 +193,6 @@ def unregister_codex_native_process(
     """
     if not session_tag:
         return
-    _unpin_group_leader(session_tag)
     path = registry_path or codex_native_process_registry_path()
     with _registry_lock(path):
         entries = [entry for entry in _read_registry(path) if entry.session_tag != session_tag]
@@ -243,7 +243,6 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                     # pass before its metadata is dropped.
                     survivors.append(entry)
                     continue
-                _unpin_group_leader(entry.session_tag)
                 _reap_tmux_session(entry.tmux_session_name)
                 continue
             if not _pid_alive(entry.pid) or not _process_cmdline_has_tag(
@@ -267,11 +266,6 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                 )
                 survivors.append(entry)
                 continue
-            # Pin the leader's pid before signaling (best-effort, Linux):
-            # a held pidfd keeps the pgid from ever being recycled, so a
-            # later escalation in THIS process can group-kill members that
-            # were forked after the snapshot (e.g. from a SIGTERM handler).
-            _pin_group_leader(entry.session_tag, entry.pid)
             if _signal_process_group(entry.pgid, signal.SIGTERM):
                 _logger.info(
                     "SIGTERMed ownerless codex-native process group %d (pid %d)",
@@ -280,8 +274,10 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                 )
                 signaled += 1
                 entry = replace(entry, sigterm_at=now, members=members)
-            else:
-                _unpin_group_leader(entry.session_tag)
+                # A SIGTERM handler may fork (and the leader then exit);
+                # briefly keep re-scanning while a recorded member still
+                # anchors the group so such children join the kill list.
+                entry = _merge_members_while_anchored(entry)
             # Keep the entry either way: a failed signal retries on the
             # next pass, a delivered one is re-checked for escalation.
             survivors.append(entry)
@@ -289,16 +285,53 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
     return signaled
 
 
-def _escalate_sigkill(entry: CodexNativeProcessEntry) -> str:
+_EscalationOutcome = Literal["killed", "retry", "gone", "unverifiable"]
+
+# Post-SIGTERM anchored rescan cadence: long enough overall (~0.5s) to see
+# a child forked from a typical SIGTERM handler before the handler's owner
+# exits, short enough not to stall a reconciling caller noticeably.
+_POST_TERM_RESCAN_ATTEMPTS = 10
+_POST_TERM_RESCAN_INTERVAL_S = 0.05
+
+
+def _merge_members_while_anchored(entry: CodexNativeProcessEntry) -> CodexNativeProcessEntry:
+    """
+    Briefly re-scan a just-SIGTERMed group, merging late-forked members.
+
+    Runs only while a recorded member still identity-anchors the group
+    (proving the pgid was never recycled), so a child forked from the
+    SIGTERM handler is captured into the recorded members before its
+    parent exits and the anchor is lost.
+
+    :param entry: The entry whose group was just SIGTERMed.
+    :returns: The entry, possibly with merged members.
+    """
+    for _ in range(_POST_TERM_RESCAN_ATTEMPTS):
+        time.sleep(_POST_TERM_RESCAN_INTERVAL_S)
+        assert entry.members is not None
+        if not any(_member_identity_state(pid, start) == "match" for pid, start in entry.members):
+            break
+        fresh = _group_member_identities(entry.pgid)
+        if fresh:
+            merged = dict(entry.members)
+            merged.update(dict(fresh))
+            entry = replace(entry, members=tuple(sorted(merged.items())))
+    return entry
+
+
+def _escalate_sigkill(
+    entry: CodexNativeProcessEntry,
+) -> tuple[_EscalationOutcome, CodexNativeProcessEntry]:
     """
     SIGKILL whatever provably remains of an already-SIGTERMed entry.
 
-    While group ownership is provable — an identity-anchored recorded
-    member, or a pinned leader pid — the group is re-scanned (merging
-    members forked after the snapshot) and killed atomically via the
-    group signal, plus per-member verified kills. Without proof, nothing
-    is signaled: the entry is retained while unverifiable occupants
-    remain, and dropped only once the group is verifiably empty.
+    While an identity-anchored recorded member proves group continuity —
+    a pgid cannot be recycled while an original member lives in it — the
+    group is re-scanned (merging members forked after the snapshot) and
+    killed atomically via the group signal, plus per-member verified
+    kills. Without that proof, nothing is signaled: the entry is retained
+    while unverifiable occupants remain, and dropped only once the group
+    is verifiably empty.
 
     :param entry: The SIGTERMed registry entry past its grace.
     :returns: ``(outcome, entry)`` — the possibly member-merged entry and
@@ -325,14 +358,12 @@ def _escalate_sigkill(entry: CodexNativeProcessEntry) -> str:
         )
         return "unverifiable", entry
     anchored = any(_member_identity_state(pid, start) == "match" for pid, start in entry.members)
-    pinned = entry.session_tag in _pinned_leader_fds
     populated = _proc.group_populated(entry.pgid)
-    if anchored or (pinned and populated is True):
-        # Group ownership is still provable: an anchored recorded member
-        # proves group continuity since the snapshot, and a pinned leader
-        # pid proves the pgid was never recycled. Merge any members forked
-        # after the snapshot, then kill the whole group atomically — a
-        # per-pid list alone can never close over a fork racing it.
+    if anchored:
+        # An anchored recorded member proves group continuity since the
+        # verified snapshot. Merge any members forked after it, then kill
+        # the whole group atomically — a per-pid list alone can never
+        # close over a fork racing it.
         fresh = _group_member_identities(entry.pgid)
         if fresh:
             merged = dict(entry.members)
@@ -358,8 +389,8 @@ def _escalate_sigkill(entry: CodexNativeProcessEntry) -> str:
         return "retry", entry
     if populated is True:
         # Every recorded member is gone, yet the group has occupants and
-        # nothing proves they are ours (no anchor, no pin) — retain the
-        # entry instead of leaking or killing strangers.
+        # nothing proves they are ours — retain the entry instead of
+        # leaking or killing strangers.
         _logger.warning(
             "codex-native group %d has unverifiable occupant(s) after all "
             "recorded members exited; retaining its entry",
@@ -571,30 +602,6 @@ def _group_member_identities(pgid: int) -> tuple[tuple[int, str], ...] | None:
     if not members:
         return None
     return tuple(sorted(members.items()))
-
-
-# Process-local pidfd per session tag, opened on the (verified-live) group
-# leader just before its SIGTERM. A held pidfd keeps the leader's pid — and
-# therefore the pgid — from ever being recycled, so escalation in this same
-# process may group-kill even after every recorded member has exited.
-# Best-effort and Linux-only; other processes fall back to anchor gating.
-_pinned_leader_fds: dict[str, int] = {}
-
-
-def _pin_group_leader(session_tag: str, pid: int) -> None:
-    pidfd_open = getattr(os, "pidfd_open", None)
-    if pidfd_open is None:
-        return
-    _unpin_group_leader(session_tag)
-    with contextlib.suppress(OSError):
-        _pinned_leader_fds[session_tag] = pidfd_open(pid)
-
-
-def _unpin_group_leader(session_tag: str) -> None:
-    fd = _pinned_leader_fds.pop(session_tag, None)
-    if fd is not None:
-        with contextlib.suppress(OSError):
-            os.close(fd)
 
 
 def _member_identity_state(pid: int, identity: str) -> str:
