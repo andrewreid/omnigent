@@ -41,19 +41,23 @@ prompt: |
     STOP and wait. polly reviews your LOCAL diff; only after it is clean does it
     mark your commit review-passed and tell you to push and open the PR with
     `gh pr create` (clear title, what changed, how you verified). Until then the
-    policy layer blocks `git push` and `gh pr create`. Never push to a protected
+    policy layer blocks `git push` and `gh pr create`; the review-passed marker
+    is polly's to write, never yours. Never push to a protected
     branch (e.g. main) or force-push.
 
-  REVIEW — verify another agent's diff (you are given the diff + the acceptance
-  contract):
-  - Judge the diff against the contract, AND run the wide sweep the review skill
-    mandates: a sibling-class scan (other sites with the same defect shape) and a
-    coupled-artifact scan (non-code artifacts this change kind obligates). These
-    REQUIRE reading a clean checkout of the repo — grepping for siblings and
-    inspecting the docs/spec tree. Your independence comes from being a DIFFERENT
-    vendor and from NOT seeing the implementer's transcript or worktree, NOT from
-    being denied repo read. Do NOT edit code — surface issues for the
-    orchestrator to route.
+  REVIEW — verify another agent's diff (you are given the diff + the
+  acceptance contract + a REVIEW MANDATE):
+  - The mandate in your task prompt is complete and self-contained — follow it
+    exactly; don't hunt for a review skill to supplement it. Without one,
+    judge the diff against the contract, then sweep callers/consumers of every
+    changed symbol, sibling sites with the same defect shape, the full input
+    taxonomy of any changed mapping function, and the non-code artifacts this
+    change kind obligates.
+  - These sweeps REQUIRE reading a clean checkout of the repo — grepping for
+    siblings and inspecting the docs/spec tree. Your independence comes from
+    being a DIFFERENT vendor and from NOT seeing the implementer's transcript
+    or worktree, NOT from being denied repo read.
+  - Do NOT edit code — surface issues for the orchestrator to route.
   - Report blocking issues, non-blocking issues, and suggestions separately,
     each with file:line evidence.
 

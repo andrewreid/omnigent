@@ -381,12 +381,22 @@ def test_orchestrator_guardrails(polly_spec: AgentSpec) -> None:
 
 
 def test_subagent_guardrails(polly_spec: AgentSpec) -> None:
-    """Each sub-agent carries the blast_radius gate (push/destructive)."""
+    """
+    Each sub-agent carries the blast_radius gate (push/destructive) plus
+    require_pr_review — the mechanism half of review-before-pr: a worker's
+    ``git push`` / ``gh pr create`` is denied until polly records the
+    reviewed commit in the ``.polly/review-passed`` sentinel.
+    """
     by_name = {a.name: a for a in polly_spec.sub_agents}
     for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "pi"):
         guardrails = by_name[name].guardrails
         assert guardrails is not None, name
-        assert [p.name for p in guardrails.policies] == ["blast_radius"], name
+        assert [p.name for p in guardrails.policies] == [
+            "blast_radius",
+            "require_pr_review",
+        ], name
+        pr_review = next(p for p in guardrails.policies if p.name == "require_pr_review")
+        assert pr_review.function.arguments.get("sentinel") == ".polly/review-passed", name
 
 
 def test_function_policies_have_nonempty_arguments(polly_spec: AgentSpec) -> None:
@@ -416,6 +426,7 @@ def test_function_policies_have_nonempty_arguments(polly_spec: AgentSpec) -> Non
             )
             checked += 1
     # orchestrator: blast_radius + spawn_bounds + headless_subagent_purpose_guard
-    # = 3; sub-agents: blast_radius x6 (claude_code, codex, opencode, cursor,
-    # hermes, pi) = 6 -> 9 total. Fewer = a policy dropped.
-    assert checked == 9, f"expected 9 function policies in the bundle, inspected {checked}"
+    # = 3; sub-agents: (blast_radius + require_pr_review) x6 (claude_code,
+    # codex, opencode, cursor, hermes, pi) = 12 -> 15 total. Fewer = a policy
+    # dropped.
+    assert checked == 15, f"expected 15 function policies in the bundle, inspected {checked}"
