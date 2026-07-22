@@ -5,6 +5,8 @@ description: Delegate read-only investigation, debugging, audit, search, or code
 
 # investigate — delegated read-only work
 
+**Audience: polly ONLY** — orchestration policy, never handed to a worker.
+
 Use for any read-only task: investigation, debugging, audit, search, code
 understanding, architecture comparison, failure analysis, or answering a
 repository-specific technical question.

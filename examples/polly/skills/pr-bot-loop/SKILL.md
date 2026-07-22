@@ -5,6 +5,8 @@ description: Drive the GitHub Codex-review-bot feedback loop on a PR you pushed 
 
 # pr-bot-loop — close the external review-bot loop on a PR
 
+**Audience: polly ONLY** — orchestration policy, never handed to a worker.
+
 After a PR is opened/updated — by an implementer sub-agent, or by polly itself for a directly-authored doc/skill PR — a review bot (`chatgpt-codex-connector`, the "Codex" GitHub app) posts automated review comments ~10 min later. This is the EXTERNAL layer, separate from the internal `cross-review` skill (a different-vendor sub-agent judging the diff pre-PR): cross-review gates PR-open on the branch, this loop services the bot on the live PR so the human can resolve threads. polly runs the loop; polly never merges.
 
 ## This loop is CONDITIONAL — detect the bot BEFORE arming (don't wait on a bot that isn't wired)
