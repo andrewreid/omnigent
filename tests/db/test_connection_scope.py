@@ -241,3 +241,40 @@ def test_scope_close_returns_connection_to_pool(engine: Engine) -> None:
         assert len(checkins) == 0
 
     assert len(checkins) == 1
+
+
+def test_scope_keeps_statement_spans_single_connect_span(tmp_path: Path) -> None:
+    """
+    OTel instrumentation still emits per-statement spans on the scoped
+    path, and `connect` spans (pool checkouts) collapse to one — the
+    exact signal used to verify this change in production traces.
+    """
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("opentelemetry.instrumentation.sqlalchemy")
+    from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'otel.db'}")
+    instrumentor = SQLAlchemyInstrumentor()
+    instrumentor.instrument(engine=eng, tracer_provider=provider)
+    try:
+        session_maker = make_managed_session_maker(eng)
+        with db_connection_scope():
+            for _ in range(3):
+                with session_maker() as session:
+                    session.execute(text("SELECT 1"))
+    finally:
+        instrumentor.uninstrument(engine=eng)
+        eng.dispose()
+
+    names = [span.name for span in exporter.get_finished_spans()]
+    assert len([n for n in names if n.startswith("SELECT")]) >= 3
+    assert names.count("connect") == 1

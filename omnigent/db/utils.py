@@ -13,7 +13,7 @@ from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import Connection, Engine, create_engine, event, inspect, text
 
@@ -694,7 +694,10 @@ def make_managed_session_maker(
     # DetachedInstanceError. This is safe here because each managed session
     # is short-lived and single-writer, so there is no cross-session stale
     # data concern.
-    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    # Shared by the pooled factory and the scope-lent Session below so the
+    # two code paths cannot drift apart.
+    session_kwargs: dict[str, Any] = {"expire_on_commit": False}
+    factory = sessionmaker(bind=engine, **session_kwargs)
     is_sqlite = engine.dialect.name == "sqlite"
 
     def _session_lifecycle(session: Session) -> Iterator[Session]:
@@ -738,7 +741,7 @@ def make_managed_session_maker(
             # The session still owns its transaction: the connection is
             # never lent while inside one, so commit/rollback here commit
             # or roll back a real transaction, not a savepoint.
-            with Session(bind=conn, expire_on_commit=False) as session:
+            with Session(bind=conn, **session_kwargs) as session:
                 yield from _session_lifecycle(session)
         finally:
             scope.restore(engine, conn)
