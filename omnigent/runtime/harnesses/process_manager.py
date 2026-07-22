@@ -1479,10 +1479,8 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
     dir — every active runner binds one. We don't have the
     runner PIDs because they're orphans of a crashed AP, so
     we shell out to ``lsof`` to find which PIDs hold each
-    socket. Each holder is signaled through its whole process
-    group (harness subprocesses are session leaders, so the
-    group is exactly their tree — vendor CLI and MCP fleet
-    included).
+    socket, then snapshot each holder's group members so the
+    whole tree is tracked per member.
 
     Member identities of each holder's group are snapshotted and —
     critically — persisted into the instance dir
@@ -1575,6 +1573,20 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
         if tracked_any:
             _save_reap_state(instance_dir, groups)
         return False
+    for pgid in groups:
+        if pgid > 0 and _proc.group_populated(pgid) is True:
+            # Every recorded member is gone, yet the recorded group still
+            # has occupants (e.g. a child forked after the snapshot). This
+            # tier cannot prove they are ours; retain the dir and its
+            # state as evidence instead of deleting the only record.
+            _logger.warning(
+                "group %d under %s has unverifiable occupant(s) after all "
+                "recorded members exited; keeping instance dir",
+                pgid,
+                instance_dir,
+            )
+            _save_reap_state(instance_dir, groups)
+            return False
     # Positive-absence backstop, independent of lsof's ambiguous exit
     # status: a live runner always listens on its conv socket, so any
     # socket still accepting connections proves a survivor lsof missed.
