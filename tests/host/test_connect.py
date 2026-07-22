@@ -1138,6 +1138,59 @@ def test_install_child_subreaper_is_safe_to_call() -> None:
         assert result is False
 
 
+async def test_sweep_ownerless_trees_once_runs_all_families(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One sweep pass runs every family; a failing family blocks nothing.
+
+    The pass must also hold the host-subprocess-op guard so the zombie
+    reaper cannot steal the family sweeps' tmux/lsof children mid-wait.
+    """
+    import omnigent.codex_native_process_registry as registry_mod
+    import omnigent.inner.terminal as terminal_mod
+    import omnigent.runtime.harnesses.process_manager as pm_mod
+
+    host = _make_host_process()
+    calls: list[str] = []
+    ops_during: list[int] = []
+
+    def fake_reconcile() -> int:
+        ops_during.append(host._owned_subprocess_ops)
+        calls.append("codex")
+        raise RuntimeError("family sweep blew up")
+
+    def fake_reap_terminals() -> int:
+        calls.append("terminals")
+        return 2
+
+    async def fake_sweep_instance_dirs(tmp_parent: Path | None = None) -> int:
+        calls.append("instance-dirs")
+        return 1
+
+    monkeypatch.setattr(registry_mod, "reconcile_codex_native_process_registry", fake_reconcile)
+    monkeypatch.setattr(terminal_mod, "reap_orphaned_terminals", fake_reap_terminals)
+    monkeypatch.setattr(pm_mod, "sweep_orphaned_instance_dirs", fake_sweep_instance_dirs)
+
+    await host._sweep_ownerless_trees_once()
+
+    assert calls == ["codex", "terminals", "instance-dirs"]
+    assert ops_during == [1], "sweep must run under the host-subprocess-op guard"
+    assert host._owned_subprocess_ops == 0
+
+
+def test_ownerless_sweep_env_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sweep defaults on; only explicit off values disable it."""
+    from omnigent.host.connect import _OWNERLESS_SWEEP_ENV_VAR, _ownerless_sweep_enabled
+
+    monkeypatch.delenv(_OWNERLESS_SWEEP_ENV_VAR, raising=False)
+    assert _ownerless_sweep_enabled()
+    for off in ("0", "false", "OFF", " no "):
+        monkeypatch.setenv(_OWNERLESS_SWEEP_ENV_VAR, off)
+        assert not _ownerless_sweep_enabled()
+    monkeypatch.setenv(_OWNERLESS_SWEEP_ENV_VAR, "1")
+    assert _ownerless_sweep_enabled()
+
+
 def test_host_spawned_runner_has_parent_pid_env(
     tmp_path: Path,
 ) -> None:

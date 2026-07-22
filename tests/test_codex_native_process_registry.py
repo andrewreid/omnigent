@@ -43,6 +43,7 @@ def test_registry_add_remove_round_trip(tmp_path: Path) -> None:
             "tmux_session_name": "omnigent-codex-123",
             "session_tag": "tag-123",
             "owner_lock_path": str(tmp_path / "owner.lock"),
+            "sigterm_at": None,
         }
     ]
 
@@ -51,8 +52,40 @@ def test_registry_add_remove_round_trip(tmp_path: Path) -> None:
     assert _registry_payload(path) == []
 
 
-def test_reconciliation_reaps_alive_tagged_process(tmp_path: Path, monkeypatch) -> None:
-    """A live process with the matching cmdline tag is reaped by process group."""
+def test_reconciliation_sigterms_alive_tagged_process_and_keeps_entry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A live tagged process is SIGTERMed and kept for escalation."""
+    path = tmp_path / "registry.json"
+    registry.register_codex_native_process(
+        pid=123,
+        pgid=456,
+        session_tag="tag-123",
+        owner_lock_path=None,
+        registry_path=path,
+    )
+    killed: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(registry, "_pid_alive", lambda pid: pid == 123)
+    monkeypatch.setattr(
+        registry,
+        "_process_cmdline",
+        lambda _pid: "codex omnigent_crash_teardown_tag=tag-123 app-server",
+    )
+    monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
+
+    signaled = registry.reconcile_codex_native_process_registry(registry_path=path)
+
+    assert signaled == 1
+    assert killed == [(456, signal.SIGTERM)]
+    # The entry survives with its SIGTERM time recorded, so a later pass
+    # can escalate to SIGKILL if the process ignores the SIGTERM.
+    (payload,) = _registry_payload(path)
+    assert payload["session_tag"] == "tag-123"
+    assert isinstance(payload["sigterm_at"], float)
+
+
+def test_reconciliation_escalates_to_sigkill_after_grace(tmp_path: Path, monkeypatch) -> None:
+    """A SIGTERM-surviving process is SIGKILLed once the grace elapses."""
     path = tmp_path / "registry.json"
     registry.register_codex_native_process(
         pid=123,
@@ -71,8 +104,15 @@ def test_reconciliation_reaps_alive_tagged_process(tmp_path: Path, monkeypatch) 
     monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
 
     registry.reconcile_codex_native_process_registry(registry_path=path)
-
+    # Within the grace: no second signal, entry untouched.
+    registry.reconcile_codex_native_process_registry(registry_path=path)
     assert killed == [(456, signal.SIGTERM)]
+    assert len(_registry_payload(path)) == 1
+
+    monkeypatch.setattr(registry, "_SIGKILL_GRACE_S", 0.0)
+    registry.reconcile_codex_native_process_registry(registry_path=path)
+
+    assert killed == [(456, signal.SIGTERM), (456, signal.SIGKILL)]
     assert _registry_payload(path) == []
 
 
@@ -130,6 +170,7 @@ def test_reconciliation_skips_live_sibling_when_owner_lock_is_held(
             "tmux_session_name": None,
             "session_tag": "tag-123",
             "owner_lock_path": str(owner_lock),
+            "sigterm_at": None,
         }
     ]
 
@@ -158,7 +199,8 @@ def test_reconciliation_reaps_when_owner_lock_is_not_held(tmp_path: Path, monkey
     registry.reconcile_codex_native_process_registry(registry_path=path)
 
     assert killed == [(456, signal.SIGTERM)]
-    assert _registry_payload(path) == []
+    (payload,) = _registry_payload(path)
+    assert payload["sigterm_at"] is not None
 
 
 def test_reconciliation_drops_dead_pids(tmp_path: Path, monkeypatch) -> None:
@@ -182,7 +224,7 @@ def test_reconciliation_drops_dead_pids(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_tmux_session_reaped_only_when_recorded_name_exists(tmp_path: Path, monkeypatch) -> None:
-    """Matching tagged process reaps only the recorded existing tmux session."""
+    """Dropping an entry reaps only its recorded, still-existing tmux session."""
     path = tmp_path / "registry.json"
     registry.register_codex_native_process(
         pid=123,
@@ -201,16 +243,7 @@ def test_tmux_session_reaped_only_when_recorded_name_exists(tmp_path: Path, monk
         registry_path=path,
     )
     killed_tmux: list[str] = []
-    monkeypatch.setattr(registry, "_pid_alive", lambda pid: pid in {123, 124})
-    monkeypatch.setattr(
-        registry,
-        "_process_cmdline",
-        lambda pid: (
-            "codex "
-            f"omnigent_crash_teardown_tag=tag-{'live' if pid == 123 else 'missing'} "
-            "app-server"
-        ),
-    )
+    monkeypatch.setattr(registry, "_pid_alive", lambda _pid: False)
     monkeypatch.setattr(registry.os, "killpg", lambda _pgid, _sig: None)
     monkeypatch.setattr(
         registry,
@@ -245,3 +278,63 @@ def test_registry_lock_serializes_read_modify_write(tmp_path: Path) -> None:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally:
             registry.os.close(fd)
+
+
+def test_end_to_end_spares_owned_process_and_reaps_after_owner_death(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The full kill gate against a real process and a real kernel flock.
+
+    While the launcher's owner lock is held (a live owned session), any
+    number of reconciliation passes must leave the child untouched.
+    Releasing the lock — what the kernel does on any launcher death,
+    however unclean — makes the same child reapable: first pass SIGTERMs
+    it, and once it has exited a later pass drops the entry.
+    """
+    import subprocess
+    import sys
+    import time as time_mod
+
+    monkeypatch.setattr(registry, "_codex_native_state_root", lambda: tmp_path)
+    path = tmp_path / "registry.json"
+    tag = "tag-e2e"
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(120)",
+            registry.codex_native_session_tag_cmdline_arg(tag),
+        ],
+        start_new_session=True,
+    )
+    try:
+        lock = registry.acquire_codex_native_process_owner_lock()
+        assert lock is not None
+        registry.register_codex_native_process(
+            pid=proc.pid,
+            pgid=proc.pid,
+            session_tag=tag,
+            owner_lock_path=lock.path,
+            registry_path=path,
+        )
+
+        # Owned: repeated passes never touch the live child.
+        for _ in range(3):
+            assert registry.reconcile_codex_native_process_registry(registry_path=path) == 0
+        assert proc.poll() is None
+
+        # Owner dies (kernel releases the flock): the child is now reapable.
+        lock.close()
+        assert registry.reconcile_codex_native_process_registry(registry_path=path) == 1
+        assert proc.wait(timeout=10) is not None
+
+        # Child gone: a later pass drops the entry without further signals.
+        deadline = time_mod.monotonic() + 5.0
+        while registry._pid_alive(proc.pid) and time_mod.monotonic() < deadline:
+            time_mod.sleep(0.05)
+        registry.reconcile_codex_native_process_registry(registry_path=path)
+        assert _registry_payload(path) == []
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)

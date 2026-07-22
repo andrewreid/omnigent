@@ -1191,11 +1191,54 @@ async def test_orphan_sweep_escalates_to_sigkill(
     instance_dir.mkdir()
     (instance_dir / "conv-stale.sock").touch()
 
-    mgr = HarnessProcessManager(tmp_parent=short_tmp_parent)
-    await mgr._kill_orphan_runners(instance_dir)
+    await pm_mod._kill_orphan_runners(instance_dir)
 
     assert calls == 2
     assert killed == [(12345, signal.SIGTERM), (12345, signal.SIGKILL)]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: -1)() == 0, reason="root bypasses permission checks"
+)
+async def test_orphan_sweep_skips_unreadable_foreign_entries(
+    short_tmp_parent: Path,
+) -> None:
+    """Foreign-owned entries never abort the sweep of readable orphans.
+
+    On a shared host another user's mode-700 instance dir raises
+    ``PermissionError`` from ``stat()``. The sweep must skip it and still
+    clean the readable dead sibling, instead of propagating and killing
+    the boot that runs it.
+    """
+    from omnigent.runtime.harnesses.process_manager import sweep_orphaned_instance_dirs
+
+    foreign = short_tmp_parent / "ap-foreign"
+    foreign.mkdir(mode=0o700)
+    (foreign / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+    dead = short_tmp_parent / "ap-dead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    live = short_tmp_parent / "ap-live"
+    live.mkdir(mode=0o700)
+    (live / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+    foreign.chmod(0o000)
+    try:
+        swept = await sweep_orphaned_instance_dirs(short_tmp_parent)
+    finally:
+        foreign.chmod(0o700)
+
+    assert swept == 1
+    assert not dead.exists()
+    assert foreign.exists()
+    assert live.exists()
+
+
+async def test_orphan_sweep_survives_unlistable_parent(tmp_path: Path) -> None:
+    """A missing or unlistable parent is a no-op, never a raise."""
+    from omnigent.runtime.harnesses.process_manager import sweep_orphaned_instance_dirs
+
+    assert await sweep_orphaned_instance_dirs(tmp_path / "nonexistent") == 0
 
 
 # ── Mid-spawn cancellation ──────────────────────────────────────

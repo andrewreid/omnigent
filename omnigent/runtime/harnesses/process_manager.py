@@ -1336,101 +1336,128 @@ class HarnessProcessManager:
 
     async def _sweep_orphans(self) -> None:
         """
-        Kill runner processes left behind by crashed prior AP
-        instances and remove their per-instance directories.
+        Sweep dead sibling instance dirs under ``_tmp_parent``.
 
-        Iterates every ``ap-*`` subdir under ``_tmp_parent``. For
-        each, reads the ``AP_PID`` sentinel; if the recorded PID
-        is not a live process, the dir belongs to a crashed AP
-        and gets cleaned. Sibling dirs whose PIDs are still live
-        are left alone (zero-downtime restart, multi-tenant
-        same-host case).
-
-        Best-effort throughout — a permission error or unreadable
-        sentinel logs and skips the dir rather than aborting boot.
+        Delegates to :func:`sweep_orphaned_instance_dirs` so the
+        same sweep can also run without a manager instance (the
+        host daemon's periodic ownerless-tree sweep).
         """
-        if not self._tmp_parent.exists():
-            return
-        for child in self._tmp_parent.iterdir():
-            if not child.is_dir() or not child.name.startswith("ap-"):
+        await sweep_orphaned_instance_dirs(self._tmp_parent)
+
+
+async def sweep_orphaned_instance_dirs(tmp_parent: Path | None = None) -> int:
+    """
+    Kill runner processes left behind by crashed AP instances and
+    remove their per-instance directories.
+
+    Iterates every ``ap-*`` subdir under *tmp_parent*. For each, reads
+    the ``AP_PID`` sentinel; if the recorded PID is not a live process,
+    the dir belongs to a crashed AP and gets cleaned. Sibling dirs whose
+    PIDs are still live are left alone (zero-downtime restart,
+    multi-tenant same-host case).
+
+    Best-effort throughout — on a shared host, entries owned by another
+    Unix user can be unlistable or unstatable; a permission error or
+    unreadable sentinel logs and skips that entry rather than aborting
+    the sweep (or the boot that runs it).
+
+    :param tmp_parent: Parent directory holding ``ap-*`` instance dirs;
+        defaults to :func:`_default_tmp_parent`.
+    :returns: Number of orphaned instance dirs cleaned.
+    """
+    parent = tmp_parent if tmp_parent is not None else _default_tmp_parent()
+    try:
+        children = list(parent.iterdir())
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        _logger.warning("cannot list instance-dir parent %s: %s; skipping sweep", parent, exc)
+        return 0
+    swept = 0
+    for child in children:
+        if not child.name.startswith("ap-"):
+            continue
+        sentinel = child / _AP_PID_FILE
+        try:
+            if not child.is_dir():
                 continue
-            sentinel = child / _AP_PID_FILE
-            if not sentinel.exists():
-                # No sentinel — directory either pre-dates the
-                # convention or is mid-creation. Leave alone.
-                continue
+            pid = int(sentinel.read_text(encoding="utf-8").strip())
+        except FileNotFoundError:
+            # No sentinel — directory either pre-dates the
+            # convention or is mid-creation. Leave alone.
+            continue
+        except (OSError, ValueError) as exc:
+            _logger.warning(
+                "could not read AP_PID sentinel at %s: %s; skipping",
+                sentinel,
+                exc,
+            )
+            continue
+        if _pid_alive(pid):
+            # Sibling Omnigent is still running — leave it alone.
+            continue
+        _logger.info(
+            "sweeping orphaned Omnigent instance dir %s (pid %d not running)",
+            child,
+            pid,
+        )
+        await _kill_orphan_runners(child)
+        shutil.rmtree(child, ignore_errors=True)
+        swept += 1
+    return swept
+
+
+async def _kill_orphan_runners(instance_dir: Path) -> None:
+    """
+    Send SIGTERM to runner processes whose socket lives under
+    ``instance_dir``, then escalate to SIGKILL for survivors.
+
+    Identification works by listing the socket files in the
+    dir — every active runner binds one. We don't have the
+    runner PIDs because they're orphans of a crashed AP, so
+    we shell out to ``lsof`` to find which PIDs hold each
+    socket. ``lsof`` failures fall through silently (best
+    effort).
+
+    After SIGTERM, waits :data:`_ORPHAN_SIGTERM_GRACE_S`
+    seconds, then sends SIGKILL to any runner that is still
+    alive. Prior to this escalation, orphaned
+    runners with stuck SIGTERM handlers survived the sweep
+    indefinitely.
+
+    :param instance_dir: The orphaned AP's per-instance dir
+        whose runner subprocesses to terminate.
+    """
+    all_pids: set[int] = set()
+    for socket_file in instance_dir.glob("conv-*.sock"):
+        pids = await _pids_holding_socket(socket_file)
+        for pid in pids:
             try:
-                pid_str = sentinel.read_text(encoding="utf-8").strip()
-                pid = int(pid_str)
-            except (OSError, ValueError) as exc:
+                os.kill(pid, signal.SIGTERM)
+                all_pids.add(pid)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
                 _logger.warning(
-                    "could not read AP_PID sentinel at %s: %s; skipping",
-                    sentinel,
-                    exc,
+                    "cannot signal orphan runner pid %d (permission denied)",
+                    pid,
                 )
                 continue
-            if _pid_alive(pid):
-                # Sibling Omnigent is still running — leave it alone.
-                continue
-            _logger.info(
-                "sweeping orphaned Omnigent instance dir %s (pid %d not running)",
-                child,
-                pid,
-            )
-            await self._kill_orphan_runners(child)
-            shutil.rmtree(child, ignore_errors=True)
 
-    async def _kill_orphan_runners(self, instance_dir: Path) -> None:
-        """
-        Send SIGTERM to runner processes whose socket lives under
-        ``instance_dir``, then escalate to SIGKILL for survivors.
+    if not all_pids:
+        return
 
-        Identification works by listing the socket files in the
-        dir — every active runner binds one. We don't have the
-        runner PIDs because they're orphans of a crashed AP, so
-        we shell out to ``lsof`` to find which PIDs hold each
-        socket. ``lsof`` failures fall through silently (best
-        effort).
+    await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
 
-        After SIGTERM, waits :data:`_ORPHAN_SIGTERM_GRACE_S`
-        seconds, then sends SIGKILL to any runner that is still
-        alive. Prior to this escalation, orphaned
-        runners with stuck SIGTERM handlers survived the sweep
-        indefinitely.
-
-        :param instance_dir: The orphaned AP's per-instance dir
-            whose runner subprocesses to terminate.
-        """
-        all_pids: set[int] = set()
-        for socket_file in instance_dir.glob("conv-*.sock"):
-            pids = await _pids_holding_socket(socket_file)
-            for pid in pids:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                    all_pids.add(pid)
-                except ProcessLookupError:
-                    continue
-                except PermissionError:
-                    _logger.warning(
-                        "cannot signal orphan runner pid %d (permission denied)",
-                        pid,
-                    )
-                    continue
-
-        if not all_pids:
-            return
-
-        await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
-
-        for pid in all_pids:
-            if not _pid_alive(pid):
-                continue
-            _logger.warning(
-                "orphan runner pid %d survived SIGTERM; escalating to SIGKILL",
-                pid,
-            )
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    for pid in all_pids:
+        if not _pid_alive(pid):
+            continue
+        _logger.warning(
+            "orphan runner pid %d survived SIGTERM; escalating to SIGKILL",
+            pid,
+        )
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
 
 
 def _pid_alive(pid: int) -> bool:
