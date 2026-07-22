@@ -261,8 +261,7 @@ async def test_bind_own_runner_succeeds(
 
     async def _stub_get_runner_client(
         session_id: str,
-        runner_router: object,
-    ) -> None:
+        runner_router: object, **_kwargs: object) -> None:
         return None
 
     monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub_get_runner_client)
@@ -319,8 +318,7 @@ async def test_parent_session_runner_inheritance_blocked_cross_user(
 
     async def _stub_get_runner_client(
         session_id: str,
-        runner_router: object,
-    ) -> None:
+        runner_router: object, **_kwargs: object) -> None:
         return None
 
     monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub_get_runner_client)
@@ -390,8 +388,7 @@ async def test_fork_is_unbound_and_only_forker_can_bind_runner(
 
     async def _stub_get_runner_client(
         session_id: str,
-        runner_router: object,
-    ) -> None:
+        runner_router: object, **_kwargs: object) -> None:
         return None
 
     monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub_get_runner_client)

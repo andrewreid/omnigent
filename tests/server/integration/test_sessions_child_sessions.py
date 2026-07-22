@@ -1486,8 +1486,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
 
     async def _fake_get_runner_client(
         session_id: str,
-        runner_router: object,
-    ) -> httpx.AsyncClient:
+        runner_router: object, **_kwargs: object) -> httpx.AsyncClient:
         """
         Route the native child message to the fake runner.
 

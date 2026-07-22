@@ -843,6 +843,8 @@ def _merge_by_model(
 def load_session_usage(
     conversation_id: str,
     conversation_store: ConversationStore,
+    *,
+    root_conversation_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Load cumulative session usage for a conversation **plus all of its
@@ -866,6 +868,11 @@ def load_session_usage(
     :param conversation_id: Conversation to load,
         e.g. ``"conv_abc123"``.
     :param conversation_store: Store to read from.
+    :param root_conversation_id: The conversation's tree root, when the
+        caller already holds the conversation row. Skips the internal
+        conversation read (the root binding is immutable, so a
+        caller-supplied value can never be stale). ``None`` resolves it
+        here.
     :returns: Summed usage dict with keys ``input_tokens``,
         ``output_tokens``, ``total_tokens``, ``total_cost_usd`` (the
         DISPLAY cost sum — statusLine ``S`` for claude-native), and
@@ -879,10 +886,12 @@ def load_session_usage(
         the policy seed (:func:`_policy_usage_seed`) reads
         ``policy_cost_usd`` (both unaffected by ``by_model``).
     """
-    conv = conversation_store.get_conversation(conversation_id)
-    if conv is None:
-        return {}
-    tree = _load_tree_conversations(conv.root_conversation_id, conversation_store)
+    if root_conversation_id is None:
+        conv = conversation_store.get_conversation(conversation_id)
+        if conv is None:
+            return {}
+        root_conversation_id = conv.root_conversation_id
+    tree = _load_tree_conversations(root_conversation_id, conversation_store)
     return _sum_subtree_usage(tree, conversation_id)
 
 

@@ -1152,3 +1152,23 @@ def test_build_with_preloaded_conversation_skips_own_read(
     assert calls["list_conversations"] == 1, calls
     assert dict(engine.usage) == dict(baseline.usage)
     assert engine.session_state == baseline.session_state
+
+
+def test_load_session_usage_with_preloaded_root_matches_self_resolved(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Passing the (immutable) root id skips the conversation read but
+    returns the identical subtree sum."""
+    from omnigent.runtime.policies.builder import load_session_usage
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
+    )
+    conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 0.05})
+
+    resolved = load_session_usage(child.id, conversation_store)
+    preloaded = load_session_usage(child.id, conversation_store, root_conversation_id=parent.id)
+    assert preloaded == resolved
+    assert preloaded["total_cost_usd"] == pytest.approx(0.05)
