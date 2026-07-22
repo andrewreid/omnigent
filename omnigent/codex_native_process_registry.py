@@ -192,6 +192,7 @@ def unregister_codex_native_process(
     """
     if not session_tag:
         return
+    _unpin_group_leader(session_tag)
     path = registry_path or codex_native_process_registry_path()
     with _registry_lock(path):
         entries = [entry for entry in _read_registry(path) if entry.session_tag != session_tag]
@@ -234,7 +235,7 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                 if now - entry.sigterm_at < _SIGKILL_GRACE_S:
                     survivors.append(entry)
                     continue
-                outcome = _escalate_sigkill(entry)
+                outcome, entry = _escalate_sigkill(entry)
                 if outcome == "killed":
                     signaled += 1
                 if outcome in ("killed", "retry"):
@@ -242,6 +243,7 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                     # pass before its metadata is dropped.
                     survivors.append(entry)
                     continue
+                _unpin_group_leader(entry.session_tag)
                 _reap_tmux_session(entry.tmux_session_name)
                 continue
             if not _pid_alive(entry.pid) or not _process_cmdline_has_tag(
@@ -265,6 +267,11 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                 )
                 survivors.append(entry)
                 continue
+            # Pin the leader's pid before signaling (best-effort, Linux):
+            # a held pidfd keeps the pgid from ever being recycled, so a
+            # later escalation in THIS process can group-kill members that
+            # were forked after the snapshot (e.g. from a SIGTERM handler).
+            _pin_group_leader(entry.session_tag, entry.pid)
             if _signal_process_group(entry.pgid, signal.SIGTERM):
                 _logger.info(
                     "SIGTERMed ownerless codex-native process group %d (pid %d)",
@@ -273,6 +280,8 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                 )
                 signaled += 1
                 entry = replace(entry, sigterm_at=now, members=members)
+            else:
+                _unpin_group_leader(entry.session_tag)
             # Keep the entry either way: a failed signal retries on the
             # next pass, a delivered one is re-checked for escalation.
             survivors.append(entry)
@@ -284,53 +293,80 @@ def _escalate_sigkill(entry: CodexNativeProcessEntry) -> str:
     """
     SIGKILL whatever provably remains of an already-SIGTERMed entry.
 
-    With a member snapshot, each recorded ``(pid, start-time)`` identity is
-    re-verified and only matching survivors are killed — pid reuse fails
-    the start-time check. Without a snapshot, a group kill is allowed only
-    while the tagged leader itself is still alive to prove ownership;
-    otherwise nothing is signaled.
+    While group ownership is provable — an identity-anchored recorded
+    member, or a pinned leader pid — the group is re-scanned (merging
+    members forked after the snapshot) and killed atomically via the
+    group signal, plus per-member verified kills. Without proof, nothing
+    is signaled: the entry is retained while unverifiable occupants
+    remain, and dropped only once the group is verifiably empty.
 
     :param entry: The SIGTERMed registry entry past its grace.
-    :returns: ``"killed"`` when a SIGKILL was delivered, ``"retry"`` when a
-        kill failed and should be retried, ``"gone"`` when every member is
-        verifiably absent, ``"unverifiable"`` when no survivor can be
-        safely identified — the last two mean the entry can be dropped.
+    :returns: ``(outcome, entry)`` — the possibly member-merged entry and
+        ``"killed"`` (SIGKILL delivered), ``"retry"`` (keep and retry),
+        ``"gone"`` (verifiably empty), or ``"unverifiable"`` (legacy entry
+        with no safe target) — the last two mean the entry can be dropped.
     """
     kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
-    if entry.members is not None:
-        states = [(pid, start, _member_identity_state(pid, start)) for pid, start in entry.members]
-        alive = [(pid, start) for pid, start, state in states if state == "match"]
-        if alive:
-            delivered = [pid for pid, start in alive if _kill_member_verified(pid, start)]
-            if delivered:
+    if entry.members is None:
+        # Legacy entry written before member snapshots existed: a group
+        # kill is safe only while the tagged leader still proves ownership.
+        if _pid_alive(entry.pid) and _process_cmdline_has_tag(entry.pid, entry.session_tag):
+            if _signal_process_group(entry.pgid, kill_sig):
                 _logger.warning(
-                    "codex-native group %d survived SIGTERM; SIGKILLed member(s) %s",
+                    "ownerless codex-native process group %d survived SIGTERM; SIGKILLed",
                     entry.pgid,
-                    delivered,
                 )
-                return "killed"
-            return "retry"
-        if any(state == "unverifiable" for _pid, _start, state in states):
-            # A member that exists but cannot be identified might still be
-            # ours; keep the entry rather than declaring the group gone.
-            return "retry"
-        return "gone"
-    # Legacy entry written before member snapshots existed: a group kill
-    # is safe only while the tagged leader still proves ownership.
-    if _pid_alive(entry.pid) and _process_cmdline_has_tag(entry.pid, entry.session_tag):
-        if _signal_process_group(entry.pgid, kill_sig):
+                return "killed", entry
+            return "retry", entry
+        _logger.info(
+            "dropping codex-native entry for group %d: tagged leader gone and no "
+            "member snapshot to verify survivors",
+            entry.pgid,
+        )
+        return "unverifiable", entry
+    anchored = any(_member_identity_state(pid, start) == "match" for pid, start in entry.members)
+    pinned = entry.session_tag in _pinned_leader_fds
+    populated = _proc.group_populated(entry.pgid)
+    if anchored or (pinned and populated is True):
+        # Group ownership is still provable: an anchored recorded member
+        # proves group continuity since the snapshot, and a pinned leader
+        # pid proves the pgid was never recycled. Merge any members forked
+        # after the snapshot, then kill the whole group atomically — a
+        # per-pid list alone can never close over a fork racing it.
+        fresh = _group_member_identities(entry.pgid)
+        if fresh:
+            merged = dict(entry.members)
+            merged.update(dict(fresh))
+            entry = replace(entry, members=tuple(sorted(merged.items())))
+        delivered = [
+            pid
+            for pid, start in entry.members
+            if _member_identity_state(pid, start) == "match" and _kill_member_verified(pid, start)
+        ]
+        group_killed = _signal_process_group(entry.pgid, kill_sig)
+        if delivered or group_killed:
             _logger.warning(
-                "ownerless codex-native process group %d survived SIGTERM; SIGKILLed",
+                "codex-native group %d survived SIGTERM; SIGKILLed member(s) %s",
                 entry.pgid,
+                delivered or "via group signal",
             )
-            return "killed"
-        return "retry"
-    _logger.info(
-        "dropping codex-native entry for group %d: tagged leader gone and no "
-        "member snapshot to verify survivors",
-        entry.pgid,
-    )
-    return "unverifiable"
+            return "killed", entry
+        return "retry", entry
+    if any(_member_identity_state(pid, start) == "unverifiable" for pid, start in entry.members):
+        # A member that exists but cannot be identified might still be
+        # ours; keep the entry rather than declaring the group gone.
+        return "retry", entry
+    if populated is True:
+        # Every recorded member is gone, yet the group has occupants and
+        # nothing proves they are ours (no anchor, no pin) — retain the
+        # entry instead of leaking or killing strangers.
+        _logger.warning(
+            "codex-native group %d has unverifiable occupant(s) after all "
+            "recorded members exited; retaining its entry",
+            entry.pgid,
+        )
+        return "retry", entry
+    return "gone", entry
 
 
 @contextlib.contextmanager
@@ -535,6 +571,30 @@ def _group_member_identities(pgid: int) -> tuple[tuple[int, str], ...] | None:
     if not members:
         return None
     return tuple(sorted(members.items()))
+
+
+# Process-local pidfd per session tag, opened on the (verified-live) group
+# leader just before its SIGTERM. A held pidfd keeps the leader's pid — and
+# therefore the pgid — from ever being recycled, so escalation in this same
+# process may group-kill even after every recorded member has exited.
+# Best-effort and Linux-only; other processes fall back to anchor gating.
+_pinned_leader_fds: dict[str, int] = {}
+
+
+def _pin_group_leader(session_tag: str, pid: int) -> None:
+    pidfd_open = getattr(os, "pidfd_open", None)
+    if pidfd_open is None:
+        return
+    _unpin_group_leader(session_tag)
+    with contextlib.suppress(OSError):
+        _pinned_leader_fds[session_tag] = pidfd_open(pid)
+
+
+def _unpin_group_leader(session_tag: str) -> None:
+    fd = _pinned_leader_fds.pop(session_tag, None)
+    if fd is not None:
+        with contextlib.suppress(OSError):
+            os.close(fd)
 
 
 def _member_identity_state(pid: int, identity: str) -> str:

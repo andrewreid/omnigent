@@ -258,6 +258,15 @@ def group_member_identities(pgid: int) -> dict[int, str] | None:
         return None
     members: dict[int, str] = {}
     for pid in pids:
+        # Identity → membership → identity: a stable identity across the
+        # membership check proves the verdict applies to this incarnation,
+        # so a pid recycled mid-scan cannot bind a stranger to the list.
+        try:
+            first = repr(psutil.Process(pid).create_time())
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.Error, OSError):
+            return None  # exists but unreadable — snapshot incomplete
         try:
             if _getpgid_fn(pid) != pgid:
                 continue
@@ -266,12 +275,37 @@ def group_member_identities(pgid: int) -> dict[int, str] | None:
         except OSError:
             return None  # membership unknowable — snapshot incomplete
         try:
-            members[pid] = repr(psutil.Process(pid).create_time())
+            second = repr(psutil.Process(pid).create_time())
         except psutil.NoSuchProcess:
-            continue  # exited between the group check and the identity read
+            continue
         except (psutil.Error, OSError):
-            return None  # member exists but is unreadable — fail closed
+            return None
+        if second != first:
+            continue  # recycled across the check — not provably a member
+        members[pid] = first
     return members or None
+
+
+def group_populated(pgid: int) -> bool | None:
+    """
+    Whether process group *pgid* currently has any members.
+
+    Unreaped zombies count as members, so a just-SIGKILLed group reads as
+    populated until its reaper runs — callers treat that as "not yet
+    verifiably empty" and retry.
+
+    :param pgid: The process group to probe.
+    :returns: ``True``/``False``, or ``None`` where groups don't exist.
+    """
+    if pgid <= 0 or _killpg_fn is None:
+        return None
+    try:
+        _killpg_fn(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
 
 
 def kill_verified(pid: int, identity: str, sig: int) -> bool:

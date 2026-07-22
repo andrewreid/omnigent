@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import secrets
@@ -1453,22 +1454,26 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
     group is exactly their tree — vendor CLI and MCP fleet
     included).
 
-    Member identities of each holder's group are snapshotted
-    *before* the SIGTERM, so escalation and the final death
-    check track the whole tree — not just the holder, which may
-    exit promptly while a TERM-ignoring child survives. SIGKILL
-    goes only to identity-verified members (see
-    :func:`omnigent.inner._proc.kill_verified`), then the
-    survivors are polled until verifiably gone.
+    Member identities of each holder's group are snapshotted before the
+    SIGTERM and — critically — persisted into the instance dir
+    (:data:`_REAP_STATE_FILE`), so a later pass still knows the tree even
+    after the socket-holding leader exits and lsof finds nothing. During
+    escalation, groups whose ownership is still provable (a fresh holder
+    this pass, or an identity-anchored recorded member) are re-scanned to
+    merge members forked after the snapshot and then killed atomically
+    via the group signal, alongside per-member verified kills. The dir is
+    released only when every recorded member is definitively gone and
+    every owned group is verifiably empty.
 
     :param instance_dir: The orphaned AP's per-instance dir
         whose runner subprocesses to terminate.
     :returns: ``True`` when every tracked process is confirmed
         gone (or none were found); ``False`` when a socket
-        lookup failed or a process is still alive — the caller
+        lookup failed or a survivor may remain — the caller
         must keep the dir so a later sweep retries.
     """
-    tracked: dict[int, str] = {}
+    groups = _load_reap_state(instance_dir)
+    fresh_pgids: set[int] = set()
     lookup_failed = False
     for socket_file in instance_dir.glob("conv-*.sock"):
         pids = await _pids_holding_socket(socket_file)
@@ -1476,41 +1481,61 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
             lookup_failed = True
             continue
         for pid in pids:
-            members = _holder_member_identities(pid)
-            if members is None:
+            snapshot = _holder_group_snapshot(pid)
+            if snapshot is None:
                 # The holder's tree could not be completely snapshotted:
                 # signaling it anyway would leave survivors escalation
                 # cannot verify. Keep the dir and retry.
                 lookup_failed = True
                 continue
+            pgid, members = snapshot
             if not members:
                 continue  # holder already gone
-            for member, identity in members.items():
-                tracked.setdefault(member, identity)
+            groups.setdefault(pgid, {}).update(members)
+            fresh_pgids.add(pgid)
             _signal_pid_tree(pid, signal.SIGTERM)
 
-    if tracked:
+    tracked_any = any(members for members in groups.values())
+    if tracked_any:
+        # Persist before waiting: metadata must survive this process too.
+        _save_reap_state(instance_dir, groups)
         await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
-        for pid, identity in tracked.items():
-            if _proc.process_identity_state(pid, identity) != "match":
-                continue
-            _logger.warning(
-                "orphan runner pid %d survived SIGTERM; escalating to SIGKILL",
-                pid,
+        kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+        for pgid, members in groups.items():
+            anchored = any(
+                _proc.process_identity_state(pid, identity) == "match"
+                for pid, identity in members.items()
             )
-            _proc.kill_verified(pid, identity, getattr(signal, "SIGKILL", signal.SIGTERM))
+            owned = pgid > 0 and (anchored or pgid in fresh_pgids)
+            if owned:
+                # Ownership provable (anchored continuity, or verified via
+                # a live holder seconds ago): merge late-forked members and
+                # kill the group atomically — a static pid list can never
+                # close over a fork racing it.
+                fresh = _proc.group_member_identities(pgid)
+                if fresh:
+                    members.update(fresh)
+            for pid, identity in members.items():
+                if _proc.process_identity_state(pid, identity) != "match":
+                    continue
+                _logger.warning(
+                    "orphan runner pid %d survived SIGTERM; escalating to SIGKILL",
+                    pid,
+                )
+                _proc.kill_verified(pid, identity, kill_sig)
+            if owned:
+                with contextlib.suppress(OSError):
+                    os.killpg(pgid, kill_sig)
         deadline = time.monotonic() + _ORPHAN_KILL_VERIFY_TIMEOUT_S
-        # Only a definitive "gone" clears a tracked member; an unreadable
-        # one keeps the dir so a later pass can settle it.
-        while any(
-            _proc.process_identity_state(pid, identity) != "gone"
-            for pid, identity in tracked.items()
-        ):
+        while not _reap_state_settled(groups):
             if time.monotonic() >= deadline:
+                _save_reap_state(instance_dir, groups)
                 return False
             await asyncio.sleep(0.1)
 
     if lookup_failed:
+        if tracked_any:
+            _save_reap_state(instance_dir, groups)
         return False
     # Positive-absence backstop, independent of lsof's ambiguous exit
     # status: a live runner always listens on its conv socket, so any
@@ -1525,41 +1550,122 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
     return True
 
 
-def _holder_member_identities(pid: int) -> dict[int, str] | None:
+def _holder_group_snapshot(pid: int) -> tuple[int, dict[int, str]] | None:
     """
-    Snapshot the identities of the socket holder's whole group.
+    Snapshot the socket holder's group and its member identities.
 
     Taken while the holder still proves ownership (it holds a conv socket
     under a dead-AP dir), so the recorded ``pid -> start-identity`` map is
     a safe kill/verify list even after the holder itself exits. When the
     holder shares OUR group (legacy topology) group operations are off the
     table — a group signal would hit ourselves — so only the holder is
-    tracked and signaled.
+    tracked and signaled, under the sentinel pgid ``0``.
 
     :param pid: The socket-holding process id.
-    :returns: ``pid -> identity`` for every member to track; empty when
-        the holder is definitively gone; ``None`` when the tree could not
-        be completely snapshotted — the caller must not signal it.
+    :returns: ``(pgid, members)`` — pgid ``0`` for an ungrouped holder;
+        empty members when the holder is definitively gone; ``None`` when
+        the tree could not be completely snapshotted — the caller must
+        not signal it.
     """
     if pid <= 0:
-        return {}
-    own_group = False
+        return (0, {})
     if hasattr(os, "getpgid"):
         try:
             pgid = os.getpgid(pid)
             own_group = pgid == os.getpgid(0)
         except ProcessLookupError:
-            return {}
+            return (0, {})
         except OSError:
             return None
         if not own_group:
-            return _proc.group_member_identities(pgid)
+            members = _proc.group_member_identities(pgid)
+            if members is None:
+                return None
+            return (pgid, members)
     identity = _proc.process_start_identity(pid)
     if identity is None:
         # Gone or unreadable: lsof re-resolves a gone holder to nothing on
         # the next pass, and an unreadable one must not be signaled blind.
         return None
-    return {pid: identity}
+    return (0, {pid: identity})
+
+
+_REAP_STATE_FILE = "REAP_STATE"
+
+
+def _load_reap_state(instance_dir: Path) -> dict[int, dict[int, str]]:
+    """
+    Load the persisted ``pgid -> {pid: identity}`` reap bookkeeping.
+
+    The state outlives the sweep process, so a later pass still knows
+    which tree it SIGTERMed even after lsof can no longer see a holder.
+    Tolerant of a missing or malformed file (empty state).
+
+    :param instance_dir: The orphaned AP's per-instance dir.
+    :returns: Recorded groups; sentinel pgid ``0`` holds ungrouped pids.
+    """
+    try:
+        payload = json.loads((instance_dir / _REAP_STATE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    groups: dict[int, dict[int, str]] = {}
+    for pgid_str, members in payload.items():
+        try:
+            pgid = int(pgid_str)
+        except ValueError:
+            continue
+        if not isinstance(members, dict):
+            continue
+        parsed: dict[int, str] = {}
+        for pid_str, identity in members.items():
+            try:
+                member = int(pid_str)
+            except ValueError:
+                continue
+            if isinstance(identity, str) and identity:
+                parsed[member] = identity
+        if parsed:
+            groups[pgid] = parsed
+    return groups
+
+
+def _save_reap_state(instance_dir: Path, groups: dict[int, dict[int, str]]) -> None:
+    """
+    Persist the reap bookkeeping into the instance dir (best-effort).
+
+    :param instance_dir: The orphaned AP's per-instance dir.
+    :param groups: Current ``pgid -> {pid: identity}`` tracking.
+    """
+    payload = {
+        str(pgid): {str(pid): identity for pid, identity in members.items()}
+        for pgid, members in groups.items()
+        if members
+    }
+    try:
+        tmp = instance_dir / (_REAP_STATE_FILE + ".tmp")
+        tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, instance_dir / _REAP_STATE_FILE)
+    except OSError:
+        _logger.debug("could not persist reap state under %s", instance_dir, exc_info=True)
+
+
+def _reap_state_settled(groups: dict[int, dict[int, str]]) -> bool:
+    """
+    Whether every recorded member is definitively gone and every owned
+    group verifiably empty.
+
+    :param groups: Current ``pgid -> {pid: identity}`` tracking.
+    :returns: ``True`` only on positive verification of absence.
+    """
+    for pgid, members in groups.items():
+        for pid, identity in members.items():
+            if _proc.process_identity_state(pid, identity) != "gone":
+                return False
+        if pgid > 0 and _proc.group_populated(pgid) is True:
+            return False
+    return True
 
 
 def _signal_pid_tree(pid: int, sig: signal.Signals) -> bool:
