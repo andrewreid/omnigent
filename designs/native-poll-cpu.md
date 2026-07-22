@@ -531,6 +531,28 @@ No blocking findings. Two fixes:
 2. **The watcher docstring still described Claude/Pi only** while eight roles
    were supported. It now points at `PTY_STATUS_OWNING_TERMINAL_ROLES`.
 
+### 7.4 Fifth round — cross-vendor review
+
+No blocking findings. Two fixes:
+
+1. **`Condition.wait` was not predicate-looped.** `consume`'s timeout *is* the
+   watcher's backed-off poll interval, so a `wait` returning before its
+   timeout with nothing pending reads as "the interval elapsed" and forks tmux
+   early — precisely the cost the backoff removes. Now
+   `wait_for(lambda: self._pending, timeout)`, which loops against a monotonic
+   deadline. Two tests drive a `Condition` subclass whose `wait` always
+   returns early: one asserts the sleep is still served in full and the loop
+   re-waited, the other that a real wake landing mid-loop is still taken
+   promptly. Reverting to the bare `wait` fails both.
+2. **`wake_idle_watcher`'s thread-safety note still described a
+   `threading.Event`.** Updated to `_WakeSignal`'s lock and its retention
+   guarantee.
+
+The first spurious-wake stub held the condition's lock across its early
+return, which deadlocked the thread posting the wake — the opposite of the
+situation under test. It now releases and re-acquires around the return, as
+the real `wait` does.
+
 ## 8. Residual risks
 
 1. **Late `running` edge on autonomous pane output.** A terminal that starts

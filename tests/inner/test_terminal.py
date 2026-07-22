@@ -1789,6 +1789,89 @@ def test_wake_signal_couples_reason_to_the_wake_under_interleaving() -> None:
     assert signal.consume(0.0) == (True, False)
 
 
+class _SpuriousCondition(threading.Condition):
+    """Condition whose ``wait`` always returns early without a notify.
+
+    Stands in for a spurious wake-up so the predicate loop can be exercised
+    deterministically instead of hoping the platform produces one.
+
+    :param waits: Running count of ``wait`` calls, asserted by the test.
+    """
+
+    def __init__(self) -> None:
+        """Start with no waits recorded."""
+        super().__init__()
+        self.waits = 0
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Return early, as a spurious wake-up would.
+
+        Drops the lock around the (non-)wait exactly as the real ``wait``
+        does. A stub that held it would deadlock any thread trying to post a
+        wake, which is the opposite of the situation under test.
+
+        :param timeout: Ignored; the point is to return before it elapses.
+        :returns: ``False``, matching a timed-out wait.
+        """
+        del timeout
+        self.waits += 1
+        self.release()
+        try:
+            time.sleep(0.0005)
+        finally:
+            self.acquire()
+        return False
+
+
+def test_wake_signal_consume_survives_spurious_condition_returns() -> None:
+    """
+    A spurious ``wait`` return does not end the sleep early or invent a wake.
+
+    ``consume``'s timeout IS the watcher's backed-off poll interval. A bare
+    ``Condition.wait`` that returned early would be read as "the interval
+    elapsed", so the watcher would fork tmux ahead of schedule — the cost the
+    backoff exists to remove. The predicate loop keeps waiting until a wake is
+    actually pending or the monotonic deadline passes.
+
+    :returns: None.
+    """
+    signal = terminal_mod._WakeSignal()
+    spurious = _SpuriousCondition()
+    signal._condition = spurious
+
+    started = time.monotonic()
+    assert signal.consume(0.05) == (False, False)
+    elapsed = time.monotonic() - started
+
+    # Looped rather than accepting the first spurious return...
+    assert spurious.waits > 1
+    # ...and still waited out the requested interval.
+    assert elapsed >= 0.045, f"backoff sleep truncated to {elapsed:.4f}s"
+
+
+def test_wake_signal_consume_takes_a_wake_that_lands_during_spurious_returns() -> None:
+    """
+    A real wake arriving mid-loop is still picked up promptly.
+
+    The predicate loop must not be so busy re-waiting that it misses the wake
+    it is looping for.
+
+    :returns: None.
+    """
+    signal = terminal_mod._WakeSignal()
+    spurious = _SpuriousCondition()
+    signal._condition = spurious
+    waker = threading.Timer(0.02, lambda: signal.wake(expect_output=True))
+    waker.start()
+    try:
+        started = time.monotonic()
+        assert signal.consume(5.0) == (True, True)
+        # Returned on the wake, not by waiting out the (much longer) timeout.
+        assert time.monotonic() - started < 1.0
+    finally:
+        waker.cancel()
+
+
 def test_wake_signal_consume_blocks_until_a_wake_arrives() -> None:
     """
     ``consume`` waits out its timeout, and returns early when woken.
