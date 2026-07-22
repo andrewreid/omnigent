@@ -2219,15 +2219,24 @@ class SqlAlchemyConversationStore(ConversationStore):
         # kind and archived both live on the AP ``conversations`` table now
         # (kind derived from parent-nullness, archived a real column), so they
         # are filtered directly on the AP query below. The only filters that
-        # still require an Omnigent-side prefetch are the permission scopes.
+        # still require Omnigent-side data are the permission scopes.
         needs_meta_filter = (accessible_by is not None) or (owned_by is not None)
 
+        # ACL strategy. Single-DB (the AP and Omnigent tables share one bind):
+        # push the permission check into the conversations query as a
+        # correlated EXISTS, so LIMIT bounds the work and no ids round-trip
+        # through Python — the prefetch otherwise costs O(all-accessible) per
+        # request (ids out, ids back in as an IN clause, two UUID conversions
+        # each). Split-DB: a cross-DB EXISTS is impossible, so keep the
+        # prefetch fallback.
+        acl_pushdown = needs_meta_filter and self._conv_engine is self._engine
+
         qualifying_ids: list[str] | None = None
-        if needs_meta_filter:
+        if needs_meta_filter and not acl_pushdown:
             # Pre-fetch permission-qualifying IDs from the Omnigent DB
             # (session_permissions), then filter the AP query. accessible_by and
             # owned_by are intersected (both applied) to match the prior
-            # behaviour. (ACL pushdown to a single AP query is a follow-up.)
+            # behaviour.
             with self._session() as meta_sess:
                 accessible_set: set[str] | None = None
                 owned_set: set[str] | None = None
@@ -2264,6 +2273,34 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             if qualifying_ids is not None:
                 stmt = stmt.where(SqlConversation.id.in_(qualifying_ids))
+
+            if acl_pushdown:
+                # Correlated on both PK members so Postgres can drive the
+                # semi-join off pk_session_permissions
+                # (workspace_id, user_id, conversation_id). accessible_by and
+                # owned_by are intersected (both applied), matching the
+                # prefetch path.
+                if accessible_by is not None:
+                    stmt = stmt.where(
+                        select(SqlSessionPermission.conversation_id)
+                        .where(
+                            SqlSessionPermission.workspace_id == SqlConversation.workspace_id,
+                            SqlSessionPermission.conversation_id == SqlConversation.id,
+                            SqlSessionPermission.user_id == accessible_by,
+                        )
+                        .exists()
+                    )
+                if owned_by is not None:
+                    stmt = stmt.where(
+                        select(SqlSessionPermission.conversation_id)
+                        .where(
+                            SqlSessionPermission.workspace_id == SqlConversation.workspace_id,
+                            SqlSessionPermission.conversation_id == SqlConversation.id,
+                            SqlSessionPermission.user_id == owned_by,
+                            SqlSessionPermission.level >= LEVEL_OWNER,
+                        )
+                        .exists()
+                    )
 
             # Kind filter as parent-nullness (see above): sub_agent ⇔ parent set.
             if kind_requires_parent is True:
