@@ -1462,22 +1462,44 @@ async def test_dead_leader_attribution_uses_registry_and_spawn_records(
     assert host._dead_leader_group_is_ours(4242, pin) is False
 
 
-def test_kill_switch_covers_periodic_sweep_and_shutdown_drain(
+async def test_kill_switch_covers_periodic_sweep_and_shutdown_drain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One switch disables ALL active ownerless killing in the host."""
-    from omnigent.host.connect import _OWNERLESS_SWEEP_ENV_VAR, _ownerless_sweep_enabled
+    """One switch disables ALL active ownerless killing in the host.
 
-    monkeypatch.setenv(_OWNERLESS_SWEEP_ENV_VAR, "0")
-    assert not _ownerless_sweep_enabled()
-    # run()'s shutdown path gates the final drain on the same predicate;
-    # assert the source wiring so a future refactor cannot split them.
-    import inspect
-
+    Executes run() to completion with the switch off and on, spying on
+    the sweep loop and the shutdown drain: off, neither may fire; on,
+    the shutdown drain must.
+    """
     from omnigent.host import connect as connect_mod
 
-    run_src = inspect.getsource(connect_mod.HostProcess.run)
-    assert "self._is_subreaper and _ownerless_sweep_enabled()" in run_src
+    async def _run_with_switch(value: str) -> tuple[bool, bool]:
+        monkeypatch.setenv(connect_mod._OWNERLESS_SWEEP_ENV_VAR, value)
+        host = _make_host_process()
+        swept: list[bool] = []
+        drained: list[bool] = []
+
+        async def _spy_sweep() -> None:
+            swept.append(True)
+
+        async def _spy_drain(budget_s: float = 3.0) -> None:
+            drained.append(True)
+
+        async def _interrupt() -> None:
+            # Yield once so the just-created sweep task gets scheduled
+            # before shutdown begins.
+            await asyncio.sleep(0)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(host, "_ownerless_sweep_loop", _spy_sweep)
+        monkeypatch.setattr(host, "_final_adoption_drain", _spy_drain)
+        monkeypatch.setattr(host, "_connect_and_serve", _interrupt)
+        monkeypatch.setattr(connect_mod, "_install_child_subreaper", lambda: True)
+        await host.run()
+        return bool(swept), bool(drained)
+
+    assert await _run_with_switch("0") == (False, False)
+    assert await _run_with_switch("1") == (True, True)
 
 
 async def test_final_adoption_drain_reaps_condemned_trees_at_shutdown() -> None:
