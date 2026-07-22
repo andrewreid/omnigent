@@ -353,6 +353,18 @@ def _escalate_sigkill(
         # A member that exists but cannot be identified might still be
         # ours; keep the entry rather than declaring the group gone.
         return "retry", entry
+    if _proc.group_populated(entry.pgid) is True:
+        # Every recorded member is verifiably gone, yet the group still
+        # has occupants (e.g. children forked after the snapshot). This
+        # tier cannot prove they are ours, so it retains the entry and
+        # logs instead of leaking silently; a subreaper host drains such
+        # groups through its adopted-orphan reaper.
+        _logger.warning(
+            "codex-native group %d has unverifiable occupant(s) after all "
+            "recorded members exited; retaining its entry",
+            entry.pgid,
+        )
+        return "retry", entry
     return "gone", entry
 
 

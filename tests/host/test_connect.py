@@ -1248,10 +1248,16 @@ async def test_drain_defers_dead_leader_and_adopted_sweep_drains_group(
 
         # Zombie drain: the dead leader with a live group is pinned, not
         # consumed — leader.poll() must still see it unreaped.
+        host._ownerless_sweep_task = asyncio.current_task()  # deferral requires a releaser
         host._reap_orphans_once()
         assert leader.pid in host._adopted_pins
         assert host._adopted_pins[leader.pid].deferred_zombie
-        assert leader.poll() is None, "pinned zombie must not be reaped"
+        # Non-consuming probe: Popen.poll() would reap the zombie and
+        # destroy the very kernel pin under test.
+        import psutil as psutil_mod
+
+        assert psutil_mod.Process(leader.pid).status() == psutil_mod.STATUS_ZOMBIE
+        assert leader.returncode is None, "Popen must never have observed the exit"
 
         # Adopted sweep: the child's signature attributes the group; the
         # pinned killpg drains it (grace zeroed: TERM pass then KILL pass).
@@ -1273,6 +1279,7 @@ async def test_drain_defers_dead_leader_and_adopted_sweep_drains_group(
         host._reap_adopted_orphans_once()
         assert leader.pid not in host._adopted_pins
     finally:
+        host._ownerless_sweep_task = None
         import contextlib as ctx
 
         if child_pid is not None:
@@ -1376,6 +1383,83 @@ async def test_adopted_sweep_leaves_unknown_children_untouched() -> None:
     finally:
         child.kill()
         child.wait(timeout=10)
+
+
+async def test_adopted_sweep_excludes_recorded_local_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The --local Omnigent server is host-owned, never an adopted orphan.
+
+    Even with a condemn signature planted in its argv, the recorded local
+    server pid must be neither pinned nor signaled.
+    """
+    import subprocess
+    import sys
+
+    host = _make_host_process()
+    host._is_subreaper = True
+
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(120)",
+            "omnigent-start-on-attach",
+        ],
+        start_new_session=True,
+    )
+    try:
+        monkeypatch.setattr(
+            "omnigent.host.local_server._read_local_server_pid_file",
+            lambda: (child.pid, 1234),
+        )
+        host._reap_adopted_orphans_once()
+        assert child.pid not in host._adopted_pins
+        assert child.poll() is None, "recorded local server must survive the sweep"
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+
+
+async def test_dead_leader_attribution_uses_registry_and_spawn_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred dead leader is condemned via recorded attribution.
+
+    With no live member carrying a signature, attribution falls to the
+    codex registry match, then the harness spawn record; with neither,
+    the group is not ours and the pin is released.
+    """
+    from omnigent.host.connect import _AdoptedPin
+
+    host = _make_host_process()
+    host._is_subreaper = True
+    pin = _AdoptedPin(identity="id-x", is_leader=True, deferred_zombie=True)
+
+    monkeypatch.setattr(
+        "omnigent.host.connect._live_group_member_pids", lambda _pgid, exclude=None: []
+    )
+    monkeypatch.setattr(
+        "omnigent.codex_native_process_registry.ownerless_entry_matches_leader",
+        lambda _pid, _ident: True,
+    )
+    assert host._dead_leader_group_is_ours(4242, pin) is True
+
+    monkeypatch.setattr(
+        "omnigent.codex_native_process_registry.ownerless_entry_matches_leader",
+        lambda _pid, _ident: False,
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses.process_manager.harness_spawn_record_matches",
+        lambda _pid, _ident: True,
+    )
+    assert host._dead_leader_group_is_ours(4242, pin) is True
+
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses.process_manager.harness_spawn_record_matches",
+        lambda _pid, _ident: False,
+    )
+    assert host._dead_leader_group_is_ours(4242, pin) is False
 
 
 async def test_zombie_drain_skips_pinned_and_reaps_the_rest() -> None:
