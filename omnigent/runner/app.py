@@ -13727,6 +13727,9 @@ def create_runner_app(
             sub_spec = _find_spec_by_name(cached_spec, _sa_name)
             if sub_spec is not None:
                 cached_spec = sub_spec
+                # Child workdir = its own agents/<name>/ dir, never the
+                # parent bundle root (see _sub_agent_bundle_dir).
+                cached_spec_workdir = _sub_agent_bundle_dir(cached_spec_workdir, _sa_name)
                 _session_spec_cache[conv] = (
                     ResolvedSpec(spec=cached_spec, workdir=cached_spec_workdir)
                     if cached_spec_workdir is not None
@@ -19011,6 +19014,9 @@ async def _resolve_harness_config(
                 sub_spec = _find_spec_by_name(spec, sub_agent_name)
                 if sub_spec is not None:
                     spec = sub_spec
+                    # Child workdir = its own agents/<name>/ dir, never the
+                    # parent bundle root (see _sub_agent_bundle_dir).
+                    workdir = _sub_agent_bundle_dir(workdir, sub_agent_name)
             harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
             harness = canonicalize_harness(harness) or harness
             spawn_env = _build_spawn_env_from_spec(
