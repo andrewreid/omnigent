@@ -210,6 +210,15 @@ produce output; waking it would put it on high-rate polling for an unrelated
 turn, which is the cost this change exists to remove. The same frozenset gates
 the watcher's own status emission, so the two cannot drift.
 
+The wake and its reason live in one `_WakeSignal`, taken together under a
+single lock by `consume()`. They began as a `threading.Event` beside a `bool`,
+which meant a wake's two halves could be observed and cleared independently —
+whether that was safe took an interleaving-by-interleaving argument, which is
+the tell that the state wanted to be one object. Two properties are now
+structural rather than argued: a wake can never be split across ticks, and one
+raised after `consume()` returns stays pending for the next call instead of
+being dropped.
+
 **Grace.** A turn-start wake says output is *coming*, not that it has arrived,
 and turn setup can outlast the idle threshold — so it also pins the base
 interval for `_IDLE_POLL_WAKE_GRACE_SECONDS`. Two bounds keep that cheap:
@@ -502,6 +511,26 @@ and `loop`). Caught by the registry suite (`NameError: name 'loop' is not
 defined`) and restored; the diff was then audited line by line to confirm
 nothing else was lost.
 
+### 7.3 Fourth round — cross-vendor review
+
+No blocking findings. Two fixes:
+
+1. **The wake and its reason were separate cross-thread state.** A
+   `threading.Event` plus a `bool`, set and cleared independently: a turn wake
+   landing between another wake's `clear` and the reason read had its halves
+   consumed by different ticks. Walking the interleavings showed the grace
+   still got armed in each one — but needing that walk at all was the defect.
+   Both now live in `_WakeSignal` and are taken together by `consume()` under
+   one lock, which also subsumes the round-3 "don't clear an unobserved wake"
+   patch: there is no longer a window in which a wake can be reported absent
+   *and* discarded. `expect_output` latches while a wake is pending, so a
+   client interaction racing a turn cannot downgrade it. Covered by
+   deterministic interleaving tests in both orders, plus retention and blocking
+   cases; two mutations (unlatched reason, non-clearing consume) both fail
+   them.
+2. **The watcher docstring still described Claude/Pi only** while eight roles
+   were supported. It now points at `PTY_STATUS_OWNING_TERMINAL_ROLES`.
+
 ## 8. Residual risks
 
 1. **Late `running` edge on autonomous pane output.** A terminal that starts
@@ -538,7 +567,16 @@ nothing else was lost.
    a role lookup per terminal happens for every session, native or not. At the
    sizes involved (a handful of terminals per session) that is a dict lookup
    and a short loop, once per turn.
-9. **An unobserved wake costs one base interval.** Not clearing a wake the
-   watcher did not observe is what keeps it from being destroyed, but it means
-   such a wake is serviced on the next sleep rather than immediately — up to
-   0.2 s late for the native watcher.
+9. **An unobserved wake costs one base interval.** A wake raised while the
+   tick body is running stays pending rather than being destroyed, but it is
+   serviced on the next sleep rather than immediately — up to 0.2 s late for
+   the native watcher.
+10. **The grace is released by any agent-attributed pane change, not only the
+    awaited turn's output.** A status-bar repaint during turn setup ends the
+    grace early, after which the ordinary idle threshold and backoff ramp
+    apply — so detection falls back to the ceiling (≤2 s native) rather than
+    staying pinned at base. Deliberate: `changed_this_tick` is the same signal
+    that drives `on_activity`/`running`, and giving the grace a private,
+    stricter notion of "real output" would put two definitions of activity in
+    one loop. Client-driven repaints are already excluded by
+    `suppress_activity`.

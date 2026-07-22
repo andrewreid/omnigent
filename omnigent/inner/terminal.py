@@ -490,6 +490,71 @@ def _next_idle_poll_interval(current: float, base: float) -> float:
 _SEND_KEYS_LITERAL_CHARS_PER_CALL = 1024
 
 
+class _WakeSignal:
+    """
+    Cross-thread wake for the threaded idle watcher.
+
+    Couples the wake and its *reason* under one lock. They started out as a
+    :class:`threading.Event` plus a separate ``bool``, which meant a wake's
+    reason and its event could be observed and cleared independently: a turn
+    wake landing between another wake's ``clear`` and the reason read had its
+    two halves consumed by different ticks. Reasoning about that required
+    enumerating interleavings, which is the tell that the state wanted to be
+    one object.
+
+    Two properties the watcher depends on, both structural here rather than
+    argued:
+
+    1. :meth:`consume` returns the pending flag and its reason atomically, so
+       a wake can never be split.
+    2. A wake raised after :meth:`consume` returns stays pending for the next
+       call. Nothing is dropped — a wake the watcher has not observed is never
+       cleared, so at worst it is serviced one base interval late.
+    """
+
+    def __init__(self) -> None:
+        """Start with no wake pending."""
+        self._condition = threading.Condition()
+        self._pending = False
+        self._expects_output = False
+
+    def wake(self, *, expect_output: bool) -> None:
+        """
+        Raise a wake, optionally marking that output is expected to follow.
+
+        ``expect_output`` latches: if any wake still pending when the watcher
+        consumes expected output, the consumed wake does too. A turn-start
+        wake therefore cannot be downgraded by a client interaction racing it.
+
+        :param expect_output: Whether agent output is expected but has not
+            arrived yet, which earns the consumer a grace window.
+        :returns: None.
+        """
+        with self._condition:
+            self._pending = True
+            self._expects_output = self._expects_output or expect_output
+            self._condition.notify_all()
+
+    def consume(self, timeout: float) -> tuple[bool, bool]:
+        """
+        Wait for a wake and take it, clearing both halves together.
+
+        :param timeout: Longest time to wait in seconds. Values at or below
+            zero poll without blocking, which is how the watcher checks for a
+            wake while already at its base interval.
+        :returns: ``(was_woken, expects_output)``. ``expects_output`` is only
+            ever ``True`` alongside ``was_woken``.
+        """
+        with self._condition:
+            if not self._pending and timeout > 0:
+                self._condition.wait(timeout)
+            woken = self._pending
+            expects_output = self._expects_output
+            self._pending = False
+            self._expects_output = False
+            return woken, expects_output
+
+
 class _IdleDetector:
     """
     Pure state machine for the pane-idle decision.
@@ -1101,13 +1166,7 @@ class TerminalInstance:
     # into it, a web client interacting with it, or the close path — so a quiet
     # watcher returns to its base interval immediately instead of discovering
     # the change up to a full backed-off interval later.
-    _idle_wake_event: threading.Event | None = field(default=None, repr=False)
-    # Set alongside the wake event when the waker expects agent output to
-    # follow (a turn being dispatched) rather than a one-off client repaint.
-    # The watcher consumes it to decide whether the wake also earns a grace
-    # window. Plain bool assignment, atomic under the GIL like the interaction
-    # stamp above.
-    _idle_wake_expects_output: bool = field(default=False, repr=False)
+    _idle_wake_signal: _WakeSignal | None = field(default=None, repr=False)
     # Monotonic timestamp of the last client interaction observed on this
     # terminal's web attach (keystroke / focus / mouse / resize / connect /
     # disconnect — see :meth:`note_client_interaction`). The idle watcher
@@ -1169,11 +1228,9 @@ class TerminalInstance:
             for client interactions, which repaint once and then stop.
         :returns: None.
         """
-        if expect_output:
-            self._idle_wake_expects_output = True
-        wake_event = self._idle_wake_event
-        if wake_event is not None:
-            wake_event.set()
+        wake_signal = self._idle_wake_signal
+        if wake_signal is not None:
+            wake_signal.wake(expect_output=expect_output)
 
     def last_pane_text(self) -> str | None:
         """Return the last visible pane text captured for diagnostics.
@@ -1721,15 +1778,14 @@ class TerminalInstance:
                 return
             self._stop_idle_watcher_thread()
         stop_event = threading.Event()
-        wake_event = threading.Event()
+        # A fresh signal per watcher, so a wake raised while none was running
+        # cannot hand this one a grace window it never asked for.
+        wake_signal = _WakeSignal()
         self._idle_stop_event = stop_event
-        self._idle_wake_event = wake_event
-        # A wake raised while no watcher was running would otherwise hand this
-        # fresh one a grace window it never asked for.
-        self._idle_wake_expects_output = False
+        self._idle_wake_signal = wake_signal
         self._idle_thread = threading.Thread(
             target=self._idle_watch_loop_threaded,
-            args=(stop_event, wake_event),
+            args=(stop_event, wake_signal),
             kwargs={
                 "on_idle": on_idle,
                 "on_activity": on_activity,
@@ -1745,7 +1801,7 @@ class TerminalInstance:
     def _idle_watch_loop_threaded(
         self,
         stop_event: threading.Event,
-        wake_event: threading.Event | None = None,
+        wake_signal: _WakeSignal | None = None,
         *,
         on_idle: Callable[[], None] | None = None,
         on_activity: Callable[[], None] | None = None,
@@ -1774,9 +1830,10 @@ class TerminalInstance:
             shutdown. Doubles as the poll-interval sleep via
             :meth:`Event.wait` so the join window is bounded by
             one poll interval, not the full sleep.
-        :param wake_event: Event set by :meth:`wake_idle_watcher` to cut
-            short the extra backoff sleep. ``None`` disables early wake-up
-            (the watcher still backs off and still stops promptly).
+        :param wake_signal: Signal raised by :meth:`wake_idle_watcher` to
+            cut short the extra backoff sleep, carrying whether output is
+            expected. ``None`` disables early wake-up (the watcher still backs
+            off and still stops promptly).
         :param on_idle: Optional idle-edge callback (see
             :meth:`start_idle_watcher_thread`); skipped when ``None``.
         :param on_activity: Optional pane-changed callback; fired each
@@ -1804,8 +1861,8 @@ class TerminalInstance:
         # normal turn pays a few extra captures rather than the whole window.
         hold_base_until = 0.0
         while self.running:
-            should_stop, woken = self._wait_next_idle_tick(
-                stop_event, wake_event, interval, base_interval
+            should_stop, woken, expects_output = self._wait_next_idle_tick(
+                stop_event, wake_signal, interval, base_interval
             )
             if should_stop:
                 return
@@ -1823,8 +1880,7 @@ class TerminalInstance:
                         base_interval,
                     )
                 interval = base_interval
-                if self._idle_wake_expects_output:
-                    self._idle_wake_expects_output = False
+                if expects_output:
                     hold_base_until = time.monotonic() + _IDLE_POLL_WAKE_GRACE_SECONDS
             if not self.running:
                 return
@@ -1909,50 +1965,41 @@ class TerminalInstance:
     def _wait_next_idle_tick(
         self,
         stop_event: threading.Event,
-        wake_event: threading.Event | None,
+        wake_signal: _WakeSignal | None,
         interval: float,
         base_interval: float,
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, bool]:
         """
         Sleep until the next watcher tick, honouring stop and wake signals.
 
         Split in two so a burst of wakes cannot become a burst of tmux
         subprocesses: the first *base_interval* is a floor that only
         ``stop_event`` interrupts, and only the extra backoff beyond it is
-        cut short by ``wake_event``. Polling therefore never exceeds the
-        watcher's configured base rate, however often a client interacts
-        with the pane. ``stop_event`` and ``wake_event`` are set together by
-        the close path, so teardown never waits out a backed-off sleep.
+        cut short by ``wake_signal``. Polling therefore never exceeds the
+        watcher's configured base rate, however often a client interacts with
+        the pane. The close path sets ``stop_event`` and raises a wake, so
+        teardown never waits out a backed-off sleep.
 
-        Only a wake this call actually observed is cleared. Clearing
-        unconditionally would swallow one that arrives between a timed-out
-        ``wait`` and the ``clear`` — the caller would be told it was not woken
-        while the signal was destroyed, losing both the interval reset and the
-        grace, and reopening the late-``running`` race the wake exists to
-        close. Leaving an unobserved wake set costs at most one base interval:
-        the next sleep sees it immediately. A wake raised while the tick body
-        runs is retained the same way.
+        The wake and its reason are taken together by
+        :meth:`_WakeSignal.consume`, so they cannot be split across ticks, and
+        a wake raised while the tick body runs stays pending for the next
+        sleep rather than being dropped.
 
         :param stop_event: Set by the close path to end the watcher.
-        :param wake_event: Set to cut the backoff short, or ``None``.
+        :param wake_signal: Signal cutting the backoff short, or ``None``.
         :param interval: Total seconds to wait, e.g. ``1.6``.
         :param base_interval: Un-interruptible floor, e.g. ``0.2``.
-        :returns: ``(should_stop, was_woken)``.
+        :returns: ``(should_stop, was_woken, expects_output)``.
         """
         if stop_event.wait(min(interval, base_interval)):
-            return True, False
-        if wake_event is None:
-            remaining = interval - base_interval
-            if remaining > 0 and stop_event.wait(remaining):
-                return True, False
-            return stop_event.is_set(), False
-        woken = wake_event.is_set()
+            return True, False, False
         remaining = interval - base_interval
-        if remaining > 0 and not woken:
-            woken = wake_event.wait(remaining)
-        if woken:
-            wake_event.clear()
-        return stop_event.is_set(), woken
+        if wake_signal is None:
+            if remaining > 0 and stop_event.wait(remaining):
+                return True, False, False
+            return stop_event.is_set(), False, False
+        woken, expects_output = wake_signal.consume(remaining)
+        return stop_event.is_set(), woken, expects_output
 
     def _capture_pane_state_or_none(self) -> tuple[bool, str] | None:
         """
@@ -2032,22 +2079,22 @@ class TerminalInstance:
         will exit when the process does, and the next iteration's
         ``self.running`` check will short-circuit it anyway.
 
-        Both events are set: the stop event ends the loop, and the wake
-        event cuts short a backed-off sleep so a quiesced watcher exits as
-        promptly as a busy one instead of lingering for its full interval.
+        Both signals fire: the stop event ends the loop, and a wake cuts short
+        a backed-off sleep so a quiesced watcher exits as promptly as a busy
+        one instead of lingering for its full interval.
         """
         thread = self._idle_thread
         stop_event = self._idle_stop_event
-        wake_event = self._idle_wake_event
+        wake_signal = self._idle_wake_signal
         if thread is None:
             return
         self._idle_thread = None
         self._idle_stop_event = None
-        self._idle_wake_event = None
+        self._idle_wake_signal = None
         if stop_event is not None:
             stop_event.set()
-        if wake_event is not None:
-            wake_event.set()
+        if wake_signal is not None:
+            wake_signal.wake(expect_output=False)
         if thread.is_alive():
             thread.join(timeout=_IDLE_WATCHER_JOIN_TIMEOUT_S)
 
