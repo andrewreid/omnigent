@@ -25,6 +25,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
+from omnigent.db.utils import db_connection_scope
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
@@ -1559,6 +1560,30 @@ def create_app(
     # hold a session's runner tunnel serve the same sidebar fields.
     session_live_state.configure(conversation_store)
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
+
+    @app.middleware("http")
+    async def _db_connection_scope_middleware(
+        request: Request,
+        call_next: _FastAPICallNext,
+    ) -> Response:
+        """
+        Hold one pooled DB connection per engine for the request.
+
+        Store calls made while handling the request (directly or via
+        ``asyncio.to_thread``) reuse the scope's connection instead of
+        paying a pool checkout + ``pool_pre_ping`` round-trip each. The
+        scope closes when the handler returns, so streaming response
+        bodies that keep making store calls fall back to plain pooled
+        sessions rather than pinning a connection for the stream's
+        lifetime.
+
+        :param request: Incoming FastAPI request.
+        :param call_next: FastAPI middleware continuation that executes
+            the matched route and returns its response.
+        :returns: The downstream route response.
+        """
+        with db_connection_scope():
+            return await call_next(request)
 
     @app.middleware("http")
     async def _record_server_metrics(
