@@ -1248,7 +1248,7 @@ async def test_drain_defers_dead_leader_and_adopted_sweep_drains_group(
 
         # Zombie drain: the dead leader with a live group is pinned, not
         # consumed — leader.poll() must still see it unreaped.
-        host._ownerless_sweep_task = asyncio.current_task()  # deferral requires a releaser
+        host._adoption_active = True  # deferral requires a releaser
         host._reap_orphans_once()
         assert leader.pid in host._adopted_pins
         assert host._adopted_pins[leader.pid].deferred_zombie
@@ -1273,7 +1273,7 @@ async def test_drain_defers_dead_leader_and_adopted_sweep_drains_group(
         host._reap_adopted_orphans_once()
         assert leader.pid not in host._adopted_pins
     finally:
-        host._ownerless_sweep_task = None
+        host._adoption_active = False
         import contextlib as ctx
 
         if child_pid is not None:
@@ -1403,13 +1403,19 @@ async def test_adopted_sweep_excludes_recorded_local_server(
         start_new_session=True,
     )
     try:
-        monkeypatch.setattr(
-            "omnigent.host.local_server._read_local_server_pid_file",
-            lambda: (child.pid, 1234),
-        )
-        host._reap_adopted_orphans_once()
-        assert child.pid not in host._adopted_pins
+        # The spawner hands the pid over explicitly; the incarnation is
+        # captured at init — no pidfile fallback exists to go stale.
+        host._local_server_incarnation = None
+        host2 = HostProcess(host._identity, "http://localhost:8000", local_server_pid=child.pid)
+        host2._is_subreaper = True
+        host2._reap_adopted_orphans_once()
+        assert child.pid not in host2._adopted_pins
         assert child.poll() is None, "recorded local server must survive the sweep"
+
+        # A different incarnation behind the same pid gets no shield: the
+        # exclusion drops itself on identity mismatch.
+        host2._local_server_incarnation = (child.pid, "stranger-start")
+        assert host2._local_server_pids() == set()
     finally:
         child.kill()
         child.wait(timeout=10)
@@ -1454,6 +1460,24 @@ async def test_dead_leader_attribution_uses_registry_and_spawn_records(
         lambda _pid, _ident: False,
     )
     assert host._dead_leader_group_is_ours(4242, pin) is False
+
+
+def test_kill_switch_covers_periodic_sweep_and_shutdown_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One switch disables ALL active ownerless killing in the host."""
+    from omnigent.host.connect import _OWNERLESS_SWEEP_ENV_VAR, _ownerless_sweep_enabled
+
+    monkeypatch.setenv(_OWNERLESS_SWEEP_ENV_VAR, "0")
+    assert not _ownerless_sweep_enabled()
+    # run()'s shutdown path gates the final drain on the same predicate;
+    # assert the source wiring so a future refactor cannot split them.
+    import inspect
+
+    from omnigent.host import connect as connect_mod
+
+    run_src = inspect.getsource(connect_mod.HostProcess.run)
+    assert "self._is_subreaper and _ownerless_sweep_enabled()" in run_src
 
 
 async def test_final_adoption_drain_reaps_condemned_trees_at_shutdown() -> None:

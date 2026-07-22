@@ -185,9 +185,10 @@ _OWNERLESS_SWEEP_TIMEOUT_S = 120.0
 # shutdown drain, while a wedged worker cannot stall shutdown either.
 _OWNERLESS_SWEEP_JOIN_TIMEOUT_S = 15.0
 
-# Kill-switch: set to ``0`` (or ``false``/``off``/``no``) to disable the
-# active ownerless-tree sweep. Zombie draining and the spawn-time /
-# runner-startup sweeps are unaffected.
+# Kill-switch: set to ``0`` (or ``false``/``off``/``no``) to disable ALL
+# active ownerless killing in the host — the periodic sweep AND the
+# shutdown adoption drain. Zombie draining and the spawn-time /
+# runner-startup family sweeps are unaffected.
 _OWNERLESS_SWEEP_ENV_VAR = "OMNIGENT_HOST_OWNERLESS_SWEEP"
 
 
@@ -852,11 +853,16 @@ class HostProcess:
         self,
         identity: HostIdentity,
         server_url: str,
+        *,
+        local_server_pid: int | None = None,
     ) -> None:
         """Initialize the host process.
 
         :param identity: Host identity from ``config.yaml``.
         :param server_url: Server URL to connect to.
+        :param local_server_pid: Pid of the local Omnigent server THIS
+            invocation spawned or health-verified (``--local`` mode) —
+            the adopted-orphan reaper excludes exactly that incarnation.
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
@@ -899,9 +905,14 @@ class HostProcess:
         # accumulate forever.
         self._adoption_active = False
         # (pid, start identity) of the local Omnigent server incarnation
-        # currently excluded from adoption, bound so a recycled pidfile
-        # pid can never shield an unrelated adopted orphan.
+        # excluded from adoption. Captured HERE, from the pid the spawner
+        # handed over after health-verifying it — never later from the
+        # pidfile, whose raw pid could already be a recycled stranger.
         self._local_server_incarnation: tuple[int, str] | None = None
+        if local_server_pid is not None:
+            identity_str = _proc.process_start_identity(local_server_pid)
+            if identity_str is not None:
+                self._local_server_incarnation = (local_server_pid, identity_str)
         # pid -> pin for direct children the zombie drain must NOT reap:
         # condemned adopted orphans mid-kill, and zombies that died group
         # leaders with live members (the held zombie is the kernel pin on
@@ -1364,38 +1375,22 @@ class HostProcess:
             )
 
     def _local_server_pids(self) -> set[int]:
-        """Pid of the local Omnigent server's CURRENT incarnation, if any.
+        """Pid of the local Omnigent server incarnation this host owns.
 
-        The ``--local`` daemon spawns (or reuses) a detached server that
-        can be a direct child of this process; it is host-owned, never an
-        adopted orphan. The pidfile's raw pid can outlive the server and
-        be recycled, so the exclusion binds the pid to the start identity
-        captured when that pidfile value was first seen and drops itself
-        on mismatch.
+        The ``--local`` daemon spawns (or health-verifies and reuses) the
+        server before this process constructs :class:`HostProcess`, and
+        hands the pid in explicitly; the incarnation was captured at init.
+        Verified per pass — a recycled pid gets no shield, and there is no
+        pidfile fallback (a stale pidfile's pid could already belong to a
+        stranger by first observation).
 
         :returns: A zero-or-one element pid set.
         """
-        from omnigent.host.local_server import _read_local_server_pid_file
-
-        try:
-            recorded = _read_local_server_pid_file()
-        except Exception:  # noqa: BLE001 — exclusion is best-effort
-            return set()
-        if not recorded:
-            self._local_server_incarnation = None
-            return set()
-        pid = recorded[0]
         cached = self._local_server_incarnation
-        if cached is None or cached[0] != pid:
-            identity = _proc.process_start_identity(pid)
-            if identity is None:
-                self._local_server_incarnation = None
-                return set()
-            self._local_server_incarnation = (pid, identity)
-            return {pid}
-        if _proc.process_identity_state(pid, cached[1]) == "match":
-            return {pid}
-        # The recorded incarnation is gone; a recycled pid gets no shield.
+        if cached is None:
+            return set()
+        if _proc.process_identity_state(cached[0], cached[1]) == "match":
+            return {cached[0]}
         return set()
 
     def _classify_adopted_pin(self, pid: int, pin: _AdoptedPin) -> bool:
@@ -2607,7 +2602,7 @@ class HostProcess:
             # condemn/drain cycle reaps what it can before exit; whatever
             # remains reparents above us (deployments: systemd's
             # control-group kill finishes the job).
-            if self._is_subreaper:
+            if self._is_subreaper and _ownerless_sweep_enabled():
                 await self._final_adoption_drain()
             self._adoption_active = False
             # Final drain: _cleanup_runners has just reaped the tracked
@@ -2936,6 +2931,8 @@ class HostProcess:
 def run_host_process(
     server_url: str,
     config_path: Path | None = None,
+    *,
+    local_server_pid: int | None = None,
 ) -> None:
     """Entry point for ``omnigent host``.
 
@@ -2946,6 +2943,8 @@ def run_host_process(
         ``"https://omnigent-app.databricksapps.com"``.
     :param config_path: Optional path to ``config.yaml``.
         Defaults to ``~/.omnigent/config.yaml``.
+    :param local_server_pid: Pid of the local Omnigent server this
+        invocation spawned/verified, for the adopted-orphan exclusion.
     :raises SystemExit: With code 1 when the tunnel fails permanently
         (auth / authorization / outdated server). The
         actionable cause is printed to stderr first.
@@ -2979,7 +2978,7 @@ def run_host_process(
     if _cli_log is not None and _cli_log != host_log_path:
         print(f"CLI diagnostics: {_display_log_path(_cli_log)}")
 
-    host = HostProcess(identity, server_url)
+    host = HostProcess(identity, server_url, local_server_pid=local_server_pid)
     try:
         asyncio.run(host.run())
     except HostConnectError as exc:

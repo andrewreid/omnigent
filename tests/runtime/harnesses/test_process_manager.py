@@ -1503,6 +1503,37 @@ def test_harness_spawn_record_matches_only_dead_ap_and_identity(
     assert pm_mod.harness_spawn_record_matches(5353, "id-b") is False
 
 
+async def test_orphan_sweep_retains_dir_while_recorded_group_still_occupied(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recorded members gone but the group occupied: retain, log, never chase.
+
+    An unrecorded late fork keeps the recorded pgid populated; the dir and
+    its state are the only evidence and must survive for the subreaper
+    host (or an operator) instead of being deleted under it.
+    """
+    import json as json_mod
+
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    monkeypatch.setattr(pm_mod, "_ORPHAN_SIGTERM_GRACE_S", 0.0)
+    monkeypatch.setattr(pm_mod._proc, "group_populated", lambda _pgid: True)
+
+    dead = short_tmp_parent / "ap-dead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (dead / pm_mod._REAP_STATE_FILE).write_text(
+        json_mod.dumps({"54321": {"99999998": "gone-identity"}}), encoding="utf-8"
+    )
+
+    swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+
+    assert swept == 0
+    assert dead.exists(), "occupied recorded group must keep its evidence"
+    assert (dead / pm_mod._REAP_STATE_FILE).exists()
+
+
 async def test_orphan_sweep_treats_malformed_state_as_indeterminate(
     short_tmp_parent: Path,
 ) -> None:
