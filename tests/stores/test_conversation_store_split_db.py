@@ -596,3 +596,111 @@ def test_delete_conversation_keeps_template_agent(
 
     asyncio.run(store.delete_conversation(conv.id))
     assert _col(omnigent_db, "agents", "id") == ["191cbf904e3223e9e00ac9a1abfe79a5"]
+
+
+# ── ACL filters (split-DB prefetch fallback) ───────────
+#
+# In split-DB mode the session_permissions table lives on a different bind
+# than conversations, so the EXISTS pushdown is impossible; these verify the
+# id-prefetch fallback keeps ACL semantics identical.
+
+
+def _perms(omnigent_db: Path):
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    perms = SqlAlchemyPermissionStore(f"sqlite:///{omnigent_db}")
+    for user in ("alice@example.com", "bob@example.com"):
+        perms.ensure_user(user)
+    return perms
+
+
+def test_split_db_uses_prefetch_fallback_not_pushdown(
+    omnigent_db: Path, store: SqlAlchemyConversationStore
+) -> None:
+    """
+    Split binds take the prefetch path: a standalone session_permissions
+    SELECT runs on the Omnigent engine, and the AP conversations query
+    carries no cross-DB EXISTS on session_permissions.
+    """
+    from sqlalchemy import event
+
+    conv = store.create_conversation(title="mine")
+    perms = _perms(omnigent_db)
+    perms.grant("alice@example.com", conv.id, 4)
+
+    captured: dict[str, list[str]] = {"omnigent": [], "conv": []}
+
+    def _capture(key: str):
+        def _on_execute(conn, cursor, statement, parameters, context, executemany):
+            captured[key].append(statement)
+
+        return _on_execute
+
+    omni_listener = _capture("omnigent")
+    conv_listener = _capture("conv")
+    event.listen(store._engine, "before_cursor_execute", omni_listener)
+    event.listen(store._conv_engine, "before_cursor_execute", conv_listener)
+    try:
+        result = store.list_conversations(accessible_by="alice@example.com")
+    finally:
+        event.remove(store._engine, "before_cursor_execute", omni_listener)
+        event.remove(store._conv_engine, "before_cursor_execute", conv_listener)
+
+    assert {c.id for c in result.data} == {conv.id}
+    prefetch = [
+        s
+        for s in captured["omnigent"]
+        if "session_permissions" in s and "FROM conversations" not in s
+    ]
+    assert prefetch, "expected a standalone session_permissions prefetch"
+    assert not any("session_permissions" in s for s in captured["conv"])
+
+
+def test_list_conversations_accessible_by_split_db(
+    omnigent_db: Path, store: SqlAlchemyConversationStore
+) -> None:
+    """Non-granted sessions are excluded for accessible_by in split-DB mode."""
+    mine = store.create_conversation(title="mine")
+    other = store.create_conversation(title="other")
+    perms = _perms(omnigent_db)
+    perms.grant("alice@example.com", mine.id, 1)
+    perms.grant("bob@example.com", other.id, 4)
+
+    ids = {c.id for c in store.list_conversations(accessible_by="alice@example.com").data}
+    assert ids == {mine.id}
+    assert not store.list_conversations(accessible_by="nobody@example.com").data
+
+
+def test_list_conversations_owned_by_split_db(
+    omnigent_db: Path, store: SqlAlchemyConversationStore
+) -> None:
+    """owned_by requires an owner-level grant; a read grant is not enough."""
+    owned = store.create_conversation(title="owned")
+    shared = store.create_conversation(title="shared")
+    perms = _perms(omnigent_db)
+    perms.grant("alice@example.com", owned.id, 4)
+    perms.grant("alice@example.com", shared.id, 1)
+
+    ids = {c.id for c in store.list_conversations(owned_by="alice@example.com").data}
+    assert ids == {owned.id}
+
+
+def test_list_conversations_accessible_and_owned_intersect_split_db(
+    omnigent_db: Path, store: SqlAlchemyConversationStore
+) -> None:
+    """Both filters together intersect (owner grants that are also accessible)."""
+    owned = store.create_conversation(title="owned")
+    shared = store.create_conversation(title="shared")
+    perms = _perms(omnigent_db)
+    perms.grant("alice@example.com", owned.id, 4)
+    perms.grant("alice@example.com", shared.id, 1)
+
+    ids = {
+        c.id
+        for c in store.list_conversations(
+            accessible_by="alice@example.com", owned_by="alice@example.com"
+        ).data
+    }
+    assert ids == {owned.id}
