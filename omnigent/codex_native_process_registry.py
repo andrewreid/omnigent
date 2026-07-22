@@ -282,11 +282,20 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
         if not _write_registry(path, survivors):
             return signaled
         for entry in pending_terms:
-            if _signal_process_group(entry.pgid, signal.SIGTERM):
+            # Per-member verified delivery: an unpinned numeric pgid could
+            # have been recycled during persistence, and killpg targets
+            # whoever occupies it now — this tier never signals a name it
+            # has not re-verified.
+            delivered = [
+                pid
+                for pid, start in entry.members or ()
+                if _signal_member_verified(pid, start, signal.SIGTERM)
+            ]
+            if delivered:
                 _logger.info(
-                    "SIGTERMed ownerless codex-native process group %d (pid %d)",
+                    "SIGTERMed ownerless codex-native member(s) %s of group %d",
+                    delivered,
                     entry.pgid,
-                    entry.pid,
                 )
                 signaled += 1
     return signaled
@@ -318,16 +327,19 @@ def _escalate_sigkill(
     """
     kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
     if entry.members is None:
-        # Legacy entry written before member snapshots existed: a group
-        # kill is safe only while the tagged leader still proves ownership.
+        # Legacy entry written before member snapshots existed: only the
+        # tag-verified leader pid itself is a safe target (a numeric pgid
+        # could be recycled; killpg would hit its current occupants).
         if _pid_alive(entry.pid) and _process_cmdline_has_tag(entry.pid, entry.session_tag):
-            if _signal_process_group(entry.pgid, kill_sig):
-                _logger.warning(
-                    "ownerless codex-native process group %d survived SIGTERM; SIGKILLed",
-                    entry.pgid,
-                )
-                return "killed", entry
-            return "retry", entry
+            try:
+                os.kill(entry.pid, kill_sig)
+            except OSError:
+                return "retry", entry
+            _logger.warning(
+                "ownerless codex-native leader %d survived SIGTERM; SIGKILLed",
+                entry.pid,
+            )
+            return "killed", entry
         _logger.info(
             "dropping codex-native entry for group %d: tagged leader gone and no "
             "member snapshot to verify survivors",
@@ -616,6 +628,18 @@ def _member_identity_state(pid: int, identity: str) -> str:
     return _proc.process_identity_state(pid, identity)
 
 
+def _signal_member_verified(pid: int, identity: str, sig: signal.Signals) -> bool:
+    """
+    Deliver *sig* to *pid* only if it is still the recorded incarnation.
+
+    :param pid: Recorded group member.
+    :param identity: Its snapshotted identity.
+    :param sig: The signal to deliver.
+    :returns: ``True`` if the signal reached the verified target.
+    """
+    return _proc.kill_verified(pid, identity, sig)
+
+
 def _kill_member_verified(pid: int, identity: str) -> bool:
     """
     SIGKILL *pid* only if it is still the recorded incarnation.
@@ -624,19 +648,7 @@ def _kill_member_verified(pid: int, identity: str) -> bool:
     :param identity: Its snapshotted identity.
     :returns: ``True`` if the kill was delivered to the verified target.
     """
-    return _proc.kill_verified(pid, identity, getattr(signal, "SIGKILL", signal.SIGTERM))
-
-
-def _signal_process_group(pgid: int, sig: signal.Signals) -> bool:
-    if os.name == "posix":
-        try:
-            os.killpg(pgid, sig)
-        except ProcessLookupError:
-            return True
-        except (PermissionError, OSError):
-            return False
-        return True
-    return False
+    return _signal_member_verified(pid, identity, getattr(signal, "SIGKILL", signal.SIGTERM))
 
 
 def _reap_tmux_session(tmux_session_name: str | None) -> None:

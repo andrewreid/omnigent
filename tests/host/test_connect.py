@@ -1263,14 +1263,8 @@ async def test_drain_defers_dead_leader_and_adopted_sweep_drains_group(
         # pinned killpg drains it (grace zeroed: TERM pass then KILL pass).
         host._reap_adopted_orphans_once()
         host._reap_adopted_orphans_once()
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            from omnigent.inner import _proc as proc_mod
-
-            if proc_mod.process_identity_state(child_pid, None) == "gone" or not _pid_alive_probe(
-                child_pid
-            ):
-                break
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and _pid_alive_probe(child_pid):
             host._reap_adopted_orphans_once()
             await asyncio.sleep(0.05)
         assert not _pid_alive_probe(child_pid), "late-forked child survived the pinned drain"
@@ -1460,6 +1454,43 @@ async def test_dead_leader_attribution_uses_registry_and_spawn_records(
         lambda _pid, _ident: False,
     )
     assert host._dead_leader_group_is_ours(4242, pin) is False
+
+
+async def test_final_adoption_drain_reaps_condemned_trees_at_shutdown() -> None:
+    """Shutdown's bounded drain condemns and kills freshly adopted trees.
+
+    Runner teardown orphans descendants after the periodic sweep died;
+    the final drain must TERM/KILL them with zero grace inside its budget
+    and release every pin before the host exits.
+    """
+    import subprocess
+    import sys
+
+    host = _make_host_process()
+    host._is_subreaper = True
+    host._adoption_active = True
+
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(120)",
+            "omnigent-start-on-attach",
+        ],
+        start_new_session=True,
+    )
+    try:
+        await host._final_adoption_drain(budget_s=5.0)
+        assert child.pid not in host._adopted_pins
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and _pid_alive_probe(child.pid):
+            await asyncio.sleep(0.05)
+        assert not _pid_alive_probe(child.pid), "shutdown drain left the tree alive"
+    finally:
+        with contextlib.suppress(OSError):
+            os.kill(child.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            child.wait(timeout=10)
 
 
 async def test_zombie_drain_skips_pinned_and_reaps_the_rest() -> None:

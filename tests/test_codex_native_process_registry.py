@@ -75,12 +75,18 @@ def test_reconciliation_sigterms_alive_tagged_process_and_keeps_entry(
         lambda _pid: "codex omnigent_crash_teardown_tag=tag-123 app-server",
     )
     monkeypatch.setattr(registry, "_group_member_identities", lambda _pgid: ((123, "start-a"),))
-    monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
+
+    def fake_term(pid: int, identity: str, sig: signal.Signals) -> bool:
+        assert identity == "start-a"
+        killed.append((pid, sig))
+        return True
+
+    monkeypatch.setattr(registry, "_signal_member_verified", fake_term)
 
     signaled = registry.reconcile_codex_native_process_registry(registry_path=path)
 
     assert signaled == 1
-    assert killed == [(456, signal.SIGTERM)]
+    assert killed == [(123, signal.SIGTERM)]
     # The entry survives with its SIGTERM time recorded, so a later pass
     # can escalate to SIGKILL if the process ignores the SIGTERM.
     (payload,) = _registry_payload(path)
@@ -113,7 +119,13 @@ def test_reconciliation_escalates_to_sigkill_after_grace(tmp_path: Path, monkeyp
         lambda _pid: "codex omnigent_crash_teardown_tag=tag-123 app-server",
     )
     monkeypatch.setattr(registry, "_group_member_identities", lambda _pgid: ((123, "start-a"),))
-    monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: killed_group.append((pgid, sig)))
+
+    def fake_term(pid: int, identity: str, sig: signal.Signals) -> bool:
+        assert identity == "start-a"
+        killed_group.append((pid, sig))
+        return True
+
+    monkeypatch.setattr(registry, "_signal_member_verified", fake_term)
 
     def fake_kill_member(pid: int, identity: str) -> bool:
         assert identity == "start-a"
@@ -125,7 +137,7 @@ def test_reconciliation_escalates_to_sigkill_after_grace(tmp_path: Path, monkeyp
     registry.reconcile_codex_native_process_registry(registry_path=path)
     # Within the grace: no second signal, entry untouched.
     registry.reconcile_codex_native_process_registry(registry_path=path)
-    assert killed_group == [(456, signal.SIGTERM)]
+    assert killed_group == [(123, signal.SIGTERM)]
     assert killed_pid == []
     assert len(_registry_payload(path)) == 1
 
@@ -232,11 +244,15 @@ def test_reconciliation_reaps_when_owner_lock_is_not_held(tmp_path: Path, monkey
         lambda _pid: "codex omnigent_crash_teardown_tag=tag-123 app-server",
     )
     monkeypatch.setattr(registry, "_group_member_identities", lambda _pgid: ((123, "start-a"),))
-    monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
+    monkeypatch.setattr(
+        registry,
+        "_signal_member_verified",
+        lambda pid, _ident, sig: killed.append((pid, sig)) or True,
+    )
 
     registry.reconcile_codex_native_process_registry(registry_path=path)
 
-    assert killed == [(456, signal.SIGTERM)]
+    assert killed == [(123, signal.SIGTERM)]
     (payload,) = _registry_payload(path)
     assert payload["sigterm_at"] is not None
 
@@ -579,7 +595,11 @@ def test_reconciliation_is_write_ahead_and_defers_on_write_failure(
         lambda _pid: "codex omnigent_crash_teardown_tag=tag-wa app-server",
     )
     monkeypatch.setattr(registry, "_group_member_identities", lambda _pgid: ((123, "s"),))
-    monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
+    monkeypatch.setattr(
+        registry,
+        "_signal_member_verified",
+        lambda pid, _ident, sig: killed.append((pid, sig)) or True,
+    )
     monkeypatch.setattr(registry, "_write_registry", lambda _path, _entries: False)
 
     assert registry.reconcile_codex_native_process_registry(registry_path=path) == 0
