@@ -202,10 +202,26 @@ A new per-watcher `threading.Event` is set by:
 - `_stop_idle_watcher_thread()` — so teardown does not wait out a backed-off
   sleep.
 
-A wake says output is *coming*, not that it has arrived, and turn setup can
-outlast the idle threshold. So a wake also pins the base interval for
-`_IDLE_POLL_WAKE_GRACE_SECONDS` (15 s); without it the watcher would ramp back
-up during spec resolution and miss the output it was woken for.
+**Scope.** The turn-start wake fires only for
+`PTY_STATUS_OWNING_TERMINAL_ROLES` — the eight harnesses whose pane watcher
+*is* the session's status. A generic shell or auxiliary pane drives only the
+activity badge, and a session turn implies nothing about whether it will
+produce output; waking it would put it on high-rate polling for an unrelated
+turn, which is the cost this change exists to remove. The same frozenset gates
+the watcher's own status emission, so the two cannot drift.
+
+**Grace.** A turn-start wake says output is *coming*, not that it has arrived,
+and turn setup can outlast the idle threshold — so it also pins the base
+interval for `_IDLE_POLL_WAKE_GRACE_SECONDS`. Two bounds keep that cheap:
+
+- Only wakes that pass `expect_output=True` arm it. Client interactions do
+  not: they are one-off repaints arriving per keystroke and mouse event, and
+  arming a full window on each would hold the pane at base rate far longer
+  than the repaint warrants.
+- It is released the moment the pane actually changes. A normal turn therefore
+  pays a handful of extra captures, not the whole window; the full window is
+  spent only when the expected output never comes, which is exactly the case
+  it exists for.
 
 The sleep is split so a wake storm cannot become a fork storm:
 
@@ -455,6 +471,37 @@ Also added in this round: a wake grace window, without which the wake fixed in
 (1) would have been undone by the watcher re-ramping during turn setup — the
 wake marks output as *expected*, and setup can outlast the idle threshold.
 
+### 7.2 Third round — cross-vendor review
+
+No blocking findings. Three scoping/correctness fixes:
+
+1. **The wake was too broad.** It woke *every* terminal of *every* harness, so
+   a generic or auxiliary pane went to high-rate polling for a turn that had
+   nothing to do with it. Now filtered to
+   `PTY_STATUS_OWNING_TERMINAL_ROLES`, hoisted out of the watcher's inline set
+   so the wake and the status gate read one definition. The route test had
+   reinforced the wrong scope by asserting on a role-less pane; it now
+   registers the claude-native role, and a negative test covers a generic pane
+   and a codex-native one (whose forwarder, not its watcher, owns status).
+2. **Every wake armed the full 15 s grace, and nothing released it.** Client
+   interactions arrive per keystroke, so at the 0.2 s native base that was
+   ~75 captures per interaction. The grace is now opt-in via
+   `expect_output=True` (turn start only) and is released as soon as the pane
+   changes — a normal turn pays a few captures, the full window only when the
+   expected output never arrives.
+3. **A wake landing between a timed-out `wait` and the `clear` was destroyed.**
+   The caller was told it was not woken *and* the signal was gone, losing both
+   the interval reset and the grace, which reopens the late-`running` race the
+   wake exists to close. Only an observed wake is cleared now; an unobserved
+   one stays set and costs at most one base interval. Covered by a boundary
+   test using an event that fires the instant its wait times out.
+
+While fixing (1) a block replacement over-captured and deleted three live
+lines from `_start_terminal_activity_watcher` (the early return, `resource_id`,
+and `loop`). Caught by the registry suite (`NameError: name 'loop' is not
+defined`) and restored; the diff was then audited line by line to confirm
+nothing else was lost.
+
 ## 8. Residual risks
 
 1. **Late `running` edge on autonomous pane output.** A terminal that starts
@@ -486,8 +533,12 @@ wake marks output as *expected*, and setup can outlast the idle threshold.
    interval early.
 7. **Idle CPU still scales with accumulated fan-out** — ~0.65 % of a core per
    idle session at 100 sub-agents (§4). Down ~11x, but not flat.
-8. **The turn-start wake fires for every session, not only native ones.** It is
-   a no-op for a session with no terminals or no watcher, but it does walk that
-   session's terminal list on every turn-start status edge. At the registry
+8. **The turn-start wake walks the session's terminal list on every turn.** It
+   wakes nothing outside `PTY_STATUS_OWNING_TERMINAL_ROLES`, but the walk plus
+   a role lookup per terminal happens for every session, native or not. At the
    sizes involved (a handful of terminals per session) that is a dict lookup
-   and a short loop.
+   and a short loop, once per turn.
+9. **An unobserved wake costs one base interval.** Not clearing a wake the
+   watcher did not observe is what keeps it from being destroyed, but it means
+   such a wake is serviced on the next sleep rather than immediately — up to
+   0.2 s late for the native watcher.
