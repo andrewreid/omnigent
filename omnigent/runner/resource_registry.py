@@ -1033,14 +1033,13 @@ class SessionResourceRegistry:
         aligned with the underlying tmux process. No-op when no publisher
         is installed (e.g. embedded/test runners).
 
-        For the claude-native *agent* terminal (``resource_role`` ==
-        :data:`CLAUDE_NATIVE_TERMINAL_ROLE` or
-        :data:`PI_NATIVE_TERMINAL_ROLE`) the same watcher also drives the
-        session's working status: pane activity → ``running`` and a short
+        For a terminal whose ``resource_role`` is in
+        :data:`PTY_STATUS_OWNING_TERMINAL_ROLES` the same watcher also drives
+        the session's working status: pane activity → ``running`` and a short
         quiescence → ``idle``, emitted via the session-status publisher.
         This PTY-derived status catches cases lifecycle hooks can miss
         because it observes the terminal directly. The status edges are
-        gated to these roles so a side shell's output never flips the
+        gated to those roles so a side shell's output never flips the
         session's status.
 
         :param session_id: Session/conversation identifier.

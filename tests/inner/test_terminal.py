@@ -1731,63 +1731,82 @@ def test_threaded_idle_watcher_wake_holds_base_rate_through_slow_setup(
         instance._stop_idle_watcher_thread()
 
 
-def test_wait_next_idle_tick_keeps_a_wake_that_lands_after_the_wait(tmp_path: Path) -> None:
+def test_wake_signal_retains_a_wake_raised_after_a_timed_out_consume() -> None:
     """
-    A wake arriving between a timed-out wait and the clear is not destroyed.
+    A wake landing after ``consume`` returns stays pending for the next call.
 
-    Clearing unconditionally would report ``was_woken=False`` *and* consume the
-    signal, so the caller neither resets its interval nor arms the grace — the
-    late-``running`` race the wake exists to close comes straight back.
+    ``consume`` takes the flag and its reason under one lock, so there is no
+    window in which a wake can be reported as absent *and* discarded. Losing
+    one would drop both the interval reset and the grace, reopening the
+    late-``running`` race the wake exists to close.
 
-    :param tmp_path: Temporary directory used for placeholder tmux paths.
     :returns: None.
     """
+    signal = terminal_mod._WakeSignal()
 
-    class _LateWakeEvent:
-        """Event that fires the instant its wait times out."""
+    # Nothing pending: a zero-timeout consume reports no wake and takes nothing.
+    assert signal.consume(0.0) == (False, False)
 
-        def __init__(self) -> None:
-            """Start unset."""
-            self._set = False
+    # A wake raised "after" that consume — i.e. while the tick body runs — is
+    # still there for the next sleep.
+    signal.wake(expect_output=True)
+    assert signal.consume(0.0) == (True, True)
+    # ...and only once.
+    assert signal.consume(0.0) == (False, False)
 
-        def is_set(self) -> bool:
-            """Report the flag."""
-            return self._set
 
-        def set(self) -> None:
-            """Raise the flag."""
-            self._set = True
+def test_wake_signal_couples_reason_to_the_wake_under_interleaving() -> None:
+    """
+    Mixed client and turn wakes cannot have their halves consumed separately.
 
-        def clear(self) -> None:
-            """Lower the flag."""
-            self._set = False
+    The reason used to live in a bool beside a :class:`threading.Event`, so a
+    turn wake landing between another wake's ``clear`` and the reason read had
+    its two halves taken by different ticks. Coupling them makes every
+    interleaving deterministic: whichever order they arrive in, one consume
+    returns both, and ``expect_output`` cannot be downgraded by a client
+    interaction racing a turn.
 
-        def wait(self, timeout: float | None = None) -> bool:
-            """Time out, but let a wake land in the same breath."""
-            del timeout
-            self._set = True
-            return False
+    :returns: None.
+    """
+    # Client first, then a turn wake before the watcher looks.
+    signal = terminal_mod._WakeSignal()
+    signal.wake(expect_output=False)
+    signal.wake(expect_output=True)
+    assert signal.consume(0.0) == (True, True)
+    assert signal.consume(0.0) == (False, False)
 
-    instance = TerminalInstance(
-        name="runtime",
-        session_key="main",
-        socket_path=tmp_path / "tmux.sock",
-        private_dir=tmp_path,
-        running=True,
-    )
-    late = _LateWakeEvent()
+    # Turn first, then a client interaction races it. The grace survives.
+    signal = terminal_mod._WakeSignal()
+    signal.wake(expect_output=True)
+    signal.wake(expect_output=False)
+    assert signal.consume(0.0) == (True, True)
+    assert signal.consume(0.0) == (False, False)
 
-    should_stop, woken = instance._wait_next_idle_tick(
-        threading.Event(),
-        late,  # type: ignore[arg-type]
-        0.05,
-        0.01,
-    )
+    # Client wakes alone never earn a grace, however many arrive.
+    signal = terminal_mod._WakeSignal()
+    signal.wake(expect_output=False)
+    signal.wake(expect_output=False)
+    assert signal.consume(0.0) == (True, False)
 
-    assert should_stop is False
-    # Either this call reported the wake, or it left it set for the next sleep.
-    # What it must not do is swallow it silently.
-    assert woken or late.is_set()
+
+def test_wake_signal_consume_blocks_until_a_wake_arrives() -> None:
+    """
+    ``consume`` waits out its timeout, and returns early when woken.
+
+    :returns: None.
+    """
+    signal = terminal_mod._WakeSignal()
+
+    started = time.monotonic()
+    assert signal.consume(0.05) == (False, False)
+    assert time.monotonic() - started >= 0.04
+
+    waker = threading.Timer(0.05, lambda: signal.wake(expect_output=True))
+    waker.start()
+    try:
+        assert signal.consume(2.0) == (True, True)
+    finally:
+        waker.cancel()
 
 
 def test_client_interaction_wake_does_not_arm_the_grace(tmp_path: Path) -> None:
@@ -1809,16 +1828,15 @@ def test_client_interaction_wake_does_not_arm_the_grace(tmp_path: Path) -> None:
         private_dir=tmp_path,
         running=True,
     )
-    instance._idle_wake_event = threading.Event()
+    instance._idle_wake_signal = terminal_mod._WakeSignal()
 
     instance.note_client_interaction()
 
-    assert instance._idle_wake_event.is_set()
-    assert instance._idle_wake_expects_output is False
+    assert instance._idle_wake_signal.consume(0.0) == (True, False)
 
     instance.wake_idle_watcher(expect_output=True)
 
-    assert instance._idle_wake_expects_output is True
+    assert instance._idle_wake_signal.consume(0.0) == (True, True)
 
 
 def test_threaded_idle_watcher_releases_the_grace_once_output_arrives(
