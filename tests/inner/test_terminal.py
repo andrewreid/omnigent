@@ -1719,7 +1719,7 @@ def test_threaded_idle_watcher_wake_holds_base_rate_through_slow_setup(
             pass
         assert not polled.acquire(timeout=0.5)
 
-        instance.wake_idle_watcher()
+        instance.wake_idle_watcher(expect_output=True)
         # The pane stays quiet — as it does during turn setup — so only the
         # grace keeps the watcher at base rate. Well past the 0.1s idle
         # threshold, it must still be polling.
@@ -1727,5 +1727,154 @@ def test_threaded_idle_watcher_wake_holds_base_rate_through_slow_setup(
         while polled.acquire(blocking=False):
             pass
         assert polled.acquire(timeout=0.5), "watcher re-ramped during the wake grace"
+    finally:
+        instance._stop_idle_watcher_thread()
+
+
+def test_wait_next_idle_tick_keeps_a_wake_that_lands_after_the_wait(tmp_path: Path) -> None:
+    """
+    A wake arriving between a timed-out wait and the clear is not destroyed.
+
+    Clearing unconditionally would report ``was_woken=False`` *and* consume the
+    signal, so the caller neither resets its interval nor arms the grace — the
+    late-``running`` race the wake exists to close comes straight back.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    :returns: None.
+    """
+
+    class _LateWakeEvent:
+        """Event that fires the instant its wait times out."""
+
+        def __init__(self) -> None:
+            """Start unset."""
+            self._set = False
+
+        def is_set(self) -> bool:
+            """Report the flag."""
+            return self._set
+
+        def set(self) -> None:
+            """Raise the flag."""
+            self._set = True
+
+        def clear(self) -> None:
+            """Lower the flag."""
+            self._set = False
+
+        def wait(self, timeout: float | None = None) -> bool:
+            """Time out, but let a wake land in the same breath."""
+            del timeout
+            self._set = True
+            return False
+
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    late = _LateWakeEvent()
+
+    should_stop, woken = instance._wait_next_idle_tick(
+        threading.Event(),
+        late,  # type: ignore[arg-type]
+        0.05,
+        0.01,
+    )
+
+    assert should_stop is False
+    # Either this call reported the wake, or it left it set for the next sleep.
+    # What it must not do is swallow it silently.
+    assert woken or late.is_set()
+
+
+def test_client_interaction_wake_does_not_arm_the_grace(tmp_path: Path) -> None:
+    """
+    A client interaction asks for one prompt look, not a grace window.
+
+    Interactions arrive per keystroke and mouse event. Arming the full
+    output-expected grace on each would hold the pane at base rate long after
+    the one-off repaint it caused, which at the native 0.2s base is a large
+    multiple of the captures the interaction warrants.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    :returns: None.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    instance._idle_wake_event = threading.Event()
+
+    instance.note_client_interaction()
+
+    assert instance._idle_wake_event.is_set()
+    assert instance._idle_wake_expects_output is False
+
+    instance.wake_idle_watcher(expect_output=True)
+
+    assert instance._idle_wake_expects_output is True
+
+
+def test_threaded_idle_watcher_releases_the_grace_once_output_arrives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The grace ends when the expected output lands, not when its timer expires.
+
+    A turn-start wake pins the base interval so setup cannot outlast it. Once
+    the pane actually changes, that purpose is served — holding the rest of the
+    window would keep polling at full rate long after the turn went quiet.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_WAKE_GRACE_SECONDS", 30.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_FACTOR", 100.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_MAX_MULTIPLE", 1000.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_MAX_INTERVAL_SECONDS", 60.0)
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    polled = threading.Semaphore(0)
+    pane = {"text": "idle"}
+
+    def _capture() -> tuple[bool, str]:
+        polled.release()
+        return False, pane["text"]
+
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
+    instance.start_idle_watcher_thread(
+        on_activity=lambda: None,
+        on_idle=lambda: None,
+        idle_threshold_s=0.1,
+        poll_interval_s=0.05,
+    )
+    try:
+        assert polled.acquire(timeout=2.0)
+        # A turn is dispatched, and its output lands.
+        instance.wake_idle_watcher(expect_output=True)
+        pane["text"] = "output"
+        time.sleep(0.3)
+        pane["text"] = "output"  # quiet again
+
+        # With the grace released on that change, the watcher goes back to
+        # backing off after the idle threshold — well inside the 30s window it
+        # would otherwise still be holding.
+        time.sleep(0.5)
+        while polled.acquire(blocking=False):
+            pass
+        assert not polled.acquire(timeout=0.5), "grace held past the output it waited for"
     finally:
         instance._stop_idle_watcher_thread()

@@ -18807,20 +18807,20 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
     )
 
 
-@pytest.mark.asyncio
-async def test_turn_start_wakes_session_terminal_watchers(tmp_path: Path) -> None:
+async def _post_turn_and_collect_wakes(
+    tmp_path: Path,
+    *,
+    session_id: str,
+    terminal_role: str | None,
+) -> list[bool]:
     """
-    Starting a turn wakes the session's pane watchers before dispatch.
-
-    Native harnesses inject through the bridge from the harness process, so
-    ``TerminalInstance.send`` is never called and the pane watcher — which for
-    those harnesses is the *only* running/idle source — gets no in-process
-    signal that a turn began. The wake is hung off the turn-start ``running``
-    edge because every dispatch path publishes it first, including the
-    streaming branch that never reaches ``_run_turn_bg``.
+    Drive one runner turn and report the wakes its terminal received.
 
     :param tmp_path: Temporary directory for placeholder tmux paths.
-    :returns: None.
+    :param session_id: Session id to POST the turn to.
+    :param terminal_role: Runner-private role to register for the seeded
+        terminal, or ``None`` for a generic pane with no role.
+    :returns: One entry per wake, carrying its ``expect_output`` flag.
     """
     sse_frames = [
         _sse({"type": "response.created", "response": {"id": "resp_wake"}}),
@@ -18834,7 +18834,6 @@ async def test_turn_start_wakes_session_terminal_watchers(tmp_path: Path) -> Non
         del agent_id, session_id
         return spec
 
-    session_id = "aa84b0dc308668bb715607e42ae268b0"
     terminal_registry = TerminalRegistry()
     instance = TerminalInstance(
         name="claude",
@@ -18845,8 +18844,10 @@ async def test_turn_start_wakes_session_terminal_watchers(tmp_path: Path) -> Non
     )
     terminal_registry._by_conversation[session_id] = {("claude", "main"): instance}
 
-    wakes: list[int] = []
-    instance.wake_idle_watcher = lambda: wakes.append(1)  # type: ignore[method-assign]
+    wakes: list[bool] = []
+    instance.wake_idle_watcher = (  # type: ignore[method-assign]
+        lambda *, expect_output=False: wakes.append(expect_output)
+    )
 
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
@@ -18854,6 +18855,12 @@ async def test_turn_start_wakes_session_terminal_watchers(tmp_path: Path) -> Non
         server_client=NullServerClient(),  # type: ignore[arg-type]
         terminal_registry=terminal_registry,
     )
+    registry = app.state.session_resource_registry
+    if terminal_role is not None:
+        registry._terminal_roles[(session_id, terminal_resource_id("claude", "main"))] = (
+            terminal_role
+        )
+
     async with _runner_client(app) as client:
         resp = await client.post(
             f"/v1/sessions/{session_id}/events",
@@ -18867,9 +18874,65 @@ async def test_turn_start_wakes_session_terminal_watchers(tmp_path: Path) -> Non
             },
         )
         assert resp.status_code == 202
-        for _ in range(100):
+        for _ in range(60):
             if wakes:
                 break
             await asyncio.sleep(0.05)
+    return wakes
 
-    assert wakes, "turn start did not wake the session's terminal watchers"
+
+@pytest.mark.asyncio
+async def test_turn_start_wakes_the_status_owning_native_terminal(tmp_path: Path) -> None:
+    """
+    Starting a turn wakes the pane whose watcher owns the session's status.
+
+    Native harnesses inject through the bridge from the harness process, so
+    ``TerminalInstance.send`` is never called and that watcher — the *only*
+    running/idle source for these roles — gets no in-process signal that a turn
+    began. The wake hangs off the turn-start ``running`` edge because every
+    dispatch path publishes it first, including the streaming branch that never
+    reaches ``_run_turn_bg``.
+
+    :param tmp_path: Temporary directory for placeholder tmux paths.
+    :returns: None.
+    """
+    wakes = await _post_turn_and_collect_wakes(
+        tmp_path,
+        session_id="aa84b0dc308668bb715607e42ae268b0",
+        terminal_role=CLAUDE_NATIVE_TERMINAL_ROLE,
+    )
+
+    assert wakes, "turn start did not wake the status-owning terminal"
+    # Output is expected but has not arrived, so the wake must also arm the
+    # grace that keeps the watcher at base rate through turn setup.
+    assert all(wakes), wakes
+
+
+@pytest.mark.asyncio
+async def test_turn_start_leaves_generic_and_auxiliary_panes_alone(tmp_path: Path) -> None:
+    """
+    A turn does not wake panes whose watcher does not own the session's status.
+
+    A generic shell or an auxiliary pane drives only the activity badge and
+    exit detection, and a session turn implies nothing about whether it will
+    produce output. Waking it would put it on high-rate polling for an
+    unrelated turn — the exact cost this change exists to remove.
+
+    :param tmp_path: Temporary directory for placeholder tmux paths.
+    :returns: None.
+    """
+    generic = await _post_turn_and_collect_wakes(
+        tmp_path / "generic",
+        session_id="bb84b0dc308668bb715607e42ae268b0",
+        terminal_role=None,
+    )
+    assert generic == [], f"generic pane was woken: {generic}"
+
+    # codex-native's watcher runs with status emission off (its forwarder owns
+    # the edges), so it is out of scope too.
+    codex = await _post_turn_and_collect_wakes(
+        tmp_path / "codex",
+        session_id="cc84b0dc308668bb715607e42ae268b0",
+        terminal_role=CODEX_NATIVE_TERMINAL_ROLE,
+    )
+    assert codex == [], f"codex-native pane was woken: {codex}"

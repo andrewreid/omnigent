@@ -14,6 +14,7 @@ import pytest
 
 import omnigent.inner.terminal as terminal_mod
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
@@ -1138,6 +1139,11 @@ async def test_turn_start_wake_reaches_a_backed_off_native_status_watcher(
 
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
     registry.set_session_status_publisher(_publish)
+    # The wake is scoped to status-owning roles, so the role has to be
+    # registered exactly as the launch path registers it.
+    registry._terminal_roles[("conv_wake", terminal_resource_id("claude", "main"))] = (
+        CLAUDE_NATIVE_TERMINAL_ROLE
+    )
     registry._start_terminal_activity_watcher(
         "conv_wake",
         "claude",

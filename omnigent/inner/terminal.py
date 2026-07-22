@@ -1102,6 +1102,12 @@ class TerminalInstance:
     # watcher returns to its base interval immediately instead of discovering
     # the change up to a full backed-off interval later.
     _idle_wake_event: threading.Event | None = field(default=None, repr=False)
+    # Set alongside the wake event when the waker expects agent output to
+    # follow (a turn being dispatched) rather than a one-off client repaint.
+    # The watcher consumes it to decide whether the wake also earns a grace
+    # window. Plain bool assignment, atomic under the GIL like the interaction
+    # stamp above.
+    _idle_wake_expects_output: bool = field(default=False, repr=False)
     # Monotonic timestamp of the last client interaction observed on this
     # terminal's web attach (keystroke / focus / mouse / resize / connect /
     # disconnect — see :meth:`note_client_interaction`). The idle watcher
@@ -1136,13 +1142,15 @@ class TerminalInstance:
         :returns: None.
         """
         self._last_client_interaction_at = time.monotonic()
+        # No grace: a client interaction is a one-off repaint, not the start of
+        # agent work, so it only needs the watcher to look once at base rate.
         self.wake_idle_watcher()
 
-    def wake_idle_watcher(self) -> None:
+    def wake_idle_watcher(self, *, expect_output: bool = False) -> None:
         """Pull a backed-off idle watcher back to its base poll interval.
 
         Called from whichever thread is about to make the pane change — the
-        runner writing a turn into it, the attach bridge forwarding a
+        runner dispatching a turn into it, the attach bridge forwarding a
         keystroke, or the close path. A watcher polling at its base interval
         is unaffected; only the extra backoff sleep is cut short, so a burst
         of wakes can never poll tmux faster than the base rate.
@@ -1151,8 +1159,18 @@ class TerminalInstance:
         thread, and a wake that arrives while the watcher is mid-tick is
         retained for the following sleep rather than lost.
 
+        :param expect_output: ``True`` when agent output is expected to follow
+            but has not arrived yet (a turn being dispatched), which also pins
+            the base interval for :data:`_IDLE_POLL_WAKE_GRACE_SECONDS` so the
+            watcher cannot ramp back up while the turn is still starting. The
+            grace is released as soon as the pane actually changes, so it costs
+            a full window only when the expected output never comes. ``False``
+            (the default) requests a single prompt look and no grace — right
+            for client interactions, which repaint once and then stop.
         :returns: None.
         """
+        if expect_output:
+            self._idle_wake_expects_output = True
         wake_event = self._idle_wake_event
         if wake_event is not None:
             wake_event.set()
@@ -1706,6 +1724,9 @@ class TerminalInstance:
         wake_event = threading.Event()
         self._idle_stop_event = stop_event
         self._idle_wake_event = wake_event
+        # A wake raised while no watcher was running would otherwise hand this
+        # fresh one a grace window it never asked for.
+        self._idle_wake_expects_output = False
         self._idle_thread = threading.Thread(
             target=self._idle_watch_loop_threaded,
             args=(stop_event, wake_event),
@@ -1775,11 +1796,12 @@ class TerminalInstance:
         )
         backoff_enabled = _idle_poll_backoff_enabled()
         interval = base_interval
-        # Monotonic time before which backoff may not resume. A wake means
-        # output is expected but has not landed yet, and the work that
-        # produces it (turn setup, harness dispatch, injection) can take
-        # longer than the idle threshold — without the grace the watcher
-        # would ramp back up and miss the very output it was woken for.
+        # Monotonic time before which backoff may not resume. Only a wake that
+        # expects output arms it: the work producing that output (turn setup,
+        # harness dispatch, injection) can outlast the idle threshold, and
+        # without the grace the watcher would ramp back up and miss the very
+        # output it was woken for. Released the moment the pane changes, so a
+        # normal turn pays a few extra captures rather than the whole window.
         hold_base_until = 0.0
         while self.running:
             should_stop, woken = self._wait_next_idle_tick(
@@ -1801,7 +1823,9 @@ class TerminalInstance:
                         base_interval,
                     )
                 interval = base_interval
-                hold_base_until = time.monotonic() + _IDLE_POLL_WAKE_GRACE_SECONDS
+                if self._idle_wake_expects_output:
+                    self._idle_wake_expects_output = False
+                    hold_base_until = time.monotonic() + _IDLE_POLL_WAKE_GRACE_SECONDS
             if not self.running:
                 return
             capture = self._capture_pane_state_or_none()
@@ -1851,6 +1875,10 @@ class TerminalInstance:
                         base_interval,
                     )
                 interval = base_interval
+                # The output the grace was holding out for arrived, so the
+                # grace has served its purpose. The idle threshold governs from
+                # here — backoff still cannot resume until the edge fires.
+                hold_base_until = 0.0
             elif backoff_enabled and detector.idle_notified and now >= hold_base_until:
                 grown = _next_idle_poll_interval(interval, base_interval)
                 if grown != interval:
@@ -1896,9 +1924,14 @@ class TerminalInstance:
         with the pane. ``stop_event`` and ``wake_event`` are set together by
         the close path, so teardown never waits out a backed-off sleep.
 
-        The wake flag is cleared just before returning, so a wake raised
-        while the tick body runs is retained and shortens the next sleep
-        instead of being dropped.
+        Only a wake this call actually observed is cleared. Clearing
+        unconditionally would swallow one that arrives between a timed-out
+        ``wait`` and the ``clear`` — the caller would be told it was not woken
+        while the signal was destroyed, losing both the interval reset and the
+        grace, and reopening the late-``running`` race the wake exists to
+        close. Leaving an unobserved wake set costs at most one base interval:
+        the next sleep sees it immediately. A wake raised while the tick body
+        runs is retained the same way.
 
         :param stop_event: Set by the close path to end the watcher.
         :param wake_event: Set to cut the backoff short, or ``None``.
@@ -1917,7 +1950,8 @@ class TerminalInstance:
         remaining = interval - base_interval
         if remaining > 0 and not woken:
             woken = wake_event.wait(remaining)
-        wake_event.clear()
+        if woken:
+            wake_event.clear()
         return stop_event.is_set(), woken
 
     def _capture_pane_state_or_none(self) -> tuple[bool, str] | None:

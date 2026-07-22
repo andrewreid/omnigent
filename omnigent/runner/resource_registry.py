@@ -69,6 +69,32 @@ HERMES_NATIVE_TERMINAL_ROLE = "hermes-native"
 # (the REPL exited or crashed) instead of rejecting the attach.
 OMNIGENT_REPL_TERMINAL_ROLE = "omnigent-repl"
 
+# Terminal roles whose pane watcher IS the session's working status. Each of
+# these harnesses returns from ``run_turn`` the moment the message is injected,
+# so nothing else observes the model turn — the PTY watcher owns both the
+# ``running`` and the ``idle`` edge.
+#
+# Deliberately excludes codex-native and antigravity-native: their watcher runs
+# with status emission off (a forwarder / RPC read driver owns their edges), and
+# excludes generic and auxiliary panes, whose watcher only drives the activity
+# badge and exit detection.
+#
+# Read in two places that must agree: the watcher's status gate, and
+# :meth:`SessionResourceRegistry.wake_session_terminal_watchers`, which pulls
+# exactly these panes back to base rate at turn start.
+PTY_STATUS_OWNING_TERMINAL_ROLES = frozenset(
+    {
+        CLAUDE_NATIVE_TERMINAL_ROLE,
+        PI_NATIVE_TERMINAL_ROLE,
+        CURSOR_NATIVE_TERMINAL_ROLE,
+        KIRO_NATIVE_TERMINAL_ROLE,
+        GOOSE_NATIVE_TERMINAL_ROLE,
+        QWEN_NATIVE_TERMINAL_ROLE,
+        KIMI_NATIVE_TERMINAL_ROLE,
+        HERMES_NATIVE_TERMINAL_ROLE,
+    }
+)
+
 _IS_ALIVE_CACHE_TTL_S = 2.0
 _IS_ALIVE_CACHE_MAX = 256
 
@@ -366,20 +392,25 @@ class SessionResourceRegistry:
         self._terminal_exit_publisher = publisher
 
     def wake_session_terminal_watchers(self, session_id: str) -> None:
-        """Pull this session's idle watchers back to their base poll interval.
+        """Pull this session's status-owning pane watchers back to base rate.
 
         Native harnesses inject a turn through the bridge, from the harness
         process — not through :meth:`TerminalInstance.send` in the runner — so
         the pane watcher gets no in-process signal that a turn is starting.
-        For the native agent terminals in
-        :meth:`_start_terminal_activity_watcher`'s status set, that watcher is
-        the *only* source of the session's running/idle status, so a quiesced
-        watcher would report ``idle`` for up to its backed-off interval into a
-        turn the user just sent. The runner calls this as it begins dispatching
-        a turn, which is the earliest point it knows output is coming.
+        For the roles in :data:`PTY_STATUS_OWNING_TERMINAL_ROLES` that watcher
+        is the *only* source of the session's running/idle status, so a
+        quiesced one would report ``idle`` for up to its backed-off interval
+        into a turn the user just sent. The runner calls this as it begins
+        dispatching a turn, the earliest point it knows output is coming.
 
-        Safe to call for any session: terminals with no watcher, or one already
-        at its base interval, are unaffected.
+        Scoped to those roles on purpose. A generic or auxiliary pane's watcher
+        drives only the activity badge and exit detection, and a session turn
+        implies nothing about whether that pane will produce output — waking it
+        would put it on high-rate polling for an unrelated turn, which is the
+        cost this whole change exists to remove.
+
+        Safe to call for any session: one with no terminals, no matching role,
+        or no running watcher is unaffected.
 
         :param session_id: Session/conversation identifier, e.g.
             ``"conv_abc123"``.
@@ -389,7 +420,11 @@ class SessionResourceRegistry:
         if registry is None:
             return
         for entry in registry.list_for_conversation(session_id):
-            entry.instance.wake_idle_watcher()
+            resource_id = terminal_resource_id(entry.terminal_name, entry.session_key)
+            with self._lock:
+                role = self._terminal_roles.get((session_id, resource_id))
+            if role in PTY_STATUS_OWNING_TERMINAL_ROLES:
+                entry.instance.wake_idle_watcher(expect_output=True)
 
     async def wait_for_terminal_exit_cleanup(self) -> None:
         """Await the scheduled terminal-exit cleanup to completion so its
@@ -1025,30 +1060,9 @@ class SessionResourceRegistry:
         exit_publisher = self._terminal_exit_publisher
         # Status edges are derived only from native agent terminals — a
         # generic shell's output must not move the session's working status.
-        emit_status = status_publisher is not None and resource_role in {
-            CLAUDE_NATIVE_TERMINAL_ROLE,
-            PI_NATIVE_TERMINAL_ROLE,
-            # cursor-native has no forwarder/hook (run_turn returns immediately
-            # after the paste), so — like pi/claude — the PTY watcher is its only
-            # status source. Without this the web "Working…" badge never clears.
-            CURSOR_NATIVE_TERMINAL_ROLE,
-            KIRO_NATIVE_TERMINAL_ROLE,
-            # goose-native injects then returns (its forwarder only mirrors the
-            # transcript, not status), so the PTY watcher is its status source too.
-            GOOSE_NATIVE_TERMINAL_ROLE,
-            # qwen-native appends then returns (its forwarder only mirrors the
-            # JSON event transcript, not status), so the PTY watcher is its
-            # status source too.
-            QWEN_NATIVE_TERMINAL_ROLE,
-            # kimi-native also has no forwarder/hook (the injection run_turn
-            # returns right after the tmux paste), so the PTY watcher is its
-            # only running/idle status source — same as cursor/pi/claude.
-            KIMI_NATIVE_TERMINAL_ROLE,
-            # hermes-native injects then returns (its forwarder only mirrors the
-            # SQLite transcript, not status), so the PTY watcher is its status
-            # source too.
-            HERMES_NATIVE_TERMINAL_ROLE,
-        }
+        emit_status = (
+            status_publisher is not None and resource_role in PTY_STATUS_OWNING_TERMINAL_ROLES
+        )
         if activity_publisher is None and not emit_status and exit_publisher is None:
             return
         resource_id = terminal_resource_id(terminal_name, session_key)
