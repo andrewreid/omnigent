@@ -941,8 +941,11 @@ def test_foreground_connect_connection_failure_skips_prompt(
 ) -> None:
     """A connection failure (SystemExit) does not prompt over the error."""
 
-    def _fail(server_url: str) -> None:
+    reached: list[bool] = []
+
+    def _fail(server_url: str, local_server_pid: int | None = None) -> None:
         """Simulate a permanent connection failure exiting non-zero."""
+        reached.append(True)
         raise SystemExit(1)
 
     _patch_foreground_host_local(monkeypatch, tmp_path, run_host_process=_fail)
@@ -954,6 +957,7 @@ def test_foreground_connect_connection_failure_skips_prompt(
 
     result = CliRunner().invoke(cli_group, ["host", ""])
 
+    assert reached == [True], "the exit code must come from the connect failure"
     assert result.exit_code == 1
 
 
