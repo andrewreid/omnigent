@@ -539,6 +539,13 @@ class _WakeSignal:
         """
         Wait for a wake and take it, clearing both halves together.
 
+        The wait is predicate-looped via :meth:`threading.Condition.wait_for`
+        against a monotonic deadline, not a bare ``wait``. A bare one may
+        return before its timeout without a wake pending, and the caller reads
+        that as "the poll interval elapsed" — so a spurious return would cut a
+        backed-off sleep short and fork tmux early, which is the cost the
+        backoff exists to avoid.
+
         :param timeout: Longest time to wait in seconds. Values at or below
             zero poll without blocking, which is how the watcher checks for a
             wake while already at its base interval.
@@ -546,8 +553,8 @@ class _WakeSignal:
             ever ``True`` alongside ``was_woken``.
         """
         with self._condition:
-            if not self._pending and timeout > 0:
-                self._condition.wait(timeout)
+            if timeout > 0:
+                self._condition.wait_for(lambda: self._pending, timeout)
             woken = self._pending
             expects_output = self._expects_output
             self._pending = False
@@ -1214,9 +1221,12 @@ class TerminalInstance:
         is unaffected; only the extra backoff sleep is cut short, so a burst
         of wakes can never poll tmux faster than the base rate.
 
-        Thread-safety: :class:`threading.Event` is safe to set from any
-        thread, and a wake that arrives while the watcher is mid-tick is
-        retained for the following sleep rather than lost.
+        Thread-safety is :class:`_WakeSignal`'s: the wake and its reason are
+        raised together under its lock, so a wake can be posted from any
+        thread without racing the watcher's read. A wake that arrives while
+        the watcher is mid-tick stays pending and shortens the following
+        sleep — it is never dropped, only serviced up to one base interval
+        later.
 
         :param expect_output: ``True`` when agent output is expected to follow
             but has not arrived yet (a turn being dispatched), which also pins
