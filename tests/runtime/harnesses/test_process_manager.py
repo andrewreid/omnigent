@@ -1198,7 +1198,7 @@ async def test_orphan_sweep_escalates_to_sigkill(
     monkeypatch.setattr(pm_mod, "_ORPHAN_KILL_VERIFY_TIMEOUT_S", 0.0)
     monkeypatch.setattr(pm_mod, "_pids_holding_socket", fake_pids_holding_socket)
     monkeypatch.setattr(pm_mod, "_holder_member_identities", lambda _pid: {12345: "id-a"})
-    monkeypatch.setattr(pm_mod._proc, "process_start_identity", lambda _pid: "id-a")
+    monkeypatch.setattr(pm_mod._proc, "process_identity_state", lambda _pid, _ident: "match")
     monkeypatch.setattr(pm_mod._proc, "kill_verified", fake_kill_verified)
     monkeypatch.setattr(pm_mod.os, "getpgid", fake_getpgid)
     monkeypatch.setattr(pm_mod.os, "killpg", fake_killpg)
@@ -1346,6 +1346,39 @@ async def test_orphan_sweep_keeps_dir_while_socket_still_listens(
         assert instance_dir.exists(), "listening socket must veto dir removal"
     finally:
         server.close()
+
+
+async def test_orphan_sweep_keeps_dir_when_group_snapshot_fails(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unsnapshottable holder tree is neither signaled nor deleted.
+
+    Signaling a tree whose members could not be completely captured would
+    leave survivors that escalation cannot verify; the sweep must skip the
+    signal and retain the dir for a retry.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    async def lookup(_socket_path: Path) -> list[int]:
+        return [12345]
+
+    def must_not_signal(_pid: int, _sig: signal.Signals) -> bool:
+        raise AssertionError("an unverifiable tree must not be signaled")
+
+    monkeypatch.setattr(pm_mod, "_pids_holding_socket", lookup)
+    monkeypatch.setattr(pm_mod, "_holder_member_identities", lambda _pid: None)
+    monkeypatch.setattr(pm_mod, "_signal_pid_tree", must_not_signal)
+
+    dead = short_tmp_parent / "ap-dead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (dead / "conv-stale.sock").touch()
+
+    swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+
+    assert swept == 0
+    assert dead.exists(), "dir with an unverifiable tree must be kept for retry"
 
 
 async def test_orphan_sweep_keeps_dir_when_socket_lookup_fails(

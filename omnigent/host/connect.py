@@ -966,16 +966,14 @@ class HostProcess:
         """Run one pass of every per-family ownerless-tree sweep.
 
         Families are independent: a failure in one is logged and never
-        blocks the others. The whole pass holds :meth:`_host_subprocess_op`
-        because the family sweeps fork helpers (tmux/lsof/ps) as direct
-        children of this host — the zombie reaper must not steal their exit
-        statuses mid-``wait()``. The blocking family sweeps run in a worker
-        thread so a slow pass never stalls the event loop.
-
-        On cancellation, an in-flight worker thread is joined (bounded by
-        :data:`_OWNERLESS_SWEEP_JOIN_TIMEOUT_S`) before the op-guard
-        unwinds, so no sweep helper's exit status is exposed to the final
-        shutdown drain.
+        blocks the others. Each family holds a subprocess-op ref (see
+        :meth:`_host_subprocess_op`) for its true lifetime — released by a
+        done-callback, not by the awaiting coroutine — because the family
+        sweeps fork helpers (tmux/lsof/ps) as direct children of this host
+        and the zombie reaper must not steal their exit statuses
+        mid-``wait()``. A worker that outlives a cancelled await therefore
+        keeps the reaper paused until it actually finishes; the bounded
+        joins below only cap how long shutdown waits for it.
 
         :returns: None.
         """
@@ -987,57 +985,68 @@ class HostProcess:
             sweep_orphaned_instance_dirs,
         )
 
-        with self._host_subprocess_op():
-            try:
-                signaled = await self._run_family_in_thread(
-                    reconcile_codex_native_process_registry
+        try:
+            signaled = await self._run_family_in_thread(reconcile_codex_native_process_registry)
+            if signaled:
+                _logger.info(
+                    "ownerless sweep: signaled %d codex-native process group(s)",
+                    signaled,
                 )
-                if signaled:
-                    _logger.info(
-                        "ownerless sweep: signaled %d codex-native process group(s)",
-                        signaled,
-                    )
-            except Exception:  # noqa: BLE001 — best-effort per family
-                _logger.warning("codex-native ownerless sweep failed", exc_info=True)
-            try:
-                reaped = await self._run_family_in_thread(reap_orphaned_terminals)
-                if reaped:
-                    _logger.info(
-                        "ownerless sweep: reaped %d orphaned terminal tmux server(s)",
-                        reaped,
-                    )
-            except Exception:  # noqa: BLE001 — best-effort per family
-                _logger.warning("terminal ownerless sweep failed", exc_info=True)
-            try:
-                # A timed-out pass may cancel mid-kill, leaving a runner
-                # SIGTERMed but not yet SIGKILLed; the next pass finishes it.
-                swept = await self._run_family_task(
-                    asyncio.wait_for(
-                        sweep_orphaned_instance_dirs(),
-                        timeout=_OWNERLESS_SWEEP_TIMEOUT_S,
-                    )
+        except Exception:  # noqa: BLE001 — best-effort per family
+            _logger.warning("codex-native ownerless sweep failed", exc_info=True)
+        try:
+            reaped = await self._run_family_in_thread(reap_orphaned_terminals)
+            if reaped:
+                _logger.info(
+                    "ownerless sweep: reaped %d orphaned terminal tmux server(s)",
+                    reaped,
                 )
-                if swept:
-                    _logger.info(
-                        "ownerless sweep: cleaned %d orphaned harness instance dir(s)",
-                        swept,
-                    )
-            except Exception:  # noqa: BLE001 — best-effort per family
-                _logger.warning("harness instance-dir ownerless sweep failed", exc_info=True)
+        except Exception:  # noqa: BLE001 — best-effort per family
+            _logger.warning("terminal ownerless sweep failed", exc_info=True)
+        try:
+            # A timed-out pass may cancel mid-kill, leaving a runner
+            # SIGTERMed but not yet SIGKILLed; the next pass finishes it.
+            swept = await self._run_family_task(
+                asyncio.wait_for(
+                    sweep_orphaned_instance_dirs(),
+                    timeout=_OWNERLESS_SWEEP_TIMEOUT_S,
+                )
+            )
+            if swept:
+                _logger.info(
+                    "ownerless sweep: cleaned %d orphaned harness instance dir(s)",
+                    swept,
+                )
+        except Exception:  # noqa: BLE001 — best-effort per family
+            _logger.warning("harness instance-dir ownerless sweep failed", exc_info=True)
+
+    def _release_subprocess_op(self) -> None:
+        """Drop one subprocess-op ref (family-sweep done-callback target).
+
+        Paired with the increment each family helper performs *before*
+        submitting its worker; the done-callback runs even when the
+        awaiting coroutine was cancelled long before, so a sweep worker
+        can never outlive its guard.
+        """
+        self._owned_subprocess_ops -= 1
 
     async def _run_family_in_thread(self, fn: Callable[[], int]) -> int:
-        """Run one blocking family sweep in a worker thread, join-safe.
+        """Run one blocking family sweep in a worker thread, guard-safe.
 
         A cancelled ``to_thread`` await returns immediately while its
-        thread keeps running — which would let the thread spawn helpers
-        after the caller's subprocess-op guard unwound. On cancellation
-        this waits (bounded) for the worker to finish before re-raising,
-        keeping the guard honest.
+        thread keeps running, so the subprocess-op ref is tied to the
+        worker future itself (released only when the thread finishes). On
+        cancellation the worker is additionally joined, bounded, so
+        shutdown normally proceeds with no worker in flight at all.
 
         :param fn: The blocking sweep callable.
         :returns: The sweep's reaped/signaled count.
         """
+        # Increment BEFORE submission — the worker can start on its thread
+        # before this coroutine runs another line.
+        self._owned_subprocess_ops += 1
         future = asyncio.get_running_loop().run_in_executor(None, fn)
+        future.add_done_callback(lambda _f: self._release_subprocess_op())
         try:
             return await asyncio.shield(future)
         except asyncio.CancelledError:
@@ -1051,14 +1060,17 @@ class HostProcess:
         """Run one async family sweep as a task, join-safe on cancellation.
 
         The async sweep's own cancellation handlers (e.g. killing an
-        in-flight ``lsof``) must run to completion inside the caller's
-        subprocess-op guard, so cancellation propagates into the task and
-        is then awaited (bounded) before re-raising.
+        in-flight ``lsof``) must run to completion inside the sweep's
+        subprocess-op ref — held until the task is truly done — so
+        cancellation propagates into the task and is then awaited
+        (bounded) before re-raising.
 
         :param coro: The family sweep awaitable.
         :returns: The sweep's cleaned count.
         """
+        self._owned_subprocess_ops += 1
         task = asyncio.ensure_future(coro)
+        task.add_done_callback(lambda _f: self._release_subprocess_op())
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:

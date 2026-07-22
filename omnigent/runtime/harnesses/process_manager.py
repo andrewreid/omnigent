@@ -1476,14 +1476,23 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
             lookup_failed = True
             continue
         for pid in pids:
-            for member, identity in _holder_member_identities(pid).items():
+            members = _holder_member_identities(pid)
+            if members is None:
+                # The holder's tree could not be completely snapshotted:
+                # signaling it anyway would leave survivors escalation
+                # cannot verify. Keep the dir and retry.
+                lookup_failed = True
+                continue
+            if not members:
+                continue  # holder already gone
+            for member, identity in members.items():
                 tracked.setdefault(member, identity)
             _signal_pid_tree(pid, signal.SIGTERM)
 
     if tracked:
         await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
         for pid, identity in tracked.items():
-            if _proc.process_start_identity(pid) != identity:
+            if _proc.process_identity_state(pid, identity) != "match":
                 continue
             _logger.warning(
                 "orphan runner pid %d survived SIGTERM; escalating to SIGKILL",
@@ -1491,8 +1500,11 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
             )
             _proc.kill_verified(pid, identity, getattr(signal, "SIGKILL", signal.SIGTERM))
         deadline = time.monotonic() + _ORPHAN_KILL_VERIFY_TIMEOUT_S
+        # Only a definitive "gone" clears a tracked member; an unreadable
+        # one keeps the dir so a later pass can settle it.
         while any(
-            _proc.process_start_identity(pid) == identity for pid, identity in tracked.items()
+            _proc.process_identity_state(pid, identity) != "gone"
+            for pid, identity in tracked.items()
         ):
             if time.monotonic() >= deadline:
                 return False
@@ -1513,34 +1525,41 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
     return True
 
 
-def _holder_member_identities(pid: int) -> dict[int, str]:
+def _holder_member_identities(pid: int) -> dict[int, str] | None:
     """
     Snapshot the identities of the socket holder's whole group.
 
     Taken while the holder still proves ownership (it holds a conv socket
     under a dead-AP dir), so the recorded ``pid -> start-identity`` map is
-    a safe kill/verify list even after the holder itself exits. Falls back
-    to the holder alone when its group cannot be resolved (foreign, our
-    own shared group, or no POSIX groups).
+    a safe kill/verify list even after the holder itself exits. When the
+    holder shares OUR group (legacy topology) group operations are off the
+    table — a group signal would hit ourselves — so only the holder is
+    tracked and signaled.
 
     :param pid: The socket-holding process id.
     :returns: ``pid -> identity`` for every member to track; empty when
-        the holder is already gone.
+        the holder is definitively gone; ``None`` when the tree could not
+        be completely snapshotted — the caller must not signal it.
     """
-    pgid: int | None = None
+    if pid <= 0:
+        return {}
+    own_group = False
     if hasattr(os, "getpgid"):
         try:
             pgid = os.getpgid(pid)
-            if pgid == os.getpgid(0):
-                pgid = None
+            own_group = pgid == os.getpgid(0)
+        except ProcessLookupError:
+            return {}
         except OSError:
-            pgid = None
-    if pgid is not None:
-        members = _proc.group_member_identities(pgid)
-        if members:
-            return members
+            return None
+        if not own_group:
+            return _proc.group_member_identities(pgid)
     identity = _proc.process_start_identity(pid)
-    return {pid: identity} if identity is not None else {}
+    if identity is None:
+        # Gone or unreadable: lsof re-resolves a gone holder to nothing on
+        # the next pass, and an unreadable one must not be signaled blind.
+        return None
+    return {pid: identity}
 
 
 def _signal_pid_tree(pid: int, sig: signal.Signals) -> bool:

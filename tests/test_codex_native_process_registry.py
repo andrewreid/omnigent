@@ -130,13 +130,19 @@ def test_reconciliation_escalates_to_sigkill_after_grace(tmp_path: Path, monkeyp
     # Past the grace, the member's identity still matches: SIGKILL it and
     # keep the entry for a later absence check.
     monkeypatch.setattr(registry, "_SIGKILL_GRACE_S", 0.0)
-    monkeypatch.setattr(registry, "_process_start_identity", lambda _pid: "start-a")
+    monkeypatch.setattr(registry, "_member_identity_state", lambda _pid, _start: "match")
     assert registry.reconcile_codex_native_process_registry(registry_path=path) == 1
     assert killed_pid == [(123, signal.SIGKILL)]
     assert len(_registry_payload(path)) == 1
 
+    # Unverifiable member: retain the entry, signal nothing.
+    monkeypatch.setattr(registry, "_member_identity_state", lambda _pid, _start: "unverifiable")
+    assert registry.reconcile_codex_native_process_registry(registry_path=path) == 0
+    assert killed_pid == [(123, signal.SIGKILL)]
+    assert len(_registry_payload(path)) == 1
+
     # Member verifiably gone: the entry is dropped without further kills.
-    monkeypatch.setattr(registry, "_process_start_identity", lambda _pid: None)
+    monkeypatch.setattr(registry, "_member_identity_state", lambda _pid, _start: "gone")
     assert registry.reconcile_codex_native_process_registry(registry_path=path) == 0
     assert killed_pid == [(123, signal.SIGKILL)]
     assert _registry_payload(path) == []
