@@ -4964,3 +4964,123 @@ def test_live_state_writes_via_chokepoint_land_in_scoped_workspace(
             assert updated.pending_elicitation_count == 3
     finally:
         session_live_state.configure(None)
+
+
+# ── ACL EXISTS pushdown (single-DB) ────────────────────
+
+
+def _acl_perms(db_uri: str):
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    for user in ("alice@example.com", "bob@example.com"):
+        perms.ensure_user(user)
+    return perms
+
+
+def test_list_conversations_accessible_by_excludes_non_granted(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """A user sees exactly the sessions they hold a grant for."""
+    mine = conversation_store.create_conversation(title="mine")
+    other = conversation_store.create_conversation(title="other")
+    perms = _acl_perms(db_uri)
+    perms.grant("alice@example.com", mine.id, 1)
+    perms.grant("bob@example.com", other.id, 4)
+
+    ids = {
+        c.id for c in conversation_store.list_conversations(accessible_by="alice@example.com").data
+    }
+    assert ids == {mine.id}
+    assert not conversation_store.list_conversations(accessible_by="nobody@example.com").data
+
+
+def test_list_conversations_accessible_and_owned_intersect(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """accessible_by + owned_by together keep only owner-level grants."""
+    owned = conversation_store.create_conversation(title="owned")
+    shared = conversation_store.create_conversation(title="shared")
+    perms = _acl_perms(db_uri)
+    perms.grant("alice@example.com", owned.id, 4)
+    perms.grant("alice@example.com", shared.id, 1)
+
+    ids = {
+        c.id
+        for c in conversation_store.list_conversations(
+            accessible_by="alice@example.com", owned_by="alice@example.com"
+        ).data
+    }
+    assert ids == {owned.id}
+
+
+def test_single_db_acl_uses_exists_pushdown_not_prefetch(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """
+    Single-DB mode pushes the ACL into the conversations query as a
+    correlated EXISTS: no standalone session_permissions prefetch runs,
+    and the ids never round-trip through Python.
+    """
+    from sqlalchemy import event
+
+    assert conversation_store._conv_engine is conversation_store._engine
+
+    conv = conversation_store.create_conversation(title="mine")
+    perms = _acl_perms(db_uri)
+    perms.grant("alice@example.com", conv.id, 4)
+
+    statements: list[str] = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(conversation_store._engine, "before_cursor_execute", _capture)
+    try:
+        result = conversation_store.list_conversations(
+            accessible_by="alice@example.com", owned_by="alice@example.com"
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", _capture)
+
+    assert {c.id for c in result.data} == {conv.id}
+    perm_stmts = [s for s in statements if "session_permissions" in s]
+    # The permission table appears only inside the conversations query
+    # (as EXISTS subqueries) — never as its own prefetch SELECT.
+    assert perm_stmts, "expected the list query to reference session_permissions"
+    for stmt in perm_stmts:
+        assert "FROM conversations" in stmt
+        assert "EXISTS" in stmt
+
+
+def test_list_conversations_acl_with_cursor_pagination(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """Cursor pagination composes with the ACL filter: pages never leak
+    non-granted rows, never overlap, and a non-granted conversation id
+    still works as a cursor."""
+    convs = [conversation_store.create_conversation(title=f"c{i}") for i in range(6)]
+    granted = {c.id for c in convs[:4]}
+    perms = _acl_perms(db_uri)
+    for c in convs[:4]:
+        perms.grant("alice@example.com", c.id, 4)
+
+    page1 = conversation_store.list_conversations(accessible_by="alice@example.com", limit=2)
+    page2 = conversation_store.list_conversations(
+        accessible_by="alice@example.com", limit=2, after=page1.last_id
+    )
+    ids1 = {c.id for c in page1.data}
+    ids2 = {c.id for c in page2.data}
+    assert ids1 <= granted and ids2 <= granted
+    assert not ids1 & ids2
+    assert len(ids1) == 2 and len(ids2) == 2
+    assert page2.has_more is False
+
+    # A non-granted conversation as the cursor filters position only —
+    # the returned rows are still ACL-scoped.
+    page3 = conversation_store.list_conversations(
+        accessible_by="alice@example.com", limit=10, after=convs[4].id
+    )
+    assert {c.id for c in page3.data} <= granted
