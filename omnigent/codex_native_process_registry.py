@@ -30,12 +30,6 @@ _TAG_ARG_PREFIX = "omnigent_crash_teardown_tag="
 # flush rollout state; short enough that a TERM-ignoring child dies on the
 # next periodic sweep rather than surviving indefinitely.
 _SIGKILL_GRACE_S = 10.0
-# Ceiling on group-liveness escalation after a SIGTERM. Within it the pgid
-# was recently verified ours (live tagged leader at SIGTERM time), so a
-# group kill is safe even if the leader has since exited while a child
-# survives. Past it the pgid can no longer be trusted against reuse, so the
-# entry is dropped instead of risking a kill of an unrelated group.
-_SIGKILL_WINDOW_S = 300.0
 
 
 @dataclass(frozen=True)
@@ -53,6 +47,11 @@ class CodexNativeProcessEntry:
     :param sigterm_at: Wall-clock time a reconciliation pass SIGTERMed
         this entry's process group, or ``None`` if never signaled. A
         later pass escalates to SIGKILL once the grace has elapsed.
+    :param members: ``(pid, start-time)`` identities of every group
+        member, snapshotted while the tagged leader was still alive (the
+        moment group ownership is provable). Escalation kills exactly
+        these identity-verified processes, so it can neither hit a
+        recycled pgid nor lose a child that outlives its leader.
     """
 
     pid: int
@@ -61,6 +60,7 @@ class CodexNativeProcessEntry:
     session_tag: str
     owner_lock_path: str | None = None
     sigterm_at: float | None = None
+    members: tuple[tuple[int, str], ...] | None = None
 
 
 @dataclass
@@ -209,11 +209,13 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
     once :data:`_SIGKILL_GRACE_S` has elapsed, so a child that ignores or
     wedges on SIGTERM cannot outlive reconciliation.
 
-    Escalation outlives the group leader: a SIGTERMed entry is settled by
-    process-*group* liveness, not leader liveness, so a child that
-    survives its exiting leader is still killed. Group kills stop at
-    :data:`_SIGKILL_WINDOW_S` past the SIGTERM — beyond that the pgid can
-    no longer be trusted against reuse and the entry is dropped.
+    Escalation outlives the group leader: member identities (pid plus
+    start time) are snapshotted while the tagged leader is still alive —
+    the moment group ownership is provable — and a later pass SIGKILLs
+    exactly the identity-verified survivors. A recycled pid fails the
+    start-time check, so escalation can neither hit an unrelated process
+    nor lose a child that outlives its leader, and entries persist until
+    every recorded member is verifiably gone.
 
     :param registry_path: Test override for the registry file path.
     :returns: Number of process groups signaled this pass.
@@ -228,34 +230,18 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                 survivors.append(entry)
                 continue
             if entry.sigterm_at is not None:
-                # Already SIGTERMed: settle by group liveness. The leader
-                # may have exited while a TERM-ignoring child survives, so
-                # the leader-identity checks below no longer apply.
-                elapsed = now - entry.sigterm_at
-                if elapsed < _SIGKILL_GRACE_S:
+                if now - entry.sigterm_at < _SIGKILL_GRACE_S:
                     survivors.append(entry)
                     continue
-                if elapsed > _SIGKILL_WINDOW_S:
-                    _logger.warning(
-                        "giving up on codex-native process group %d: SIGTERMed "
-                        "%.0fs ago, pgid no longer trustworthy against reuse",
-                        entry.pgid,
-                        elapsed,
-                    )
-                    _reap_tmux_session(entry.tmux_session_name)
-                    continue
-                if not _process_group_alive(entry.pgid):
-                    _reap_tmux_session(entry.tmux_session_name)
-                    continue
-                if _signal_process_group(entry.pgid, signal.SIGKILL):
-                    _logger.warning(
-                        "ownerless codex-native process group %d survived SIGTERM; SIGKILLed",
-                        entry.pgid,
-                    )
+                outcome = _escalate_sigkill(entry)
+                if outcome == "killed":
                     signaled += 1
-                    _reap_tmux_session(entry.tmux_session_name)
-                else:
+                if outcome in ("killed", "retry"):
+                    # Keep the entry: absence is re-verified on a later
+                    # pass before its metadata is dropped.
                     survivors.append(entry)
+                    continue
+                _reap_tmux_session(entry.tmux_session_name)
                 continue
             if not _pid_alive(entry.pid) or not _process_cmdline_has_tag(
                 entry.pid, entry.session_tag
@@ -266,6 +252,7 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                 # leftover tmux session.
                 _reap_tmux_session(entry.tmux_session_name)
                 continue
+            members = _group_member_identities(entry.pgid)
             if _signal_process_group(entry.pgid, signal.SIGTERM):
                 _logger.info(
                     "SIGTERMed ownerless codex-native process group %d (pid %d)",
@@ -273,12 +260,58 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                     entry.pid,
                 )
                 signaled += 1
-                entry = replace(entry, sigterm_at=now)
+                entry = replace(entry, sigterm_at=now, members=members)
             # Keep the entry either way: a failed signal retries on the
             # next pass, a delivered one is re-checked for escalation.
             survivors.append(entry)
         _write_registry(path, survivors)
     return signaled
+
+
+def _escalate_sigkill(entry: CodexNativeProcessEntry) -> str:
+    """
+    SIGKILL whatever provably remains of an already-SIGTERMed entry.
+
+    With a member snapshot, each recorded ``(pid, start-time)`` identity is
+    re-verified and only matching survivors are killed — pid reuse fails
+    the start-time check. Without a snapshot, a group kill is allowed only
+    while the tagged leader itself is still alive to prove ownership;
+    otherwise nothing is signaled.
+
+    :param entry: The SIGTERMed registry entry past its grace.
+    :returns: ``"killed"`` when a SIGKILL was delivered, ``"retry"`` when a
+        kill failed and should be retried, ``"gone"`` when every member is
+        verifiably absent, ``"unverifiable"`` when no survivor can be
+        safely identified — the last two mean the entry can be dropped.
+    """
+    kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+    if entry.members is not None:
+        survivors = [pid for pid, start in entry.members if _process_start_identity(pid) == start]
+        if not survivors:
+            return "gone"
+        for pid in survivors:
+            with contextlib.suppress(OSError):
+                os.kill(pid, kill_sig)
+        _logger.warning(
+            "codex-native group %d survived SIGTERM; SIGKILLed member(s) %s",
+            entry.pgid,
+            survivors,
+        )
+        return "killed"
+    if _pid_alive(entry.pid) and _process_cmdline_has_tag(entry.pid, entry.session_tag):
+        if _signal_process_group(entry.pgid, kill_sig):
+            _logger.warning(
+                "ownerless codex-native process group %d survived SIGTERM; SIGKILLed",
+                entry.pgid,
+            )
+            return "killed"
+        return "retry"
+    _logger.info(
+        "dropping codex-native entry for group %d: tagged leader gone and no "
+        "member snapshot to verify survivors",
+        entry.pgid,
+    )
+    return "unverifiable"
 
 
 @contextlib.contextmanager
@@ -363,6 +396,7 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
     tmux_session_name = item.get("tmux_session_name")
     owner_lock_path = item.get("owner_lock_path")
     sigterm_at = item.get("sigterm_at")
+    members = _members_from_json(item.get("members"))
     if not isinstance(pid, int) or pid <= 0:
         return None
     if not isinstance(pgid, int) or pgid <= 0:
@@ -382,7 +416,24 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
         session_tag=session_tag,
         owner_lock_path=owner_lock_path,
         sigterm_at=float(sigterm_at) if sigterm_at is not None else None,
+        members=members,
     )
+
+
+def _members_from_json(raw: object) -> tuple[tuple[int, str], ...] | None:
+    if not isinstance(raw, list):
+        return None
+    members: list[tuple[int, str]] = []
+    for item in raw:
+        if not isinstance(item, list) or len(item) != 2:
+            return None
+        pid, start = item
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return None
+        if not isinstance(start, str) or not start:
+            return None
+        members.append((pid, start))
+    return tuple(members) if members else None
 
 
 def _owner_lock_held(owner_lock_path: str | None) -> bool:
@@ -449,16 +500,69 @@ def _process_cmdline(pid: int) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
-def _process_group_alive(pgid: int) -> bool:
-    if os.name != "posix":
-        return False
+def _group_member_identities(pgid: int) -> tuple[tuple[int, str], ...] | None:
+    """
+    Snapshot ``(pid, start-time)`` identities of every member of *pgid*.
+
+    Must be taken while group ownership is provable (live tagged leader).
+    ``lstart`` is stable for a process's lifetime and second-granular, so a
+    recycled pid later fails the equality check.
+
+    :param pgid: Process group to enumerate.
+    :returns: Member identities, or ``None`` when they could not be read.
+    """
     try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True
-    return True
+        proc = subprocess.run(
+            ["ps", "-A", "-o", "pid=", "-o", "pgid=", "-o", "lstart="],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    members: list[tuple[int, str]] = []
+    for line in proc.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            member_pid, member_pgid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if member_pgid == pgid:
+            members.append((member_pid, parts[2].strip()))
+    return tuple(members) if members else None
+
+
+def _process_start_identity(pid: int) -> str | None:
+    """
+    Return *pid*'s start time, or ``None`` when it cannot be read.
+
+    ``None`` never matches a recorded identity, so an unreadable (usually
+    already-gone) process is conservatively treated as not ours to kill.
+
+    :param pid: Process to identify.
+    :returns: The ``lstart`` string, e.g. ``"Mon Jul 20 10:01:02 2026"``.
+    """
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    identity = proc.stdout.strip()
+    return identity or None
 
 
 def _signal_process_group(pgid: int, sig: signal.Signals) -> bool:

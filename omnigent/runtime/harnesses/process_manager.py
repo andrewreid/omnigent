@@ -1149,6 +1149,10 @@ class HarnessProcessManager:
         # ``--parent-pid`` enables the runner's parent-death
         # watchdog thread so orphaned runners self-terminate
         # when the spawning process exits.
+        # ``spawn_kwargs`` detaches the harness into its own session, so it
+        # (not the shared AP group) leads the group holding its vendor CLI
+        # and MCP children — the boundary the orphan sweep's group kill
+        # needs to reap the whole tree after an unclean AP death.
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
@@ -1165,6 +1169,7 @@ class HarnessProcessManager:
             stdout=None,
             stderr=None,
             env=effective_env,
+            **_proc.spawn_kwargs(),
         )
         try:
             await _wait_for_bind(process, endpoint, harness, conversation_id)
@@ -1486,7 +1491,19 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
                 return False
             await asyncio.sleep(0.1)
 
-    return not lookup_failed
+    if lookup_failed:
+        return False
+    # Positive-absence backstop, independent of lsof's ambiguous exit
+    # status: a live runner always listens on its conv socket, so any
+    # socket still accepting connections proves a survivor lsof missed.
+    for socket_file in instance_dir.glob("conv-*.sock"):
+        if await _can_connect_uds(socket_file):
+            _logger.warning(
+                "socket %s still accepts connections; keeping instance dir",
+                socket_file,
+            )
+            return False
+    return True
 
 
 def _signal_pid_tree(pid: int, sig: signal.Signals) -> bool:
