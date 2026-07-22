@@ -1191,6 +1191,89 @@ def test_ownerless_sweep_env_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _ownerless_sweep_enabled()
 
 
+async def test_sweep_ownerless_trees_once_reaps_real_families(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One real pass cleans every family and spares everything live-owned.
+
+    Only the filesystem roots are redirected; no family sweep logic is
+    mocked. A dead-owner terminal dir and a dead-AP instance dir disappear,
+    an ownerless tagged process is signaled, and the live-owned siblings of
+    each survive untouched.
+    """
+    import os
+    import sys
+
+    import omnigent.codex_native_process_registry as registry_mod
+    import omnigent.inner.terminal as terminal_mod
+    from omnigent.runtime.harnesses.process_manager import (
+        _AP_PID_FILE,
+        _TMP_PARENT_ENV_VAR,
+    )
+
+    host = _make_host_process()
+
+    # Terminal family: dead-owner dir (no tmux socket, so no tmux needed)
+    # plus a live-owned sibling that must survive.
+    terminals_root = tmp_path / "terminals"
+    terminals_root.mkdir()
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: terminals_root)
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    probe = subprocess.Popen([sys.executable, "-c", "pass"])
+    probe.wait()
+    dead_owner_dir = terminals_root / "omnigent-terminal-deadhost"
+    dead_owner_dir.mkdir()
+    (dead_owner_dir / "owner.pid").write_text(str(probe.pid), encoding="utf-8")
+    live_owner_dir = terminals_root / "omnigent-terminal-livehost"
+    live_owner_dir.mkdir()
+    (live_owner_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+    # Instance-dir family: dead-AP dir plus a live-AP sibling.
+    ap_parent = tmp_path / "ap-parent"
+    ap_parent.mkdir()
+    monkeypatch.setenv(_TMP_PARENT_ENV_VAR, str(ap_parent))
+    dead_ap = ap_parent / "ap-dead"
+    dead_ap.mkdir()
+    (dead_ap / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    live_ap = ap_parent / "ap-live"
+    live_ap.mkdir()
+    (live_ap / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+
+    # Codex family: a real ownerless tagged process (no owner lock held).
+    monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(tmp_path / "codex-state"))
+    tag = "tag-host-e2e"
+    orphan = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(120)",
+            registry_mod.codex_native_session_tag_cmdline_arg(tag),
+        ],
+        start_new_session=True,
+    )
+    try:
+        registry_mod.register_codex_native_process(
+            pid=orphan.pid,
+            pgid=orphan.pid,
+            session_tag=tag,
+            owner_lock_path=None,
+        )
+
+        await host._sweep_ownerless_trees_once()
+
+        assert not dead_owner_dir.exists()
+        assert live_owner_dir.exists()
+        assert not dead_ap.exists()
+        assert live_ap.exists()
+        # The sweep SIGTERMed the ownerless group; the process dies.
+        assert orphan.wait(timeout=10) is not None
+    finally:
+        if orphan.poll() is None:
+            orphan.kill()
+            orphan.wait(timeout=10)
+
+
 def test_host_spawned_runner_has_parent_pid_env(
     tmp_path: Path,
 ) -> None:

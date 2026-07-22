@@ -965,6 +965,12 @@ class HostProcess:
         statuses mid-``wait()``. The blocking family sweeps run in a worker
         thread so a slow pass never stalls the event loop.
 
+        Known residual: cancelling this task (shutdown) does not stop an
+        in-flight worker thread, which can spawn one more helper after the
+        op-guard unwinds. The only exposure is the final shutdown drain
+        misreading that helper's exit status — every helper here is a
+        best-effort probe whose exit code is not load-bearing.
+
         :returns: None.
         """
         from omnigent.codex_native_process_registry import (

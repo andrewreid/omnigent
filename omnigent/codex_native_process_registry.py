@@ -30,6 +30,12 @@ _TAG_ARG_PREFIX = "omnigent_crash_teardown_tag="
 # flush rollout state; short enough that a TERM-ignoring child dies on the
 # next periodic sweep rather than surviving indefinitely.
 _SIGKILL_GRACE_S = 10.0
+# Ceiling on group-liveness escalation after a SIGTERM. Within it the pgid
+# was recently verified ours (live tagged leader at SIGTERM time), so a
+# group kill is safe even if the leader has since exited while a child
+# survives. Past it the pgid can no longer be trusted against reuse, so the
+# entry is dropped instead of risking a kill of an unrelated group.
+_SIGKILL_WINDOW_S = 300.0
 
 
 @dataclass(frozen=True)
@@ -203,6 +209,12 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
     once :data:`_SIGKILL_GRACE_S` has elapsed, so a child that ignores or
     wedges on SIGTERM cannot outlive reconciliation.
 
+    Escalation outlives the group leader: a SIGTERMed entry is settled by
+    process-*group* liveness, not leader liveness, so a child that
+    survives its exiting leader is still killed. Group kills stop at
+    :data:`_SIGKILL_WINDOW_S` past the SIGTERM — beyond that the pgid can
+    no longer be trusted against reuse and the entry is dropped.
+
     :param registry_path: Test override for the registry file path.
     :returns: Number of process groups signaled this pass.
     """
@@ -215,38 +227,56 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
             if _owner_lock_held(entry.owner_lock_path):
                 survivors.append(entry)
                 continue
+            if entry.sigterm_at is not None:
+                # Already SIGTERMed: settle by group liveness. The leader
+                # may have exited while a TERM-ignoring child survives, so
+                # the leader-identity checks below no longer apply.
+                elapsed = now - entry.sigterm_at
+                if elapsed < _SIGKILL_GRACE_S:
+                    survivors.append(entry)
+                    continue
+                if elapsed > _SIGKILL_WINDOW_S:
+                    _logger.warning(
+                        "giving up on codex-native process group %d: SIGTERMed "
+                        "%.0fs ago, pgid no longer trustworthy against reuse",
+                        entry.pgid,
+                        elapsed,
+                    )
+                    _reap_tmux_session(entry.tmux_session_name)
+                    continue
+                if not _process_group_alive(entry.pgid):
+                    _reap_tmux_session(entry.tmux_session_name)
+                    continue
+                if _signal_process_group(entry.pgid, signal.SIGKILL):
+                    _logger.warning(
+                        "ownerless codex-native process group %d survived SIGTERM; SIGKILLed",
+                        entry.pgid,
+                    )
+                    signaled += 1
+                    _reap_tmux_session(entry.tmux_session_name)
+                else:
+                    survivors.append(entry)
+                continue
             if not _pid_alive(entry.pid) or not _process_cmdline_has_tag(
                 entry.pid, entry.session_tag
             ):
-                # Process already gone (or its pid reused by an unrelated
-                # process): drop the entry, sweep any leftover tmux session.
+                # Never signaled and the tagged leader is gone (or its pid
+                # was reused): without the leader there is no safe way to
+                # verify group ownership, so drop the entry and sweep any
+                # leftover tmux session.
                 _reap_tmux_session(entry.tmux_session_name)
                 continue
-            if entry.sigterm_at is None:
-                if _signal_process_group(entry.pgid, signal.SIGTERM):
-                    _logger.info(
-                        "SIGTERMed ownerless codex-native process group %d (pid %d)",
-                        entry.pgid,
-                        entry.pid,
-                    )
-                    signaled += 1
-                    entry = replace(entry, sigterm_at=now)
-                # Keep the entry either way: a failed signal retries on the
-                # next pass, a delivered one is re-checked for escalation.
-                survivors.append(entry)
-                continue
-            if now - entry.sigterm_at < _SIGKILL_GRACE_S:
-                survivors.append(entry)
-                continue
-            if _signal_process_group(entry.pgid, signal.SIGKILL):
-                _logger.warning(
-                    "ownerless codex-native process group %d survived SIGTERM; SIGKILLed",
+            if _signal_process_group(entry.pgid, signal.SIGTERM):
+                _logger.info(
+                    "SIGTERMed ownerless codex-native process group %d (pid %d)",
                     entry.pgid,
+                    entry.pid,
                 )
                 signaled += 1
-                _reap_tmux_session(entry.tmux_session_name)
-            else:
-                survivors.append(entry)
+                entry = replace(entry, sigterm_at=now)
+            # Keep the entry either way: a failed signal retries on the
+            # next pass, a delivered one is re-checked for escalation.
+            survivors.append(entry)
         _write_registry(path, survivors)
     return signaled
 
@@ -417,6 +447,18 @@ def _process_cmdline(pid: int) -> str:
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _process_group_alive(pgid: int) -> bool:
+    if os.name != "posix":
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
 
 
 def _signal_process_group(pgid: int, sig: signal.Signals) -> bool:

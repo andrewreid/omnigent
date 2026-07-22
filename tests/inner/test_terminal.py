@@ -1259,6 +1259,42 @@ def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
     assert kill_calls == [["tmux", "-S", str(socket_path), "kill-server"]]
 
 
+def test_reap_orphaned_terminals_keeps_dir_when_kill_server_is_unverified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A kill-server that cannot be confirmed leaves the dir for a retry.
+
+    The instance dir is the only pointer to the server's socket; removing
+    it after a timed-out kill would leak a live tmux server on an unlinked
+    socket with no later sweep able to find it.
+
+    :param tmp_path: Fake temp root the sweep scans.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+
+    def _timeout_run(*args: object, **kwargs: object) -> None:
+        """Model a wedged tmux that never answers kill-server."""
+        raise TimeoutError("tmux kill-server timed out")
+
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    monkeypatch.setattr(
+        terminal_mod,
+        "subprocess",
+        SimpleNamespace(run=_timeout_run, TimeoutExpired=TimeoutError),
+    )
+    dead_dir = _write_instance_dir(tmp_path, "omnigent-terminal-dead3", _dead_pid())
+    (dead_dir / "tmux.sock").touch()
+
+    reaped = terminal_mod.reap_orphaned_terminals()
+
+    assert reaped == 0
+    assert dead_dir.exists(), "dir must be kept until the server kill is confirmed"
+
+
 @pytest.mark.skipif(
     sys.platform not in ("linux", "darwin"),
     reason="sandbox backends only resolve on Linux (bwrap) or macOS (seatbelt)",

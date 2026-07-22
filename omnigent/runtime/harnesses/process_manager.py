@@ -183,6 +183,26 @@ _SPAWN_POLL_INTERVAL_S = 0.05
 # the only recourse.
 _ORPHAN_SIGTERM_GRACE_S = 3.0
 
+# After SIGKILL, how long the orphan sweep polls for the processes to
+# actually disappear before keeping the instance dir for a later retry.
+# A just-SIGKILLed orphan can linger as a zombie until its reaper runs.
+_ORPHAN_KILL_VERIFY_TIMEOUT_S = 2.0
+
+# Whether the missing-lsof warning has fired; the periodic sweep would
+# otherwise repeat it every pass on hosts without lsof.
+_lsof_missing_warned = False
+
+
+def _warn_lsof_missing_once() -> None:
+    global _lsof_missing_warned
+    if _lsof_missing_warned:
+        return
+    _lsof_missing_warned = True
+    _logger.warning(
+        "lsof not found; orphaned harness instance dirs cannot be verified "
+        "and will be kept — install lsof to enable orphan cleanup"
+    )
+
 
 class NoLiveHarnessError(RuntimeError):
     """Raised when ``get_client`` is called with ``harness="any"`` and no subprocess is live."""
@@ -1401,63 +1421,119 @@ async def sweep_orphaned_instance_dirs(tmp_parent: Path | None = None) -> int:
             child,
             pid,
         )
-        await _kill_orphan_runners(child)
-        shutil.rmtree(child, ignore_errors=True)
-        swept += 1
+        if await _kill_orphan_runners(child):
+            shutil.rmtree(child, ignore_errors=True)
+            swept += 1
+        else:
+            # The dir is the only record pointing at these processes; keep
+            # it so a later sweep retries instead of leaking them untracked.
+            _logger.warning(
+                "kept orphaned instance dir %s: termination not yet verified",
+                child,
+            )
     return swept
 
 
-async def _kill_orphan_runners(instance_dir: Path) -> None:
+async def _kill_orphan_runners(instance_dir: Path) -> bool:
     """
-    Send SIGTERM to runner processes whose socket lives under
+    Send SIGTERM to runner process trees whose socket lives under
     ``instance_dir``, then escalate to SIGKILL for survivors.
 
     Identification works by listing the socket files in the
     dir — every active runner binds one. We don't have the
     runner PIDs because they're orphans of a crashed AP, so
     we shell out to ``lsof`` to find which PIDs hold each
-    socket. ``lsof`` failures fall through silently (best
-    effort).
+    socket. Each holder is signaled through its whole process
+    group (harness subprocesses are session leaders, so the
+    group is exactly their tree — vendor CLI and MCP fleet
+    included).
 
     After SIGTERM, waits :data:`_ORPHAN_SIGTERM_GRACE_S`
     seconds, then sends SIGKILL to any runner that is still
-    alive. Prior to this escalation, orphaned
-    runners with stuck SIGTERM handlers survived the sweep
-    indefinitely.
+    alive, and finally polls for the survivors to disappear.
 
     :param instance_dir: The orphaned AP's per-instance dir
         whose runner subprocesses to terminate.
+    :returns: ``True`` when every found process is confirmed
+        gone (or none were found); ``False`` when a socket
+        lookup failed or a process is still alive — the caller
+        must keep the dir so a later sweep retries.
     """
     all_pids: set[int] = set()
+    lookup_failed = False
     for socket_file in instance_dir.glob("conv-*.sock"):
         pids = await _pids_holding_socket(socket_file)
-        for pid in pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-                all_pids.add(pid)
-            except ProcessLookupError:
-                continue
-            except PermissionError:
-                _logger.warning(
-                    "cannot signal orphan runner pid %d (permission denied)",
-                    pid,
-                )
-                continue
-
-    if not all_pids:
-        return
-
-    await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
-
-    for pid in all_pids:
-        if not _pid_alive(pid):
+        if pids is None:
+            lookup_failed = True
             continue
-        _logger.warning(
-            "orphan runner pid %d survived SIGTERM; escalating to SIGKILL",
-            pid,
-        )
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        for pid in pids:
+            if _signal_pid_tree(pid, signal.SIGTERM):
+                all_pids.add(pid)
+
+    if all_pids:
+        await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
+        for pid in all_pids:
+            if not _pid_alive(pid):
+                continue
+            _logger.warning(
+                "orphan runner pid %d survived SIGTERM; escalating to SIGKILL",
+                pid,
+            )
+            _signal_pid_tree(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        deadline = time.monotonic() + _ORPHAN_KILL_VERIFY_TIMEOUT_S
+        while any(_pid_alive(pid) for pid in all_pids):
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.1)
+
+    return not lookup_failed
+
+
+def _signal_pid_tree(pid: int, sig: signal.Signals) -> bool:
+    """
+    Signal *pid*'s whole process group when safely possible, else the pid.
+
+    Refuses to signal our own group (a non-leader pid can resolve to the
+    group we share with pytest / the supervisor). Falls back to the single
+    pid when the group cannot be resolved or signaled.
+
+    :param pid: Process id to terminate.
+    :param sig: Signal to deliver.
+    :returns: ``True`` if a signal was delivered (track for verification);
+        ``False`` when the process is already gone or cannot be signaled.
+    """
+    pgid: int | None = None
+    if hasattr(os, "getpgid"):
+        try:
+            pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            pgid = None
+        if pgid is not None:
+            try:
+                if pgid == os.getpgid(0):
+                    pgid = None
+            except OSError:
+                pgid = None
+    if pgid is not None:
+        try:
+            os.killpg(pgid, sig)
+            return True
+        except ProcessLookupError:
+            return False
+        except OSError:
+            pass  # fall back to the single pid
+    try:
+        os.kill(pid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        _logger.warning("cannot signal orphan runner pid %d (permission denied)", pid)
+        return False
+    except OSError:
+        return False
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1493,7 +1569,7 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-async def _pids_holding_socket(socket_path: Path) -> list[int]:
+async def _pids_holding_socket(socket_path: Path) -> list[int] | None:
     """
     Return the OS PIDs that have ``socket_path`` open.
 
@@ -1502,12 +1578,12 @@ async def _pids_holding_socket(socket_path: Path) -> list[int]:
     portability across Linux + macOS without a third-party dep
     (``psutil`` would also work but adds an install).
 
-    Returns an empty list on any subprocess error so the caller
-    can keep going — orphan cleanup is best-effort.
-
     :param socket_path: The socket file to look up holders for.
     :returns: List of holding PIDs (often a single one — the
-        bound runner).
+        bound runner); an empty list when none hold it; ``None``
+        when the lookup itself failed (``lsof`` missing or
+        erroring) — the caller must not treat that as "no
+        holders" and destroy its retry metadata.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -1517,11 +1593,17 @@ async def _pids_holding_socket(socket_path: Path) -> list[int]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
+    except FileNotFoundError:
+        _warn_lsof_missing_once()
+        return None
     except OSError:
-        return []
+        return None
     stdout, _ = await proc.communicate()
-    if proc.returncode != 0:
-        return []
+    # lsof exits 1 both for "no holders" and some errors; with empty output
+    # it is read as "no holders" (matching its normal not-found behavior),
+    # while >1 is a real failure.
+    if proc.returncode is not None and proc.returncode > 1:
+        return None
     pids: list[int] = []
     for line in stdout.decode("utf-8", errors="replace").splitlines():
         line = line.strip()
