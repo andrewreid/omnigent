@@ -759,7 +759,25 @@ def _idle_gate_enabled() -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
-def _scan_into_fingerprint(directory: Path, prefix: str, out: _BridgeFingerprint) -> None:
+# Entries in a ``subagents/`` directory whose *content* the loop re-reads as it
+# grows. The sibling ``agent-*.meta.json`` is read once, when the sub-agent is
+# first discovered, and never again — so its arrival must change the
+# fingerprint but its bytes need not be stat'ed. At high fan-out that halves
+# the per-tick syscalls, since every sub-agent ever spawned stays on disk.
+_APPENDING_SUBAGENT_SUFFIX = ".jsonl"
+
+# Placeholder recorded for an entry whose name matters but whose content does
+# not. Membership changes still move the fingerprint; content changes cannot.
+_UNSTATTED_ENTRY = (0, 0, 0)
+
+
+def _scan_into_fingerprint(
+    directory: Path,
+    prefix: str,
+    out: _BridgeFingerprint,
+    *,
+    stat_suffix: str | None = None,
+) -> None:
     """
     Stamp every visible entry of *directory* into a fingerprint.
 
@@ -770,12 +788,18 @@ def _scan_into_fingerprint(directory: Path, prefix: str, out: _BridgeFingerprint
     :param directory: Directory to scan, e.g. the bridge dir.
     :param prefix: Namespace for the keys, e.g. ``"bridge/"``.
     :param out: Fingerprint mapping to update in place.
+    :param stat_suffix: When given, only entries with this suffix are
+        stat'ed; the rest contribute their name alone. ``None`` stats
+        everything.
     :returns: None.
     """
     try:
         with os.scandir(directory) as entries:
             for entry in entries:
                 if entry.name.startswith("."):
+                    continue
+                if stat_suffix is not None and not entry.name.endswith(stat_suffix):
+                    out[prefix + entry.name] = _UNSTATTED_ENTRY
                     continue
                 try:
                     info = entry.stat()
@@ -822,7 +846,12 @@ def _bridge_input_fingerprint(
         else:
             fingerprint["transcript"] = (info.st_mtime_ns, info.st_size, info.st_ino)
     if subagents_dir is not None:
-        _scan_into_fingerprint(subagents_dir, "subagent/", fingerprint)
+        _scan_into_fingerprint(
+            subagents_dir,
+            "subagent/",
+            fingerprint,
+            stat_suffix=_APPENDING_SUBAGENT_SUFFIX,
+        )
     return fingerprint
 
 
@@ -950,6 +979,11 @@ async def forward_claude_transcript_to_session(
     known_subagents_dir: Path | None = None
     last_input_change_at = time.monotonic()
     last_full_poll_at = 0.0
+    # Whether the last tick skipped its body. Tracked only so the two
+    # transitions are logged once each instead of on every tick — a field
+    # regression shows up as "gate never engages" (no CPU win) or "gate
+    # engaged while a turn was live" (a bug), both visible without a rebuild.
+    gate_engaged = False
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
@@ -977,8 +1011,23 @@ async def forward_claude_transcript_to_session(
                         ),
                         dedupe=dedupe,
                     ):
+                        if not gate_engaged:
+                            gate_engaged = True
+                            _logger.debug(
+                                "Claude transcript forwarder idle; skipping unchanged "
+                                "polls; session=%s bridge_dir=%s",
+                                session_id,
+                                bridge_dir,
+                            )
                         await asyncio.sleep(poll_interval_s)
                         continue
+                    if gate_engaged:
+                        gate_engaged = False
+                        _logger.debug(
+                            "Claude transcript forwarder resumed; session=%s bridge_dir=%s",
+                            session_id,
+                            bridge_dir,
+                        )
                     last_full_poll_at = now
                 current_session_id = read_active_session_id(bridge_dir) or session_id
                 if hook_state is None:

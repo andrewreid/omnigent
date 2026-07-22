@@ -18805,3 +18805,71 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
         f"No session.status: idle should be enqueued when kill_session failed; "
         f"got {status_idle!r}."
     )
+
+
+@pytest.mark.asyncio
+async def test_turn_start_wakes_session_terminal_watchers(tmp_path: Path) -> None:
+    """
+    Starting a turn wakes the session's pane watchers before dispatch.
+
+    Native harnesses inject through the bridge from the harness process, so
+    ``TerminalInstance.send`` is never called and the pane watcher — which for
+    those harnesses is the *only* running/idle source — gets no in-process
+    signal that a turn began. The wake is hung off the turn-start ``running``
+    edge because every dispatch path publishes it first, including the
+    streaming branch that never reaches ``_run_turn_bg``.
+
+    :param tmp_path: Temporary directory for placeholder tmux paths.
+    :returns: None.
+    """
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_wake"}}),
+        _sse({"type": "response.completed", "response": {"id": "resp_wake"}}),
+    ]
+    harness_client = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+    spec = AgentSpec(spec_version=1, name="plain-agent")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    session_id = "aa84b0dc308668bb715607e42ae268b0"
+    terminal_registry = TerminalRegistry()
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path / "private",
+        running=True,
+    )
+    terminal_registry._by_conversation[session_id] = {("claude", "main"): instance}
+
+    wakes: list[int] = []
+    instance.wake_idle_watcher = lambda: wakes.append(1)  # type: ignore[method-assign]
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "e61df75e32ee590087e03aa37b33abac",
+                "model": "plain-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(100):
+            if wakes:
+                break
+            await asyncio.sleep(0.05)
+
+    assert wakes, "turn start did not wake the session's terminal watchers"

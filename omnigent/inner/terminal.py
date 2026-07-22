@@ -399,6 +399,13 @@ _IDLE_POLL_BACKOFF_FACTOR = 2.0
 _IDLE_POLL_BACKOFF_MAX_MULTIPLE = 10.0
 _IDLE_POLL_MAX_INTERVAL_SECONDS = 5.0
 
+# How long after a wake the watcher stays pinned at its base interval. A wake
+# says output is coming, not that it has arrived: the runner wakes the pane's
+# watcher when it starts dispatching a turn, and spec resolution, harness
+# dispatch and injection can outlast the idle threshold. Without the grace the
+# watcher would ramp back up during setup and miss the output it was woken for.
+_IDLE_POLL_WAKE_GRACE_SECONDS = 15.0
+
 # Set to a falsy value to pin the watcher at its base interval, restoring the
 # pre-backoff polling rate without a rollback.
 _IDLE_POLL_BACKOFF_ENV_VAR = "OMNIGENT_TERMINAL_IDLE_POLL_BACKOFF"
@@ -541,6 +548,24 @@ class _IdleDetector:
         # PTY produced output" signal that powers the web activity badge,
         # without any client PTY attach.
         self.changed_this_tick: bool = False
+
+    @property
+    def idle_notified(self) -> bool:
+        """
+        Report whether this idle episode has already delivered its edge.
+
+        The threaded watcher reads this to decide when it may lengthen its
+        poll interval. Deriving the answer from the detector rather than
+        re-timing quiescence in the loop keeps the two from drifting: the
+        loop's clock starts when the watcher starts, the detector's when it
+        takes its first snapshot, and a loop-side timer would therefore
+        allow a backoff step one tick before the edge it is supposed to
+        follow.
+
+        :returns: ``True`` once either track has fired for the current
+            episode; ``False`` again after new output mutates the pane.
+        """
+        return self._idle_notified
 
     def tick(self, snapshot: str, suppress_activity: bool = False) -> bool:
         """
@@ -1748,12 +1773,14 @@ class TerminalInstance:
         base_interval = (
             poll_interval_s if poll_interval_s is not None else _IDLE_POLL_INTERVAL_SECONDS
         )
-        quiet_threshold = (
-            idle_threshold_s if idle_threshold_s is not None else _IDLE_THRESHOLD_SECONDS
-        )
         backoff_enabled = _idle_poll_backoff_enabled()
         interval = base_interval
-        last_change_at = time.monotonic()
+        # Monotonic time before which backoff may not resume. A wake means
+        # output is expected but has not landed yet, and the work that
+        # produces it (turn setup, harness dispatch, injection) can take
+        # longer than the idle threshold — without the grace the watcher
+        # would ramp back up and miss the very output it was woken for.
+        hold_base_until = 0.0
         while self.running:
             should_stop, woken = self._wait_next_idle_tick(
                 stop_event, wake_event, interval, base_interval
@@ -1762,11 +1789,19 @@ class TerminalInstance:
                 return
             if woken:
                 # Something that changes the pane just happened elsewhere (a
-                # turn typed in, a client interacting). Client-driven repaints
-                # are deliberately not counted as activity, so the change path
-                # below would not reset the interval on its own.
+                # turn being dispatched, a client interacting). Client-driven
+                # repaints are deliberately not counted as activity, so the
+                # change path below would not reset the interval on its own.
+                if interval != base_interval:
+                    logger.debug(
+                        "terminal %s:%s idle watcher woken; poll %.2fs -> %.2fs",
+                        self.name,
+                        self.session_key,
+                        interval,
+                        base_interval,
+                    )
                 interval = base_interval
-                last_change_at = time.monotonic()
+                hold_base_until = time.monotonic() + _IDLE_POLL_WAKE_GRACE_SECONDS
             if not self.running:
                 return
             capture = self._capture_pane_state_or_none()
@@ -1801,11 +1836,32 @@ class TerminalInstance:
                 now - self._last_client_interaction_at
             ) < _CLIENT_INTERACTION_WINDOW_SECONDS
             idle_fired = detector.tick(snapshot, suppress_activity=suppress)
+            # Backoff follows the detector's own idle state rather than a
+            # second quiescence timer in this loop: the two baselines start
+            # one tick apart (the loop's at watcher start, the detector's at
+            # its first snapshot), and a loop-side timer would let the
+            # interval grow one tick before the idle edge it must follow.
             if detector.changed_this_tick:
-                last_change_at = now
+                if interval != base_interval:
+                    logger.debug(
+                        "terminal %s:%s pane changed; poll %.2fs -> %.2fs",
+                        self.name,
+                        self.session_key,
+                        interval,
+                        base_interval,
+                    )
                 interval = base_interval
-            elif backoff_enabled and now - last_change_at >= quiet_threshold:
-                interval = _next_idle_poll_interval(interval, base_interval)
+            elif backoff_enabled and detector.idle_notified and now >= hold_base_until:
+                grown = _next_idle_poll_interval(interval, base_interval)
+                if grown != interval:
+                    logger.debug(
+                        "terminal %s:%s pane quiescent; poll %.2fs -> %.2fs",
+                        self.name,
+                        self.session_key,
+                        interval,
+                        grown,
+                    )
+                interval = grown
             # Activity edge first: a tick can both change the pane and
             # (much later) cross the idle threshold, but never both in
             # the same tick — a change resets the idle timer.
