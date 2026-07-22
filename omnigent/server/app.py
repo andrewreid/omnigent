@@ -1561,29 +1561,39 @@ def create_app(
     session_live_state.configure(conversation_store)
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
 
-    @app.middleware("http")
-    async def _db_connection_scope_middleware(
-        request: Request,
-        call_next: _FastAPICallNext,
-    ) -> Response:
-        """
-        Hold one pooled DB connection per engine for the request.
+    from omnigent.server.auth import env_var_is_truthy
 
-        Store calls made while handling the request (directly or via
-        ``asyncio.to_thread``) reuse the scope's connection instead of
-        paying a pool checkout + ``pool_pre_ping`` round-trip each. The
-        scope closes when the handler returns, so streaming response
-        bodies that keep making store calls fall back to plain pooled
-        sessions rather than pinning a connection for the stream's
-        lifetime.
+    if env_var_is_truthy("OMNIGENT_DB_CONNECTION_SCOPE", default=True):
 
-        :param request: Incoming FastAPI request.
-        :param call_next: FastAPI middleware continuation that executes
-            the matched route and returns its response.
-        :returns: The downstream route response.
-        """
-        with db_connection_scope():
-            return await call_next(request)
+        @app.middleware("http")
+        async def _db_connection_scope_middleware(
+            request: Request,
+            call_next: _FastAPICallNext,
+        ) -> Response:
+            """
+            Hold one pooled DB connection per engine for the request.
+
+            Store calls made while handling the request (directly or via
+            ``asyncio.to_thread``) reuse the scope's connection instead of
+            paying a pool checkout + ``pool_pre_ping`` round-trip each. The
+            scope closes when the handler returns, so streaming response
+            bodies that keep making store calls fall back to plain pooled
+            sessions rather than pinning a connection for the stream's
+            lifetime.
+
+            Trade-off: a handler that awaits slow non-DB work after its
+            first store call (e.g. a runner forward) holds its connection
+            for that await. If pool saturation is ever suspected, set
+            ``OMNIGENT_DB_CONNECTION_SCOPE=0`` to fall back to
+            checkout-per-store-call behaviour without a code change.
+
+            :param request: Incoming FastAPI request.
+            :param call_next: FastAPI middleware continuation that executes
+                the matched route and returns its response.
+            :returns: The downstream route response.
+            """
+            with db_connection_scope():
+                return await call_next(request)
 
     @app.middleware("http")
     async def _record_server_metrics(
