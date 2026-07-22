@@ -1168,20 +1168,17 @@ async def test_orphan_sweep_escalates_to_sigkill(
     register_test_harness: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Sweep SIGKILLs a surviving runner's whole group, and reports
+    """Sweep SIGKILLs surviving identity-verified members, and reports
     unverified termination so the caller keeps the dir for a retry."""
     from omnigent.runtime.harnesses import process_manager as pm_mod
 
-    killed: list[tuple[int, signal.Signals]] = []
+    killed_group: list[tuple[int, signal.Signals]] = []
+    killed_member: list[tuple[int, signal.Signals]] = []
     real_getpgid = os.getpgid
 
     async def fake_pids_holding_socket(socket_path: Path) -> list[int]:
         assert socket_path.name == "conv-stale.sock"
         return [12345]
-
-    def fake_pid_alive(pid: int) -> bool:
-        assert pid == 12345
-        return True
 
     def fake_getpgid(pid: int) -> int:
         # The orphan resolves to its own (foreign) group; pid 0 must still
@@ -1190,12 +1187,19 @@ async def test_orphan_sweep_escalates_to_sigkill(
 
     def fake_killpg(pgid: int, sig: signal.Signals) -> None:
         assert pgid == 54321
-        killed.append((pgid, sig))
+        killed_group.append((pgid, sig))
+
+    def fake_kill_verified(pid: int, identity: str, sig: signal.Signals) -> bool:
+        assert identity == "id-a"
+        killed_member.append((pid, sig))
+        return True
 
     monkeypatch.setattr(pm_mod, "_ORPHAN_SIGTERM_GRACE_S", 0)
     monkeypatch.setattr(pm_mod, "_ORPHAN_KILL_VERIFY_TIMEOUT_S", 0.0)
     monkeypatch.setattr(pm_mod, "_pids_holding_socket", fake_pids_holding_socket)
-    monkeypatch.setattr(pm_mod, "_pid_alive", fake_pid_alive)
+    monkeypatch.setattr(pm_mod, "_holder_member_identities", lambda _pid: {12345: "id-a"})
+    monkeypatch.setattr(pm_mod._proc, "process_start_identity", lambda _pid: "id-a")
+    monkeypatch.setattr(pm_mod._proc, "kill_verified", fake_kill_verified)
     monkeypatch.setattr(pm_mod.os, "getpgid", fake_getpgid)
     monkeypatch.setattr(pm_mod.os, "killpg", fake_killpg)
 
@@ -1205,8 +1209,9 @@ async def test_orphan_sweep_escalates_to_sigkill(
 
     confirmed = await pm_mod._kill_orphan_runners(instance_dir)
 
-    assert killed == [(54321, signal.SIGTERM), (54321, signal.SIGKILL)]
-    # The (mocked) group never died, so termination is unverified and the
+    assert killed_group == [(54321, signal.SIGTERM)]
+    assert killed_member == [(12345, signal.SIGKILL)]
+    # The (mocked) member never died, so termination is unverified and the
     # caller must retain the instance dir as retry metadata.
     assert confirmed is False
 
@@ -1215,15 +1220,19 @@ async def test_orphan_sweep_escalates_to_sigkill(
 @pytest.mark.skipif(shutil.which("lsof") is None, reason="lsof required")
 async def test_orphan_sweep_kills_whole_detached_harness_tree(
     short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Production topology: the sweep reaps the holder AND its children.
 
     Harness subprocesses are spawned into their own session (as the real
     spawn now does), so the group holding the vendor-CLI/MCP children is
-    the harness's own — not the shared AP group. A real leader+child tree
-    holding a conv socket must be fully dead after the sweep, dir removed.
+    the harness's own — not the shared AP group. The leader dies to the
+    group SIGTERM while the child *ignores* it, so only the snapshotted
+    member identities let the escalation finish the tree.
     """
     from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    monkeypatch.setattr(pm_mod, "_ORPHAN_SIGTERM_GRACE_S", 0.2)
 
     instance_dir = short_tmp_parent / "ap-dead"
     instance_dir.mkdir(mode=0o700)
@@ -1231,7 +1240,8 @@ async def test_orphan_sweep_kills_whole_detached_harness_tree(
     sock = instance_dir / "conv-x.sock"
 
     # Leader mirrors the fixed production spawn: own session, holds the
-    # socket path open, with a plain child in its group.
+    # socket path open, with a SIGTERM-ignoring child in its group. The
+    # child prints its pid only after installing the handler.
     leader = subprocess.Popen(
         [
             sys.executable,
@@ -1239,8 +1249,11 @@ async def test_orphan_sweep_kills_whole_detached_harness_tree(
             (
                 "import subprocess, sys, time\n"
                 f"fd = open({str(sock)!r}, 'w')\n"
-                "p = subprocess.Popen([sys.executable, '-c', "
-                "'import os, time; print(os.getpid(), flush=True); time.sleep(120)'])\n"
+                "subprocess.Popen([sys.executable, '-c', "
+                "'import os, signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print(os.getpid(), flush=True); "
+                "time.sleep(120)'])\n"
                 "time.sleep(120)\n"
             ),
         ],

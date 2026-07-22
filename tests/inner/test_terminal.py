@@ -1313,6 +1313,46 @@ def test_reap_orphaned_terminals_keeps_dir_while_server_still_listens(
         shutil.rmtree(short_root, ignore_errors=True)
 
 
+def test_tmux_server_alive_treats_connect_timeout_as_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A timed-out connect reads as alive, never as confirmed absence.
+
+    ``socket.timeout`` carries ``errno=None`` just like the pre-syscall
+    path-too-long error; conflating them would delete the retry dir of a
+    wedged-but-live server.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+
+    class _TimingOutSocket:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def connect(self, _path: str) -> None:
+            raise TimeoutError("timed out")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        terminal_mod,
+        "socket",
+        SimpleNamespace(
+            socket=_TimingOutSocket,
+            AF_UNIX=object(),
+            SOCK_STREAM=object(),
+        ),
+    )
+
+    assert terminal_mod._tmux_server_alive(Path("/tmp/any.sock")) is True
+
+
 @pytest.mark.skipif(
     sys.platform not in ("linux", "darwin"),
     reason="sandbox backends only resolve on Linux (bwrap) or macOS (seatbelt)",

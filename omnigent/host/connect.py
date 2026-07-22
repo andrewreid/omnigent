@@ -15,7 +15,7 @@ import logging
 import os
 import subprocess
 import sys
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -942,8 +942,10 @@ class HostProcess:
         where nothing else ever kills it: each family's own sweep runs only
         at spawn or runner startup, so an otherwise idle host accumulates
         live orphans indefinitely. This loop re-runs those sweeps on a
-        timer, starting with an immediate pass so trees adopted across a
-        host restart are cleared at boot.
+        timer; the first pass runs one interval after boot, so trees
+        adopted across a host restart are cleared within a minute while a
+        short-lived host process (tests, quick CLI runs) never touches
+        the system.
 
         Every family gates on its own owner-liveness marker (kernel-released
         flock, owner-pid file, ``AP_PID`` sentinel) — never on idleness — so
@@ -952,13 +954,13 @@ class HostProcess:
         :returns: None. Runs until cancelled on shutdown.
         """
         while True:
+            await asyncio.sleep(_OWNERLESS_SWEEP_INTERVAL_S)
             try:
                 await self._sweep_ownerless_trees_once()
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — the sweep must never die on a stray error
                 _logger.debug("ownerless-tree sweep failed", exc_info=True)
-            await asyncio.sleep(_OWNERLESS_SWEEP_INTERVAL_S)
 
     async def _sweep_ownerless_trees_once(self) -> None:
         """Run one pass of every per-family ownerless-tree sweep.
@@ -1009,9 +1011,11 @@ class HostProcess:
             try:
                 # A timed-out pass may cancel mid-kill, leaving a runner
                 # SIGTERMed but not yet SIGKILLed; the next pass finishes it.
-                swept = await asyncio.wait_for(
-                    sweep_orphaned_instance_dirs(),
-                    timeout=_OWNERLESS_SWEEP_TIMEOUT_S,
+                swept = await self._run_family_task(
+                    asyncio.wait_for(
+                        sweep_orphaned_instance_dirs(),
+                        timeout=_OWNERLESS_SWEEP_TIMEOUT_S,
+                    )
                 )
                 if swept:
                     _logger.info(
@@ -1041,6 +1045,26 @@ class HostProcess:
                 await asyncio.wait_for(
                     asyncio.shield(future), timeout=_OWNERLESS_SWEEP_JOIN_TIMEOUT_S
                 )
+            raise
+
+    async def _run_family_task(self, coro: Awaitable[int]) -> int:
+        """Run one async family sweep as a task, join-safe on cancellation.
+
+        The async sweep's own cancellation handlers (e.g. killing an
+        in-flight ``lsof``) must run to completion inside the caller's
+        subprocess-op guard, so cancellation propagates into the task and
+        is then awaited (bounded) before re-raising.
+
+        :param coro: The family sweep awaitable.
+        :returns: The sweep's cleaned count.
+        """
+        task = asyncio.ensure_future(coro)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(task, timeout=_OWNERLESS_SWEEP_JOIN_TIMEOUT_S)
             raise
 
     def _alive_runner_ids(self) -> list[str]:

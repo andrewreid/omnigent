@@ -1453,18 +1453,22 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
     group is exactly their tree — vendor CLI and MCP fleet
     included).
 
-    After SIGTERM, waits :data:`_ORPHAN_SIGTERM_GRACE_S`
-    seconds, then sends SIGKILL to any runner that is still
-    alive, and finally polls for the survivors to disappear.
+    Member identities of each holder's group are snapshotted
+    *before* the SIGTERM, so escalation and the final death
+    check track the whole tree — not just the holder, which may
+    exit promptly while a TERM-ignoring child survives. SIGKILL
+    goes only to identity-verified members (see
+    :func:`omnigent.inner._proc.kill_verified`), then the
+    survivors are polled until verifiably gone.
 
     :param instance_dir: The orphaned AP's per-instance dir
         whose runner subprocesses to terminate.
-    :returns: ``True`` when every found process is confirmed
+    :returns: ``True`` when every tracked process is confirmed
         gone (or none were found); ``False`` when a socket
         lookup failed or a process is still alive — the caller
         must keep the dir so a later sweep retries.
     """
-    all_pids: set[int] = set()
+    tracked: dict[int, str] = {}
     lookup_failed = False
     for socket_file in instance_dir.glob("conv-*.sock"):
         pids = await _pids_holding_socket(socket_file)
@@ -1472,21 +1476,24 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
             lookup_failed = True
             continue
         for pid in pids:
-            if _signal_pid_tree(pid, signal.SIGTERM):
-                all_pids.add(pid)
+            for member, identity in _holder_member_identities(pid).items():
+                tracked.setdefault(member, identity)
+            _signal_pid_tree(pid, signal.SIGTERM)
 
-    if all_pids:
+    if tracked:
         await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
-        for pid in all_pids:
-            if not _pid_alive(pid):
+        for pid, identity in tracked.items():
+            if _proc.process_start_identity(pid) != identity:
                 continue
             _logger.warning(
                 "orphan runner pid %d survived SIGTERM; escalating to SIGKILL",
                 pid,
             )
-            _signal_pid_tree(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            _proc.kill_verified(pid, identity, getattr(signal, "SIGKILL", signal.SIGTERM))
         deadline = time.monotonic() + _ORPHAN_KILL_VERIFY_TIMEOUT_S
-        while any(_pid_alive(pid) for pid in all_pids):
+        while any(
+            _proc.process_start_identity(pid) == identity for pid, identity in tracked.items()
+        ):
             if time.monotonic() >= deadline:
                 return False
             await asyncio.sleep(0.1)
@@ -1504,6 +1511,36 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
             )
             return False
     return True
+
+
+def _holder_member_identities(pid: int) -> dict[int, str]:
+    """
+    Snapshot the identities of the socket holder's whole group.
+
+    Taken while the holder still proves ownership (it holds a conv socket
+    under a dead-AP dir), so the recorded ``pid -> start-identity`` map is
+    a safe kill/verify list even after the holder itself exits. Falls back
+    to the holder alone when its group cannot be resolved (foreign, our
+    own shared group, or no POSIX groups).
+
+    :param pid: The socket-holding process id.
+    :returns: ``pid -> identity`` for every member to track; empty when
+        the holder is already gone.
+    """
+    pgid: int | None = None
+    if hasattr(os, "getpgid"):
+        try:
+            pgid = os.getpgid(pid)
+            if pgid == os.getpgid(0):
+                pgid = None
+        except OSError:
+            pgid = None
+    if pgid is not None:
+        members = _proc.group_member_identities(pgid)
+        if members:
+            return members
+    identity = _proc.process_start_identity(pid)
+    return {pid: identity} if identity is not None else {}
 
 
 def _signal_pid_tree(pid: int, sig: signal.Signals) -> bool:
@@ -1615,7 +1652,16 @@ async def _pids_holding_socket(socket_path: Path) -> list[int] | None:
         return None
     except OSError:
         return None
-    stdout, _ = await proc.communicate()
+    try:
+        stdout, _ = await proc.communicate()
+    except asyncio.CancelledError:
+        # Cancellation (sweep timeout, shutdown) must not leave the lsof
+        # helper running past the caller's subprocess-op guard.
+        with contextlib.suppress(OSError, ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        raise
     # lsof exits 1 both for "no holders" and some errors; with empty output
     # it is read as "no holders" (matching its normal not-found behavior),
     # while >1 is a real failure.

@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from omnigent.codex_native_state import _codex_native_state_root
+from omnigent.inner import _proc
 
 try:
     import fcntl
@@ -253,6 +254,17 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                 _reap_tmux_session(entry.tmux_session_name)
                 continue
             members = _group_member_identities(entry.pgid)
+            if members is None:
+                # Without a member snapshot, escalation could not verify
+                # survivors once the leader exits — don't signal anything
+                # yet; retry with the leader (and its lock gate) intact.
+                _logger.warning(
+                    "cannot snapshot members of codex-native group %d; "
+                    "deferring its reap to a later pass",
+                    entry.pgid,
+                )
+                survivors.append(entry)
+                continue
             if _signal_process_group(entry.pgid, signal.SIGTERM):
                 _logger.info(
                     "SIGTERMed ownerless codex-native process group %d (pid %d)",
@@ -286,18 +298,22 @@ def _escalate_sigkill(entry: CodexNativeProcessEntry) -> str:
     """
     kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
     if entry.members is not None:
-        survivors = [pid for pid, start in entry.members if _process_start_identity(pid) == start]
-        if not survivors:
+        alive = [
+            (pid, start) for pid, start in entry.members if _process_start_identity(pid) == start
+        ]
+        if not alive:
             return "gone"
-        for pid in survivors:
-            with contextlib.suppress(OSError):
-                os.kill(pid, kill_sig)
-        _logger.warning(
-            "codex-native group %d survived SIGTERM; SIGKILLed member(s) %s",
-            entry.pgid,
-            survivors,
-        )
-        return "killed"
+        delivered = [pid for pid, start in alive if _kill_member_verified(pid, start)]
+        if delivered:
+            _logger.warning(
+                "codex-native group %d survived SIGTERM; SIGKILLed member(s) %s",
+                entry.pgid,
+                delivered,
+            )
+            return "killed"
+        return "retry"
+    # Legacy entry written before member snapshots existed: a group kill
+    # is safe only while the tagged leader still proves ownership.
     if _pid_alive(entry.pid) and _process_cmdline_has_tag(entry.pid, entry.session_tag):
         if _signal_process_group(entry.pgid, kill_sig):
             _logger.warning(
@@ -502,67 +518,44 @@ def _process_cmdline(pid: int) -> str:
 
 def _group_member_identities(pgid: int) -> tuple[tuple[int, str], ...] | None:
     """
-    Snapshot ``(pid, start-time)`` identities of every member of *pgid*.
+    Snapshot ``(pid, identity)`` for every member of *pgid*.
 
     Must be taken while group ownership is provable (live tagged leader).
-    ``lstart`` is stable for a process's lifetime and second-granular, so a
-    recycled pid later fails the equality check.
+    Identities are kernel start times (see
+    :func:`omnigent.inner._proc.process_start_identity`), which a recycled
+    pid can never reproduce.
 
     :param pgid: Process group to enumerate.
     :returns: Member identities, or ``None`` when they could not be read.
     """
-    try:
-        proc = subprocess.run(
-            ["ps", "-A", "-o", "pid=", "-o", "pgid=", "-o", "lstart="],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5.0,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+    members = _proc.group_member_identities(pgid)
+    if not members:
         return None
-    if proc.returncode != 0:
-        return None
-    members: list[tuple[int, str]] = []
-    for line in proc.stdout.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3:
-            continue
-        try:
-            member_pid, member_pgid = int(parts[0]), int(parts[1])
-        except ValueError:
-            continue
-        if member_pgid == pgid:
-            members.append((member_pid, parts[2].strip()))
-    return tuple(members) if members else None
+    return tuple(sorted(members.items()))
 
 
 def _process_start_identity(pid: int) -> str | None:
     """
-    Return *pid*'s start time, or ``None`` when it cannot be read.
+    Return *pid*'s current-incarnation identity, or ``None`` if gone.
 
     ``None`` never matches a recorded identity, so an unreadable (usually
     already-gone) process is conservatively treated as not ours to kill.
 
     :param pid: Process to identify.
-    :returns: The ``lstart`` string, e.g. ``"Mon Jul 20 10:01:02 2026"``.
+    :returns: Opaque identity string.
     """
-    try:
-        proc = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "lstart="],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5.0,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if proc.returncode != 0:
-        return None
-    identity = proc.stdout.strip()
-    return identity or None
+    return _proc.process_start_identity(pid)
+
+
+def _kill_member_verified(pid: int, identity: str) -> bool:
+    """
+    SIGKILL *pid* only if it is still the recorded incarnation.
+
+    :param pid: Recorded group member.
+    :param identity: Its snapshotted identity.
+    :returns: ``True`` if the kill was delivered to the verified target.
+    """
+    return _proc.kill_verified(pid, identity, getattr(signal, "SIGKILL", signal.SIGTERM))
 
 
 def _signal_process_group(pgid: int, sig: signal.Signals) -> bool:
