@@ -840,6 +840,10 @@ def _tmux_server_alive(socket_path: Path) -> bool:
     try:
         probe.settimeout(2.0)
         probe.connect(str(socket_path))
+    except TimeoutError:
+        # A wedged-but-bound server can time out the connect; that is
+        # still a server, not confirmed absence.
+        return True
     except OSError as exc:
         if exc.errno is None:
             # Python refuses over-long AF_UNIX paths before the syscall;

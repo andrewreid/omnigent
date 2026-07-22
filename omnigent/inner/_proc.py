@@ -190,6 +190,98 @@ def _wait_gone(pid: int, timeout: float) -> None:
         psutil.Process(pid).wait(timeout=timeout)
 
 
+def process_start_identity(pid: int) -> str | None:
+    """
+    Stable identity for ``pid``'s current incarnation, or ``None`` if gone.
+
+    Uses the kernel-reported process start time (sub-second float), which a
+    recycled pid can never reproduce, so ``identity == recorded`` proves the
+    pid still names the same process. An unreadable process (gone, zombie on
+    platforms that hide it, foreign) yields ``None``, which never matches —
+    conservative in the don't-kill-strangers direction.
+
+    :param pid: The process id to identify.
+    :returns: An opaque identity string, or ``None``.
+    """
+    if pid <= 0:
+        return None
+    try:
+        return repr(psutil.Process(pid).create_time())
+    except (psutil.Error, OSError):
+        return None
+
+
+def group_member_identities(pgid: int) -> dict[int, str] | None:
+    """
+    Snapshot ``pid -> identity`` for every member of process group *pgid*.
+
+    Only meaningful while group ownership is provable (e.g. a verified live
+    leader); the caller records the result and later kills exactly these
+    identities via :func:`kill_verified`.
+
+    :param pgid: The process group to enumerate.
+    :returns: Member identities, or ``None`` when they could not be read
+        (no POSIX groups, or the pid table was unreadable).
+    """
+    if pgid <= 0 or _getpgid_fn is None:
+        return None
+    try:
+        pids = psutil.pids()
+    except (psutil.Error, OSError):
+        return None
+    members: dict[int, str] = {}
+    for pid in pids:
+        try:
+            if _getpgid_fn(pid) != pgid:
+                continue
+        except OSError:
+            continue
+        identity = process_start_identity(pid)
+        if identity is not None:
+            members[pid] = identity
+    return members or None
+
+
+def kill_verified(pid: int, identity: str, sig: int) -> bool:
+    """
+    Deliver *sig* to *pid* only if it is still the recorded incarnation.
+
+    Where pidfds exist (Linux) the target is pinned first, so the signal
+    provably reaches the verified process and pid reuse cannot be raced.
+    Elsewhere the identity is re-checked immediately before the plain kill;
+    the remaining microsecond window is the platform's best guarantee.
+
+    :param pid: The process id to signal.
+    :param identity: Its recorded :func:`process_start_identity`.
+    :param sig: The signal to deliver.
+    :returns: ``True`` if the signal was delivered to the verified target.
+    """
+    if identity is None or process_start_identity(pid) != identity:
+        return False
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send = getattr(signal, "pidfd_send_signal", None)
+    if pidfd_open is not None and pidfd_send is not None:
+        try:
+            fd = pidfd_open(pid)
+        except OSError:
+            return False
+        try:
+            if process_start_identity(pid) != identity:
+                return False
+            pidfd_send(fd, sig)
+            return True
+        except OSError:
+            return False
+        finally:
+            with suppress(OSError):
+                os.close(fd)
+    try:
+        os.kill(pid, sig)
+        return True
+    except OSError:
+        return False
+
+
 def process_alive(pid: int) -> bool:
     """
     Whether ``pid`` names a live, non-zombie process.

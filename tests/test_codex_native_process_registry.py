@@ -72,7 +72,7 @@ def test_reconciliation_sigterms_alive_tagged_process_and_keeps_entry(
         "_process_cmdline",
         lambda _pid: "codex omnigent_crash_teardown_tag=tag-123 app-server",
     )
-    monkeypatch.setattr(registry, "_group_member_identities", lambda _pgid: None)
+    monkeypatch.setattr(registry, "_group_member_identities", lambda _pgid: ((123, "start-a"),))
     monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
 
     signaled = registry.reconcile_codex_native_process_registry(registry_path=path)
@@ -112,7 +112,13 @@ def test_reconciliation_escalates_to_sigkill_after_grace(tmp_path: Path, monkeyp
     )
     monkeypatch.setattr(registry, "_group_member_identities", lambda _pgid: ((123, "start-a"),))
     monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: killed_group.append((pgid, sig)))
-    monkeypatch.setattr(registry.os, "kill", lambda pid, sig: killed_pid.append((pid, sig)))
+
+    def fake_kill_member(pid: int, identity: str) -> bool:
+        assert identity == "start-a"
+        killed_pid.append((pid, signal.SIGKILL))
+        return True
+
+    monkeypatch.setattr(registry, "_kill_member_verified", fake_kill_member)
 
     registry.reconcile_codex_native_process_registry(registry_path=path)
     # Within the grace: no second signal, entry untouched.
@@ -215,7 +221,7 @@ def test_reconciliation_reaps_when_owner_lock_is_not_held(tmp_path: Path, monkey
         "_process_cmdline",
         lambda _pid: "codex omnigent_crash_teardown_tag=tag-123 app-server",
     )
-    monkeypatch.setattr(registry, "_group_member_identities", lambda _pgid: None)
+    monkeypatch.setattr(registry, "_group_member_identities", lambda _pgid: ((123, "start-a"),))
     monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
 
     registry.reconcile_codex_native_process_registry(registry_path=path)
@@ -383,44 +389,76 @@ def test_escalation_kills_surviving_child_after_leader_exits(tmp_path: Path, mon
         leader.wait(timeout=10)
 
 
-def test_escalation_without_snapshot_never_kills_after_leader_exit(
+def test_reconciliation_defers_when_member_snapshot_unavailable(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """No member snapshot + dead leader: drop the entry, signal nothing.
+    """No snapshot means no SIGTERM: retain the entry and retry later.
 
-    Without identities there is no way to prove a surviving pid (or the
-    recorded pgid) is still ours once the tagged leader is gone, so the
-    escalation must refuse to kill rather than risk an unrelated process.
+    Signaling first and snapshotting never would leave escalation blind
+    once the leader exits — a TERM-ignoring child would leak with the
+    entry gone. The reap is deferred until a snapshot succeeds.
     """
     path = tmp_path / "registry.json"
     registry.register_codex_native_process(
         pid=123,
         pgid=456,
-        session_tag="tag-stale",
+        session_tag="tag-123",
         owner_lock_path=None,
         registry_path=path,
     )
     killed: list[tuple[int, signal.Signals]] = []
-    alive = {123}
-    monkeypatch.setattr(registry, "_pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(registry, "_pid_alive", lambda pid: pid == 123)
     monkeypatch.setattr(
         registry,
         "_process_cmdline",
-        lambda _pid: "codex omnigent_crash_teardown_tag=tag-stale app-server",
+        lambda _pid: "codex omnigent_crash_teardown_tag=tag-123 app-server",
     )
     monkeypatch.setattr(registry, "_group_member_identities", lambda _pgid: None)
     monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
 
-    registry.reconcile_codex_native_process_registry(registry_path=path)
-    assert killed == [(456, signal.SIGTERM)]
-
-    # Leader exits; without a snapshot the survivors cannot be verified,
-    # so the entry is dropped with no further signal.
-    alive.clear()
-    monkeypatch.setattr(registry, "_SIGKILL_GRACE_S", 0.0)
     assert registry.reconcile_codex_native_process_registry(registry_path=path) == 0
 
-    assert killed == [(456, signal.SIGTERM)]
+    assert killed == []
+    (payload,) = _registry_payload(path)
+    assert payload["sigterm_at"] is None
+
+
+def test_legacy_sigtermed_entry_without_snapshot_drops_after_leader_exit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Legacy entry (SIGTERMed, no members) + dead leader: drop, no kill.
+
+    Entries written before member snapshots existed carry no identities;
+    once their tagged leader is gone nothing can prove a survivor is
+    ours, so escalation must refuse to signal rather than risk an
+    unrelated process.
+    """
+    import json as json_mod
+
+    path = tmp_path / "registry.json"
+    path.write_text(
+        json_mod.dumps(
+            [
+                {
+                    "pid": 123,
+                    "pgid": 456,
+                    "tmux_session_name": None,
+                    "session_tag": "tag-legacy",
+                    "owner_lock_path": None,
+                    "sigterm_at": 1.0,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    killed: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(registry, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
+    monkeypatch.setattr(registry, "_SIGKILL_GRACE_S", 0.0)
+
+    assert registry.reconcile_codex_native_process_registry(registry_path=path) == 0
+
+    assert killed == []
     assert _registry_payload(path) == []
 
 
