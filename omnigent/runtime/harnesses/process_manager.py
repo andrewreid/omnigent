@@ -1473,7 +1473,13 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
         must keep the dir so a later sweep retries.
     """
     groups = _load_reap_state(instance_dir)
-    fresh_pgids: set[int] = set()
+    if groups is None:
+        _logger.warning(
+            "unreadable reap state under %s; keeping the dir untouched",
+            instance_dir,
+        )
+        return False
+    pending_signals: list[int] = []
     lookup_failed = False
     for socket_file in instance_dir.glob("conv-*.sock"):
         pids = await _pids_holding_socket(socket_file)
@@ -1492,26 +1498,50 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
             if not members:
                 continue  # holder already gone
             groups.setdefault(pgid, {}).update(members)
-            fresh_pgids.add(pgid)
+            pending_signals.append(pid)
+
+    if pending_signals:
+        # Write-ahead: identities must be durable before the first signal,
+        # or a crash mid-reap would strand survivors with no record.
+        if not _save_reap_state(instance_dir, groups):
+            _logger.warning(
+                "could not persist reap state under %s; deferring signals",
+                instance_dir,
+            )
+            return False
+        for pid in pending_signals:
             _signal_pid_tree(pid, signal.SIGTERM)
 
     tracked_any = any(members for members in groups.values())
     if tracked_any:
-        # Persist before waiting: metadata must survive this process too.
-        _save_reap_state(instance_dir, groups)
-        await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
+        # Grace, with anchored rescans: a SIGTERM handler may fork (and
+        # its owner then exit), so merge while a recorded member still
+        # identity-anchors the group and can prove it was never recycled.
+        grace_deadline = time.monotonic() + _ORPHAN_SIGTERM_GRACE_S
+        while True:
+            await asyncio.sleep(0.05)
+            for pgid, members in groups.items():
+                if pgid <= 0 or not any(
+                    _proc.process_identity_state(pid, identity) == "match"
+                    for pid, identity in members.items()
+                ):
+                    continue
+                fresh = _proc.group_member_identities(pgid)
+                if fresh:
+                    members.update(fresh)
+            if time.monotonic() >= grace_deadline:
+                break
         kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
         for pgid, members in groups.items():
-            anchored = any(
+            anchored = pgid > 0 and any(
                 _proc.process_identity_state(pid, identity) == "match"
                 for pid, identity in members.items()
             )
-            owned = pgid > 0 and (anchored or pgid in fresh_pgids)
-            if owned:
-                # Ownership provable (anchored continuity, or verified via
-                # a live holder seconds ago): merge late-forked members and
-                # kill the group atomically — a static pid list can never
-                # close over a fork racing it.
+            if anchored:
+                # An anchored recorded member proves group continuity, so
+                # the group kill is atomic over members forked after the
+                # snapshot — a static pid list can never close over a
+                # fork racing it.
                 fresh = _proc.group_member_identities(pgid)
                 if fresh:
                     members.update(fresh)
@@ -1523,7 +1553,7 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
                     pid,
                 )
                 _proc.kill_verified(pid, identity, kill_sig)
-            if owned:
+            if anchored:
                 with contextlib.suppress(OSError):
                     os.killpg(pgid, kill_sig)
         deadline = time.monotonic() + _ORPHAN_KILL_VERIFY_TIMEOUT_S
@@ -1593,50 +1623,58 @@ def _holder_group_snapshot(pid: int) -> tuple[int, dict[int, str]] | None:
 _REAP_STATE_FILE = "REAP_STATE"
 
 
-def _load_reap_state(instance_dir: Path) -> dict[int, dict[int, str]]:
+def _load_reap_state(instance_dir: Path) -> dict[int, dict[int, str]] | None:
     """
     Load the persisted ``pgid -> {pid: identity}`` reap bookkeeping.
 
     The state outlives the sweep process, so a later pass still knows
     which tree it SIGTERMed even after lsof can no longer see a holder.
-    Tolerant of a missing or malformed file (empty state).
+    A missing file is an empty state; an unreadable or malformed one is
+    indeterminate — prior tracking may exist but cannot be recovered, so
+    the caller must not proceed to signal or delete.
 
     :param instance_dir: The orphaned AP's per-instance dir.
-    :returns: Recorded groups; sentinel pgid ``0`` holds ungrouped pids.
+    :returns: Recorded groups (sentinel pgid ``0`` holds ungrouped pids),
+        or ``None`` when the state is indeterminate.
     """
     try:
         payload = json.loads((instance_dir / _REAP_STATE_FILE).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
     except (OSError, ValueError):
-        return {}
+        return None
     if not isinstance(payload, dict):
-        return {}
+        return None
     groups: dict[int, dict[int, str]] = {}
     for pgid_str, members in payload.items():
         try:
             pgid = int(pgid_str)
         except ValueError:
-            continue
+            return None  # a corrupt row may hide a recorded member
         if not isinstance(members, dict):
-            continue
+            return None
         parsed: dict[int, str] = {}
         for pid_str, identity in members.items():
             try:
                 member = int(pid_str)
             except ValueError:
-                continue
-            if isinstance(identity, str) and identity:
-                parsed[member] = identity
+                return None
+            if not isinstance(identity, str) or not identity:
+                return None
+            parsed[member] = identity
         if parsed:
             groups[pgid] = parsed
     return groups
 
 
-def _save_reap_state(instance_dir: Path, groups: dict[int, dict[int, str]]) -> None:
+def _save_reap_state(instance_dir: Path, groups: dict[int, dict[int, str]]) -> bool:
     """
-    Persist the reap bookkeeping into the instance dir (best-effort).
+    Persist the reap bookkeeping into the instance dir.
 
     :param instance_dir: The orphaned AP's per-instance dir.
     :param groups: Current ``pgid -> {pid: identity}`` tracking.
+    :returns: ``True`` if the state is durably written — a precondition
+        for signaling anything it records.
     """
     payload = {
         str(pgid): {str(pid): identity for pid, identity in members.items()}
@@ -1648,7 +1686,9 @@ def _save_reap_state(instance_dir: Path, groups: dict[int, dict[int, str]]) -> N
         tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
         os.replace(tmp, instance_dir / _REAP_STATE_FILE)
     except OSError:
-        _logger.debug("could not persist reap state under %s", instance_dir, exc_info=True)
+        _logger.warning("could not persist reap state under %s", instance_dir, exc_info=True)
+        return False
+    return True
 
 
 def _reap_state_settled(groups: dict[int, dict[int, str]]) -> bool:

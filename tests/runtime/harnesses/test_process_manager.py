@@ -1505,6 +1505,60 @@ async def test_orphan_sweep_keeps_dir_when_group_snapshot_fails(
     assert dead.exists(), "dir with an unverifiable tree must be kept for retry"
 
 
+async def test_orphan_sweep_defers_signals_when_state_write_fails(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No durable identities, no signals: write-ahead is a precondition.
+
+    Signaling before the record exists would strand survivors with no
+    metadata if this process dies mid-reap.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    async def lookup(_socket_path: Path) -> list[int]:
+        return [12345]
+
+    def must_not_signal(_pid: int, _sig: signal.Signals) -> bool:
+        raise AssertionError("must not signal before the reap state is durable")
+
+    monkeypatch.setattr(pm_mod, "_pids_holding_socket", lookup)
+    monkeypatch.setattr(pm_mod, "_holder_group_snapshot", lambda _pid: (54321, {12345: "id-a"}))
+    monkeypatch.setattr(pm_mod, "_save_reap_state", lambda _d, _g: False)
+    monkeypatch.setattr(pm_mod, "_signal_pid_tree", must_not_signal)
+
+    dead = short_tmp_parent / "ap-dead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (dead / "conv-stale.sock").touch()
+
+    swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+
+    assert swept == 0
+    assert dead.exists()
+
+
+async def test_orphan_sweep_treats_malformed_state_as_indeterminate(
+    short_tmp_parent: Path,
+) -> None:
+    """A corrupt REAP_STATE must block cleanup, not read as empty.
+
+    Prior tracking may exist behind the corruption; deleting the dir on
+    an empty-state assumption would strand any recorded survivor.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    dead = short_tmp_parent / "ap-dead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (dead / pm_mod._REAP_STATE_FILE).write_text("{not json", encoding="utf-8")
+
+    swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+
+    assert swept == 0
+    assert dead.exists(), "indeterminate state must keep the dir"
+
+
 async def test_orphan_sweep_keeps_dir_when_socket_lookup_fails(
     short_tmp_parent: Path,
     monkeypatch: pytest.MonkeyPatch,
