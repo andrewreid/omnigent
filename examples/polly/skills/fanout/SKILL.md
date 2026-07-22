@@ -5,6 +5,8 @@ description: Run independent subtasks in parallel — one git worktree and one i
 
 # fanout — safe parallel execution
 
+**Audience: polly ONLY** — orchestration policy, never handed to a worker.
+
 Use ONLY for subtasks that are parallel-safe (no shared files, no ordering
 dependency).
 
