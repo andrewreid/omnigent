@@ -211,17 +211,44 @@ def process_start_identity(pid: int) -> str | None:
         return None
 
 
+def process_identity_state(pid: int, identity: str | None) -> str:
+    """
+    Classify *pid* against a recorded :func:`process_start_identity`.
+
+    :param pid: The process id to probe.
+    :param identity: The recorded identity to compare against.
+    :returns: ``"match"`` — same incarnation, safe to signal;
+        ``"gone"`` — definitively absent, or the pid now belongs to a
+        different incarnation; ``"unverifiable"`` — something exists but
+        its identity cannot be read (treat as possibly ours and alive).
+    """
+    if pid <= 0 or identity is None:
+        return "gone"
+    try:
+        current = repr(psutil.Process(pid).create_time())
+    except psutil.NoSuchProcess:
+        # Includes psutil.ZombieProcess on platforms that hide zombie
+        # metadata — a zombie holds no resources worth waiting for.
+        return "gone"
+    except (psutil.Error, OSError):
+        return "unverifiable"
+    return "match" if current == identity else "gone"
+
+
 def group_member_identities(pgid: int) -> dict[int, str] | None:
     """
     Snapshot ``pid -> identity`` for every member of process group *pgid*.
 
     Only meaningful while group ownership is provable (e.g. a verified live
     leader); the caller records the result and later kills exactly these
-    identities via :func:`kill_verified`.
+    identities via :func:`kill_verified`. The snapshot fails closed: a pid
+    whose membership or identity cannot be read (rather than being
+    definitively gone) makes the whole snapshot ``None``, because a
+    silently incomplete kill list would leak the unreadable member.
 
     :param pgid: The process group to enumerate.
-    :returns: Member identities, or ``None`` when they could not be read
-        (no POSIX groups, or the pid table was unreadable).
+    :returns: Member identities, or ``None`` when a complete snapshot
+        could not be taken.
     """
     if pgid <= 0 or _getpgid_fn is None:
         return None
@@ -234,11 +261,16 @@ def group_member_identities(pgid: int) -> dict[int, str] | None:
         try:
             if _getpgid_fn(pid) != pgid:
                 continue
+        except ProcessLookupError:
+            continue  # exited mid-scan — definitively not a member anymore
         except OSError:
-            continue
-        identity = process_start_identity(pid)
-        if identity is not None:
-            members[pid] = identity
+            return None  # membership unknowable — snapshot incomplete
+        try:
+            members[pid] = repr(psutil.Process(pid).create_time())
+        except psutil.NoSuchProcess:
+            continue  # exited between the group check and the identity read
+        except (psutil.Error, OSError):
+            return None  # member exists but is unreadable — fail closed
     return members or None
 
 
@@ -246,17 +278,18 @@ def kill_verified(pid: int, identity: str, sig: int) -> bool:
     """
     Deliver *sig* to *pid* only if it is still the recorded incarnation.
 
-    Where pidfds exist (Linux) the target is pinned first, so the signal
-    provably reaches the verified process and pid reuse cannot be raced.
-    Elsewhere the identity is re-checked immediately before the plain kill;
-    the remaining microsecond window is the platform's best guarantee.
+    On Linux the target is pinned with a pidfd before the identity
+    re-check, so the signal provably reaches the verified process and pid
+    reuse cannot be raced. Other platforms (macOS has no equivalent
+    user-space handle) re-check the identity immediately before a plain
+    kill — a residual reuse window of microseconds remains there.
 
     :param pid: The process id to signal.
     :param identity: Its recorded :func:`process_start_identity`.
     :param sig: The signal to deliver.
     :returns: ``True`` if the signal was delivered to the verified target.
     """
-    if identity is None or process_start_identity(pid) != identity:
+    if process_identity_state(pid, identity) != "match":
         return False
     pidfd_open = getattr(os, "pidfd_open", None)
     pidfd_send = getattr(signal, "pidfd_send_signal", None)
@@ -266,7 +299,7 @@ def kill_verified(pid: int, identity: str, sig: int) -> bool:
         except OSError:
             return False
         try:
-            if process_start_identity(pid) != identity:
+            if process_identity_state(pid, identity) != "match":
                 return False
             pidfd_send(fd, sig)
             return True

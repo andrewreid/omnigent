@@ -298,20 +298,23 @@ def _escalate_sigkill(entry: CodexNativeProcessEntry) -> str:
     """
     kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
     if entry.members is not None:
-        alive = [
-            (pid, start) for pid, start in entry.members if _process_start_identity(pid) == start
-        ]
-        if not alive:
-            return "gone"
-        delivered = [pid for pid, start in alive if _kill_member_verified(pid, start)]
-        if delivered:
-            _logger.warning(
-                "codex-native group %d survived SIGTERM; SIGKILLed member(s) %s",
-                entry.pgid,
-                delivered,
-            )
-            return "killed"
-        return "retry"
+        states = [(pid, start, _member_identity_state(pid, start)) for pid, start in entry.members]
+        alive = [(pid, start) for pid, start, state in states if state == "match"]
+        if alive:
+            delivered = [pid for pid, start in alive if _kill_member_verified(pid, start)]
+            if delivered:
+                _logger.warning(
+                    "codex-native group %d survived SIGTERM; SIGKILLed member(s) %s",
+                    entry.pgid,
+                    delivered,
+                )
+                return "killed"
+            return "retry"
+        if any(state == "unverifiable" for _pid, _start, state in states):
+            # A member that exists but cannot be identified might still be
+            # ours; keep the entry rather than declaring the group gone.
+            return "retry"
+        return "gone"
     # Legacy entry written before member snapshots existed: a group kill
     # is safe only while the tagged leader still proves ownership.
     if _pid_alive(entry.pid) and _process_cmdline_has_tag(entry.pid, entry.session_tag):
@@ -534,17 +537,16 @@ def _group_member_identities(pgid: int) -> tuple[tuple[int, str], ...] | None:
     return tuple(sorted(members.items()))
 
 
-def _process_start_identity(pid: int) -> str | None:
+def _member_identity_state(pid: int, identity: str) -> str:
     """
-    Return *pid*'s current-incarnation identity, or ``None`` if gone.
+    Classify a recorded member against its live incarnation.
 
-    ``None`` never matches a recorded identity, so an unreadable (usually
-    already-gone) process is conservatively treated as not ours to kill.
-
-    :param pid: Process to identify.
-    :returns: Opaque identity string.
+    :param pid: Recorded group member.
+    :param identity: Its snapshotted identity.
+    :returns: ``"match"``, ``"gone"``, or ``"unverifiable"`` — see
+        :func:`omnigent.inner._proc.process_identity_state`.
     """
-    return _proc.process_start_identity(pid)
+    return _proc.process_identity_state(pid, identity)
 
 
 def _kill_member_verified(pid: int, identity: str) -> bool:
