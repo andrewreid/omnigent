@@ -13,12 +13,15 @@ import contextlib
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
+import time
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+import psutil
 import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
 
@@ -61,6 +64,7 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.inner import _proc
 from omnigent.onboarding.harness_install import harness_setup_hint
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
@@ -197,6 +201,120 @@ def _ownerless_sweep_enabled() -> bool:
     if value is None:
         return True
     return value.strip().lower() not in {"0", "false", "off", "no"}
+
+
+# Grace between condemning an adopted orphan (SIGTERM) and escalating to
+# SIGKILL. With the 60s sweep cadence the escalation lands on the next pass.
+_ADOPTED_SIGTERM_GRACE_S = 10.0
+
+# Cmdline substrings identifying the session-scaffolding families from the
+# ownerless-tree superset. For an ADOPTED child (its parent died) these
+# families are ownerless by construction — none of them legitimately
+# daemonizes away from a live owner. Per-session tmux servers DO (they
+# detach by design), so tmux is classified separately and gated on its
+# owner marker, and anything matching nothing is left alone (agents may
+# intentionally daemonize user services).
+_ADOPTED_CONDEMN_SIGNATURES: tuple[str, ...] = (
+    "omnigent_crash_teardown_tag=",
+    "omnigent.runtime.harnesses._runner",
+    "claude_native_bridge",
+    "omnigent-start-on-attach",
+    "omnigent attach ",
+)
+_TMUX_INSTANCE_DIR_MARKER = "omnigent-terminal-"
+
+
+@dataclass
+class _AdoptedPin:
+    """Bookkeeping for one pinned direct child of the host.
+
+    A pinned pid is never reaped by the zombie drain, so — kernel-enforced
+    — neither its pid nor (for a session leader) its pgid can be recycled
+    while the pin is held. The pin is the sole authority for group kills.
+
+    :param identity: ``repr(create_time)`` at pin time, or ``None`` when
+        unreadable (zombies on some platforms).
+    :param is_leader: Whether the pid led its own process group at pin time.
+    :param condemned: Whether classification condemned it (ownerless).
+    :param deferred_zombie: Pinned by the zombie drain because it died a
+        group leader with live members — held unreaped as the kernel pin
+        on its group until the sweep classifies it.
+    :param termed_at: Monotonic time the first SIGTERM was delivered.
+    """
+
+    identity: str | None
+    is_leader: bool
+    condemned: bool = False
+    deferred_zombie: bool = False
+    termed_at: float | None = None
+
+
+def _pid_stat_ids(pid: int) -> tuple[int, int] | None:
+    """Read ``(pgid, sid)`` for *pid*, valid even for an unreaped zombie.
+
+    :param pid: A direct-child pid.
+    :returns: ``(pgid, sid)``, or ``None`` when unreadable.
+    """
+    try:
+        pgid = os.getpgid(pid)
+        sid = os.getsid(pid)
+    except OSError:
+        return None
+    return pgid, sid
+
+
+def _live_group_member_pids(pgid: int, *, exclude: int | None = None) -> list[int]:
+    """Pids of live (non-zombie) members of *pgid*.
+
+    Drain detection MUST use this scan: ``killpg`` returns 0 even for a
+    zombie-only group (the signal is silently dropped for exited members),
+    so its return value can never prove emptiness.
+
+    :param pgid: Process group to scan.
+    :param exclude: Optional pid to omit (the pinned leader itself).
+    :returns: Live member pids.
+    """
+    live: list[int] = []
+    try:
+        pids = psutil.pids()
+    except (psutil.Error, OSError):
+        return live
+    for pid in pids:
+        if pid == exclude:
+            continue
+        try:
+            if os.getpgid(pid) != pgid:
+                continue
+            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                continue
+        except (psutil.Error, OSError):
+            continue
+        live.append(pid)
+    return live
+
+
+def _adopted_child_cmdline(pid: int) -> str:
+    """Space-joined cmdline of a live direct child, ``""`` if unreadable.
+
+    :param pid: The child pid.
+    :returns: The command line (empty for zombies — their argv is gone).
+    """
+    try:
+        return " ".join(psutil.Process(pid).cmdline())
+    except (psutil.Error, OSError):
+        return ""
+
+
+def _tmux_instance_dir_from_cmdline(cmdline: str) -> Path | None:
+    """Extract the per-session terminal instance dir from a tmux cmdline.
+
+    :param cmdline: e.g. ``tmux -S /tmp/omnigent-terminal-abc/tmux.sock …``.
+    :returns: The instance dir, or ``None`` when not a per-session server.
+    """
+    for token in cmdline.split():
+        if _TMUX_INSTANCE_DIR_MARKER in token and token.endswith("tmux.sock"):
+            return Path(token).parent
+    return None
 
 
 def _install_child_subreaper() -> bool:
@@ -736,6 +854,15 @@ class HostProcess:
         # Strong ref to the active ownerless-tree sweep task
         # (see :meth:`_ownerless_sweep_loop`).
         self._ownerless_sweep_task: asyncio.Task[None] | None = None
+        # Whether this process is a child subreaper (or PID 1): the kernel
+        # reparents orphaned descendants here as direct children, enabling
+        # the adopted-orphan reaper. Set in :meth:`run`.
+        self._is_subreaper = False
+        # pid -> pin for direct children the zombie drain must NOT reap:
+        # condemned adopted orphans mid-kill, and zombies that died group
+        # leaders with live members (the held zombie is the kernel pin on
+        # its pgid). Mutated only on the event loop.
+        self._adopted_pins: dict[int, _AdoptedPin] = {}
         # Number of host-owned ``subprocess`` operations (e.g. the git worktree
         # commands in :mod:`omnigent.host.git_worktree`) currently in flight.
         # The orphan reaper skips its sweep while this is >0 so it never
@@ -836,6 +963,10 @@ class HostProcess:
             return 0
         if hasattr(os, "waitid") and hasattr(os, "P_ALL"):
             return self._reap_orphans_waitid()
+        if self._is_subreaper or self._adopted_pins:
+            # No waitid, but pins/deferral are in play: per-pid targeted
+            # reaping (portable) — a blind waitpid(-1) cannot skip a pin.
+            return self._reap_orphans_targeted()
         return self._reap_orphans_waitpid()
 
     @contextlib.contextmanager
@@ -861,34 +992,110 @@ class HostProcess:
             self._owned_subprocess_ops -= 1
 
     def _reap_orphans_waitid(self) -> int:
-        """Peek-and-reap using ``os.waitid(WNOWAIT)`` (Linux/POSIX).
+        """Enumerate-and-subtract targeted reaping (Linux/POSIX).
+
+        A cheap ``waitid(P_ALL, WNOWAIT)`` peek short-circuits the common
+        nothing-reapable case. When something IS reapable, the drain
+        enumerates zombie direct children and consumes each with a
+        targeted ``waitid(P_PID, …, WNOHANG)`` — a head-peek loop cannot
+        skip a pid it must not consume (``WNOWAIT`` re-returns the same
+        head), and per-pid waits can never stall behind one.
+
+        Skipped pids: tracked runners (their Popen owns the status) and
+        :attr:`_adopted_pins` (an unreaped zombie is the kernel pin on its
+        pid/pgid). A zombie that died a group leader with live members is
+        *deferred* — pinned instead of consumed — so the adopted-orphan
+        sweep can classify its group while the pgid is still provably its
+        own; unknown deferrals are released after one sweep pass.
+
+        :returns: Count of orphan processes reaped.
+        """
+        try:
+            info = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except (ChildProcessError, OSError):
+            return 0
+        if info is None:
+            return 0  # children exist but none ready to reap
+        return self._reap_orphans_targeted()
+
+    def _reap_orphans_targeted(self) -> int:
+        """Per-pid zombie reaping over enumerated direct children.
+
+        Portable core shared by the waitid path (after its cheap peek)
+        and the no-waitid pin-aware path.
 
         :returns: Count of orphan processes reaped.
         """
         reaped = 0
         tracked = self._tracked_runner_pids()
-        while True:
+        for child in self._direct_children():
+            pid = child.pid
+            if pid in tracked or pid in self._adopted_pins:
+                continue
             try:
-                info = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-            except (ChildProcessError, OSError):
-                break
-            if info is None:
-                break  # children exist but none ready to reap
-            pid = info.si_pid
-            if pid in tracked:
-                # Leave it for _watch_runner's Popen to reap+report. Break, not
-                # continue: WNOWAIT keeps returning the same head pid, so
-                # continuing would spin. The runner is reaped within ~0.5s and
-                # the next sweep proceeds past it.
-                break
-            try:
-                os.waitpid(pid, 0)  # consume the orphan
+                if child.status() != psutil.STATUS_ZOMBIE:
+                    continue
+            except (psutil.Error, OSError):
+                continue
+            if self._is_subreaper and self._defer_dead_leader(pid):
+                continue
+            if self._consume_child_zombie(pid):
                 reaped += 1
-            except ChildProcessError:
-                break
         if reaped:
             _logger.debug("orphan reaper reaped %d process(es)", reaped)
         return reaped
+
+    def _direct_children(self) -> list[psutil.Process]:
+        """This process's direct children, zombies included.
+
+        :returns: Child process handles (kernel truth via /proc).
+        """
+        try:
+            return psutil.Process().children()
+        except (psutil.Error, OSError):
+            return []
+
+    def _defer_dead_leader(self, pid: int) -> bool:
+        """Pin (instead of reap) a zombie that led a still-live group.
+
+        Leaders usually die on their own — the parent-death watchdog
+        self-exits a harness the moment its runner dies — long before any
+        sweep could condemn them. Consuming such a zombie would release
+        the only kernel handle on its group's pgid; holding it unreaped
+        keeps ``killpg`` provably scoped to the orphaned tree.
+
+        :param pid: A zombie direct-child pid.
+        :returns: ``True`` when the zombie was pinned.
+        """
+        ids = _pid_stat_ids(pid)
+        if ids is None or ids[0] != pid:
+            return False
+        if not _live_group_member_pids(pid, exclude=pid):
+            return False
+        identity = _proc.process_start_identity(pid)
+        self._adopted_pins[pid] = _AdoptedPin(
+            identity=identity, is_leader=True, deferred_zombie=True
+        )
+        _logger.info(
+            "holding dead group leader %d unreaped (kernel pin) until its "
+            "orphaned group is classified — expect a transient <defunct> child",
+            pid,
+        )
+        return True
+
+    def _consume_child_zombie(self, pid: int) -> bool:
+        """Reap one zombie direct child by targeted wait.
+
+        :param pid: The zombie pid.
+        :returns: ``True`` when a status was consumed.
+        """
+        try:
+            if hasattr(os, "waitid"):
+                return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG) is not None
+            reaped_pid, _status = os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            return False
+        return reaped_pid == pid
 
     def _reap_orphans_waitpid(self) -> int:
         """Reap with ``waitpid(WNOHANG)``, re-injecting tracked-runner status.
@@ -985,6 +1192,19 @@ class HostProcess:
             sweep_orphaned_instance_dirs,
         )
 
+        if self._is_subreaper:
+            try:
+                # Synchronous on the event loop: nothing (in particular the
+                # zombie drain) can interleave between pinning a candidate
+                # and signaling it, so no pid/pgid can be recycled mid-pass.
+                condemned = self._reap_adopted_orphans_once()
+                if condemned:
+                    _logger.info(
+                        "ownerless sweep: driving %d adopted orphan tree(s)",
+                        condemned,
+                    )
+            except Exception:  # noqa: BLE001 — best-effort per family
+                _logger.warning("adopted-orphan sweep failed", exc_info=True)
         try:
             signaled = await self._run_family_in_thread(reconcile_codex_native_process_registry)
             if signaled:
@@ -1019,6 +1239,187 @@ class HostProcess:
                 )
         except Exception:  # noqa: BLE001 — best-effort per family
             _logger.warning("harness instance-dir ownerless sweep failed", exc_info=True)
+
+    def _reap_adopted_orphans_once(self) -> int:
+        """Classify and drive every adopted direct child (subreaper hosts).
+
+        The kernel reparents an orphan here the moment its parent dies, so
+        adoption itself proves owner death for every scaffolding family
+        except per-session tmux servers (which daemonize by design and are
+        gated on their owner marker). Unknown children are left alone —
+        agents may deliberately daemonize user services.
+
+        Runs synchronously on the event loop; pins are taken at
+        enumeration and the zombie drain skips them, so no candidate's
+        pid/pgid can be recycled between observation and signal.
+
+        :returns: Number of condemned trees currently being driven.
+        """
+        tracked = self._tracked_runner_pids()
+        excluded = tracked | self._local_server_pids()
+        for child in self._direct_children():
+            pid = child.pid
+            if pid in excluded or pid in self._adopted_pins:
+                continue
+            try:
+                is_zombie = child.status() == psutil.STATUS_ZOMBIE
+                identity = None if is_zombie else repr(child.create_time())
+            except (psutil.Error, OSError):
+                continue
+            if is_zombie:
+                continue  # the drain owns zombies (and defers dead leaders)
+            ids = _pid_stat_ids(pid)
+            self._adopted_pins[pid] = _AdoptedPin(
+                identity=identity,
+                is_leader=ids is not None and ids[0] == pid,
+            )
+
+        condemned = 0
+        now = time.monotonic()
+        for pid, pin in list(self._adopted_pins.items()):
+            if not pin.condemned and not self._classify_adopted_pin(pid, pin):
+                self._release_pin(pid)
+                continue
+            pin.condemned = True
+            if self._drive_condemned_pin(pid, pin, now):
+                condemned += 1
+        return condemned
+
+    def _local_server_pids(self) -> set[int]:
+        """Pid of the local Omnigent server, when one is recorded.
+
+        The ``--local`` daemon spawns (or reuses) a detached server that
+        can be a direct child of this process; it is host-owned, never an
+        adopted orphan.
+
+        :returns: A zero-or-one element pid set.
+        """
+        from omnigent.host.local_server import _read_local_server_pid_file
+
+        try:
+            recorded = _read_local_server_pid_file()
+        except Exception:  # noqa: BLE001 — exclusion is best-effort
+            return set()
+        return {recorded[0]} if recorded else set()
+
+    def _classify_adopted_pin(self, pid: int, pin: _AdoptedPin) -> bool:
+        """Decide whether a pinned adopted child is ownerless.
+
+        :param pid: The pinned pid.
+        :param pin: Its pin bookkeeping.
+        :returns: ``True`` to condemn; ``False`` to release untouched.
+        """
+        if pin.deferred_zombie:
+            return self._dead_leader_group_is_ours(pid, pin)
+        cmdline = _adopted_child_cmdline(pid)
+        if not cmdline:
+            return False
+        if any(marker in cmdline for marker in _ADOPTED_CONDEMN_SIGNATURES):
+            return True
+        instance_dir = _tmux_instance_dir_from_cmdline(cmdline)
+        if instance_dir is not None:
+            from omnigent.inner.terminal import terminal_owner_is_dead
+
+            return terminal_owner_is_dead(instance_dir) is True
+        return False
+
+    def _dead_leader_group_is_ours(self, pid: int, pin: _AdoptedPin) -> bool:
+        """Attribute a deferred dead leader's group to a known family.
+
+        The zombie's own argv is gone, so ownership comes from what is
+        still observable: a live group member carrying a family signature,
+        a codex registry entry recorded for this leader, or a harness
+        spawn record in a dead AP's instance dir.
+
+        :param pid: The pinned zombie leader pid.
+        :param pin: Its pin bookkeeping.
+        :returns: ``True`` when the group is provably ours to drain.
+        """
+        for member in _live_group_member_pids(pid, exclude=pid):
+            cmdline = _adopted_child_cmdline(member)
+            if any(marker in cmdline for marker in _ADOPTED_CONDEMN_SIGNATURES):
+                return True
+        from omnigent.codex_native_process_registry import (
+            ownerless_entry_matches_leader,
+        )
+        from omnigent.runtime.harnesses.process_manager import (
+            harness_spawn_record_matches,
+        )
+
+        if ownerless_entry_matches_leader(pid, pin.identity):
+            return True
+        return harness_spawn_record_matches(pid, pin.identity)
+
+    def _drive_condemned_pin(self, pid: int, pin: _AdoptedPin, now: float) -> bool:
+        """Advance one condemned tree: TERM, then KILL, then reap when empty.
+
+        Group kills go through ``killpg`` against the pinned pid — valid
+        precisely because the pin (an unreaped child, alive or zombie)
+        keeps the pgid from being recycled. Drain detection is a /proc
+        scan for live members (``killpg`` returns 0 even for a zombie-only
+        group); release sends one final ``killpg(SIGKILL)`` before the
+        deciding rescan so a fork racing the drain cannot slip out.
+
+        :param pid: The condemned pinned pid.
+        :param pin: Its pin bookkeeping.
+        :param now: Monotonic timestamp for TERM->KILL grace tracking.
+        :returns: ``True`` while the tree is still being driven.
+        """
+        kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+        alive = _proc.process_identity_state(pid, pin.identity) == "match"
+        if pin.termed_at is None:
+            sig = signal.SIGTERM if alive else kill_sig
+            self._signal_pinned(pid, pin, sig)
+            pin.termed_at = now
+            return True
+        if pin.is_leader:
+            if _live_group_member_pids(pid, exclude=pid) or alive:
+                if now - pin.termed_at >= _ADOPTED_SIGTERM_GRACE_S:
+                    self._signal_pinned(pid, pin, kill_sig)
+                return True
+            # Group looks empty: final atomic kill closes the fork race,
+            # then the deciding rescan confirms before the pin is released.
+            self._signal_pinned(pid, pin, kill_sig)
+            if _live_group_member_pids(pid, exclude=pid):
+                return True
+            self._release_pin(pid)
+            return False
+        if alive:
+            if now - pin.termed_at >= _ADOPTED_SIGTERM_GRACE_S:
+                self._signal_pinned(pid, pin, kill_sig)
+            return True
+        self._release_pin(pid)
+        return False
+
+    def _signal_pinned(self, pid: int, pin: _AdoptedPin, sig: int) -> None:
+        """Deliver *sig* to a pinned pid (whole group for leaders).
+
+        :param pid: The pinned pid.
+        :param pin: Its pin bookkeeping.
+        :param sig: The signal to deliver.
+        """
+        try:
+            if pin.is_leader and hasattr(os, "killpg"):
+                os.killpg(pid, sig)
+            else:
+                os.kill(pid, sig)
+        except OSError:
+            pass
+        else:
+            _logger.info(
+                "adopted-orphan reaper sent signal %d to %s %d",
+                sig,
+                "group" if pin.is_leader else "pid",
+                pid,
+            )
+
+    def _release_pin(self, pid: int) -> None:
+        """Reap (if a zombie remains) and forget one pin.
+
+        :param pid: The pinned pid.
+        """
+        self._adopted_pins.pop(pid, None)
+        self._consume_child_zombie(pid)
 
     def _release_subprocess_op(self) -> None:
         """Drop one subprocess-op ref (family-sweep done-callback target).
@@ -1991,8 +2392,9 @@ class HostProcess:
         # runner dies (this host is PID 1 in a container, or a subreaper
         # otherwise). Without this they pile up as <defunct> zombies and can
         # OOM the box on a long-blocked run (#1782).
-        if _install_child_subreaper():
-            _logger.debug("installed PR_SET_CHILD_SUBREAPER; host will reap orphans")
+        self._is_subreaper = _install_child_subreaper() or os.getpid() == 1
+        if self._is_subreaper:
+            _logger.debug("host is a subreaper; orphaned descendants reparent here")
         self._reaper_task = asyncio.create_task(
             self._orphan_reaper_loop(), name="host-orphan-reaper"
         )

@@ -23,9 +23,10 @@ def _registry_payload(path: Path) -> list[dict[str, object]]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def test_registry_add_remove_round_trip(tmp_path: Path) -> None:
+def test_registry_add_remove_round_trip(tmp_path: Path, monkeypatch) -> None:
     """Registry writes and removes a tagged codex child entry."""
     path = tmp_path / "registry.json"
+    monkeypatch.setattr(registry._proc, "process_start_identity", lambda _pid: None)
 
     registry.register_codex_native_process(
         pid=123,
@@ -45,6 +46,7 @@ def test_registry_add_remove_round_trip(tmp_path: Path) -> None:
             "owner_lock_path": str(tmp_path / "owner.lock"),
             "sigterm_at": None,
             "members": None,
+            "leader_identity": None,
         }
     ]
 
@@ -175,6 +177,7 @@ def test_reconciliation_skips_live_sibling_when_owner_lock_is_held(
     """A healthy sibling child is not reaped while its launcher owns the lock."""
     path = tmp_path / "registry.json"
     owner_lock = tmp_path / "owner.lock"
+    monkeypatch.setattr(registry._proc, "process_start_identity", lambda _pid: None)
     registry.register_codex_native_process(
         pid=123,
         pgid=456,
@@ -204,6 +207,7 @@ def test_reconciliation_skips_live_sibling_when_owner_lock_is_held(
             "owner_lock_path": str(owner_lock),
             "sigterm_at": None,
             "members": None,
+            "leader_identity": None,
         }
     ]
 
@@ -468,14 +472,16 @@ def test_legacy_sigtermed_entry_without_snapshot_drops_after_leader_exit(
     assert _registry_payload(path) == []
 
 
-def test_escalation_handles_child_forked_from_sigterm_handler(tmp_path: Path, monkeypatch) -> None:
-    """A child forked by the leader's SIGTERM handler never escapes silently.
+def test_fallback_tier_never_chases_children_it_did_not_record(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The registry fallback drains its entry without heuristic chasing.
 
-    The pre-TERM snapshot cannot contain it, so the post-TERM anchored
-    rescan must capture it (the leader, still alive in its handler,
-    anchors the group) and a later pass group-kills it. Were the rescan
-    to miss, the entry must be retained — not dropped as "gone" while the
-    child lives.
+    A child forked from the leader's SIGTERM handler is not in the
+    recorded members. The fallback tier must neither kill it (no proof it
+    is ours) nor wedge on it: the entry drains once every RECORDED member
+    is verifiably gone. On subreaper hosts the adopted-orphan reaper —
+    exercised in the host tests — is what actually drains such children.
     """
     import contextlib
     import os as os_mod
@@ -496,7 +502,7 @@ def test_escalation_handles_child_forked_from_sigterm_handler(tmp_path: Path, mo
                 "'import os, signal, time; "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
                 "print(os.getpid(), flush=True); time.sleep(120)'])\n"
-                "    time.sleep(0.3)\n"
+                "    time.sleep(0.2)\n"
                 "    os._exit(0)\n"
                 "signal.signal(signal.SIGTERM, on_term)\n"
                 "print('ready', flush=True)\n"
@@ -520,24 +526,19 @@ def test_escalation_handles_child_forked_from_sigterm_handler(tmp_path: Path, mo
             registry_path=path,
         )
 
-        # SIGTERM pass: the anchored post-TERM rescan records the child
-        # the handler forks while the leader still anchors the group.
         assert registry.reconcile_codex_native_process_registry(registry_path=path) == 1
         child_pid = int(leader.stdout.readline().strip())
         assert leader.wait(timeout=10) is not None
-        assert registry._pid_alive(child_pid), "handler child should outlive the leader"
-        (payload,) = _registry_payload(path)
-        recorded = {pid for pid, _start in payload["members"]}
-        assert child_pid in recorded, "post-TERM rescan missed the handler's fork"
 
-        # Escalation passes drain the recorded child and then the entry.
         monkeypatch.setattr(registry, "_SIGKILL_GRACE_S", 0.0)
         deadline = time_mod.monotonic() + 5.0
         while _registry_payload(path) and time_mod.monotonic() < deadline:
             registry.reconcile_codex_native_process_registry(registry_path=path)
             time_mod.sleep(0.05)
-        assert not registry._pid_alive(child_pid), "late-forked child leaked"
+
+        # Entry drained; the unrecorded child was deliberately NOT chased.
         assert _registry_payload(path) == []
+        assert registry._pid_alive(child_pid), "fallback must not guess at unrecorded pids"
     finally:
         if child_pid is not None:
             with contextlib.suppress(OSError):
@@ -545,6 +546,59 @@ def test_escalation_handles_child_forked_from_sigterm_handler(tmp_path: Path, mo
         if leader.poll() is None:
             leader.kill()
         leader.wait(timeout=10)
+
+
+def test_reconciliation_is_write_ahead_and_defers_on_write_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """No durable record, no signal: a failed registry write defers TERMs."""
+    path = tmp_path / "registry.json"
+    monkeypatch.setattr(registry._proc, "process_start_identity", lambda _pid: None)
+    registry.register_codex_native_process(
+        pid=123,
+        pgid=456,
+        session_tag="tag-wa",
+        owner_lock_path=None,
+        registry_path=path,
+    )
+    killed: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(registry, "_pid_alive", lambda pid: pid == 123)
+    monkeypatch.setattr(
+        registry,
+        "_process_cmdline",
+        lambda _pid: "codex omnigent_crash_teardown_tag=tag-wa app-server",
+    )
+    monkeypatch.setattr(registry, "_group_member_identities", lambda _pgid: ((123, "s"),))
+    monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
+    monkeypatch.setattr(registry, "_write_registry", lambda _path, _entries: False)
+
+    assert registry.reconcile_codex_native_process_registry(registry_path=path) == 0
+
+    assert killed == [], "must not signal before the record is durable"
+    (payload,) = _registry_payload(path)
+    assert payload["sigterm_at"] is None, "on-disk entry must be unchanged"
+
+
+def test_ownerless_entry_matches_leader_requires_identity_and_free_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Adopted-zombie attribution needs an identity match and a free lock."""
+    monkeypatch.setattr(registry, "_codex_native_state_root", lambda: tmp_path)
+    monkeypatch.setattr(registry._proc, "process_start_identity", lambda _pid: "id-a")
+    registry.register_codex_native_process(
+        pid=123,
+        pgid=123,
+        session_tag="tag-adopt",
+        owner_lock_path=None,
+    )
+
+    assert registry.ownerless_entry_matches_leader(123, "id-a") is True
+    assert registry.ownerless_entry_matches_leader(123, "id-b") is False
+    assert registry.ownerless_entry_matches_leader(124, "id-a") is False
+    assert registry.ownerless_entry_matches_leader(123, None) is False
+
+    monkeypatch.setattr(registry, "_owner_lock_held", lambda _path: True)
+    assert registry.ownerless_entry_matches_leader(123, "id-a") is False
 
 
 def test_end_to_end_spares_owned_process_and_reaps_after_owner_death(

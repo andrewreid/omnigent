@@ -196,6 +196,9 @@ _TMUX_START_ON_ATTACH_CHANNEL = "omnigent-start-on-attach"
 # (``reap_orphaned_terminals``).
 _TERMINAL_DIR_PREFIX = "omnigent-terminal-"
 _OWNER_PID_FILENAME = "owner.pid"
+# Sibling of the owner-pid marker carrying the owner's kernel start
+# identity, so the dead-owner gate survives pid recycling.
+_OWNER_IDENTITY_FILENAME = "owner.ident"
 # Bound for each ``tmux kill-server`` in the orphan sweep; a wedged
 # tmux must not stall runner startup.
 _REAP_KILL_TIMEOUT_S = 10.0
@@ -765,6 +768,37 @@ def _terminals_tmp_root() -> Path:
     return Path(tempfile.gettempdir())
 
 
+def terminal_owner_is_dead(instance_dir: Path) -> bool | None:
+    """
+    Whether the instance dir's recorded owner is provably dead.
+
+    Identity-anchored when the marker carries a start identity (a
+    recycled owner pid reads as dead, an unverifiable one as unknown);
+    legacy markers without one fall back to raw pid liveness, which can
+    only err toward "alive" (retention).
+
+    :param instance_dir: A ``omnigent-terminal-*`` instance dir.
+    :returns: ``True`` dead, ``False`` alive, ``None`` unknown/unmarked.
+    """
+    try:
+        pid = int((instance_dir / _OWNER_PID_FILENAME).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    identity: str | None
+    try:
+        identity = (instance_dir / _OWNER_IDENTITY_FILENAME).read_text(encoding="utf-8").strip()
+    except OSError:
+        identity = None
+    if identity:
+        state = _proc.process_identity_state(pid, identity)
+        if state == "match":
+            return False
+        if state == "gone":
+            return True
+        return None
+    return not _process_alive(pid)
+
+
 def reap_orphaned_terminals() -> int:
     """
     Kill terminal tmux servers whose owning process is gone.
@@ -790,11 +824,7 @@ def reap_orphaned_terminals() -> int:
         return 0
     reaped = 0
     for entry in entries:
-        try:
-            pid = int((entry / _OWNER_PID_FILENAME).read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            continue
-        if _process_alive(pid):
+        if terminal_owner_is_dead(entry) is not True:
             continue
         socket_path = entry / "tmux.sock"
         try:
@@ -2009,6 +2039,9 @@ def create_terminal_instance(
     # server if we die without graceful shutdown (SIGKILL, harness
     # teardown) — see ``reap_orphaned_terminals``.
     (private_dir / _OWNER_PID_FILENAME).write_text(str(os.getpid()), encoding="utf-8")
+    owner_identity = _proc.process_start_identity(os.getpid())
+    if owner_identity is not None:
+        (private_dir / _OWNER_IDENTITY_FILENAME).write_text(owner_identity, encoding="utf-8")
 
     # Resolve os_env spec.  If none specified, inherit from parent.
     effective_os_env_spec = build_terminal_os_env_spec(
