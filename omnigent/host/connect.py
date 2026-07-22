@@ -213,13 +213,15 @@ _ADOPTED_SIGTERM_GRACE_S = 10.0
 # daemonizes away from a live owner. Per-session tmux servers DO (they
 # detach by design), so tmux is classified separately and gated on its
 # owner marker, and anything matching nothing is left alone (agents may
-# intentionally daemonize user services).
+# intentionally daemonize user services). ``omnigent attach`` clients are
+# deliberately NOT condemned: a user-launched one is indistinguishable
+# from the framework's, and either exits on its own once its session or
+# tmux server is gone.
 _ADOPTED_CONDEMN_SIGNATURES: tuple[str, ...] = (
     "omnigent_crash_teardown_tag=",
     "omnigent.runtime.harnesses._runner",
     "claude_native_bridge",
     "omnigent-start-on-attach",
-    "omnigent attach ",
 )
 _TMUX_INSTANCE_DIR_MARKER = "omnigent-terminal-"
 
@@ -291,6 +293,21 @@ def _live_group_member_pids(pgid: int, *, exclude: int | None = None) -> list[in
             continue
         live.append(pid)
     return live
+
+
+def _pid_is_zombie(pid: int) -> bool:
+    """Whether *pid* is an unreaped zombie (dead for drain purposes).
+
+    A pinned zombie's /proc metadata stays readable on Linux, so identity
+    probes report "match" — liveness needs this separate check.
+
+    :param pid: The pid to probe.
+    :returns: ``True`` for an unreaped zombie.
+    """
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except (psutil.Error, OSError):
+        return False
 
 
 def _adopted_child_cmdline(pid: int) -> str:
@@ -1037,7 +1054,11 @@ class HostProcess:
                     continue
             except (psutil.Error, OSError):
                 continue
-            if self._is_subreaper and self._defer_dead_leader(pid):
+            if (
+                self._is_subreaper
+                and self._ownerless_sweep_task is not None
+                and self._defer_dead_leader(pid)
+            ):
                 continue
             if self._consume_child_zombie(pid):
                 reaped += 1
@@ -1255,6 +1276,12 @@ class HostProcess:
 
         :returns: Number of condemned trees currently being driven.
         """
+        if self._owned_subprocess_ops > 0:
+            # A host-owned subprocess (e.g. a git worktree command) is a
+            # live direct child indistinguishable from an adopted orphan;
+            # pinning it ends in a targeted wait that could steal its exit
+            # status from its owner's own wait(). Defer this pass.
+            return 0
         tracked = self._tracked_runner_pids()
         excluded = tracked | self._local_server_pids()
         for child in self._direct_children():
@@ -1314,14 +1341,16 @@ class HostProcess:
         cmdline = _adopted_child_cmdline(pid)
         if not cmdline:
             return False
-        if any(marker in cmdline for marker in _ADOPTED_CONDEMN_SIGNATURES):
-            return True
+        # The tmux gate must run FIRST: a per-session server's argv can
+        # embed its pane command (e.g. the start-on-attach shell), so a
+        # signature match on a LIVE session's server must never condemn it
+        # — only its owner marker may.
         instance_dir = _tmux_instance_dir_from_cmdline(cmdline)
         if instance_dir is not None:
             from omnigent.inner.terminal import terminal_owner_is_dead
 
             return terminal_owner_is_dead(instance_dir) is True
-        return False
+        return any(marker in cmdline for marker in _ADOPTED_CONDEMN_SIGNATURES)
 
     def _dead_leader_group_is_ours(self, pid: int, pin: _AdoptedPin) -> bool:
         """Attribute a deferred dead leader's group to a known family.
@@ -1366,14 +1395,20 @@ class HostProcess:
         :returns: ``True`` while the tree is still being driven.
         """
         kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
-        alive = _proc.process_identity_state(pid, pin.identity) == "match"
+        # "Present" (identity still names our incarnation — true even for
+        # the pinned zombie, whose /proc stays readable) is distinct from
+        # "running"; release gates must key on running/group liveness or a
+        # held zombie would satisfy them forever.
+        present = _proc.process_identity_state(pid, pin.identity) == "match"
+        running = present and not _pid_is_zombie(pid)
         if pin.termed_at is None:
-            sig = signal.SIGTERM if alive else kill_sig
+            group_live = pin.is_leader and _live_group_member_pids(pid, exclude=pid)
+            sig = signal.SIGTERM if (running or group_live) else kill_sig
             self._signal_pinned(pid, pin, sig)
             pin.termed_at = now
             return True
         if pin.is_leader:
-            if _live_group_member_pids(pid, exclude=pid) or alive:
+            if _live_group_member_pids(pid, exclude=pid) or running:
                 if now - pin.termed_at >= _ADOPTED_SIGTERM_GRACE_S:
                     self._signal_pinned(pid, pin, kill_sig)
                 return True
@@ -1384,7 +1419,7 @@ class HostProcess:
                 return True
             self._release_pin(pid)
             return False
-        if alive:
+        if running:
             if now - pin.termed_at >= _ADOPTED_SIGTERM_GRACE_S:
                 self._signal_pinned(pid, pin, kill_sig)
             return True

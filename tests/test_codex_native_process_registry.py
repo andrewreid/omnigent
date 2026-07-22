@@ -475,12 +475,13 @@ def test_legacy_sigtermed_entry_without_snapshot_drops_after_leader_exit(
 def test_fallback_tier_never_chases_children_it_did_not_record(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The registry fallback drains its entry without heuristic chasing.
+    """The registry fallback retains, logs, and never heuristically chases.
 
     A child forked from the leader's SIGTERM handler is not in the
-    recorded members. The fallback tier must neither kill it (no proof it
-    is ours) nor wedge on it: the entry drains once every RECORDED member
-    is verifiably gone. On subreaper hosts the adopted-orphan reaper —
+    recorded members. The fallback tier must not kill it (no proof it is
+    ours) and must not silently drop the entry while the group is still
+    occupied; it retains with a warning until the group is verifiably
+    empty. On subreaper hosts the adopted-orphan reaper —
     exercised in the host tests — is what actually drains such children.
     """
     import contextlib
@@ -531,14 +532,23 @@ def test_fallback_tier_never_chases_children_it_did_not_record(
         assert leader.wait(timeout=10) is not None
 
         monkeypatch.setattr(registry, "_SIGKILL_GRACE_S", 0.0)
+        for _ in range(3):
+            registry.reconcile_codex_native_process_registry(registry_path=path)
+            time_mod.sleep(0.05)
+
+        # Retention-with-logging: the group still has an occupant this
+        # tier cannot prove ownership of, so the entry is RETAINED and
+        # the child is deliberately NOT chased.
+        assert len(_registry_payload(path)) == 1
+        assert registry._pid_alive(child_pid), "fallback must not guess at unrecorded pids"
+
+        # Once the occupant is gone the entry drains normally.
+        os_mod.kill(child_pid, signal.SIGKILL)
         deadline = time_mod.monotonic() + 5.0
         while _registry_payload(path) and time_mod.monotonic() < deadline:
             registry.reconcile_codex_native_process_registry(registry_path=path)
             time_mod.sleep(0.05)
-
-        # Entry drained; the unrecorded child was deliberately NOT chased.
         assert _registry_payload(path) == []
-        assert registry._pid_alive(child_pid), "fallback must not guess at unrecorded pids"
     finally:
         if child_pid is not None:
             with contextlib.suppress(OSError):
