@@ -265,34 +265,51 @@ def _pid_stat_ids(pid: int) -> tuple[int, int] | None:
     return pgid, sid
 
 
-def _live_group_member_pids(pgid: int, *, exclude: int | None = None) -> list[int]:
+def _live_group_member_pids(pgid: int, *, exclude: int | None = None) -> list[int] | None:
     """Pids of live (non-zombie) members of *pgid*.
 
     Drain detection MUST use this scan: ``killpg`` returns 0 even for a
     zombie-only group (the signal is silently dropped for exited members),
-    so its return value can never prove emptiness.
+    so its return value can never prove emptiness. Only a COMPLETE scan
+    may prove emptiness: an unenumerable pid table, or a confirmed member
+    whose state cannot be read, yields ``None`` (indeterminate) — callers
+    must retain their pin rather than treat it as empty.
 
     :param pgid: Process group to scan.
     :param exclude: Optional pid to omit (the pinned leader itself).
-    :returns: Live member pids.
+    :returns: Live member pids, or ``None`` when the scan was incomplete.
     """
     live: list[int] = []
     try:
         pids = psutil.pids()
     except (psutil.Error, OSError):
-        return live
+        return None
     for pid in pids:
         if pid == exclude:
             continue
         try:
             if os.getpgid(pid) != pgid:
                 continue
+        except OSError:
+            continue  # gone, or not ours to inspect — not a member of ours
+        try:
             if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
                 continue
-        except (psutil.Error, OSError):
+        except psutil.NoSuchProcess:
             continue
+        except (psutil.Error, OSError):
+            return None  # a confirmed member is unreadable — inconclusive
         live.append(pid)
     return live
+
+
+def _group_provably_empty(members: list[int] | None) -> bool:
+    """Whether a member scan PROVES the group has no live members.
+
+    :param members: A :func:`_live_group_member_pids` result.
+    :returns: ``True`` only for a complete, empty scan.
+    """
+    return members is not None and not members
 
 
 def _pid_is_zombie(pid: int) -> bool:
@@ -875,6 +892,16 @@ class HostProcess:
         # reparents orphaned descendants here as direct children, enabling
         # the adopted-orphan reaper. Set in :meth:`run`.
         self._is_subreaper = False
+        # Whether something will run the adopted sweep to classify and
+        # release pins: true while the ownerless sweep loop is up and
+        # during the bounded shutdown drain. The zombie drain only defers
+        # dead leaders while this holds — a pin with no releaser would
+        # accumulate forever.
+        self._adoption_active = False
+        # (pid, start identity) of the local Omnigent server incarnation
+        # currently excluded from adoption, bound so a recycled pidfile
+        # pid can never shield an unrelated adopted orphan.
+        self._local_server_incarnation: tuple[int, str] | None = None
         # pid -> pin for direct children the zombie drain must NOT reap:
         # condemned adopted orphans mid-kill, and zombies that died group
         # leaders with live members (the held zombie is the kernel pin on
@@ -1054,11 +1081,7 @@ class HostProcess:
                     continue
             except (psutil.Error, OSError):
                 continue
-            if (
-                self._is_subreaper
-                and self._ownerless_sweep_task is not None
-                and self._defer_dead_leader(pid)
-            ):
+            if self._is_subreaper and self._adoption_active and self._defer_dead_leader(pid):
                 continue
             if self._consume_child_zombie(pid):
                 reaped += 1
@@ -1091,7 +1114,8 @@ class HostProcess:
         ids = _pid_stat_ids(pid)
         if ids is None or ids[0] != pid:
             return False
-        if not _live_group_member_pids(pid, exclude=pid):
+        members = _live_group_member_pids(pid, exclude=pid)
+        if _group_provably_empty(members):
             return False
         identity = _proc.process_start_identity(pid)
         self._adopted_pins[pid] = _AdoptedPin(
@@ -1261,7 +1285,7 @@ class HostProcess:
         except Exception:  # noqa: BLE001 — best-effort per family
             _logger.warning("harness instance-dir ownerless sweep failed", exc_info=True)
 
-    def _reap_adopted_orphans_once(self) -> int:
+    def _reap_adopted_orphans_once(self, grace_s: float | None = None) -> int:
         """Classify and drive every adopted direct child (subreaper hosts).
 
         The kernel reparents an orphan here the moment its parent dies, so
@@ -1308,16 +1332,46 @@ class HostProcess:
                 self._release_pin(pid)
                 continue
             pin.condemned = True
-            if self._drive_condemned_pin(pid, pin, now):
+            if self._drive_condemned_pin(pid, pin, now, grace_s=grace_s):
                 condemned += 1
         return condemned
 
+    async def _final_adoption_drain(self, budget_s: float = 3.0) -> None:
+        """Bounded condemn/drain cycle for shutdown.
+
+        Runner teardown orphans descendants after the periodic sweep has
+        stopped; this drives them with a zero TERM->KILL grace until every
+        pin is released or the budget runs out.
+
+        :param budget_s: Wall-clock bound on the drain.
+        """
+        deadline = time.monotonic() + budget_s
+        while time.monotonic() < deadline:
+            try:
+                driving = self._reap_adopted_orphans_once(grace_s=0.0)
+            except Exception:  # noqa: BLE001 — shutdown must not raise
+                _logger.debug("final adoption drain failed", exc_info=True)
+                return
+            self._reap_orphans_once()
+            if not driving and not self._adopted_pins:
+                return
+            await asyncio.sleep(0.1)
+        if self._adopted_pins:
+            _logger.warning(
+                "exiting with %d undrained adopted orphan tree(s); their "
+                "processes reparent above this host",
+                len(self._adopted_pins),
+            )
+
     def _local_server_pids(self) -> set[int]:
-        """Pid of the local Omnigent server, when one is recorded.
+        """Pid of the local Omnigent server's CURRENT incarnation, if any.
 
         The ``--local`` daemon spawns (or reuses) a detached server that
         can be a direct child of this process; it is host-owned, never an
-        adopted orphan.
+        adopted orphan. The pidfile's raw pid can outlive the server and
+        be recycled, so the exclusion binds the pid to the start identity
+        captured when that pidfile value was first seen and drops itself
+        on mismatch.
 
         :returns: A zero-or-one element pid set.
         """
@@ -1327,7 +1381,22 @@ class HostProcess:
             recorded = _read_local_server_pid_file()
         except Exception:  # noqa: BLE001 — exclusion is best-effort
             return set()
-        return {recorded[0]} if recorded else set()
+        if not recorded:
+            self._local_server_incarnation = None
+            return set()
+        pid = recorded[0]
+        cached = self._local_server_incarnation
+        if cached is None or cached[0] != pid:
+            identity = _proc.process_start_identity(pid)
+            if identity is None:
+                self._local_server_incarnation = None
+                return set()
+            self._local_server_incarnation = (pid, identity)
+            return {pid}
+        if _proc.process_identity_state(pid, cached[1]) == "match":
+            return {pid}
+        # The recorded incarnation is gone; a recycled pid gets no shield.
+        return set()
 
     def _classify_adopted_pin(self, pid: int, pin: _AdoptedPin) -> bool:
         """Decide whether a pinned adopted child is ownerless.
@@ -1364,7 +1433,7 @@ class HostProcess:
         :param pin: Its pin bookkeeping.
         :returns: ``True`` when the group is provably ours to drain.
         """
-        for member in _live_group_member_pids(pid, exclude=pid):
+        for member in _live_group_member_pids(pid, exclude=pid) or []:
             cmdline = _adopted_child_cmdline(member)
             if any(marker in cmdline for marker in _ADOPTED_CONDEMN_SIGNATURES):
                 return True
@@ -1379,7 +1448,9 @@ class HostProcess:
             return True
         return harness_spawn_record_matches(pid, pin.identity)
 
-    def _drive_condemned_pin(self, pid: int, pin: _AdoptedPin, now: float) -> bool:
+    def _drive_condemned_pin(
+        self, pid: int, pin: _AdoptedPin, now: float, *, grace_s: float | None = None
+    ) -> bool:
         """Advance one condemned tree: TERM, then KILL, then reap when empty.
 
         Group kills go through ``killpg`` against the pinned pid — valid
@@ -1395,6 +1466,7 @@ class HostProcess:
         :returns: ``True`` while the tree is still being driven.
         """
         kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+        grace = _ADOPTED_SIGTERM_GRACE_S if grace_s is None else grace_s
         # "Present" (identity still names our incarnation — true even for
         # the pinned zombie, whose /proc stays readable) is distinct from
         # "running"; release gates must key on running/group liveness or a
@@ -1402,25 +1474,27 @@ class HostProcess:
         present = _proc.process_identity_state(pid, pin.identity) == "match"
         running = present and not _pid_is_zombie(pid)
         if pin.termed_at is None:
-            group_live = pin.is_leader and _live_group_member_pids(pid, exclude=pid)
+            group_live = pin.is_leader and not _group_provably_empty(
+                _live_group_member_pids(pid, exclude=pid)
+            )
             sig = signal.SIGTERM if (running or group_live) else kill_sig
             self._signal_pinned(pid, pin, sig)
             pin.termed_at = now
             return True
         if pin.is_leader:
-            if _live_group_member_pids(pid, exclude=pid) or running:
-                if now - pin.termed_at >= _ADOPTED_SIGTERM_GRACE_S:
+            if not _group_provably_empty(_live_group_member_pids(pid, exclude=pid)) or running:
+                if now - pin.termed_at >= grace:
                     self._signal_pinned(pid, pin, kill_sig)
                 return True
-            # Group looks empty: final atomic kill closes the fork race,
-            # then the deciding rescan confirms before the pin is released.
+            # Group provably empty: final atomic kill closes the fork
+            # race, then the deciding rescan confirms before release.
             self._signal_pinned(pid, pin, kill_sig)
-            if _live_group_member_pids(pid, exclude=pid):
+            if not _group_provably_empty(_live_group_member_pids(pid, exclude=pid)):
                 return True
             self._release_pin(pid)
             return False
         if running:
-            if now - pin.termed_at >= _ADOPTED_SIGTERM_GRACE_S:
+            if now - pin.termed_at >= grace:
                 self._signal_pinned(pid, pin, kill_sig)
             return True
         self._release_pin(pid)
@@ -2437,6 +2511,7 @@ class HostProcess:
         # subreaper: it works (and is needed) even where reparenting does
         # not apply, e.g. macOS.
         if _ownerless_sweep_enabled():
+            self._adoption_active = True
             self._ownerless_sweep_task = asyncio.create_task(
                 self._ownerless_sweep_loop(), name="host-ownerless-sweep"
             )
@@ -2527,6 +2602,14 @@ class HostProcess:
                     )
                 self._ownerless_sweep_task = None
             self._cleanup_runners()
+            # Runner teardown just orphaned the runners' descendants into
+            # this process — AFTER the periodic sweep died. A bounded final
+            # condemn/drain cycle reaps what it can before exit; whatever
+            # remains reparents above us (deployments: systemd's
+            # control-group kill finishes the job).
+            if self._is_subreaper:
+                await self._final_adoption_drain()
+            self._adoption_active = False
             # Final drain: _cleanup_runners has just reaped the tracked
             # runners via Popen, so any of their still-orphaned tool
             # grandchildren are now reapable and no tracked pid can be stolen.

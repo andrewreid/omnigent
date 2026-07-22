@@ -689,7 +689,11 @@ class HarnessProcessManager:
         sentinel.write_text(str(os.getpid()), encoding="utf-8")
         own_identity = _proc.process_start_identity(os.getpid())
         if own_identity is not None:
-            (self._instance_dir / _AP_IDENT_FILE).write_text(own_identity, encoding="utf-8")
+            # Atomic replace: a torn identity read would look like a
+            # recycled (dead) owner and could sweep a live instance dir.
+            ident_tmp = self._instance_dir / (_AP_IDENT_FILE + ".tmp")
+            ident_tmp.write_text(own_identity, encoding="utf-8")
+            os.replace(ident_tmp, self._instance_dir / _AP_IDENT_FILE)
         self._reaper_task = asyncio.create_task(
             self._idle_reaper_loop(),
             name="harness-process-manager-idle-reaper",
@@ -1480,16 +1484,16 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
     group is exactly their tree — vendor CLI and MCP fleet
     included).
 
-    Member identities of each holder's group are snapshotted before the
-    SIGTERM and — critically — persisted into the instance dir
-    (:data:`_REAP_STATE_FILE`), so a later pass still knows the tree even
-    after the socket-holding leader exits and lsof finds nothing. During
-    escalation, groups whose ownership is still provable (a fresh holder
-    this pass, or an identity-anchored recorded member) are re-scanned to
-    merge members forked after the snapshot and then killed atomically
-    via the group signal, alongside per-member verified kills. The dir is
-    released only when every recorded member is definitively gone and
-    every owned group is verifiably empty.
+    Member identities of each holder's group are snapshotted and —
+    critically — persisted into the instance dir
+    (:data:`_REAP_STATE_FILE`) BEFORE anything is signaled, so a later
+    pass still knows the tree even after the socket-holding leader exits
+    and lsof finds nothing. Both the initial SIGTERM and the escalation
+    are strictly per-member and identity-verified — this fallback tier
+    never signals a numeric pid or pgid it has not re-verified. Survivors
+    outliving every recorded member are the subreaper host's to drain;
+    the dir is released only when every recorded member is definitively
+    gone.
 
     :param instance_dir: The orphaned AP's per-instance dir
         whose runner subprocesses to terminate.
@@ -1505,7 +1509,7 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
             instance_dir,
         )
         return False
-    pending_signals: list[int] = []
+    pending_signals: list[tuple[int, str]] = []
     lookup_failed = False
     for socket_file in instance_dir.glob("conv-*.sock"):
         pids = await _pids_holding_socket(socket_file)
@@ -1524,7 +1528,7 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
             if not members:
                 continue  # holder already gone
             groups.setdefault(pgid, {}).update(members)
-            pending_signals.append(pid)
+            pending_signals.extend(members.items())
 
     if pending_signals:
         # Write-ahead: identities must be durable before the first signal,
@@ -1535,8 +1539,12 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
                 instance_dir,
             )
             return False
-        for pid in pending_signals:
-            _signal_pid_tree(pid, signal.SIGTERM)
+        # Per-member verified delivery: an unpinned numeric pgid could be
+        # recycled during persistence; this tier never signals a name it
+        # has not re-verified. Survivors that outlive the recorded members
+        # belong to the subreaper host's adopted reaper.
+        for member, identity in pending_signals:
+            _proc.kill_verified(member, identity, signal.SIGTERM)
 
     tracked_any = any(members for members in groups.values())
     if tracked_any:
@@ -1773,53 +1781,6 @@ def _reap_state_settled(groups: dict[int, dict[int, str]]) -> bool:
             if _proc.process_identity_state(pid, identity) != "gone":
                 return False
     return True
-
-
-def _signal_pid_tree(pid: int, sig: signal.Signals) -> bool:
-    """
-    Signal *pid*'s whole process group when safely possible, else the pid.
-
-    Refuses to signal our own group (a non-leader pid can resolve to the
-    group we share with pytest / the supervisor). Falls back to the single
-    pid when the group cannot be resolved or signaled.
-
-    :param pid: Process id to terminate.
-    :param sig: Signal to deliver.
-    :returns: ``True`` if a signal was delivered (track for verification);
-        ``False`` when the process is already gone or cannot be signaled.
-    """
-    pgid: int | None = None
-    if hasattr(os, "getpgid"):
-        try:
-            pgid = os.getpgid(pid)
-        except ProcessLookupError:
-            return False
-        except OSError:
-            pgid = None
-        if pgid is not None:
-            try:
-                if pgid == os.getpgid(0):
-                    pgid = None
-            except OSError:
-                pgid = None
-    if pgid is not None:
-        try:
-            os.killpg(pgid, sig)
-            return True
-        except ProcessLookupError:
-            return False
-        except OSError:
-            pass  # fall back to the single pid
-    try:
-        os.kill(pid, sig)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        _logger.warning("cannot signal orphan runner pid %d (permission denied)", pid)
-        return False
-    except OSError:
-        return False
 
 
 def _pid_alive(pid: int) -> bool:

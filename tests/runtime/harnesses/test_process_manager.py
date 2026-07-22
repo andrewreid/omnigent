@@ -1172,22 +1172,11 @@ async def test_orphan_sweep_escalates_to_sigkill(
     unverified termination so the caller keeps the dir for a retry."""
     from omnigent.runtime.harnesses import process_manager as pm_mod
 
-    killed_group: list[tuple[int, signal.Signals]] = []
     killed_member: list[tuple[int, signal.Signals]] = []
-    real_getpgid = os.getpgid
 
     async def fake_pids_holding_socket(socket_path: Path) -> list[int]:
         assert socket_path.name == "conv-stale.sock"
         return [12345]
-
-    def fake_getpgid(pid: int) -> int:
-        # The orphan resolves to its own (foreign) group; pid 0 must still
-        # resolve to OUR group so the own-group refusal check works.
-        return 54321 if pid == 12345 else real_getpgid(pid)
-
-    def fake_killpg(pgid: int, sig: signal.Signals) -> None:
-        assert pgid == 54321
-        killed_group.append((pgid, sig))
 
     def fake_kill_verified(pid: int, identity: str, sig: signal.Signals) -> bool:
         assert identity == "id-a"
@@ -1199,10 +1188,7 @@ async def test_orphan_sweep_escalates_to_sigkill(
     monkeypatch.setattr(pm_mod, "_pids_holding_socket", fake_pids_holding_socket)
     monkeypatch.setattr(pm_mod, "_holder_group_snapshot", lambda _pid: (54321, {12345: "id-a"}))
     monkeypatch.setattr(pm_mod._proc, "process_identity_state", lambda _pid, _ident: "match")
-    monkeypatch.setattr(pm_mod._proc, "group_member_identities", lambda _pgid: None)
     monkeypatch.setattr(pm_mod._proc, "kill_verified", fake_kill_verified)
-    monkeypatch.setattr(pm_mod.os, "getpgid", fake_getpgid)
-    monkeypatch.setattr(pm_mod.os, "killpg", fake_killpg)
 
     instance_dir = short_tmp_parent / "ap-dead"
     instance_dir.mkdir()
@@ -1210,11 +1196,11 @@ async def test_orphan_sweep_escalates_to_sigkill(
 
     confirmed = await pm_mod._kill_orphan_runners(instance_dir)
 
-    # SIGTERM via the tree signal; escalation is strictly per-member
-    # verified kills (group authority belongs to the host's adopted
-    # reaper, which holds the kernel pin this sweep cannot).
-    assert killed_group == [(54321, signal.SIGTERM)]
-    assert killed_member == [(12345, signal.SIGKILL)]
+    # Both the initial TERM and the escalation are per-member verified —
+    # this tier never signals a numeric pid/pgid it has not re-verified
+    # (group authority belongs to the host's adopted reaper, which holds
+    # the kernel pin this sweep cannot).
+    assert killed_member == [(12345, signal.SIGTERM), (12345, signal.SIGKILL)]
     # The (mocked) member never died, so termination is unverified and the
     # caller must retain the instance dir as retry metadata.
     assert confirmed is False
@@ -1417,12 +1403,12 @@ async def test_orphan_sweep_keeps_dir_when_group_snapshot_fails(
     async def lookup(_socket_path: Path) -> list[int]:
         return [12345]
 
-    def must_not_signal(_pid: int, _sig: signal.Signals) -> bool:
+    def must_not_signal(_pid: int, _ident: str, _sig: signal.Signals) -> bool:
         raise AssertionError("an unverifiable tree must not be signaled")
 
     monkeypatch.setattr(pm_mod, "_pids_holding_socket", lookup)
     monkeypatch.setattr(pm_mod, "_holder_group_snapshot", lambda _pid: None)
-    monkeypatch.setattr(pm_mod, "_signal_pid_tree", must_not_signal)
+    monkeypatch.setattr(pm_mod._proc, "kill_verified", must_not_signal)
 
     dead = short_tmp_parent / "ap-dead"
     dead.mkdir(mode=0o700)
@@ -1449,13 +1435,13 @@ async def test_orphan_sweep_defers_signals_when_state_write_fails(
     async def lookup(_socket_path: Path) -> list[int]:
         return [12345]
 
-    def must_not_signal(_pid: int, _sig: signal.Signals) -> bool:
+    def must_not_signal(_pid: int, _ident: str, _sig: signal.Signals) -> bool:
         raise AssertionError("must not signal before the reap state is durable")
 
     monkeypatch.setattr(pm_mod, "_pids_holding_socket", lookup)
     monkeypatch.setattr(pm_mod, "_holder_group_snapshot", lambda _pid: (54321, {12345: "id-a"}))
     monkeypatch.setattr(pm_mod, "_save_reap_state", lambda _d, _g: False)
-    monkeypatch.setattr(pm_mod, "_signal_pid_tree", must_not_signal)
+    monkeypatch.setattr(pm_mod._proc, "kill_verified", must_not_signal)
 
     dead = short_tmp_parent / "ap-dead"
     dead.mkdir(mode=0o700)

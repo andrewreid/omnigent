@@ -2041,7 +2041,11 @@ def create_terminal_instance(
     (private_dir / _OWNER_PID_FILENAME).write_text(str(os.getpid()), encoding="utf-8")
     owner_identity = _proc.process_start_identity(os.getpid())
     if owner_identity is not None:
-        (private_dir / _OWNER_IDENTITY_FILENAME).write_text(owner_identity, encoding="utf-8")
+        # Atomic replace: a torn identity read would look like a recycled
+        # (dead) owner and could reap a live session's terminal.
+        ident_tmp = private_dir / (_OWNER_IDENTITY_FILENAME + ".tmp")
+        ident_tmp.write_text(owner_identity, encoding="utf-8")
+        os.replace(ident_tmp, private_dir / _OWNER_IDENTITY_FILENAME)
 
     # Resolve os_env spec.  If none specified, inherit from parent.
     effective_os_env_spec = build_terminal_os_env_spec(
