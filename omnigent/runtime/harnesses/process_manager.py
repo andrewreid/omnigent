@@ -82,6 +82,13 @@ _HARNESS_AUTH_TOKEN_ENV = "OMNIGENT_HARNESS_AUTH_TOKEN"
 # a still-running Omnigent (leave alone) or a crashed one (kill its
 # children, remove the dir).
 _AP_PID_FILE = "AP_PID"
+# Sibling of AP_PID carrying the manager's kernel start identity, so the
+# dead-sibling gate survives pid recycling.
+_AP_IDENT_FILE = "AP_IDENT"
+# Append-only JSONL of {"pid": N, "identity": "..."} lines, one per harness
+# subprocess spawned by this instance — lets a subreaper host attribute an
+# adopted dead harness leader (whose argv is gone) back to a dead AP.
+_HARNESS_PIDS_FILE = "HARNESS_PIDS"
 
 # Mode bits applied to the per-AP subdir and the per-conversation
 # socket. Filesystem permissions + the per-AP-uuid scope are the v1
@@ -636,6 +643,26 @@ class HarnessProcessManager:
         """
         return _socket_path(self._instance_dir, conversation_id)
 
+    def _record_harness_spawn(self, pid: int | None) -> None:
+        """Append the spawned harness's identity to the instance dir.
+
+        Lets a subreaper host attribute this harness's adopted zombie —
+        whose argv is gone by then — back to this (possibly dead) AP.
+        Append-only JSONL; stale lines are identity-verified by readers.
+
+        :param pid: The just-spawned subprocess pid.
+        """
+        if pid is None:
+            return
+        identity = _proc.process_start_identity(pid)
+        if identity is None:
+            return
+        try:
+            with (self._instance_dir / _HARNESS_PIDS_FILE).open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"pid": pid, "identity": identity}) + "\n")
+        except OSError:
+            _logger.debug("could not record harness spawn identity", exc_info=True)
+
     async def start(self) -> None:
         """
         Initialize the per-instance dir, run the orphan sweep, and
@@ -660,6 +687,9 @@ class HarnessProcessManager:
         # uuid collided with a still-running instance — fail loud.
         sentinel = self._instance_dir / _AP_PID_FILE
         sentinel.write_text(str(os.getpid()), encoding="utf-8")
+        own_identity = _proc.process_start_identity(os.getpid())
+        if own_identity is not None:
+            (self._instance_dir / _AP_IDENT_FILE).write_text(own_identity, encoding="utf-8")
         self._reaper_task = asyncio.create_task(
             self._idle_reaper_loop(),
             name="harness-process-manager-idle-reaper",
@@ -1172,6 +1202,7 @@ class HarnessProcessManager:
             env=effective_env,
             **_proc.spawn_kwargs(),
         )
+        self._record_harness_spawn(process.pid)
         try:
             await _wait_for_bind(process, endpoint, harness, conversation_id)
 
@@ -1407,26 +1438,21 @@ async def sweep_orphaned_instance_dirs(tmp_parent: Path | None = None) -> int:
         try:
             if not child.is_dir():
                 continue
-            pid = int(sentinel.read_text(encoding="utf-8").strip())
-        except FileNotFoundError:
-            # No sentinel — directory either pre-dates the
-            # convention or is mid-creation. Leave alone.
-            continue
-        except (OSError, ValueError) as exc:
+            if not sentinel.exists():
+                # No sentinel — directory either pre-dates the
+                # convention or is mid-creation. Leave alone.
+                continue
+        except OSError as exc:
             _logger.warning(
-                "could not read AP_PID sentinel at %s: %s; skipping",
-                sentinel,
+                "could not stat instance dir %s: %s; skipping",
+                child,
                 exc,
             )
             continue
-        if _pid_alive(pid):
-            # Sibling Omnigent is still running — leave it alone.
+        if _ap_owner_is_dead(child) is not True:
+            # Sibling Omnigent still running, or unverifiable — leave it.
             continue
-        _logger.info(
-            "sweeping orphaned Omnigent instance dir %s (pid %d not running)",
-            child,
-            pid,
-        )
+        _logger.info("sweeping orphaned Omnigent instance dir %s", child)
         if await _kill_orphan_runners(child):
             shutil.rmtree(child, ignore_errors=True)
             swept += 1
@@ -1514,37 +1540,14 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
 
     tracked_any = any(members for members in groups.values())
     if tracked_any:
-        # Grace, with anchored rescans: a SIGTERM handler may fork (and
-        # its owner then exit), so merge while a recorded member still
-        # identity-anchors the group and can prove it was never recycled.
-        grace_deadline = time.monotonic() + _ORPHAN_SIGTERM_GRACE_S
-        while True:
-            await asyncio.sleep(0.05)
-            for pgid, members in groups.items():
-                if pgid <= 0 or not any(
-                    _proc.process_identity_state(pid, identity) == "match"
-                    for pid, identity in members.items()
-                ):
-                    continue
-                fresh = _proc.group_member_identities(pgid)
-                if fresh:
-                    members.update(fresh)
-            if time.monotonic() >= grace_deadline:
-                break
+        await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
+        # Fallback-tier escalation: strictly per-pid on the recorded,
+        # identity-verified members — no group signal, so no
+        # pgid-continuity assumption. On subreaper hosts survivors that
+        # outlive every recorded member reparent to the host and are
+        # drained by its adopted-orphan reaper instead.
         kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
-        for pgid, members in groups.items():
-            anchored = pgid > 0 and any(
-                _proc.process_identity_state(pid, identity) == "match"
-                for pid, identity in members.items()
-            )
-            if anchored:
-                # An anchored recorded member proves group continuity, so
-                # the group kill is atomic over members forked after the
-                # snapshot — a static pid list can never close over a
-                # fork racing it.
-                fresh = _proc.group_member_identities(pgid)
-                if fresh:
-                    members.update(fresh)
+        for members in groups.values():
             for pid, identity in members.items():
                 if _proc.process_identity_state(pid, identity) != "match":
                     continue
@@ -1553,9 +1556,6 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
                     pid,
                 )
                 _proc.kill_verified(pid, identity, kill_sig)
-            if anchored:
-                with contextlib.suppress(OSError):
-                    os.killpg(pgid, kill_sig)
         deadline = time.monotonic() + _ORPHAN_KILL_VERIFY_TIMEOUT_S
         while not _reap_state_settled(groups):
             if time.monotonic() >= deadline:
@@ -1618,6 +1618,75 @@ def _holder_group_snapshot(pid: int) -> tuple[int, dict[int, str]] | None:
         # the next pass, and an unreadable one must not be signaled blind.
         return None
     return (0, {pid: identity})
+
+
+def harness_spawn_record_matches(pid: int, identity: str | None) -> bool:
+    """
+    Whether ``(pid, identity)`` was spawned by a now-dead AP instance.
+
+    Used by the subreaper host to attribute an adopted dead harness
+    leader back to a crashed AP: scans ``ap-*`` dirs whose owner is
+    provably dead and matches the recorded spawn identities. A recycled
+    pid never matches.
+
+    :param pid: The adopted leader's pid.
+    :param identity: Its start identity, or ``None`` when unreadable.
+    :returns: ``True`` on a verified match.
+    """
+    if identity is None:
+        return False
+    parent = _default_tmp_parent()
+    try:
+        children = list(parent.iterdir())
+    except OSError:
+        return False
+    for child in children:
+        if not child.name.startswith("ap-"):
+            continue
+        try:
+            if _ap_owner_is_dead(child) is not True:
+                continue
+            lines = (child / _HARNESS_PIDS_FILE).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("pid") == pid and record.get("identity") == identity:
+                return True
+    return False
+
+
+def _ap_owner_is_dead(instance_dir: Path) -> bool | None:
+    """
+    Whether the instance dir's recorded AP owner is provably dead.
+
+    Identity-anchored when an ``AP_IDENT`` sibling exists (recycled pids
+    read as dead, unverifiable ones as unknown); legacy dirs fall back to
+    raw pid liveness, which can only err toward "alive" (retention).
+
+    :param instance_dir: An ``ap-*`` instance dir.
+    :returns: ``True`` dead, ``False`` alive, ``None`` unknown/unmarked.
+    """
+    try:
+        pid = int((instance_dir / _AP_PID_FILE).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    identity: str | None
+    try:
+        identity = (instance_dir / _AP_IDENT_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        identity = None
+    if identity:
+        state = _proc.process_identity_state(pid, identity)
+        if state == "match":
+            return False
+        if state == "gone":
+            return True
+        return None
+    return not _pid_alive(pid)
 
 
 _REAP_STATE_FILE = "REAP_STATE"
@@ -1699,12 +1768,10 @@ def _reap_state_settled(groups: dict[int, dict[int, str]]) -> bool:
     :param groups: Current ``pgid -> {pid: identity}`` tracking.
     :returns: ``True`` only on positive verification of absence.
     """
-    for pgid, members in groups.items():
+    for members in groups.values():
         for pid, identity in members.items():
             if _proc.process_identity_state(pid, identity) != "gone":
                 return False
-        if pgid > 0 and _proc.group_populated(pgid) is True:
-            return False
     return True
 
 

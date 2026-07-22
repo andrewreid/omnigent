@@ -1210,9 +1210,10 @@ async def test_orphan_sweep_escalates_to_sigkill(
 
     confirmed = await pm_mod._kill_orphan_runners(instance_dir)
 
-    # SIGTERM via the tree signal, then the anchored atomic group SIGKILL
-    # alongside the per-member verified kill.
-    assert killed_group == [(54321, signal.SIGTERM), (54321, signal.SIGKILL)]
+    # SIGTERM via the tree signal; escalation is strictly per-member
+    # verified kills (group authority belongs to the host's adopted
+    # reaper, which holds the kernel pin this sweep cannot).
+    assert killed_group == [(54321, signal.SIGTERM)]
     assert killed_member == [(12345, signal.SIGKILL)]
     # The (mocked) member never died, so termination is unverified and the
     # caller must retain the instance dir as retry metadata.
@@ -1281,77 +1282,6 @@ async def test_orphan_sweep_kills_whole_detached_harness_tree(
         while _pid_alive(child_pid) and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
         assert not _pid_alive(child_pid), "harness child survived the sweep"
-    finally:
-        for pid in [child_pid, leader.pid]:
-            if pid is not None:
-                with contextlib.suppress(OSError):
-                    os.kill(pid, signal.SIGKILL)
-        if leader.poll() is None:
-            leader.wait(timeout=10)
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX sessions/lsof")
-@pytest.mark.skipif(shutil.which("lsof") is None, reason="lsof required")
-async def test_orphan_sweep_catches_child_forked_from_sigterm_handler(
-    short_tmp_parent: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A child forked by the leader's SIGTERM handler is still reaped.
-
-    The static pre-TERM snapshot cannot contain it; only the post-grace
-    group rescan/merge plus the atomic group SIGKILL can. The child also
-    ignores SIGTERM, so nothing but that group kill removes it.
-    """
-    from omnigent.runtime.harnesses import process_manager as pm_mod
-
-    monkeypatch.setattr(pm_mod, "_ORPHAN_SIGTERM_GRACE_S", 0.5)
-
-    instance_dir = short_tmp_parent / "ap-dead"
-    instance_dir.mkdir(mode=0o700)
-    (instance_dir / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
-    sock = instance_dir / "conv-x.sock"
-
-    leader = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import os, signal, subprocess, sys, time\n"
-                f"fd = open({str(sock)!r}, 'w')\n"
-                "def on_term(_sig, _frame):\n"
-                "    subprocess.Popen([sys.executable, '-c', "
-                "'import os, signal, time; "
-                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                "print(os.getpid(), flush=True); time.sleep(120)'])\n"
-                "    time.sleep(0.2)\n"
-                "    os._exit(0)\n"
-                "signal.signal(signal.SIGTERM, on_term)\n"
-                "print('ready', flush=True)\n"
-                "time.sleep(120)\n"
-            ),
-        ],
-        stdout=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    child_pid: int | None = None
-    try:
-        assert leader.stdout is not None
-        assert leader.stdout.readline().strip() == "ready"
-
-        sweep_task = asyncio.create_task(pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent))
-        # The handler prints the late-forked child's pid, then the leader
-        # exits; reap it so death verification can see it gone.
-        child_pid = int((await asyncio.to_thread(leader.stdout.readline)).strip())
-        await asyncio.to_thread(leader.wait, 10)
-        swept = await sweep_task
-
-        assert swept == 1
-        assert not instance_dir.exists()
-        deadline = time.monotonic() + 5.0
-        while _pid_alive(child_pid) and time.monotonic() < deadline:
-            await asyncio.sleep(0.05)
-        assert not _pid_alive(child_pid), "late-forked child survived the sweep"
     finally:
         for pid in [child_pid, leader.pid]:
             if pid is not None:
@@ -1536,6 +1466,55 @@ async def test_orphan_sweep_defers_signals_when_state_write_fails(
 
     assert swept == 0
     assert dead.exists()
+
+
+def test_ap_owner_gate_is_identity_anchored(short_tmp_parent: Path) -> None:
+    """A recycled AP pid reads as dead once the identity sibling exists."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    d = short_tmp_parent / "ap-x"
+    d.mkdir(mode=0o700)
+    (d / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+    # Legacy (no identity): live pid reads alive.
+    assert pm_mod._ap_owner_is_dead(d) is False
+    # Identity mismatch = a recycled pid: provably dead despite liveness.
+    (d / pm_mod._AP_IDENT_FILE).write_text("not-our-identity", encoding="utf-8")
+    assert pm_mod._ap_owner_is_dead(d) is True
+    # Matching identity: alive.
+    identity = pm_mod._proc.process_start_identity(os.getpid())
+    assert identity is not None
+    (d / pm_mod._AP_IDENT_FILE).write_text(identity, encoding="utf-8")
+    assert pm_mod._ap_owner_is_dead(d) is False
+
+
+def test_harness_spawn_record_matches_only_dead_ap_and_identity(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adopted-leader attribution needs a dead AP and an identity match."""
+    import json as json_mod
+
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    monkeypatch.setenv(_TMP_PARENT_ENV_VAR, str(short_tmp_parent))
+    dead = short_tmp_parent / "ap-dead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (dead / pm_mod._HARNESS_PIDS_FILE).write_text(
+        json_mod.dumps({"pid": 4242, "identity": "id-a"}) + "\n", encoding="utf-8"
+    )
+    live = short_tmp_parent / "ap-live"
+    live.mkdir(mode=0o700)
+    (live / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+    (live / pm_mod._HARNESS_PIDS_FILE).write_text(
+        json_mod.dumps({"pid": 5353, "identity": "id-b"}) + "\n", encoding="utf-8"
+    )
+
+    assert pm_mod.harness_spawn_record_matches(4242, "id-a") is True
+    assert pm_mod.harness_spawn_record_matches(4242, "id-x") is False
+    assert pm_mod.harness_spawn_record_matches(4242, None) is False
+    # Recorded by a LIVE AP: never attributed as ownerless.
+    assert pm_mod.harness_spawn_record_matches(5353, "id-b") is False
 
 
 async def test_orphan_sweep_treats_malformed_state_as_indeterminate(

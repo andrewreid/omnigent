@@ -54,6 +54,9 @@ class CodexNativeProcessEntry:
         moment group ownership is provable). Escalation kills exactly
         these identity-verified processes, so it can neither hit a
         recycled pgid nor lose a child that outlives its leader.
+    :param leader_identity: The leader's own start identity, recorded at
+        registration so a subreaper host can attribute the leader's
+        adopted zombie (whose argv is gone) back to this entry.
     """
 
     pid: int
@@ -63,6 +66,7 @@ class CodexNativeProcessEntry:
     owner_lock_path: str | None = None
     sigterm_at: float | None = None
     members: tuple[tuple[int, str], ...] | None = None
+    leader_identity: str | None = None
 
 
 @dataclass
@@ -169,6 +173,7 @@ def register_codex_native_process(
         tmux_session_name=tmux_session_name,
         session_tag=session_tag,
         owner_lock_path=str(owner_lock_path) if owner_lock_path is not None else None,
+        leader_identity=_proc.process_start_identity(pid),
     )
     path = registry_path or codex_native_process_registry_path()
     with _registry_lock(path):
@@ -211,13 +216,14 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
     once :data:`_SIGKILL_GRACE_S` has elapsed, so a child that ignores or
     wedges on SIGTERM cannot outlive reconciliation.
 
-    Escalation outlives the group leader: member identities (pid plus
-    start time) are snapshotted while the tagged leader is still alive —
-    the moment group ownership is provable — and a later pass SIGKILLs
-    exactly the identity-verified survivors. A recycled pid fails the
-    start-time check, so escalation can neither hit an unrelated process
-    nor lose a child that outlives its leader, and entries persist until
-    every recorded member is verifiably gone.
+    Member identities (pid plus start time) are snapshotted while the
+    tagged leader is alive — the moment group ownership is provable — and
+    **persisted before the SIGTERM is delivered** (write-ahead), so a
+    crash mid-reap can never strand survivors without a record; a failed
+    registry write defers the signal to a later pass. Escalation SIGKILLs
+    exactly the identity-verified recorded members. On subreaper hosts
+    this path is the fallback tier — the host's adopted-orphan reaper
+    owns whole-tree draining the moment the runner dies.
 
     :param registry_path: Test override for the registry file path.
     :returns: Number of process groups signaled this pass.
@@ -227,6 +233,7 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
     with _registry_lock(path):
         now = time.time()
         survivors: list[CodexNativeProcessEntry] = []
+        pending_terms: list[CodexNativeProcessEntry] = []
         for entry in _read_registry(path):
             if _owner_lock_held(entry.owner_lock_path):
                 survivors.append(entry)
@@ -266,6 +273,15 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                 )
                 survivors.append(entry)
                 continue
+            entry = replace(entry, sigterm_at=now, members=members)
+            survivors.append(entry)
+            pending_terms.append(entry)
+        # Write-ahead: the recorded members must be durable before the
+        # first signal. A failed write defers every pending SIGTERM — the
+        # entries on disk are unchanged, so a later pass simply retries.
+        if not _write_registry(path, survivors):
+            return signaled
+        for entry in pending_terms:
             if _signal_process_group(entry.pgid, signal.SIGTERM):
                 _logger.info(
                     "SIGTERMed ownerless codex-native process group %d (pid %d)",
@@ -273,71 +289,32 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
                     entry.pid,
                 )
                 signaled += 1
-                entry = replace(entry, sigterm_at=now, members=members)
-                # A SIGTERM handler may fork (and the leader then exit);
-                # briefly keep re-scanning while a recorded member still
-                # anchors the group so such children join the kill list.
-                entry = _merge_members_while_anchored(entry)
-            # Keep the entry either way: a failed signal retries on the
-            # next pass, a delivered one is re-checked for escalation.
-            survivors.append(entry)
-        _write_registry(path, survivors)
     return signaled
 
 
 _EscalationOutcome = Literal["killed", "retry", "gone", "unverifiable"]
-
-# Post-SIGTERM anchored rescan cadence: long enough overall (~0.5s) to see
-# a child forked from a typical SIGTERM handler before the handler's owner
-# exits, short enough not to stall a reconciling caller noticeably.
-_POST_TERM_RESCAN_ATTEMPTS = 10
-_POST_TERM_RESCAN_INTERVAL_S = 0.05
-
-
-def _merge_members_while_anchored(entry: CodexNativeProcessEntry) -> CodexNativeProcessEntry:
-    """
-    Briefly re-scan a just-SIGTERMed group, merging late-forked members.
-
-    Runs only while a recorded member still identity-anchors the group
-    (proving the pgid was never recycled), so a child forked from the
-    SIGTERM handler is captured into the recorded members before its
-    parent exits and the anchor is lost.
-
-    :param entry: The entry whose group was just SIGTERMed.
-    :returns: The entry, possibly with merged members.
-    """
-    for _ in range(_POST_TERM_RESCAN_ATTEMPTS):
-        time.sleep(_POST_TERM_RESCAN_INTERVAL_S)
-        assert entry.members is not None
-        if not any(_member_identity_state(pid, start) == "match" for pid, start in entry.members):
-            break
-        fresh = _group_member_identities(entry.pgid)
-        if fresh:
-            merged = dict(entry.members)
-            merged.update(dict(fresh))
-            entry = replace(entry, members=tuple(sorted(merged.items())))
-    return entry
 
 
 def _escalate_sigkill(
     entry: CodexNativeProcessEntry,
 ) -> tuple[_EscalationOutcome, CodexNativeProcessEntry]:
     """
-    SIGKILL whatever provably remains of an already-SIGTERMed entry.
+    SIGKILL the identity-verified recorded members of a SIGTERMed entry.
 
-    While an identity-anchored recorded member proves group continuity —
-    a pgid cannot be recycled while an original member lives in it — the
-    group is re-scanned (merging members forked after the snapshot) and
-    killed atomically via the group signal, plus per-member verified
-    kills. Without that proof, nothing is signaled: the entry is retained
-    while unverifiable occupants remain, and dropped only once the group
-    is verifiably empty.
+    Fallback-tier escalation: strictly per-pid, gated on each recorded
+    member's kernel start identity (see
+    :func:`omnigent.inner._proc.kill_verified`) — never a group signal, so
+    no pgid-continuity assumption is needed. A member that exists but
+    cannot be identified retains the entry; the entry is dropped only when
+    every recorded member is verifiably gone. On subreaper hosts the
+    adopted-orphan reaper drains whole trees; this path covers everything
+    it cannot adopt (macOS, orphans predating a host restart).
 
     :param entry: The SIGTERMed registry entry past its grace.
-    :returns: ``(outcome, entry)`` — the possibly member-merged entry and
-        ``"killed"`` (SIGKILL delivered), ``"retry"`` (keep and retry),
-        ``"gone"`` (verifiably empty), or ``"unverifiable"`` (legacy entry
-        with no safe target) — the last two mean the entry can be dropped.
+    :returns: ``(outcome, entry)`` — ``"killed"`` (SIGKILL delivered),
+        ``"retry"`` (keep and retry), ``"gone"`` (every member verifiably
+        absent), or ``"unverifiable"`` (legacy entry with no safe target)
+        — the last two mean the entry can be dropped.
     """
     kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
     if entry.members is None:
@@ -357,47 +334,52 @@ def _escalate_sigkill(
             entry.pgid,
         )
         return "unverifiable", entry
-    anchored = any(_member_identity_state(pid, start) == "match" for pid, start in entry.members)
-    populated = _proc.group_populated(entry.pgid)
-    if anchored:
-        # An anchored recorded member proves group continuity since the
-        # verified snapshot. Merge any members forked after it, then kill
-        # the whole group atomically — a per-pid list alone can never
-        # close over a fork racing it.
-        fresh = _group_member_identities(entry.pgid)
-        if fresh:
-            merged = dict(entry.members)
-            merged.update(dict(fresh))
-            entry = replace(entry, members=tuple(sorted(merged.items())))
-        delivered = [
-            pid
-            for pid, start in entry.members
-            if _member_identity_state(pid, start) == "match" and _kill_member_verified(pid, start)
-        ]
-        group_killed = _signal_process_group(entry.pgid, kill_sig)
-        if delivered or group_killed:
-            _logger.warning(
-                "codex-native group %d survived SIGTERM; SIGKILLed member(s) %s",
-                entry.pgid,
-                delivered or "via group signal",
-            )
-            return "killed", entry
+    states = [(pid, start, _member_identity_state(pid, start)) for pid, start in entry.members]
+    delivered = [
+        pid
+        for pid, start, state in states
+        if state == "match" and _kill_member_verified(pid, start)
+    ]
+    if delivered:
+        _logger.warning(
+            "codex-native group %d survived SIGTERM; SIGKILLed member(s) %s",
+            entry.pgid,
+            delivered,
+        )
+        return "killed", entry
+    if any(state == "match" for _pid, _start, state in states):
         return "retry", entry
-    if any(_member_identity_state(pid, start) == "unverifiable" for pid, start in entry.members):
+    if any(state == "unverifiable" for _pid, _start, state in states):
         # A member that exists but cannot be identified might still be
         # ours; keep the entry rather than declaring the group gone.
         return "retry", entry
-    if populated is True:
-        # Every recorded member is gone, yet the group has occupants and
-        # nothing proves they are ours — retain the entry instead of
-        # leaking or killing strangers.
-        _logger.warning(
-            "codex-native group %d has unverifiable occupant(s) after all "
-            "recorded members exited; retaining its entry",
-            entry.pgid,
-        )
-        return "retry", entry
     return "gone", entry
+
+
+def ownerless_entry_matches_leader(pid: int, identity: str | None) -> bool:
+    """
+    Whether an adopted zombie leader corresponds to an ownerless entry.
+
+    Used by the subreaper host to attribute a dead leader (whose argv is
+    gone) back to a codex-native session whose launcher no longer holds
+    its owner lock. Identity must match the value recorded at
+    registration — a recycled pid never does.
+
+    :param pid: The adopted zombie leader's pid.
+    :param identity: Its start identity, or ``None`` when unreadable.
+    :returns: ``True`` when an ownerless entry recorded this leader.
+    """
+    if identity is None:
+        return False
+    try:
+        entries = _read_registry(codex_native_process_registry_path())
+    except Exception:  # noqa: BLE001 — attribution is best-effort
+        return False
+    for entry in entries:
+        if entry.pid != pid or entry.leader_identity != identity:
+            continue
+        return not _owner_lock_held(entry.owner_lock_path)
+    return False
 
 
 @contextlib.contextmanager
@@ -462,7 +444,7 @@ def _read_registry(path: Path) -> list[CodexNativeProcessEntry]:
     return entries
 
 
-def _write_registry(path: Path, entries: list[CodexNativeProcessEntry]) -> None:
+def _write_registry(path: Path, entries: list[CodexNativeProcessEntry]) -> bool:
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         payload = [asdict(entry) for entry in entries]
@@ -471,6 +453,8 @@ def _write_registry(path: Path, entries: list[CodexNativeProcessEntry]) -> None:
         os.replace(tmp, path)
     except OSError:
         _logger.warning("codex-native process registry write failed", exc_info=True)
+        return False
+    return True
 
 
 def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
@@ -483,6 +467,9 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
     owner_lock_path = item.get("owner_lock_path")
     sigterm_at = item.get("sigterm_at")
     members = _members_from_json(item.get("members"))
+    leader_identity = item.get("leader_identity")
+    if not isinstance(leader_identity, str) or not leader_identity:
+        leader_identity = None
     if not isinstance(pid, int) or pid <= 0:
         return None
     if not isinstance(pgid, int) or pgid <= 0:
@@ -503,6 +490,7 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
         owner_lock_path=owner_lock_path,
         sigterm_at=float(sigterm_at) if sigterm_at is not None else None,
         members=members,
+        leader_identity=leader_identity,
     )
 
 

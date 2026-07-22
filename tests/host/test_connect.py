@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
+import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -1176,6 +1180,235 @@ async def test_sweep_ownerless_trees_once_runs_all_families(
     assert calls == ["codex", "terminals", "instance-dirs"]
     assert ops_during == [1], "sweep must run under the host-subprocess-op guard"
     assert host._owned_subprocess_ops == 0
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="zombie pgid inspection (and subreaper adoption) are Linux-only",
+)
+async def test_drain_defers_dead_leader_and_adopted_sweep_drains_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The kernel-pin path end to end, with a SIGTERM-handler late fork.
+
+    The leader forks a TERM-ignoring child from its handler and exits —
+    the child is in the leader's group but recorded nowhere. The zombie
+    drain must DEFER the dead leader (the held zombie is the kernel pin
+    on the pgid), the adopted sweep must attribute the group via the
+    child's family signature, and the pinned ``killpg`` must drain the
+    child no observation window could have recorded.
+    """
+    import subprocess
+    import sys
+
+    from omnigent.host import connect as connect_mod
+
+    host = _make_host_process()
+    host._is_subreaper = True  # direct-child logic needs no reparenting here
+    monkeypatch.setattr(connect_mod, "_ADOPTED_SIGTERM_GRACE_S", 0.0)
+
+    leader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, signal, subprocess, sys, time\n"
+                "def on_term(_sig, _frame):\n"
+                "    subprocess.Popen([sys.executable, '-c', "
+                "'import os, signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print(os.getpid(), flush=True); time.sleep(120)', "
+                "'omnigent-start-on-attach'])\n"
+                "    time.sleep(0.2)\n"
+                "    os._exit(0)\n"
+                "signal.signal(signal.SIGTERM, on_term)\n"
+                "print('ready', flush=True)\n"
+                "time.sleep(120)\n"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    child_pid: int | None = None
+    try:
+        assert leader.stdout is not None
+        assert leader.stdout.readline().strip() == "ready"
+        # Simulate the ownerless trigger: the leader dies (here via TERM,
+        # standing in for any unclean owner death) leaving the late fork.
+        os.kill(leader.pid, signal.SIGTERM)
+        child_pid = int(leader.stdout.readline().strip())
+
+        # Let the leader become a zombie WITHOUT reaping it ourselves.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not connect_mod._live_group_member_pids(leader.pid, exclude=child_pid):
+                break
+            await asyncio.sleep(0.05)
+
+        # Zombie drain: the dead leader with a live group is pinned, not
+        # consumed — leader.poll() must still see it unreaped.
+        host._reap_orphans_once()
+        assert leader.pid in host._adopted_pins
+        assert host._adopted_pins[leader.pid].deferred_zombie
+        assert leader.poll() is None, "pinned zombie must not be reaped"
+
+        # Adopted sweep: the child's signature attributes the group; the
+        # pinned killpg drains it (grace zeroed: TERM pass then KILL pass).
+        host._reap_adopted_orphans_once()
+        host._reap_adopted_orphans_once()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            from omnigent.inner import _proc as proc_mod
+
+            if proc_mod.process_identity_state(child_pid, None) == "gone" or not _pid_alive_probe(
+                child_pid
+            ):
+                break
+            host._reap_adopted_orphans_once()
+            await asyncio.sleep(0.05)
+        assert not _pid_alive_probe(child_pid), "late-forked child survived the pinned drain"
+
+        # Drained group: the pin is released and the zombie reaped.
+        host._reap_adopted_orphans_once()
+        assert leader.pid not in host._adopted_pins
+    finally:
+        import contextlib as ctx
+
+        if child_pid is not None:
+            with ctx.suppress(OSError):
+                os.kill(child_pid, signal.SIGKILL)
+        with ctx.suppress(OSError):
+            os.kill(leader.pid, signal.SIGKILL)
+        with ctx.suppress(Exception):
+            leader.wait(timeout=10)
+
+
+def _pid_alive_probe(pid: int) -> bool:
+    """Liveness probe treating zombies as dead (group-drain semantics)."""
+    import psutil as psutil_mod
+
+    try:
+        return psutil_mod.Process(pid).status() != psutil_mod.STATUS_ZOMBIE
+    except psutil_mod.Error:
+        return False
+
+
+async def test_adopted_sweep_kills_condemned_live_leader_and_its_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live adopted leader with a family signature is drained as a group.
+
+    The leader carries the start-on-attach waiter signature; its
+    TERM-ignoring child dies via the pinned group kill even though only
+    the leader was classified.
+    """
+    import subprocess
+    import sys
+
+    from omnigent.host import connect as connect_mod
+
+    host = _make_host_process()
+    host._is_subreaper = True
+    monkeypatch.setattr(connect_mod, "_ADOPTED_SIGTERM_GRACE_S", 0.0)
+
+    leader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import subprocess, sys, time\n"
+                "subprocess.Popen([sys.executable, '-c', "
+                "'import os, signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print(os.getpid(), flush=True); time.sleep(120)'])\n"
+                "time.sleep(120)\n"
+            ),
+            "omnigent-start-on-attach",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    child_pid: int | None = None
+    try:
+        assert leader.stdout is not None
+        child_pid = int(leader.stdout.readline().strip())
+
+        host._reap_adopted_orphans_once()  # TERM pass (leader dies)
+        await asyncio.to_thread(leader.wait, 10)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and _pid_alive_probe(child_pid):
+            host._reap_adopted_orphans_once()  # KILL passes drain the group
+            await asyncio.sleep(0.05)
+        assert not _pid_alive_probe(child_pid), "group member survived the drain"
+    finally:
+        if child_pid is not None:
+            with contextlib.suppress(OSError):
+                os.kill(child_pid, signal.SIGKILL)
+        with contextlib.suppress(OSError):
+            os.kill(leader.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            leader.wait(timeout=10)
+
+
+async def test_adopted_sweep_leaves_unknown_children_untouched() -> None:
+    """An adopted child matching no family signature is never signaled.
+
+    Agents may deliberately daemonize user services; adoption alone must
+    not condemn. The child is pinned for classification, released
+    unharmed, and not reaped.
+    """
+    import subprocess
+    import sys
+
+    host = _make_host_process()
+    host._is_subreaper = True
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        start_new_session=True,
+    )
+    try:
+        host._reap_adopted_orphans_once()
+        assert child.pid not in host._adopted_pins
+        assert child.poll() is None, "unknown adopted child must survive the sweep"
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+
+
+async def test_zombie_drain_skips_pinned_and_reaps_the_rest() -> None:
+    """Pinned zombies survive the drain; unpinned orphan zombies do not."""
+    import errno as errno_mod
+
+    host = _make_host_process()
+
+    pinned = os.fork()
+    if pinned == 0:  # pragma: no cover — child leg
+        os._exit(0)
+    victim = os.fork()
+    if victim == 0:  # pragma: no cover — child leg
+        os._exit(0)
+    from omnigent.host.connect import _AdoptedPin
+
+    host._adopted_pins[pinned] = _AdoptedPin(identity=None, is_leader=False)
+
+    host._is_subreaper = True  # route through the pin-aware targeted drain
+    deadline = time.monotonic() + 5.0
+    reaped = 0
+    while time.monotonic() < deadline and reaped == 0:
+        reaped = host._reap_orphans_targeted()
+        time.sleep(0.05)
+
+    # The unpinned zombie was consumed; the pinned one still awaits us.
+    with pytest.raises(OSError) as exc_info:
+        os.waitpid(victim, os.WNOHANG)
+    assert exc_info.value.errno == errno_mod.ECHILD
+    assert os.waitpid(pinned, os.WNOHANG)[0] in (0, pinned)
+    host._adopted_pins.clear()
+    with contextlib.suppress(OSError):
+        os.waitpid(pinned, 0)
 
 
 def test_ownerless_sweep_env_gate(monkeypatch: pytest.MonkeyPatch) -> None:

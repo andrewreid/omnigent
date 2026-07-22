@@ -1171,6 +1171,21 @@ def _dead_pid() -> int:
     return child.pid
 
 
+def test_terminal_owner_gate_is_identity_anchored(tmp_path: Path) -> None:
+    """A recycled owner pid reads as dead once the identity sibling exists."""
+    d = tmp_path / "omnigent-terminal-x"
+    d.mkdir()
+    (d / "owner.pid").write_text(str(__import__("os").getpid()), encoding="utf-8")
+    assert terminal_mod.terminal_owner_is_dead(d) is False
+    (d / "owner.ident").write_text("not-our-identity", encoding="utf-8")
+    assert terminal_mod.terminal_owner_is_dead(d) is True
+    identity = terminal_mod._proc.process_start_identity(__import__("os").getpid())
+    assert identity is not None
+    (d / "owner.ident").write_text(identity, encoding="utf-8")
+    assert terminal_mod.terminal_owner_is_dead(d) is False
+    assert terminal_mod.terminal_owner_is_dead(tmp_path / "omnigent-terminal-none") is None
+
+
 def test_reap_orphaned_terminals_reaps_only_dead_owner_dirs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
