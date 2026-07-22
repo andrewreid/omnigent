@@ -176,6 +176,11 @@ _OWNERLESS_SWEEP_INTERVAL_S = 60.0
 # timeout of their own, and a wedged filesystem must not stall the loop.
 _OWNERLESS_SWEEP_TIMEOUT_S = 120.0
 
+# Bound on joining an in-flight sweep worker after cancellation, so its
+# tmux/ps helpers cannot outlive the subprocess-op guard into the final
+# shutdown drain, while a wedged worker cannot stall shutdown either.
+_OWNERLESS_SWEEP_JOIN_TIMEOUT_S = 15.0
+
 # Kill-switch: set to ``0`` (or ``false``/``off``/``no``) to disable the
 # active ownerless-tree sweep. Zombie draining and the spawn-time /
 # runner-startup sweeps are unaffected.
@@ -965,11 +970,10 @@ class HostProcess:
         statuses mid-``wait()``. The blocking family sweeps run in a worker
         thread so a slow pass never stalls the event loop.
 
-        Known residual: cancelling this task (shutdown) does not stop an
-        in-flight worker thread, which can spawn one more helper after the
-        op-guard unwinds. The only exposure is the final shutdown drain
-        misreading that helper's exit status — every helper here is a
-        best-effort probe whose exit code is not load-bearing.
+        On cancellation, an in-flight worker thread is joined (bounded by
+        :data:`_OWNERLESS_SWEEP_JOIN_TIMEOUT_S`) before the op-guard
+        unwinds, so no sweep helper's exit status is exposed to the final
+        shutdown drain.
 
         :returns: None.
         """
@@ -983,7 +987,9 @@ class HostProcess:
 
         with self._host_subprocess_op():
             try:
-                signaled = await asyncio.to_thread(reconcile_codex_native_process_registry)
+                signaled = await self._run_family_in_thread(
+                    reconcile_codex_native_process_registry
+                )
                 if signaled:
                     _logger.info(
                         "ownerless sweep: signaled %d codex-native process group(s)",
@@ -992,7 +998,7 @@ class HostProcess:
             except Exception:  # noqa: BLE001 — best-effort per family
                 _logger.warning("codex-native ownerless sweep failed", exc_info=True)
             try:
-                reaped = await asyncio.to_thread(reap_orphaned_terminals)
+                reaped = await self._run_family_in_thread(reap_orphaned_terminals)
                 if reaped:
                     _logger.info(
                         "ownerless sweep: reaped %d orphaned terminal tmux server(s)",
@@ -1014,6 +1020,28 @@ class HostProcess:
                     )
             except Exception:  # noqa: BLE001 — best-effort per family
                 _logger.warning("harness instance-dir ownerless sweep failed", exc_info=True)
+
+    async def _run_family_in_thread(self, fn: Callable[[], int]) -> int:
+        """Run one blocking family sweep in a worker thread, join-safe.
+
+        A cancelled ``to_thread`` await returns immediately while its
+        thread keeps running — which would let the thread spawn helpers
+        after the caller's subprocess-op guard unwound. On cancellation
+        this waits (bounded) for the worker to finish before re-raising,
+        keeping the guard honest.
+
+        :param fn: The blocking sweep callable.
+        :returns: The sweep's reaped/signaled count.
+        """
+        future = asyncio.get_running_loop().run_in_executor(None, fn)
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.shield(future), timeout=_OWNERLESS_SWEEP_JOIN_TIMEOUT_S
+                )
+            raise
 
     def _alive_runner_ids(self) -> list[str]:
         """Return IDs of runners that are still alive.
@@ -2017,6 +2045,13 @@ class HostProcess:
                 self._reaper_task = None
             if self._ownerless_sweep_task is not None:
                 self._ownerless_sweep_task.cancel()
+                # Join (bounded) so no sweep helper survives into the
+                # final drain below with a stealable exit status.
+                with contextlib.suppress(BaseException):
+                    await asyncio.wait_for(
+                        self._ownerless_sweep_task,
+                        timeout=_OWNERLESS_SWEEP_JOIN_TIMEOUT_S,
+                    )
                 self._ownerless_sweep_task = None
             self._cleanup_runners()
             # Final drain: _cleanup_runners has just reaped the tracked

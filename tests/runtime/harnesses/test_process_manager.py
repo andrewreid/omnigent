@@ -27,6 +27,7 @@ import contextlib
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -1208,6 +1209,130 @@ async def test_orphan_sweep_escalates_to_sigkill(
     # The (mocked) group never died, so termination is unverified and the
     # caller must retain the instance dir as retry metadata.
     assert confirmed is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX sessions/lsof")
+@pytest.mark.skipif(shutil.which("lsof") is None, reason="lsof required")
+async def test_orphan_sweep_kills_whole_detached_harness_tree(
+    short_tmp_parent: Path,
+) -> None:
+    """Production topology: the sweep reaps the holder AND its children.
+
+    Harness subprocesses are spawned into their own session (as the real
+    spawn now does), so the group holding the vendor-CLI/MCP children is
+    the harness's own — not the shared AP group. A real leader+child tree
+    holding a conv socket must be fully dead after the sweep, dir removed.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    instance_dir = short_tmp_parent / "ap-dead"
+    instance_dir.mkdir(mode=0o700)
+    (instance_dir / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    sock = instance_dir / "conv-x.sock"
+
+    # Leader mirrors the fixed production spawn: own session, holds the
+    # socket path open, with a plain child in its group.
+    leader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import subprocess, sys, time\n"
+                f"fd = open({str(sock)!r}, 'w')\n"
+                "p = subprocess.Popen([sys.executable, '-c', "
+                "'import os, time; print(os.getpid(), flush=True); time.sleep(120)'])\n"
+                "time.sleep(120)\n"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    child_pid: int | None = None
+    try:
+        assert leader.stdout is not None
+        child_pid = int(leader.stdout.readline().strip())
+
+        sweep_task = asyncio.create_task(pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent))
+        # Reap the leader promptly so the sweep's death verification can
+        # observe it gone (it is this test's Popen child).
+        await asyncio.to_thread(leader.wait, 10)
+        swept = await sweep_task
+
+        assert swept == 1
+        assert not instance_dir.exists()
+        deadline = time.monotonic() + 5.0
+        while _pid_alive(child_pid) and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        assert not _pid_alive(child_pid), "harness child survived the sweep"
+    finally:
+        for pid in [child_pid, leader.pid]:
+            if pid is not None:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+        if leader.poll() is None:
+            leader.wait(timeout=10)
+
+
+async def test_harness_subprocess_is_spawned_as_session_leader(
+    manager: HarnessProcessManager,
+    register_test_harness: None,
+) -> None:
+    """The real spawn detaches the harness into its own session.
+
+    The orphan sweep's group kill relies on this boundary: a harness
+    sharing the AP's group would be unreapable as a tree (the sweep
+    refuses to signal its own group).
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX process groups")
+    await manager.start()
+    try:
+        await manager.get_client("conv_leader", _TEST_HARNESS_NAME)
+        entry = manager._entries["conv_leader"]
+        pid = entry.process.pid
+        assert pid is not None
+        assert os.getpgid(pid) == pid
+        assert os.getpgid(pid) != os.getpgid(0)
+    finally:
+        await manager.shutdown()
+
+
+async def test_orphan_sweep_keeps_dir_while_socket_still_listens(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A still-accepting conv socket vetoes dir removal even if lsof lied.
+
+    lsof exit status 1 is ambiguous (none found vs failure); the connect
+    probe is the positive backstop — a live runner always listens on its
+    socket, so acceptance proves a survivor and the retry metadata stays.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    async def lying_lookup(_socket_path: Path) -> list[int]:
+        return []
+
+    monkeypatch.setattr(pm_mod, "_pids_holding_socket", lying_lookup)
+
+    instance_dir = short_tmp_parent / "ap-dead"
+    instance_dir.mkdir(mode=0o700)
+    (instance_dir / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    sock_path = instance_dir / "conv-x.sock"
+
+    import socket as socket_mod
+
+    server = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    try:
+        server.bind(str(sock_path))
+        server.listen(1)
+
+        swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+
+        assert swept == 0
+        assert instance_dir.exists(), "listening socket must veto dir removal"
+    finally:
+        server.close()
 
 
 async def test_orphan_sweep_keeps_dir_when_socket_lookup_fails(

@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -801,7 +803,7 @@ def reap_orphaned_terminals() -> int:
             # Foreign-owned dir on a shared host — not ours to reap.
             continue
         if has_socket:
-            try:
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                 subprocess.run(
                     ["tmux", "-S", str(socket_path), "kill-server"],
                     # kill-server on an already-dead server exits non-zero;
@@ -810,14 +812,48 @@ def reap_orphaned_terminals() -> int:
                     capture_output=True,
                     timeout=_REAP_KILL_TIMEOUT_S,
                 )
-            except (OSError, subprocess.TimeoutExpired):
-                # Could not confirm the server is down. Keep the dir — it is
-                # the only pointer to the socket — so a later sweep retries
-                # instead of leaking a live server on an unlinked socket.
+            if _tmux_server_alive(socket_path):
+                # Kill unverified (wedged tmux, permission failure): keep
+                # the dir — the only pointer to the socket — so a later
+                # sweep retries instead of leaking a live server on an
+                # unlinked socket.
                 continue
         shutil.rmtree(entry, ignore_errors=True)
         reaped += 1
     return reaped
+
+
+def _tmux_server_alive(socket_path: Path) -> bool:
+    """
+    Positively probe whether a tmux server still listens on *socket_path*.
+
+    ``kill-server``'s exit status cannot distinguish "server already dead"
+    (the common orphan case) from a failed kill, so absence is verified by
+    connecting: a live server accepts, a dead one leaves a connect-refused
+    (or unlinked, or never-a-socket) path. Ambiguous errors — permission
+    denied, timeouts — read as alive so the caller keeps the dir.
+
+    :param socket_path: The instance's ``tmux.sock`` path.
+    :returns: ``True`` when a server (or an unprobeable socket) is there.
+    """
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(2.0)
+        probe.connect(str(socket_path))
+    except OSError as exc:
+        if exc.errno is None:
+            # Python refuses over-long AF_UNIX paths before the syscall;
+            # no server could ever have bound such a path either.
+            return False
+        return exc.errno not in (
+            errno.ENOENT,
+            errno.ECONNREFUSED,
+            errno.ENOTSOCK,
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            probe.close()
+    return True
 
 
 def build_terminal_os_env_spec(

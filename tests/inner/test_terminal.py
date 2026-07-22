@@ -1259,40 +1259,58 @@ def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
     assert kill_calls == [["tmux", "-S", str(socket_path), "kill-server"]]
 
 
-def test_reap_orphaned_terminals_keeps_dir_when_kill_server_is_unverified(
+def test_reap_orphaned_terminals_keeps_dir_while_server_still_listens(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A kill-server that cannot be confirmed leaves the dir for a retry.
+    A dir whose server survives the kill attempt is kept for a retry.
 
-    The instance dir is the only pointer to the server's socket; removing
-    it after a timed-out kill would leak a live tmux server on an unlinked
-    socket with no later sweep able to find it.
+    The kill is verified by connecting to the socket, not by kill-server's
+    ambiguous exit status. A still-listening server (wedged tmux, failed
+    kill) means the dir — the only pointer to the socket — must survive;
+    removing it would leak a live server on an unlinked socket forever.
 
-    :param tmp_path: Fake temp root the sweep scans.
+    :param tmp_path: Unused pytest fixture slot (socket paths need a short
+        root; macOS caps ``AF_UNIX`` paths at ~104 chars).
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
+    import socket as socket_mod
+    import tempfile
 
-    def _timeout_run(*args: object, **kwargs: object) -> None:
-        """Model a wedged tmux that never answers kill-server."""
-        raise TimeoutError("tmux kill-server timed out")
+    def _failing_run(*args: object, **kwargs: object) -> SimpleNamespace:
+        """Model a kill-server that reports failure and kills nothing."""
+        return SimpleNamespace(returncode=1)
 
-    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    short_root = Path(tempfile.mkdtemp(prefix="omnigent-t-", dir="/tmp"))
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: short_root)
     monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
     monkeypatch.setattr(
         terminal_mod,
         "subprocess",
-        SimpleNamespace(run=_timeout_run, TimeoutExpired=TimeoutError),
+        SimpleNamespace(run=_failing_run, TimeoutExpired=TimeoutError),
     )
-    dead_dir = _write_instance_dir(tmp_path, "omnigent-terminal-dead3", _dead_pid())
-    (dead_dir / "tmux.sock").touch()
+    server = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    try:
+        dead_dir = _write_instance_dir(short_root, "omnigent-terminal-dead3", _dead_pid())
+        server.bind(str(dead_dir / "tmux.sock"))
+        server.listen(1)
 
-    reaped = terminal_mod.reap_orphaned_terminals()
+        reaped = terminal_mod.reap_orphaned_terminals()
 
-    assert reaped == 0
-    assert dead_dir.exists(), "dir must be kept until the server kill is confirmed"
+        assert reaped == 0
+        assert dead_dir.exists(), "dir must be kept while the server still listens"
+
+        # Once the server is really gone (connect refused), the same dir
+        # is reapable on the next pass.
+        server.close()
+        reaped = terminal_mod.reap_orphaned_terminals()
+        assert reaped == 1
+        assert not dead_dir.exists()
+    finally:
+        server.close()
+        shutil.rmtree(short_root, ignore_errors=True)
 
 
 @pytest.mark.skipif(
