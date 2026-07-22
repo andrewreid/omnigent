@@ -965,11 +965,16 @@ async def test_pids_holding_socket_returns_empty_for_missing(
     assert pids == []
 
 
-async def test_pids_holding_socket_returns_empty_when_lsof_is_missing(
+async def test_pids_holding_socket_reports_failure_when_lsof_is_missing(
     monkeypatch: pytest.MonkeyPatch,
     short_tmp_parent: Path,
 ) -> None:
-    """Missing ``lsof`` is best-effort cleanup noise, not a boot failure."""
+    """Missing ``lsof`` reads as lookup failure, never as "no holders".
+
+    Conflating the two would let the sweep delete an instance dir — its
+    only retry metadata — while the runner processes it could not see
+    stay alive forever.
+    """
 
     async def missing_lsof(*_args: object, **_kwargs: object) -> object:
         raise FileNotFoundError(2, "No such file or directory", "lsof")
@@ -977,7 +982,7 @@ async def test_pids_holding_socket_returns_empty_when_lsof_is_missing(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", missing_lsof)
 
     pids = await _pids_holding_socket(short_tmp_parent / "conv-stale.sock")
-    assert pids == []
+    assert pids is None
 
 
 # ── Per-spawn env override ─────────────────────────────────────
@@ -1162,11 +1167,12 @@ async def test_orphan_sweep_escalates_to_sigkill(
     register_test_harness: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Orphan sweep SIGKILLs runners that survive SIGTERM."""
+    """Sweep SIGKILLs a surviving runner's whole group, and reports
+    unverified termination so the caller keeps the dir for a retry."""
     from omnigent.runtime.harnesses import process_manager as pm_mod
 
     killed: list[tuple[int, signal.Signals]] = []
-    calls = 0
+    real_getpgid = os.getpgid
 
     async def fake_pids_holding_socket(socket_path: Path) -> list[int]:
         assert socket_path.name == "conv-stale.sock"
@@ -1176,25 +1182,55 @@ async def test_orphan_sweep_escalates_to_sigkill(
         assert pid == 12345
         return True
 
-    def fake_kill(pid: int, sig: signal.Signals) -> None:
-        nonlocal calls
-        calls += 1
-        assert pid == 12345
-        killed.append((pid, sig))
+    def fake_getpgid(pid: int) -> int:
+        # The orphan resolves to its own (foreign) group; pid 0 must still
+        # resolve to OUR group so the own-group refusal check works.
+        return 54321 if pid == 12345 else real_getpgid(pid)
+
+    def fake_killpg(pgid: int, sig: signal.Signals) -> None:
+        assert pgid == 54321
+        killed.append((pgid, sig))
 
     monkeypatch.setattr(pm_mod, "_ORPHAN_SIGTERM_GRACE_S", 0)
+    monkeypatch.setattr(pm_mod, "_ORPHAN_KILL_VERIFY_TIMEOUT_S", 0.0)
     monkeypatch.setattr(pm_mod, "_pids_holding_socket", fake_pids_holding_socket)
     monkeypatch.setattr(pm_mod, "_pid_alive", fake_pid_alive)
-    monkeypatch.setattr(pm_mod.os, "kill", fake_kill)
+    monkeypatch.setattr(pm_mod.os, "getpgid", fake_getpgid)
+    monkeypatch.setattr(pm_mod.os, "killpg", fake_killpg)
 
     instance_dir = short_tmp_parent / "ap-dead"
     instance_dir.mkdir()
     (instance_dir / "conv-stale.sock").touch()
 
-    await pm_mod._kill_orphan_runners(instance_dir)
+    confirmed = await pm_mod._kill_orphan_runners(instance_dir)
 
-    assert calls == 2
-    assert killed == [(12345, signal.SIGTERM), (12345, signal.SIGKILL)]
+    assert killed == [(54321, signal.SIGTERM), (54321, signal.SIGKILL)]
+    # The (mocked) group never died, so termination is unverified and the
+    # caller must retain the instance dir as retry metadata.
+    assert confirmed is False
+
+
+async def test_orphan_sweep_keeps_dir_when_socket_lookup_fails(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed lsof lookup must not cost the dir — the only retry record."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    async def failing_lookup(_socket_path: Path) -> None:
+        return None
+
+    monkeypatch.setattr(pm_mod, "_pids_holding_socket", failing_lookup)
+
+    dead = short_tmp_parent / "ap-dead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (dead / "conv-stale.sock").touch()
+
+    swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+
+    assert swept == 0
+    assert dead.exists(), "dir with unverified processes must be kept for retry"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")

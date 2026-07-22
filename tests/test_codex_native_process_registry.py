@@ -110,6 +110,7 @@ def test_reconciliation_escalates_to_sigkill_after_grace(tmp_path: Path, monkeyp
     assert len(_registry_payload(path)) == 1
 
     monkeypatch.setattr(registry, "_SIGKILL_GRACE_S", 0.0)
+    monkeypatch.setattr(registry, "_process_group_alive", lambda _pgid: True)
     registry.reconcile_codex_native_process_registry(registry_path=path)
 
     assert killed == [(456, signal.SIGTERM), (456, signal.SIGKILL)]
@@ -280,6 +281,120 @@ def test_registry_lock_serializes_read_modify_write(tmp_path: Path) -> None:
             registry.os.close(fd)
 
 
+def test_escalation_kills_surviving_child_after_leader_exits(tmp_path: Path, monkeypatch) -> None:
+    """A TERM-ignoring group child is SIGKILLed even after its leader exits.
+
+    SIGTERM kills the tagged leader but a descendant in the same group
+    ignores it. The next pass must settle by group liveness — not drop the
+    entry because the leader pid is gone — so the child still dies.
+    """
+    import subprocess
+    import sys
+    import time as time_mod
+
+    path = tmp_path / "registry.json"
+    tag = "tag-child"
+    # Leader spawns a SIGTERM-ignoring child in its group, then sleeps
+    # until SIGTERMed. The child prints its own pid only AFTER installing
+    # the handler, so reading the pid proves the ignore is in place.
+    leader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import subprocess, sys, time\n"
+                "subprocess.Popen([sys.executable, '-c', "
+                "'import os, signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print(os.getpid(), flush=True); "
+                "time.sleep(120)'])\n"
+                "time.sleep(120)\n"
+            ),
+            registry.codex_native_session_tag_cmdline_arg(tag),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    child_pid: int | None = None
+    try:
+        assert leader.stdout is not None
+        child_pid = int(leader.stdout.readline().strip())
+        registry.register_codex_native_process(
+            pid=leader.pid,
+            pgid=leader.pid,
+            session_tag=tag,
+            owner_lock_path=None,
+            registry_path=path,
+        )
+
+        # Pass 1: SIGTERM the group. Leader dies, child ignores it.
+        assert registry.reconcile_codex_native_process_registry(registry_path=path) == 1
+        assert leader.wait(timeout=10) is not None
+        deadline = time_mod.monotonic() + 5.0
+        while registry._pid_alive(leader.pid) and time_mod.monotonic() < deadline:
+            time_mod.sleep(0.05)
+        assert registry._pid_alive(child_pid), "child should have ignored the SIGTERM"
+
+        # Pass 2 after grace: leader gone, but the group is still alive —
+        # escalate to SIGKILL instead of dropping the entry.
+        monkeypatch.setattr(registry, "_SIGKILL_GRACE_S", 0.0)
+        assert registry.reconcile_codex_native_process_registry(registry_path=path) == 1
+        deadline = time_mod.monotonic() + 5.0
+        while registry._pid_alive(child_pid) and time_mod.monotonic() < deadline:
+            time_mod.sleep(0.05)
+        assert not registry._pid_alive(child_pid), "surviving group child leaked"
+        assert _registry_payload(path) == []
+    finally:
+        import contextlib
+        import os
+
+        if child_pid is not None:
+            with contextlib.suppress(OSError):
+                os.kill(child_pid, signal.SIGKILL)
+        if leader.poll() is None:
+            leader.kill()
+        leader.wait(timeout=10)
+
+
+def test_escalation_gives_up_past_the_group_trust_window(tmp_path: Path, monkeypatch) -> None:
+    """A stale SIGTERMed entry is dropped, never group-killed.
+
+    Past the trust window the pgid may have been recycled by an unrelated
+    session leader, so killing it would be a false positive; the entry is
+    dropped with a warning instead.
+    """
+    path = tmp_path / "registry.json"
+    registry.register_codex_native_process(
+        pid=123,
+        pgid=456,
+        session_tag="tag-stale",
+        owner_lock_path=None,
+        registry_path=path,
+    )
+    killed: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(registry, "_pid_alive", lambda pid: pid == 123)
+    monkeypatch.setattr(
+        registry,
+        "_process_cmdline",
+        lambda _pid: "codex omnigent_crash_teardown_tag=tag-stale app-server",
+    )
+    monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
+
+    registry.reconcile_codex_native_process_registry(registry_path=path)
+    assert killed == [(456, signal.SIGTERM)]
+
+    # Fast-forward past the trust window: the entry must be dropped with no
+    # further signal, even though the group would still read as alive.
+    monkeypatch.setattr(registry, "_SIGKILL_GRACE_S", 0.0)
+    monkeypatch.setattr(registry, "_SIGKILL_WINDOW_S", 0.0)
+    monkeypatch.setattr(registry, "_process_group_alive", lambda _pgid: True)
+    assert registry.reconcile_codex_native_process_registry(registry_path=path) == 0
+
+    assert killed == [(456, signal.SIGTERM)]
+    assert _registry_payload(path) == []
+
+
 def test_end_to_end_spares_owned_process_and_reaps_after_owner_death(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -328,11 +443,12 @@ def test_end_to_end_spares_owned_process_and_reaps_after_owner_death(
         assert registry.reconcile_codex_native_process_registry(registry_path=path) == 1
         assert proc.wait(timeout=10) is not None
 
-        # Child gone: a later pass drops the entry without further signals.
+        # Group gone: a post-grace pass drops the entry without signals.
         deadline = time_mod.monotonic() + 5.0
         while registry._pid_alive(proc.pid) and time_mod.monotonic() < deadline:
             time_mod.sleep(0.05)
-        registry.reconcile_codex_native_process_registry(registry_path=path)
+        monkeypatch.setattr(registry, "_SIGKILL_GRACE_S", 0.0)
+        assert registry.reconcile_codex_native_process_registry(registry_path=path) == 0
         assert _registry_payload(path) == []
     finally:
         if proc.poll() is None:

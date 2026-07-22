@@ -801,7 +801,7 @@ def reap_orphaned_terminals() -> int:
             # Foreign-owned dir on a shared host — not ours to reap.
             continue
         if has_socket:
-            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            try:
                 subprocess.run(
                     ["tmux", "-S", str(socket_path), "kill-server"],
                     # kill-server on an already-dead server exits non-zero;
@@ -810,6 +810,11 @@ def reap_orphaned_terminals() -> int:
                     capture_output=True,
                     timeout=_REAP_KILL_TIMEOUT_S,
                 )
+            except (OSError, subprocess.TimeoutExpired):
+                # Could not confirm the server is down. Keep the dir — it is
+                # the only pointer to the socket — so a later sweep retries
+                # instead of leaking a live server on an unlinked socket.
+                continue
         shutil.rmtree(entry, ignore_errors=True)
         reaped += 1
     return reaped
