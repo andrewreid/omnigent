@@ -289,7 +289,8 @@ file change:
 
 **Latency impact: none.** The poll interval is untouched, and any change to a
 currently watched input file is seen on the very next 0.25 s tick. An input
-that is not watched falls back to the resync — see §3.3.1 and residual risk 10.
+that is not watched falls back to the resync — see §3.3.1 and the
+"classification contract is not fail-closed" residual risk.
 
 ### 3.3.1 The detector must not watch its own outputs
 
@@ -326,8 +327,8 @@ producer set grows; not worth it for the current five.
 
 A miss costs bounded staleness rather than permanent loss: an unwatched
 input's changes surface on the `_IDLE_RESYNC_SECONDS` sweep instead of the
-next tick. That is eventual observation, not correctness during the gap — see
-residual risk 10.
+next tick. That is eventual observation, not correctness during the gap — see the
+"classification contract is not fail-closed" residual risk.
 
 Paths are pre-resolved once per session into `_BridgeInputPaths` and held as
 plain strings. This is not incidental: a by-name version that built
@@ -335,11 +336,27 @@ plain strings. This is not incidental: a by-name version that built
 replaced, because `pathlib` construction costs more than the `os.stat` it
 feeds.
 
-Sub-agent membership is cached and re-listed only when the `subagents/`
-directory's own mtime moves — creating, removing or renaming an entry moves
-it, and that directory's stat is itself in the fingerprint, so an arrival is
-never missed. Appends to an existing transcript move neither, which is why the
-cached transcripts are still stat'ed individually every tick.
+Sub-agent membership is cached and re-listed when the `subagents/` directory's
+own mtime moves, **or while that mtime is too recent to trust**. Appends to an
+existing transcript move neither the directory mtime nor the member list,
+which is why the cached transcripts are still stat'ed individually every tick.
+
+The second condition is not belt-and-braces. `st_mtime_ns` reports nanoseconds
+but filesystems do not store them: Linux stamps directory mtimes from the jiffy
+clock — 4 ms at the common `CONFIG_HZ=250` — and older filesystems round to
+1-2 s. An entry created inside the tick already recorded leaves the mtime
+unchanged, and nothing moves it afterwards either, so comparing mtimes alone
+loses that sub-agent until the resync. Measured on a `CONFIG_HZ=250` box:
+adding an entry left the directory mtime unchanged **194 times out of 200**.
+APFS stamps at ~50 µs and misses 0/200, which is why this survived review and
+only surfaced on an integration build.
+
+`_DIR_MTIME_RACY_WINDOW_NS` (2 s, comfortably past the 1-2 s filesystems)
+therefore forces a re-list while the mtime sits within that window of now —
+the same "racily clean" problem git solves for its index. It costs extra
+listings only just after a change and nothing once the directory is quiet, so
+the steady state this gate exists to make cheap is unaffected: measured
+unchanged at fan-out 6 and 100.
 
 ### 3.4 Blast radius, kill switches, observability
 
@@ -369,9 +386,14 @@ a rebuild.
 ### 3.5 Platform reach
 
 Everything used is portable: `shutil.which`, `subprocess.run`, `threading.Event`,
-`os.scandir`, `os.stat`. `st_ino` and `st_mtime_ns` are meaningful on both APFS
-and ext4. No `inotify`, no `kqueue`, no `/proc`. There is no degraded path to
-fall back to because there is no platform-specific path.
+`os.scandir`, `os.stat`. No `inotify`, no `kqueue`, no `/proc`. There is no
+degraded path to fall back to because there is no platform-specific path.
+
+`st_ino` and `st_mtime_ns` are meaningful on both APFS and ext4, but their
+*resolution* is not portable and must not be assumed — see the granularity
+discussion in §3.3.1. Timestamp-derived logic is written against a window, not
+against equality, precisely because a nanosecond field can carry a 4 ms (or
+1 s) value.
 
 ## 4. Measurement
 
@@ -633,6 +655,26 @@ to recover it: `claude_native.py` runs `supervise_forwarder` in the native CLI
 wrapper process, so the runner-side turn-start wake cannot reach it. Cheapening
 the detector gets a larger win at zero latency cost.
 
+### 7.3.2 Integration build: the mtime granularity assumption
+
+The sub-agent membership cache keyed re-listing on the directory mtime
+changing. That assumption held on the development box and failed on an
+integration build, where
+`test_bridge_input_fingerprint_picks_up_a_subagent_added_after_priming` failed
+~90 % of runs: `st_mtime_ns` carries nanoseconds but Linux stamps directory
+mtimes from the jiffy clock, so an entry created inside the recorded tick left
+the mtime unchanged 194/200 times — and nothing moved it afterwards, so the
+sub-agent stayed unwatched until the resync.
+
+This was dismissed during design as "extremely unlikely (ns resolution)". The
+error was reading `st_mtime_ns`'s *units* as its *resolution*. APFS misses
+0/200, which is why local runs and every review round passed.
+
+Fixed with a racy window (§3.3.1). The regression test pins the directory mtime
+back with `os.utime` rather than racing for the collision, so it reproduces on
+any filesystem instead of only on a coarse one — the property the original test
+lacked.
+
 ### 7.4 Fifth round — cross-vendor review
 
 No blocking findings. Two fixes:
@@ -662,40 +704,46 @@ the real `wait` does.
    up to `max_interval` late (2 s claude-native, 5 s generic). Turn start,
    typing, and attach are all wake-triggered, so this only affects output that
    originates entirely inside the pane after ≥1 idle threshold of silence.
-2. **Fingerprint blind spot.** A same-inode, same-size, same-`mtime_ns` rewrite
+2. **Clock skew defeats the racy window.** `_mtime_is_racy` compares the
+    filesystem's timestamp against the local clock, so a networked filesystem
+    whose server clock leads or lags by more than the window makes a fresh
+    change look settled, and membership falls back to mtime equality. Bounded
+    by the resync. Future-dated stamps are handled (the comparison is
+    absolute); a *lagging* server beyond 2 s is not.
+3. **Fingerprint blind spot.** A same-inode, same-size, same-`mtime_ns` rewrite
    would be missed for up to `_IDLE_RESYNC_SECONDS`. No current writer can
    produce one; the resync bounds it regardless.
-3. **Settle window is a constant, not a derivation.** If a future time-based
+4. **Settle window is a constant, not a derivation.** If a future time-based
    transition longer than 8 s is added to the forwarder body without a matching
    deadline check, it would be delayed to the next resync. Mitigated by the
    constant carrying a comment naming what it must cover.
-4. **Late `running` under slow sustained output.** A pane that changes less
+5. **Late `running` under slow sustained output.** A pane that changes less
    often than its idle threshold already reads idle between changes (existing
    detector semantics, unchanged). Backoff additionally delays the following
    `running` edge by up to the ceiling. Bounded at 2 s claude-native / 5 s
    generic.
-5. **A backed-off watcher reports a pane exit up to one interval late.** Only
+6. **A backed-off watcher reports a pane exit up to one interval late.** Only
    reachable for a pane that dies after ≥1 idle threshold of silence — i.e. a
    kill or crash, not a clean end-of-turn exit, which repaints first and so is
    seen at base rate.
-6. **Merged tmux probe changes one error path.** Previously a failing
+7. **Merged tmux probe changes one error path.** Previously a failing
    `list-panes` was treated as "pane alive"; now a failing sequence is treated
    as "server gone" and fires `on_exit`. Both commands target the same session,
    so they succeed and fail together in practice, but a tmux that could fail
    `display-message` while serving `capture-pane` would report an exit one
    interval early.
-7. **Idle CPU still scales with accumulated fan-out** — ~0.65 % of a core per
+8. **Idle CPU still scales with accumulated fan-out** — ~0.65 % of a core per
    idle session at 100 sub-agents (§4). Down ~11x, but not flat.
-8. **The turn-start wake walks the session's terminal list on every turn.** It
+9. **The turn-start wake walks the session's terminal list on every turn.** It
    wakes nothing outside `PTY_STATUS_OWNING_TERMINAL_ROLES`, but the walk plus
    a role lookup per terminal happens for every session, native or not. At the
    sizes involved (a handful of terminals per session) that is a dict lookup
    and a short loop, once per turn.
-9. **An unobserved wake costs one base interval.** A wake raised while the
+10. **An unobserved wake costs one base interval.** A wake raised while the
    tick body is running stays pending rather than being destroyed, but it is
    serviced on the next sleep rather than immediately — up to 0.2 s late for
    the native watcher.
-10. **The bridge-file classification contract is not fail-closed.** The
+11. **The bridge-file classification contract is not fail-closed.** The
     by-name sweep misses a producer nobody listed; the live-session test
     misses a producer or branch its scenario does not reach (§3.3.1). An
     unwatched *input* would have its changes surface on the 10 s resync rather
@@ -705,7 +753,7 @@ the real `wait` does.
     gap, so a future input carrying something time-critical would need
     watching, not just resyncing. An unwatched *output* is harmless, which is
     what every miss so far has been.
-11. **The grace is released by any agent-attributed pane change, not only the
+12. **The grace is released by any agent-attributed pane change, not only the
     awaited turn's output.** A status-bar repaint during turn setup ends the
     grace early, after which the ordinary idle threshold and backoff ramp
     apply — so detection falls back to the ceiling (≤2 s native) rather than

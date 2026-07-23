@@ -7664,6 +7664,109 @@ def test_bridge_input_fingerprint_picks_up_a_subagent_added_after_priming(
     assert paths.fingerprint() != after_arrival
 
 
+def test_bridge_input_fingerprint_sees_a_subagent_added_within_one_mtime_tick(
+    tmp_path: Path,
+) -> None:
+    """
+    A sub-agent whose arrival does not move the directory mtime is still watched.
+
+    ``st_mtime_ns`` reports nanoseconds but filesystems do not store them —
+    Linux stamps directory mtimes from the jiffy clock (4ms at CONFIG_HZ=250).
+    An entry created inside the same tick as the previous stat leaves the
+    recorded mtime unchanged, and nothing moves it afterwards either, so a
+    membership cache keyed on mtime inequality alone would leave that sub-agent
+    unwatched until the resync — its output surfacing in 10s chunks.
+
+    The directory mtime is pinned back deliberately rather than raced for: on a
+    fine-grained filesystem (APFS stamps at ~50us) the collision would almost
+    never occur, which is exactly how this escaped review.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = _seed_transcript_with_subagents_dir(tmp_path)
+    subagents = _subagents_dir(transcript)
+    paths = _fingerprint_for(bridge_dir, transcript)
+    paths.fingerprint()
+
+    frozen = os.stat(subagents).st_mtime_ns
+    child = subagents / "agent-same-tick.jsonl"
+    child.write_text("{}\n", encoding="utf-8")
+    # Coarse-granularity filesystem: the create lands in the tick already
+    # recorded, so the directory's mtime does not advance.
+    os.utime(subagents, ns=(frozen, frozen))
+    assert os.stat(subagents).st_mtime_ns == frozen
+
+    after_arrival = paths.fingerprint()
+    assert "subagent/agent-same-tick.jsonl" in after_arrival
+
+    # ...and it stays watched, so its output is seen on the next tick.
+    with child.open("a", encoding="utf-8") as handle:
+        handle.write("{}\n")
+
+    assert paths.fingerprint() != after_arrival
+
+
+def test_mtime_is_racy_only_inside_the_granularity_window() -> None:
+    """
+    Recent and future timestamps are untrustworthy; settled ones are not.
+
+    The window is what keeps a directory being re-listed just after a change.
+    If it never expired the membership cache would be pointless, and if it
+    ignored future stamps an NFS server whose clock leads ours would silently
+    pass the mtime comparison.
+
+    :returns: None.
+    """
+    now = time.time_ns()
+
+    assert forwarder._mtime_is_racy(now)
+    assert forwarder._mtime_is_racy(now + forwarder._DIR_MTIME_RACY_WINDOW_NS // 2)
+    assert not forwarder._mtime_is_racy(now - forwarder._DIR_MTIME_RACY_WINDOW_NS * 2)
+
+
+def test_bridge_input_fingerprint_stops_relisting_once_a_subagent_dir_settles(
+    tmp_path: Path,
+) -> None:
+    """
+    A quiet sub-agent directory is not re-listed on every tick.
+
+    The racy window buys correctness just after a change; the membership cache
+    is what keeps steady-state idle cheap under fan-out. If the window applied
+    forever, every tick would pay a directory scan again.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = _seed_transcript_with_subagents_dir(tmp_path)
+    subagents = _subagents_dir(transcript)
+    (subagents / "agent-1.jsonl").write_text("{}\n", encoding="utf-8")
+    paths = _fingerprint_for(bridge_dir, transcript)
+
+    # Age the directory well past the window, as an idle session's would be.
+    settled = time.time_ns() - forwarder._DIR_MTIME_RACY_WINDOW_NS * 2
+    os.utime(subagents, ns=(settled, settled))
+    paths.fingerprint()
+
+    listings = 0
+    original = paths._refresh_subagents
+
+    def _counting(dir_key: tuple[int, int]) -> None:
+        nonlocal listings
+        listings += 1
+        original(dir_key)
+
+    paths._refresh_subagents = _counting  # type: ignore[method-assign]
+    for _ in range(5):
+        paths.fingerprint()
+
+    assert listings == 0
+
+
 def test_bridge_input_fingerprint_drops_subagents_after_a_rotation(tmp_path: Path) -> None:
     """
     A /clear or /fork rotation retargets the fingerprint at the new session.
