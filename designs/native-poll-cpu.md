@@ -300,13 +300,27 @@ fingerprint, which runs the next tick's body, which can write the cursor
 again. On an idle session with a `message_deltas.jsonl` present the gate
 engaged only **54 %** of ticks instead of settling.
 
-So the inputs are now stat'ed by name, from `_WATCHED_BRIDGE_FILES`, with the
-four `_FORWARDER_OWNED_BRIDGE_FILES` deliberately excluded. That trades the
-self-maintaining property for an explicit contract, so
-`test_fingerprint_classifies_every_bridge_file` pins it: every `*_FILE`
-constant in the bridge module must be classified as watched or
-forwarder-owned, and the two sets must be disjoint. A new bridge file fails
-CI rather than going silently unwatched.
+So the inputs are now stat'ed by name, from `_WATCHED_BRIDGE_FILES`, with
+`_FORWARDER_OWNED_BRIDGE_FILES` — the loop's own cursors plus the shared
+dead-letter sink — deliberately excluded.
+
+That trades the scan's self-maintaining property for an explicit contract,
+pinned two ways because the obvious way was not enough on its own:
+
+- `test_fingerprint_classifies_every_declared_bridge_file` sweeps the `*_FILE`
+  constants of every module that writes into a bridge dir — the bridge, the
+  forwarder, the statusLine wrapper, the message-display hook, and the shared
+  post-delivery module.
+- `test_fingerprint_classifies_every_file_a_live_session_writes` drives those
+  producers for real and requires every file left in the directory to be
+  classified.
+
+The second exists because the first depends on someone listing the producing
+module, and that list missed one three review rounds running — most recently
+the dead-letter sink, whose name is tied to no convention this module owns.
+Grounding the same contract in the filesystem does not depend on the list
+being right. Either way a new bridge file fails CI instead of going silently
+unwatched.
 
 Paths are pre-resolved once per session into `_BridgeInputPaths` and held as
 plain strings. This is not incidental: a by-name version that built
