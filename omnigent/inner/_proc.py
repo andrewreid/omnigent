@@ -302,26 +302,42 @@ def process_is_zombie(pid: int) -> bool:
         return False
 
 
-def group_populated(pgid: int) -> bool | None:
+def group_has_live_members(pgid: int) -> bool | None:
     """
-    Whether process group *pgid* currently has any members.
+    Whether process group *pgid* has any live (non-zombie) members.
 
-    Unreaped zombies count as members, so a just-SIGKILLed group reads as
-    populated until its reaper runs — callers treat that as "not yet
-    verifiably empty" and retry.
+    Zombies are ignored: they hold no resources and their collection
+    belongs to a foreign reaper on its own schedule — counting them (as a
+    plain ``killpg(pgid, 0)`` probe does) would veto settlement forever
+    under a subreaper that has not drained yet. Fail-closed: a scan that
+    cannot be completed (unenumerable pid table, an unreadable confirmed
+    member) yields ``None`` — callers must retain, not release.
 
     :param pgid: The process group to probe.
-    :returns: ``True``/``False``, or ``None`` where groups don't exist.
+    :returns: ``True`` when a live member exists, ``False`` only for a
+        complete scan that found none, ``None`` when indeterminate.
     """
-    if pgid <= 0 or _killpg_fn is None:
+    if pgid <= 0 or _getpgid_fn is None:
         return None
     try:
-        _killpg_fn(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
+        pids = psutil.pids()
+    except (psutil.Error, OSError):
+        return None
+    for pid in pids:
+        try:
+            if _getpgid_fn(pid) != pgid:
+                continue
+        except OSError:
+            continue  # gone, or not ours to inspect — not a member of ours
+        try:
+            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                continue
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.Error, OSError):
+            return None  # a confirmed member is unreadable — inconclusive
         return True
-    return True
+    return False
 
 
 def kill_verified(pid: int, identity: str, sig: int) -> bool:

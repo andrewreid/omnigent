@@ -1574,11 +1574,14 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
             _save_reap_state(instance_dir, groups)
         return False
     for pgid in groups:
-        if pgid > 0 and _proc.group_populated(pgid) is True:
-            # Every recorded member is gone, yet the recorded group still
-            # has occupants (e.g. a child forked after the snapshot). This
-            # tier cannot prove they are ours; retain the dir and its
-            # state as evidence instead of deleting the only record.
+        if pgid > 0 and _proc.group_has_live_members(pgid) is not False:
+            # Every recorded member is dead, yet the recorded group still
+            # has (or may have — an incomplete scan fails closed) LIVE
+            # occupants, e.g. a child forked after the snapshot. Zombies
+            # do not veto: their collection belongs to a foreign reaper.
+            # This tier cannot prove live occupants are ours; retain the
+            # dir and its state as evidence instead of deleting the only
+            # record.
             _logger.warning(
                 "group %d under %s has unverifiable occupant(s) after all "
                 "recorded members exited; keeping instance dir",
