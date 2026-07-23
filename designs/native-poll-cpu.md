@@ -287,8 +287,9 @@ file change:
 | HTTP post retry | 1–30 s | explicit tracker check (3) |
 | cost post retry | backoff | explicit `cost_retry_not_before` check (3) |
 
-**Latency impact: none.** The poll interval is untouched, and any change to any
-input file is seen on the very next 0.25 s tick.
+**Latency impact: none.** The poll interval is untouched, and any change to a
+currently watched input file is seen on the very next 0.25 s tick. An input
+that is not watched falls back to the resync — see §3.3.1 and residual risk 10.
 
 ### 3.3.1 The detector must not watch its own outputs
 

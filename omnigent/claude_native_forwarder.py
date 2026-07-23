@@ -882,16 +882,18 @@ class _BridgeInputPaths:
 
     def fingerprint(self) -> _BridgeFingerprint:
         """
-        Snapshot every file the poll loop reads.
+        Snapshot the watched inputs: :data:`_WATCHED_BRIDGE_FILES`, the
+        transcript, and the sub-agent directory with its transcripts.
 
         Inode is part of the triple because the bridge writes its JSON state
         via a temp file plus ``os.replace``, so every write lands a new inode
         even when the size and timestamp would look unchanged. Append-only
         files (hook events, message deltas, transcripts) always grow their
-        size. Between them there is no writer here that can mutate an input
-        invisibly.
+        size. Between them, no writer can mutate a *watched* input invisibly;
+        an input missing from the watch list is a different failure, caught by
+        the classification tests and bounded by the resync.
 
-        :returns: Fingerprint of the loop's inputs.
+        :returns: Fingerprint of the watched inputs.
         """
         fingerprint: _BridgeFingerprint = {}
         stat = os.stat
@@ -1043,10 +1045,10 @@ async def forward_claude_transcript_to_session(
     task_subjects: dict[str, str] = {}
     task_statuses: dict[str, str] = {}
     task_order: list[str] = []
-    # Idle gating: a tick whose on-disk inputs are byte-identical to the
+    # Idle gating: a tick whose watched inputs are byte-identical to the
     # previous tick has nothing to forward, so it skips the ~20 file reads and
     # ~10 scans the body would otherwise redo. The poll interval is untouched,
-    # so any change is still picked up on the very next tick.
+    # so a change to a watched input is still picked up on the very next tick.
     gate_enabled = _idle_gate_enabled()
     fingerprint: _BridgeFingerprint | None = None
     known_transcript_path: Path | None = None
