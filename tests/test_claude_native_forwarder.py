@@ -7502,20 +7502,21 @@ def _assert_all_classified(candidates: dict[str, str]) -> None:
         f"bridge file(s) {sorted(unclassified)} ({sorted(unclassified.values())}) are "
         "neither watched by the poll loop's fingerprint nor declared "
         "forwarder-owned; add them to _WATCHED_BRIDGE_FILES (an input the loop "
-        "reads) or _FORWARDER_OWNED_BRIDGE_FILES (written, never read back)"
+        "reads) or _FORWARDER_OWNED_BRIDGE_FILES (written by us, not read by "
+        "the steady-state poll loop)"
     )
     # A file cannot be both: watching our own output re-opens the gate on work
     # we just did.
     assert not (watched & owned)
 
 
-def test_fingerprint_does_not_watch_the_forwarders_own_cursors(tmp_path: Path) -> None:
+def test_fingerprint_does_not_watch_the_forwarders_own_outputs(tmp_path: Path) -> None:
     """
-    Writing a forwarder cursor does not move the fingerprint.
+    Writing anything the forwarder owns does not move the fingerprint.
 
-    The cursors live in the bridge dir and change whenever the loop advances.
-    Counting them would re-open the gate on the forwarder's own output and buy
-    an extra full tick after every batch.
+    Its cursors and the dead-letter sink all live in the bridge dir and change
+    whenever the loop does work. Counting them would re-open the gate on the
+    forwarder's own output and buy an extra full tick after every batch.
 
     :param tmp_path: Per-test temp directory.
     :returns: None.
