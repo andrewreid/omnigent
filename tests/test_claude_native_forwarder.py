@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -19,8 +20,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+import omnigent._native_post_delivery as native_post_delivery
 import omnigent.claude_native_bridge as bridge_module
 import omnigent.claude_native_forwarder as forwarder
+import omnigent.claude_native_message_display_hook as claude_native_message_display_hook
+import omnigent.claude_native_status as claude_native_status
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeMessageDelta,
@@ -7374,9 +7378,21 @@ def _fingerprint_for(bridge_dir: Path, transcript: Path | None = None):
     return paths
 
 
-def test_fingerprint_classifies_every_bridge_file() -> None:
+# Modules that place files in a claude-native bridge directory. Swept by the
+# by-name contract below. Deliberately excludes claude_native_state, whose
+# launch.json lives under ~/.omnigent/claude-native rather than the bridge dir.
+_BRIDGE_DIR_PRODUCER_MODULES = (
+    bridge_module,
+    forwarder,
+    claude_native_status,
+    claude_native_message_display_hook,
+    native_post_delivery,
+)
+
+
+def test_fingerprint_classifies_every_declared_bridge_file() -> None:
     """
-    Every bridge-dir filename is either watched for changes or explicitly ours.
+    Every declared bridge-dir filename is watched for changes or explicitly ours.
 
     The fingerprint stats a fixed list of names rather than scanning the
     directory, which is ~2x cheaper but stops being self-maintaining: a file
@@ -7384,30 +7400,105 @@ def test_fingerprint_classifies_every_bridge_file() -> None:
     periodic resync. This pins the classification so adding one without
     deciding which side it falls on fails here instead of in production.
 
-    Both modules that name bridge-dir files are swept, not just the bridge:
-    the forwarder declares filenames too, so a new *input* constant added
-    beside its cursor files would otherwise slip through unwatched.
+    Paired with the live-session test below, which grounds the same contract in
+    what a session actually writes — this one depends on the producing module
+    being listed, and that list has been the weak link.
 
     :returns: None.
     """
     declared: dict[str, str] = {}
-    for module in (bridge_module, forwarder):
+    for module in _BRIDGE_DIR_PRODUCER_MODULES:
         for name, value in vars(module).items():
             if name.endswith("_FILE") and isinstance(value, str):
                 declared[value] = f"{module.__name__}.{name}"
     assert declared, "no bridge file constants found — has the naming changed?"
 
+    _assert_all_classified(declared)
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_classifies_every_file_a_live_session_writes(tmp_path: Path) -> None:
+    """
+    Whatever a real session leaves in the bridge dir is classified.
+
+    The by-name sweep depends on someone listing the producing module, and that
+    list has missed one three review rounds running — most recently the shared
+    dead-letter sink, which no naming convention tied to this module. This
+    grounds the same contract in the filesystem: drive the real producers, then
+    require every file they leave behind to be accounted for.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir, _transcript = _seed_idle_session(tmp_path)
+
+    # Every producer that writes into a bridge dir, driven for real.
+    claude_native_status._write_context_atomic(bridge_dir, {"context_window_size": 200000})
+    delta_payload = json.dumps(
+        {"hook_event_name": "MessageDisplay", "message_id": "m1", "final": True, "delta": "hi"}
+    )
+    with patch("sys.stdin", io.StringIO(delta_payload)):
+        claude_native_message_display_hook.main(["--bridge-dir", str(bridge_dir)])
+    native_post_delivery.append_dead_letter(
+        bridge_dir,
+        session_id="conv_dead",
+        event_type="external_conversation_item",
+        payload={"item": "x"},
+        reason="permanent_rejection",
+    )
+
+    # ...plus the forwarder's own cursors, written by an actual run.
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_files",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        await _get_recorded_item_request(server)
+        await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    on_disk = {
+        entry.name: "written by a live session"
+        for entry in bridge_dir.iterdir()
+        if entry.is_file() and not entry.name.startswith(".")
+    }
+    assert len(on_disk) > 5, f"session wrote too little to be a real check: {sorted(on_disk)}"
+
+    _assert_all_classified(on_disk)
+
+
+def _assert_all_classified(candidates: dict[str, str]) -> None:
+    """
+    Require every bridge-dir filename to be watched or declared forwarder-owned.
+
+    :param candidates: Filename mapped to where it came from, for the message.
+    :returns: None.
+    """
     watched = set(forwarder._WATCHED_BRIDGE_FILES)
     owned = set(forwarder._FORWARDER_OWNED_BRIDGE_FILES)
 
     unclassified = {
-        value: origin for value, origin in declared.items() if value not in watched | owned
+        name: origin for name, origin in candidates.items() if name not in watched | owned
     }
     assert not unclassified, (
-        f"bridge file(s) {sorted(unclassified)} "
-        f"(declared at {sorted(unclassified.values())}) are neither watched by "
-        "the poll loop's fingerprint nor declared forwarder-owned; add them to "
-        "_WATCHED_BRIDGE_FILES (an input) or _FORWARDER_OWNED_BRIDGE_FILES (our output)"
+        f"bridge file(s) {sorted(unclassified)} ({sorted(unclassified.values())}) are "
+        "neither watched by the poll loop's fingerprint nor declared "
+        "forwarder-owned; add them to _WATCHED_BRIDGE_FILES (an input the loop "
+        "reads) or _FORWARDER_OWNED_BRIDGE_FILES (written, never read back)"
     )
     # A file cannot be both: watching our own output re-opens the gate on work
     # we just did.

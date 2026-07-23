@@ -18,6 +18,8 @@ from typing import Any
 import httpx
 
 from omnigent._native_post_delivery import (
+    _DEAD_LETTER_BACKUP_FILE,
+    _DEAD_LETTER_FILE,
     append_dead_letter,
     post_external_session_status,
     post_may_have_been_delivered,
@@ -788,6 +790,10 @@ _FORWARDER_OWNED_BRIDGE_FILES = (
     _HOOK_STATE_FILE,
     _SUBAGENT_STATE_FILE,
     _DELTA_STATE_FILE,
+    # Write-only sink for permanently-undeliverable payloads, shared by every
+    # native forwarder. Nothing reads it back, so it must not move the gate.
+    _DEAD_LETTER_FILE,
+    _DEAD_LETTER_BACKUP_FILE,
 )
 
 # Sub-agent transcripts grow; their sibling ``agent-*.meta.json`` is read once
