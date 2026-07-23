@@ -305,22 +305,26 @@ So the inputs are now stat'ed by name, from `_WATCHED_BRIDGE_FILES`, with
 dead-letter sink — deliberately excluded.
 
 That trades the scan's self-maintaining property for an explicit contract,
-pinned two ways because the obvious way was not enough on its own:
+guarded by two tests that fail for different mistakes:
 
 - `test_fingerprint_classifies_every_declared_bridge_file` sweeps the `*_FILE`
-  constants of every module that writes into a bridge dir — the bridge, the
+  constants of the modules that write into a bridge dir — the bridge, the
   forwarder, the statusLine wrapper, the message-display hook, and the shared
-  post-delivery module.
+  post-delivery module. Blind to a producer nobody listed.
 - `test_fingerprint_classifies_every_file_a_live_session_writes` drives those
-  producers for real and requires every file left in the directory to be
-  classified.
+  producers and requires every file left in the directory to be classified.
+  Blind to a producer or branch the scenario does not reach.
 
-The second exists because the first depends on someone listing the producing
-module, and that list missed one three review rounds running — most recently
-the dead-letter sink, whose name is tied to no convention this module owns.
-Grounding the same contract in the filesystem does not depend on the list
-being right. Either way a new bridge file fails CI instead of going silently
-unwatched.
+**Neither is fail-closed, and together they are not either** — they are two
+partial nets over the same contract, and the residual is stated in §8. A
+genuinely closed version would need every producer to take its filenames from
+one registry, but nothing forces a producer to use a registry rather than a
+literal, so that buys discoverability rather than a guarantee — at the cost of
+threading a new dependency through five modules. Worth revisiting if the
+producer set grows; not worth it for the current five.
+
+The consequence of a miss is bounded: an unwatched input's changes surface on
+the `_IDLE_RESYNC_SECONDS` sweep instead of the next tick.
 
 Paths are pre-resolved once per session into `_BridgeInputPaths` and held as
 plain strings. This is not incidental: a by-name version that built
@@ -688,7 +692,13 @@ the real `wait` does.
    tick body is running stays pending rather than being destroyed, but it is
    serviced on the next sleep rather than immediately — up to 0.2 s late for
    the native watcher.
-10. **The grace is released by any agent-attributed pane change, not only the
+10. **The bridge-file classification contract is not fail-closed.** The
+    by-name sweep misses a producer nobody listed; the live-session test
+    misses a producer or branch its scenario does not reach (§3.3.1). An
+    unwatched *input* would have its changes surface on the 10 s resync rather
+    than the next tick — degraded, not wrong. An unwatched *output* is
+    harmless, which is what the current miss class has been.
+11. **The grace is released by any agent-attributed pane change, not only the
     awaited turn's output.** A status-bar repaint during turn setup ends the
     grace early, after which the ordinary idle threshold and backoff ramp
     apply — so detection falls back to the ceiling (≤2 s native) rather than
