@@ -1574,17 +1574,20 @@ async def _kill_orphan_runners(instance_dir: Path) -> bool:
             _save_reap_state(instance_dir, groups)
         return False
     for pgid in groups:
-        if pgid > 0 and _proc.group_has_live_members(pgid) is not False:
-            # Every recorded member is dead, yet the recorded group still
-            # has (or may have — an incomplete scan fails closed) LIVE
-            # occupants, e.g. a child forked after the snapshot. Zombies
-            # do not veto: their collection belongs to a foreign reaper.
-            # This tier cannot prove live occupants are ours; retain the
-            # dir and its state as evidence instead of deleting the only
-            # record.
+        if pgid <= 0:
+            continue
+        # This tier signals only recorded members, so no userspace scan
+        # can prove the group empty (a relay forks a replacement after
+        # each pid listing). The kernel's own group check is the only
+        # sound delete gate: retain the evidence unless killpg reports the
+        # group provably absent (ESRCH). A recorded member's zombie keeps
+        # the group present until a foreign reaper collects it — release
+        # then lags that collection, which is a bounded, dir-only cost.
+        present = _proc.group_kernel_present(pgid)
+        if present is not False:
             _logger.warning(
-                "group %d under %s has unverifiable occupant(s) after all "
-                "recorded members exited; keeping instance dir",
+                "group %d under %s still present after all recorded members "
+                "exited; keeping instance dir",
                 pgid,
                 instance_dir,
             )

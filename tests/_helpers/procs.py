@@ -30,32 +30,53 @@ def capture_identity(pid: int) -> str:
     return identity
 
 
-def alive(pid: int, identity: str) -> bool:
-    """Whether the recorded incarnation is still running (zombie = dead).
+def settled(pid: int, identity: str) -> bool:
+    """Whether the recorded incarnation is DEFINITIVELY dead.
+
+    Death is proven only by identity ``"gone"`` or by the same incarnation
+    (``"match"``) being an unreaped zombie. ``"unverifiable"`` (exists but
+    unreadable — a foreign/racing process) is NOT death: it keeps waiting.
 
     :param pid: The recorded pid.
     :param identity: Its captured identity.
-    :returns: ``True`` only for the same, non-zombie incarnation.
+    :returns: ``True`` only on positive proof of death.
     """
-    return _proc.process_identity_state(pid, identity) == "match" and not _proc.process_is_zombie(
-        pid
-    )
+    state = _proc.process_identity_state(pid, identity)
+    if state == "gone":
+        return True
+    if state == "match" and _proc.process_is_zombie(pid):
+        return True
+    return False
+
+
+def alive(pid: int, identity: str) -> bool:
+    """Whether the recorded incarnation is NOT yet definitively dead.
+
+    The inverse of :func:`settled`: an ``"unverifiable"`` process counts as
+    still-alive so waiters keep waiting rather than declaring a possibly
+    live process gone.
+
+    :param pid: The recorded pid.
+    :param identity: Its captured identity.
+    :returns: ``True`` until death is proven.
+    """
+    return not settled(pid, identity)
 
 
 def wait_gone(pid: int, identity: str, deadline_s: float = 10.0) -> bool:
-    """Poll until the recorded incarnation is dead (or the deadline hits).
+    """Poll until the recorded incarnation is provably dead.
 
     :param pid: The recorded pid.
     :param identity: Its captured identity.
     :param deadline_s: Wall-clock budget.
-    :returns: ``True`` when it died within the budget.
+    :returns: ``True`` only on proof of death within the budget.
     """
     deadline = time.monotonic() + deadline_s
     while time.monotonic() < deadline:
-        if not alive(pid, identity):
+        if settled(pid, identity):
             return True
         time.sleep(0.05)
-    return not alive(pid, identity)
+    return settled(pid, identity)
 
 
 def safe_kill(pid: int, identity: str) -> None:

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import contextlib
 import os
+import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -453,3 +455,87 @@ def test_cli_fallback_dirs_no_nvm_dir_is_safe(monkeypatch, tmp_path):
     monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
     dirs = _platform._cli_fallback_dirs()
     assert tmp_path / ".local" / "bin" in dirs
+
+
+@pytest.mark.skipif(_platform.IS_WINDOWS, reason="POSIX process groups")
+def test_group_kernel_present_tracks_real_group_lifecycle() -> None:
+    """killpg-0 reports present for a live group and ESRCH-absent once empty.
+
+    This is the relay-proof delete gate the fallback tiers rely on: the
+    kernel checks the whole group atomically, so no fork racing a
+    userspace scan can hide from it.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    pgid = os.getpgid(proc.pid)
+    try:
+        assert _proc.group_kernel_present(pgid) is True
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+    deadline = time.monotonic() + 5.0
+    while _proc.group_kernel_present(pgid) is not False and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert _proc.group_kernel_present(pgid) is False
+
+
+@pytest.mark.skipif(_platform.IS_WINDOWS, reason="POSIX process groups")
+def test_group_kernel_present_survives_a_fork_relay() -> None:
+    """A member forking a survivor keeps the group kernel-present.
+
+    The exact adversarial shape a fixed-count userspace scan could not
+    handle: repeated relays never make killpg-0 report the group absent
+    while any generation is live.
+    """
+    relay = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, subprocess, sys, time\n"
+                # Keep a survivor generation alive in the group.
+                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                "time.sleep(30)\n"
+            ),
+        ],
+        start_new_session=True,
+    )
+    pgid = os.getpgid(relay.pid)
+    try:
+        for _ in range(5):
+            assert _proc.group_kernel_present(pgid) is True
+            time.sleep(0.02)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGKILL)
+        relay.wait(timeout=10)
+
+
+def test_group_kernel_present_none_for_bad_pgid() -> None:
+    """A non-positive pgid is indeterminate, never a false absence."""
+    assert _proc.group_kernel_present(0) is None
+    assert _proc.group_kernel_present(-1) is None
+
+
+def test_settled_helper_treats_unverifiable_as_not_dead(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The test settled predicate never reports an unreadable process dead.
+
+    "unverifiable" (exists but its identity cannot be read — a foreign or
+    racing process) must keep waiters waiting, not falsely pass a
+    death-wait.
+    """
+    from tests._helpers import procs as test_procs
+
+    monkeypatch.setattr(test_procs._proc, "process_identity_state", lambda _p, _i: "unverifiable")
+    monkeypatch.setattr(test_procs._proc, "process_is_zombie", lambda _p: False)
+    assert test_procs.settled(123, "id") is False
+    assert test_procs.alive(123, "id") is True
+    assert test_procs.wait_gone(123, "id", deadline_s=0.05) is False
+
+    monkeypatch.setattr(test_procs._proc, "process_identity_state", lambda _p, _i: "gone")
+    assert test_procs.settled(123, "id") is True
+
+    monkeypatch.setattr(test_procs._proc, "process_identity_state", lambda _p, _i: "match")
+    monkeypatch.setattr(test_procs._proc, "process_is_zombie", lambda _p: True)
+    assert test_procs.settled(123, "id") is True

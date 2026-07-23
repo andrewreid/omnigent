@@ -24,7 +24,6 @@ import logging
 import os
 import signal
 import subprocess
-import time
 from contextlib import suppress
 from typing import Protocol
 
@@ -303,8 +302,31 @@ def process_is_zombie(pid: int) -> bool:
         return False
 
 
-def _scan_group_live(pgid: int) -> bool | None:
-    """One pass of :func:`group_has_live_members` (see its contract)."""
+def group_has_live_members(pgid: int) -> bool | None:
+    """
+    Whether process group *pgid* has any live (non-zombie) members.
+
+    Single /proc pass. Zombies are ignored (their collection belongs to a
+    foreign reaper). Fail-closed: an unenumerable pid table or an
+    unreadable confirmed member yields ``None``.
+
+    IMPORTANT — soundness scope. This scan CANNOT prove a group empty on
+    its own: a member can fork a survivor after the pid listing and exit,
+    hiding the survivor. It is therefore safe ONLY where the caller is
+    actively ``SIGKILL``-ing the whole group before it scans — a process
+    with a pending ``SIGKILL`` cannot return to userspace to fork again,
+    so no new generation can appear after the kill and the scan can only
+    err toward "still live" (retain), never toward a false "empty". For a
+    release decision WITHOUT such a kill (the fallback tiers, which signal
+    only recorded members), use :func:`group_kernel_present` instead — the
+    kernel's own group check, which no fork relay can outrun.
+
+    :param pgid: The process group to probe.
+    :returns: ``True`` when a live member exists, ``False`` for a complete
+        scan that found none, ``None`` when indeterminate.
+    """
+    if pgid <= 0 or _getpgid_fn is None:
+        return None
     try:
         pids = psutil.pids()
     except (psutil.Error, OSError):
@@ -328,30 +350,34 @@ def _scan_group_live(pgid: int) -> bool | None:
     return False
 
 
-def group_has_live_members(pgid: int) -> bool | None:
+def group_kernel_present(pgid: int) -> bool | None:
     """
-    Whether process group *pgid* has any live (non-zombie) members.
+    Whether the kernel reports process group *pgid* as having any members.
 
-    Zombies are ignored: they hold no resources and their collection
-    belongs to a foreign reaper on its own schedule. Fail-closed on
-    incomplete scans, and "no live members" requires TWO consecutive
-    complete empty scans: a member can fork a survivor after one pid
-    listing and then exit, hiding the survivor from that single pass —
-    but any survivor chain alive across the first pass must appear in
-    the second listing, so escaping both requires lifetimes shorter than
-    a /proc readdir.
+    ``killpg(pgid, 0)`` is atomic and authoritative: the kernel checks the
+    whole group, so no fork-relay racing a userspace scan can hide from
+    it. ``ESRCH`` means the group is provably empty of ALL members (live
+    and zombie) — the only sound basis for deleting a tier's evidence when
+    that tier cannot itself kill unrecorded group members. A zombie keeps
+    the group present until a foreign reaper collects it, so release lags
+    that collection (bounded, and it is only on-disk evidence).
 
     :param pgid: The process group to probe.
-    :returns: ``True`` when a live member exists, ``False`` only when two
-        consecutive complete scans found none, ``None`` if indeterminate.
+    :returns: ``False`` when provably empty (``ESRCH``), ``True`` when a
+        member exists (including a foreign-owned ``EPERM`` one), ``None``
+        when indeterminate.
     """
-    if pgid <= 0 or _getpgid_fn is None:
+    if pgid <= 0 or _killpg_fn is None:
         return None
-    first = _scan_group_live(pgid)
-    if first is not False:
-        return first
-    time.sleep(0.02)
-    return _scan_group_live(pgid)
+    try:
+        _killpg_fn(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
 
 
 def kill_verified(pid: int, identity: str, sig: int) -> bool:
