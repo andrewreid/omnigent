@@ -284,6 +284,24 @@ def group_member_identities(pgid: int) -> dict[int, str] | None:
     return members or None
 
 
+def process_is_zombie(pid: int) -> bool:
+    """
+    Whether *pid* is an unreaped zombie — dead for reaping purposes.
+
+    A zombie's metadata stays readable on Linux, so identity probes report
+    ``"match"``; callers deciding "is there anything left to wait for"
+    must pair the identity check with this one. A zombie holds no
+    sockets, memory, or CPU — only an exit status awaiting collection.
+
+    :param pid: The pid to probe.
+    :returns: ``True`` for an unreaped zombie.
+    """
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except (psutil.Error, OSError):
+        return False
+
+
 def group_populated(pgid: int) -> bool | None:
     """
     Whether process group *pgid* currently has any members.

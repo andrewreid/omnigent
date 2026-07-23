@@ -37,6 +37,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.inner import _proc
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses.process_manager import (
     _AP_PID_FILE,
@@ -1103,7 +1104,9 @@ async def test_runner_subprocess_exits_when_spawning_parent_exits(
             await mgr.start()
             client = await mgr.get_client('conv_parent_death', {_TEST_HARNESS_NAME!r})
             pid = (await client.get('/pid')).json()['pid']
+            from omnigent.inner import _proc
             print(pid, flush=True)
+            print(_proc.process_start_identity(pid), flush=True)
             os._exit(0)
 
         asyncio.run(main())
@@ -1117,16 +1120,31 @@ async def test_runner_subprocess_exits_when_spawning_parent_exits(
         timeout=30,
         env={**os.environ, "PYTHONPATH": os.getcwd()},
     )
-    runner_pid = int(proc.stdout.strip().splitlines()[-1])
+    runner_pid_line, runner_identity = proc.stdout.strip().splitlines()[-2:]
+    runner_pid = int(runner_pid_line)
+
+    def _runner_exited() -> bool:
+        """Identity-based death probe: load-proof and pid-reuse-proof.
+
+        Raw ``_pid_alive`` polling failed two ways on a busy shared box:
+        the runner's pid could be recycled mid-window (the probe then
+        watches a stranger forever — and cleanup would SIGKILL it), and
+        an unreaped zombie parked with a lagging foreign reaper still
+        reads as alive.
+        """
+        state = _proc.process_identity_state(runner_pid, runner_identity)
+        return state == "gone" or _proc.process_is_zombie(runner_pid)
 
     try:
-        for _ in range(60):
-            if not _pid_alive(runner_pid):
-                break
+        # Deadline sized for a loaded machine: watchdog tick (1s) plus a
+        # full graceful uvicorn shutdown can far exceed the old 6s budget.
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline and not _runner_exited():
             await asyncio.sleep(0.1)
-        assert not _pid_alive(runner_pid)
+        assert _runner_exited(), "runner outlived its spawning parent"
     finally:
-        if _pid_alive(runner_pid):
+        if _proc.process_identity_state(runner_pid, runner_identity) == "match":
+            # Only ever signal the incarnation we spawned.
             with contextlib.suppress(ProcessLookupError):
                 os.kill(runner_pid, signal.SIGKILL)
 

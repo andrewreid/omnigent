@@ -1782,15 +1782,21 @@ def _save_reap_state(instance_dir: Path, groups: dict[int, dict[int, str]]) -> b
 
 def _reap_state_settled(groups: dict[int, dict[int, str]]) -> bool:
     """
-    Whether every recorded member is definitively gone and every owned
-    group verifiably empty.
+    Whether every recorded member is definitively dead.
+
+    An unreaped zombie counts as settled: its identity still reads as
+    ``"match"`` on Linux, but it holds no resources — only an exit status
+    whose collection belongs to a FOREIGN reaper (init, or a subreaper
+    host) on its own schedule. Gating on ``"gone"`` alone made dir
+    release wait on that schedule and time out under load.
 
     :param groups: Current ``pgid -> {pid: identity}`` tracking.
-    :returns: ``True`` only on positive verification of absence.
+    :returns: ``True`` only on positive verification of death.
     """
     for members in groups.values():
         for pid, identity in members.items():
-            if _proc.process_identity_state(pid, identity) != "gone":
+            state = _proc.process_identity_state(pid, identity)
+            if state != "gone" and not _proc.process_is_zombie(pid):
                 return False
     return True
 
