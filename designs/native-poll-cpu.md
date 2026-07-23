@@ -323,8 +323,10 @@ literal, so that buys discoverability rather than a guarantee — at the cost of
 threading a new dependency through five modules. Worth revisiting if the
 producer set grows; not worth it for the current five.
 
-The consequence of a miss is bounded: an unwatched input's changes surface on
-the `_IDLE_RESYNC_SECONDS` sweep instead of the next tick.
+A miss costs bounded staleness rather than permanent loss: an unwatched
+input's changes surface on the `_IDLE_RESYNC_SECONDS` sweep instead of the
+next tick. That is eventual observation, not correctness during the gap — see
+residual risk 10.
 
 Paths are pre-resolved once per session into `_BridgeInputPaths` and held as
 plain strings. This is not incidental: a by-name version that built
@@ -696,8 +698,12 @@ the real `wait` does.
     by-name sweep misses a producer nobody listed; the live-session test
     misses a producer or branch its scenario does not reach (§3.3.1). An
     unwatched *input* would have its changes surface on the 10 s resync rather
-    than the next tick — degraded, not wrong. An unwatched *output* is
-    harmless, which is what the current miss class has been.
+    than the next tick: bounded staleness, not permanent loss. Whether that
+    staleness is merely late or actually wrong depends on what the input means
+    — the resync guarantees eventual observation, not correctness during the
+    gap, so a future input carrying something time-critical would need
+    watching, not just resyncing. An unwatched *output* is harmless, which is
+    what every miss so far has been.
 11. **The grace is released by any agent-attributed pane change, not only the
     awaited turn's output.** A status-bar repaint during turn setup ends the
     grace early, after which the ordinary idle threshold and backoff ramp

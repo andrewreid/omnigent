@@ -782,16 +782,17 @@ _WATCHED_BRIDGE_FILES = (
     MESSAGE_DELTAS_FILE,
 )
 
-# Bridge files this module writes. Deliberately unwatched — they change only
-# because the loop just did work, so watching them would re-open the gate on
-# the forwarder's own output.
+# Bridge files this module writes and the steady-state poll loop never reads.
+# The cursors are read once at startup to resume, but nothing re-reads them
+# per tick — so within the loop they change only because it just did work, and
+# watching them would re-open the gate on the forwarder's own output.
 _FORWARDER_OWNED_BRIDGE_FILES = (
     _FORWARDER_STATE_FILE,
     _HOOK_STATE_FILE,
     _SUBAGENT_STATE_FILE,
     _DELTA_STATE_FILE,
-    # Write-only sink for permanently-undeliverable payloads, shared by every
-    # native forwarder. Nothing reads it back, so it must not move the gate.
+    # Sink for permanently-undeliverable payloads, shared by every native
+    # forwarder. Written for operators to inspect, not consumed by the loop.
     _DEAD_LETTER_FILE,
     _DEAD_LETTER_BACKUP_FILE,
 )
