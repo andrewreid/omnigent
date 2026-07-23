@@ -890,8 +890,8 @@ class _BridgeInputPaths:
         even when the size and timestamp would look unchanged. Append-only
         files (hook events, message deltas, transcripts) always grow their
         size. Between them, no writer can mutate a *watched* input invisibly;
-        an input missing from the watch list is a different failure, caught by
-        the classification tests and bounded by the resync.
+        an input missing from the watch list is a different failure, guarded
+        against by the classification tests and bounded by the resync.
 
         :returns: Fingerprint of the watched inputs.
         """
