@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+import omnigent.claude_native_bridge as bridge_module
 import omnigent.claude_native_forwarder as forwarder
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -7336,6 +7337,98 @@ async def test_forwarder_gate_can_be_disabled_by_env(
         thread.join(timeout=5.0)
 
 
+def _subagents_dir(transcript: Path) -> Path:
+    """
+    Resolve a transcript's ``subagents/`` directory.
+
+    :param transcript: Parent transcript JSONL.
+    :returns: The sibling ``<stem>/subagents`` directory.
+    """
+    return transcript.parent / transcript.stem / "subagents"
+
+
+def _seed_transcript_with_subagents_dir(tmp_path: Path, *, stem: str = "session") -> Path:
+    """
+    Create a transcript plus the empty ``subagents/`` directory beside it.
+
+    :param tmp_path: Per-test temp directory.
+    :param stem: Transcript filename stem, so a test can model a rotation.
+    :returns: The transcript path.
+    """
+    transcript = tmp_path / f"{stem}.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    _subagents_dir(transcript).mkdir(parents=True, exist_ok=True)
+    return transcript
+
+
+def _fingerprint_for(bridge_dir: Path, transcript: Path | None = None):
+    """
+    Build a fingerprint helper pointed at *bridge_dir*.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param transcript: Transcript to watch, or ``None``.
+    :returns: A primed :class:`_BridgeInputPaths`.
+    """
+    paths = forwarder._BridgeInputPaths(bridge_dir)
+    paths.set_transcript(transcript)
+    return paths
+
+
+def test_fingerprint_classifies_every_bridge_file() -> None:
+    """
+    Every bridge file is either watched for changes or explicitly ours.
+
+    The fingerprint stats a fixed list of names rather than scanning the
+    directory, which is ~2x cheaper but stops being self-maintaining: a bridge
+    file added later would go unwatched, and its changes would only surface on
+    the periodic resync. This pins the classification so adding one without
+    deciding which side it falls on fails here instead of in production.
+
+    :returns: None.
+    """
+    declared = {
+        value
+        for name, value in vars(bridge_module).items()
+        if name.endswith("_FILE") and isinstance(value, str)
+    }
+    assert declared, "no bridge file constants found — has the naming changed?"
+
+    watched = set(forwarder._WATCHED_BRIDGE_FILES)
+    owned = set(forwarder._FORWARDER_OWNED_BRIDGE_FILES)
+
+    unclassified = declared - watched - owned
+    assert not unclassified, (
+        f"bridge file(s) {sorted(unclassified)} are neither watched by the poll "
+        "loop's fingerprint nor declared forwarder-owned; add them to "
+        "_WATCHED_BRIDGE_FILES (an input) or _FORWARDER_OWNED_BRIDGE_FILES (our output)"
+    )
+    # A file cannot be both: watching our own output re-opens the gate on work
+    # we just did.
+    assert not (watched & owned)
+
+
+def test_fingerprint_does_not_watch_the_forwarders_own_cursors(tmp_path: Path) -> None:
+    """
+    Writing a forwarder cursor does not move the fingerprint.
+
+    The cursors live in the bridge dir and change whenever the loop advances.
+    Counting them would re-open the gate on the forwarder's own output and buy
+    an extra full tick after every batch.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    paths = _fingerprint_for(bridge_dir)
+    before = paths.fingerprint()
+
+    for name in forwarder._FORWARDER_OWNED_BRIDGE_FILES:
+        (bridge_dir / name).write_text('{"byte_offset": 1}', encoding="utf-8")
+
+    assert paths.fingerprint() == before
+
+
 def test_bridge_input_fingerprint_sees_an_in_place_same_size_rewrite(tmp_path: Path) -> None:
     """
     A rewrite that keeps the byte count still changes the fingerprint.
@@ -7351,14 +7444,15 @@ def test_bridge_input_fingerprint_sees_an_in_place_same_size_rewrite(tmp_path: P
     bridge_dir.mkdir()
     state = bridge_dir / "state.json"
     state.write_text('{"a":1}', encoding="utf-8")
-    before = forwarder._bridge_input_fingerprint(bridge_dir, None, None)
+    paths = _fingerprint_for(bridge_dir)
+    before = paths.fingerprint()
 
     # Same length, different content, written the way the bridge writes it.
     replacement = bridge_dir / "state.json.new"
     replacement.write_text('{"a":2}', encoding="utf-8")
     os.replace(replacement, state)
 
-    assert forwarder._bridge_input_fingerprint(bridge_dir, None, None) != before
+    assert paths.fingerprint() != before
 
 
 def test_bridge_input_fingerprint_ignores_atomic_write_scratch_files(tmp_path: Path) -> None:
@@ -7375,11 +7469,123 @@ def test_bridge_input_fingerprint_ignores_atomic_write_scratch_files(tmp_path: P
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     (bridge_dir / "state.json").write_text("{}", encoding="utf-8")
-    before = forwarder._bridge_input_fingerprint(bridge_dir, None, None)
+    paths = _fingerprint_for(bridge_dir)
+    before = paths.fingerprint()
 
     (bridge_dir / ".state.json.abc123.tmp").write_text("{}", encoding="utf-8")
 
-    assert forwarder._bridge_input_fingerprint(bridge_dir, None, None) == before
+    assert paths.fingerprint() == before
+
+
+def test_bridge_input_fingerprint_sees_a_new_subagent_before_its_transcript(
+    tmp_path: Path,
+) -> None:
+    """
+    A sub-agent's meta file moves the fingerprint even though it is not stat'ed.
+
+    Only ``agent-*.jsonl`` is stat'ed — every sub-agent ever spawned stays on
+    disk, so stat'ing the write-once meta files too would inflate the per-tick
+    syscalls at high fan-out. Their *arrival* must still open the gate: Claude
+    can write the meta before the transcript, and that meta is what registers
+    the sub-agent. The directory's own stat is what carries it.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = _seed_transcript_with_subagents_dir(tmp_path)
+    paths = _fingerprint_for(bridge_dir, transcript)
+    before = paths.fingerprint()
+
+    (_subagents_dir(transcript) / "agent-1.meta.json").write_text(
+        '{"agent_id": "1"}', encoding="utf-8"
+    )
+
+    assert paths.fingerprint() != before
+
+
+def test_bridge_input_fingerprint_sees_subagent_transcript_growth(tmp_path: Path) -> None:
+    """
+    Appends to a sub-agent transcript still move the fingerprint.
+
+    Membership is cached between directory-mtime changes, and an append moves
+    neither the directory mtime nor the member list — so this is the case a
+    membership-only check would miss.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = _seed_transcript_with_subagents_dir(tmp_path)
+    child = _subagents_dir(transcript) / "agent-1.jsonl"
+    child.write_text("{}\n", encoding="utf-8")
+    paths = _fingerprint_for(bridge_dir, transcript)
+    before = paths.fingerprint()
+
+    with child.open("a", encoding="utf-8") as handle:
+        handle.write("{}\n")
+
+    assert paths.fingerprint() != before
+
+
+def test_bridge_input_fingerprint_picks_up_a_subagent_added_after_priming(
+    tmp_path: Path,
+) -> None:
+    """
+    A sub-agent appearing mid-session is watched from then on.
+
+    Membership is only re-listed when the directory's mtime moves, so a
+    sub-agent spawned after the cache was primed has to both move the
+    fingerprint on arrival *and* get added to the stat set — otherwise its
+    output would be invisible until the periodic resync.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = _seed_transcript_with_subagents_dir(tmp_path)
+    paths = _fingerprint_for(bridge_dir, transcript)
+    paths.fingerprint()
+
+    child = _subagents_dir(transcript) / "agent-late.jsonl"
+    child.write_text("{}\n", encoding="utf-8")
+    after_arrival = paths.fingerprint()
+    assert "subagent/agent-late.jsonl" in after_arrival
+
+    with child.open("a", encoding="utf-8") as handle:
+        handle.write("{}\n")
+
+    assert paths.fingerprint() != after_arrival
+
+
+def test_bridge_input_fingerprint_drops_subagents_after_a_rotation(tmp_path: Path) -> None:
+    """
+    A /clear or /fork rotation retargets the fingerprint at the new session.
+
+    The rotated session resolves a different ``subagents/`` directory, so the
+    cached membership belongs to the old one and must not keep being stat'ed.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    first = _seed_transcript_with_subagents_dir(tmp_path, stem="first")
+    (_subagents_dir(first) / "agent-1.jsonl").write_text("{}\n", encoding="utf-8")
+    paths = _fingerprint_for(bridge_dir, first)
+    assert "subagent/agent-1.jsonl" in paths.fingerprint()
+
+    second = _seed_transcript_with_subagents_dir(tmp_path, stem="second")
+    paths.set_transcript(second)
+
+    # Dropped eagerly, not merely on the next listing refresh: the refresh is
+    # keyed on the directory's stat, so leaving the old entries in place would
+    # rely on the new directory never presenting the same key.
+    assert paths._subagent_targets == ()
+    assert "subagent/agent-1.jsonl" not in paths.fingerprint()
 
 
 def test_forwarder_tick_is_needed_while_a_retry_is_outstanding() -> None:
@@ -7459,50 +7665,3 @@ def test_forwarder_tick_is_needed_on_the_periodic_resync() -> None:
         retry_trackers=(),
         dedupe=forwarder._ForwardDedupeState(),
     )
-
-
-def test_bridge_input_fingerprint_sees_a_new_subagent_before_its_transcript(
-    tmp_path: Path,
-) -> None:
-    """
-    A sub-agent's meta file moves the fingerprint even though it is not stat'ed.
-
-    Only ``agent-*.jsonl`` is stat'ed — every sub-agent ever spawned stays on
-    disk, so stat'ing the write-once meta files too would double the per-tick
-    syscalls at high fan-out. Their *arrival* must still open the gate: Claude
-    can write the meta before the transcript, and that meta is what registers
-    the sub-agent.
-
-    :param tmp_path: Per-test temp directory.
-    :returns: None.
-    """
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    subagents = tmp_path / "subagents"
-    subagents.mkdir()
-    before = forwarder._bridge_input_fingerprint(bridge_dir, None, subagents)
-
-    (subagents / "agent-1.meta.json").write_text('{"agent_id": "1"}', encoding="utf-8")
-
-    assert forwarder._bridge_input_fingerprint(bridge_dir, None, subagents) != before
-
-
-def test_bridge_input_fingerprint_sees_subagent_transcript_growth(tmp_path: Path) -> None:
-    """
-    Appends to a sub-agent transcript still move the fingerprint.
-
-    :param tmp_path: Per-test temp directory.
-    :returns: None.
-    """
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    subagents = tmp_path / "subagents"
-    subagents.mkdir()
-    transcript = subagents / "agent-1.jsonl"
-    transcript.write_text("{}\n", encoding="utf-8")
-    before = forwarder._bridge_input_fingerprint(bridge_dir, None, subagents)
-
-    with transcript.open("a", encoding="utf-8") as handle:
-        handle.write("{}\n")
-
-    assert forwarder._bridge_input_fingerprint(bridge_dir, None, subagents) != before
