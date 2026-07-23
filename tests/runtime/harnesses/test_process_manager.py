@@ -1283,14 +1283,24 @@ async def test_orphan_sweep_kills_whole_detached_harness_tree(
         # Reap the leader promptly so the sweep's death verification can
         # observe it gone (it is this test's Popen child).
         await asyncio.to_thread(leader.wait, 10)
-        swept = await sweep_task
+        await sweep_task
 
-        assert swept == 1
-        assert not instance_dir.exists()
-        # Identity-based, zombie-tolerant: under a subreaper the killed
-        # child's corpse may await a foreign reaper, and its raw pid can
-        # be recycled on a busy host.
+        # The kill landed: the child is dead or a not-yet-collected zombie.
         assert test_procs.wait_gone(child_pid, child_ident), "harness child survived the sweep"
+
+        # Dir release is gated on the kernel reporting the group absent
+        # (relay-proof), so it lags a foreign reaper collecting the child's
+        # zombie. Act as that reaper (under a PR_SET_CHILD_SUBREAPER pytest
+        # the child reparents to us; under an init container init collects
+        # it) and re-sweep until the evidence is released.
+        deadline = time.monotonic() + 10.0
+        while instance_dir.exists() and time.monotonic() < deadline:
+            with contextlib.suppress(ChildProcessError):
+                while os.waitpid(-1, os.WNOHANG)[0]:
+                    pass
+            await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+            await asyncio.sleep(0.05)
+        assert not instance_dir.exists(), "dir not released after the group went absent"
     finally:
         if child_pid is not None and child_ident is not None:
             test_procs.safe_kill(child_pid, child_ident)
@@ -1540,7 +1550,10 @@ async def test_orphan_sweep_retains_dir_while_recorded_group_still_occupied(
     from omnigent.runtime.harnesses import process_manager as pm_mod
 
     monkeypatch.setattr(pm_mod, "_ORPHAN_SIGTERM_GRACE_S", 0.0)
-    monkeypatch.setattr(pm_mod._proc, "group_has_live_members", lambda _pgid: True)
+    # The recorded member is gone; the group's fate is decided by the
+    # kernel presence check, not a userspace scan (relay-proof).
+    present = {"value": True}
+    monkeypatch.setattr(pm_mod._proc, "group_kernel_present", lambda _pgid: present["value"])
 
     dead = short_tmp_parent / "ap-dead"
     dead.mkdir(mode=0o700)
@@ -1549,11 +1562,17 @@ async def test_orphan_sweep_retains_dir_while_recorded_group_still_occupied(
         json_mod.dumps({"54321": {"99999998": "gone-identity"}}), encoding="utf-8"
     )
 
+    # Group still present (a fork the tier cannot attribute): retain+log.
     swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
-
     assert swept == 0
-    assert dead.exists(), "occupied recorded group must keep its evidence"
+    assert dead.exists(), "present group must keep its evidence"
     assert (dead / pm_mod._REAP_STATE_FILE).exists()
+
+    # Group provably absent (ESRCH): the evidence is finally released.
+    present["value"] = False
+    swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
+    assert swept == 1
+    assert not dead.exists()
 
 
 async def test_orphan_sweep_treats_malformed_state_as_indeterminate(

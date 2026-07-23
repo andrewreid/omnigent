@@ -1119,8 +1119,9 @@ class HostProcess:
         ids = _pid_stat_ids(pid)
         if ids is None or ids[0] != pid:
             return False
-        # Release-deciding emptiness must survive fork-after-snapshot:
-        # only the double-scanned probe may skip the deferral.
+        # A conservative live-scan: it may only err toward "live"
+        # (defer), never toward a false "empty", so a fork racing it just
+        # defers the pin — the drive loop then settles the group.
         if _proc.group_has_live_members(pid) is False:
             return False
         identity = _proc.process_start_identity(pid)
@@ -1476,10 +1477,14 @@ class HostProcess:
                 if now - pin.termed_at >= grace:
                     self._signal_pinned(pid, pin, kill_sig)
                 return True
-            # Group provably empty: final atomic kill closes the fork
-            # race, then the deciding rescan — double-scanned, so a
-            # survivor forked around one pid listing cannot hide —
-            # confirms before release.
+            # This is the ONE release gate that may soundly use a
+            # userspace scan: the group was just SIGKILLed, and a process
+            # with a pending SIGKILL cannot return to userspace to fork
+            # again, so no new generation can appear after the kill. The
+            # scan can therefore only err toward "still live" (another
+            # pass), never toward a false "empty" release. The pinned
+            # leader keeps the pgid stable across passes, so killpg's ESRCH
+            # can't be used here (the pin itself keeps the group present).
             self._signal_pinned(pid, pin, kill_sig)
             if _proc.group_has_live_members(pid) is not False:
                 return True

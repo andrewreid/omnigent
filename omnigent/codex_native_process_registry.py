@@ -365,13 +365,13 @@ def _escalate_sigkill(
         # A member that exists but cannot be identified might still be
         # ours; keep the entry rather than declaring the group gone.
         return "retry", entry
-    if _proc.group_has_live_members(entry.pgid) is not False:
-        # Every recorded member is verifiably gone, yet the group still
-        # has (or may have — an incomplete scan fails closed) LIVE
-        # occupants, e.g. children forked after the snapshot; zombies do
-        # not veto. This tier cannot prove live occupants are ours, so it
-        # retains the entry and logs instead of leaking silently; a
-        # subreaper host drains such groups through its adopted reaper.
+    if _proc.group_kernel_present(entry.pgid) is not False:
+        # This tier signals only recorded members, so no userspace scan
+        # can prove the group empty against a fork relay. The kernel group
+        # check (killpg ESRCH) is the only sound basis for dropping the
+        # entry; until then retain and log. A recorded member's zombie
+        # keeps the group present until a foreign reaper collects it; a
+        # subreaper host drains live survivors through its adopted reaper.
         _logger.warning(
             "codex-native group %d has unverifiable occupant(s) after all "
             "recorded members exited; retaining its entry",

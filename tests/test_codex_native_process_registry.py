@@ -375,6 +375,7 @@ def test_escalation_kills_surviving_child_after_leader_exits(tmp_path: Path, mon
     try:
         assert leader.stdout is not None
         child_pid = int(leader.stdout.readline().strip())
+        child_ident = test_procs.capture_identity(child_pid)
         registry.register_codex_native_process(
             pid=leader.pid,
             pgid=leader.pid,
@@ -389,7 +390,6 @@ def test_escalation_kills_surviving_child_after_leader_exits(tmp_path: Path, mon
         deadline = time_mod.monotonic() + 5.0
         while registry._pid_alive(leader.pid) and time_mod.monotonic() < deadline:
             time_mod.sleep(0.05)
-        child_ident = test_procs.capture_identity(child_pid)
         assert test_procs.alive(child_pid, child_ident), "child should have ignored the SIGTERM"
 
         # Pass 2 after grace: leader gone, but the snapshotted child's
@@ -540,6 +540,7 @@ def test_fallback_tier_never_chases_children_it_did_not_record(
 
         assert registry.reconcile_codex_native_process_registry(registry_path=path) == 1
         child_pid = int(leader.stdout.readline().strip())
+        child_ident = test_procs.capture_identity(child_pid)
         assert leader.wait(timeout=10) is not None
 
         monkeypatch.setattr(registry, "_SIGKILL_GRACE_S", 0.0)
@@ -551,7 +552,6 @@ def test_fallback_tier_never_chases_children_it_did_not_record(
         # tier cannot prove ownership of, so the entry is RETAINED and
         # the child is deliberately NOT chased.
         assert len(_registry_payload(path)) == 1
-        child_ident = test_procs.capture_identity(child_pid)
         assert test_procs.alive(child_pid, child_ident), (
             "fallback must not guess at unrecorded pids"
         )
