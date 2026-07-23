@@ -116,7 +116,7 @@ Strategy D's three parts multiply: `8 execve/tick → 1 execve/tick`, then
 | **A. Interval backoff (0.25 → 1 → 5 s)** | Rejected as the primary fix. It buys idle CPU by directly spending streaming latency — the one budget that cannot move. |
 | **B. Tear the forwarder down on `Stop`** | Rejected. `Stop` is not terminal: the user resumes the same session in the same pane, and the tail must be live when they do. This is the issue's own open question; the chosen fix makes it moot (a stopped harness writes nothing, so it costs nothing) without gambling on lifecycle semantics. It also stays clear of #1349's reaping decision. |
 | **C. Memoise the individual file reads** | Partial. Kills the `_read_json_file` / `pathlib` share but leaves the ~17 `to_thread` dispatches and the ~10 scans. |
-| **D. Gate the whole tick body behind a cheap change-detector** | **Chosen.** Keep ticking at 0.25 s — *zero* added latency — but make a no-change tick cost one `scandir` + a handful of `stat`s instead of the full body. |
+| **D. Gate the whole tick body behind a cheap change-detector** | **Chosen.** Keep ticking at 0.25 s — *zero* added latency — but make a no-change tick cost a handful of `stat`s instead of the full body. |
 
 ## 3. Chosen design
 
@@ -254,9 +254,13 @@ just oscillate (each backed-off sample sees a different spinner frame → reset)
 Per tick, before the body:
 
 ```
-fingerprint = scandir(bridge_dir) + stat(transcript) + scandir(subagents_dir)
+fingerprint = stat(each _WATCHED_BRIDGE_FILES) + stat(transcript)
+            + stat(subagents_dir) + stat(each cached agent-*.jsonl)
               → {name: (st_mtime_ns, st_size, st_ino)}
 ```
+
+Targets are pre-resolved once per session and the sub-agent listing is cached;
+see §3.3.1 for why, and for what the first version got wrong.
 
 `st_ino` is what makes this airtight: `_write_json_file` writes a temp file and
 `os.replace`s it, so every state write lands a **new inode**. Append-only files
@@ -414,11 +418,11 @@ cheaper; the fingerprint itself is ~2x cheaper (28.7 → 14.1 µs at fan-out 0,
 
 Forwarder CPU stays **proportional to accumulated fan-out**: every sub-agent
 transcript a session has ever produced stays on disk and is stat'ed on every
-tick. Only the sibling `agent-*.meta.json` files are exempt — they are read
-once at discovery and never re-read, so the fingerprint records their names
-without stat'ing them, which halves the per-tick syscalls. The
-`_UNSTATTED_ENTRY` placeholder keeps a new sub-agent's arrival visible even
-when its meta file lands before its transcript.
+tick. The sibling `agent-*.meta.json` files are exempt — read once at
+discovery, never re-read — and the directory is re-listed only when its own
+mtime moves, so the per-tick cost is one stat per transcript plus one for the
+directory. That directory stat is in the fingerprint, which is what keeps a
+new sub-agent's arrival visible even when its meta file lands first.
 
 The remaining proportionality is inherent to a change-detector that must
 notice growth in any of those files, and the shape is unchanged from before —
