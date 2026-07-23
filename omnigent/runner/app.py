@@ -7120,6 +7120,10 @@ class _SessionSnapshot:
         ``"cursor-native-ui"``. Used as the sub-agent label when rebuilding a
         work entry for a child the server did not record a ``sub_agent_name``
         for. ``None`` when unbound / the fetch failed.
+    :param model_override: Persisted per-session ``/model`` override, e.g.
+        ``"anthropic/claude-opus-4"``. Projected so ``create_session`` can seed
+        the initial spawn with the override model and avoid a first-turn
+        respawn. ``None`` when unset / the fetch failed.
     """
 
     ok: bool
@@ -7130,6 +7134,7 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     agent_name: str | None = None
+    model_override: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -8566,6 +8571,10 @@ def create_runner_app(
     app.state.desync_terminalized = _desync_terminalized
     # Exposed below (after definition) on app.state for tests that drive the
     # desync recovery entry directly: app.state.resync_turn_state.
+    # Per-conversation origin of a pending interrupt (``"user"`` / ``"system"``),
+    # set when the cancel is registered and popped at cancellation-marker time
+    # to choose between the user-abandonment and neutral system markers.
+    _cancel_origin: dict[str, str] = {}
     _background_tasks: set[asyncio.Task[Any]] = set()
     # Parent sessions with an outstanding sub-agent wake POST. Debounces a
     # fan-out's completions: while a parent's wake is outstanding, further
@@ -9146,6 +9155,7 @@ def create_runner_app(
             sub_agent_name: str | None = None
             parent_session_id: str | None = None
             agent_name: str | None = None
+            model_override: str | None = None
             try:
                 resp = await server_client.get(f"/v1/sessions/{session_id}")
                 status_code = resp.status_code
@@ -9177,6 +9187,12 @@ def create_runner_app(
                     raw_agent_name = body.get("agent_name")
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
+                    # Persisted /model override, so create_session can seed the
+                    # initial spawn with the override model and skip a wasteful
+                    # first-turn respawn.
+                    raw_model_override = body.get("model_override")
+                    if isinstance(raw_model_override, str) and raw_model_override:
+                        model_override = raw_model_override
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -9188,6 +9204,7 @@ def create_runner_app(
                 sub_agent_name=sub_agent_name,
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
+                model_override=model_override,
             )
             # Cache only a complete snapshot. A 200 with agent_id still
             # null means the agent has not bound yet; caching it would
@@ -9757,11 +9774,19 @@ def create_runner_app(
                 if _start_verdict.data is not None:
                     _apply_sandbox_override_from_verdict(spec, _start_verdict.data)
 
+            # Seed the initial spawn with the persisted /model override so the
+            # first turn does not force a wasteful respawn (the child spawns
+            # with the override model directly). Shares the cached snapshot the
+            # _session_runtime_cwd call above already fetched — no extra
+            # round-trip. Native harnesses no-op (env is None; guard in
+            # _build_spawn_env_from_spec).
+            _snap = await _session_snapshot(session_id)
             spawn_env = _build_spawn_env_from_spec(
                 spec,
                 harness_name,
                 workdir=_resolved_spec_workdir(spec_entry),
                 cwd=await _session_runtime_cwd(session_id),
+                model_override=_snap.model_override,
             )
             if harness_name == "claude-native" and spawn_env is None:
                 from omnigent.claude_native_bridge import (
@@ -11239,6 +11264,13 @@ def create_runner_app(
         "user message as the current instruction. The preceding assistant "
         "message may be incomplete."
     )
+    # Substituted for the user-abandonment marker when the interrupt was
+    # system-originated (e.g. a policy hook declining a change), not the user
+    # pressing Esc — a resumed child reading the abandonment marker would
+    # otherwise drop its task.
+    _SYSTEM_CANCEL_MARKER_TEXT = (
+        "[System: this turn was interrupted by the system, not the user — resume your task.]"
+    )
 
     def _append_cancellation_items(conv_id: str) -> None:
         """Insert synthetic items for an interrupted turn.
@@ -11296,13 +11328,21 @@ def create_runner_app(
                 synthetic_items.append(synthetic_output)
                 items_to_persist.append(synthetic_output)
 
+        # One-shot pop of the cancel origin. Defaults to ``"user"`` so an
+        # untagged interrupt is always treated as user abandonment — only an
+        # explicitly system-tagged cancel reads neutral.
+        origin = _cancel_origin.pop(conv_id, "user")
         marker = {
             "type": "message",
             "role": "user",
             "content": [
                 {
                     "type": "input_text",
-                    "text": _CANCELLATION_MARKER_TEXT,
+                    "text": (
+                        _SYSTEM_CANCEL_MARKER_TEXT
+                        if origin == "system"
+                        else _CANCELLATION_MARKER_TEXT
+                    ),
                 }
             ],
         }
@@ -14050,11 +14090,17 @@ def create_runner_app(
                 exc_info=True,
             )
 
-    async def _cancel_inprocess_turn(conv_id: str) -> None:
+    async def _cancel_inprocess_turn(conv_id: str, *, origin: str = "user") -> None:
         """Stop an in-process (non-native) harness's in-flight turn.
 
         Shared by the ``interrupt`` and ``stop_session`` dispatch. No-ops when no
         turn is in flight (a stale interrupted flag would taint the next turn).
+
+        :param origin: Who initiated the cancel — ``"user"`` (default, a genuine
+            Esc / sidebar Stop) or ``"system"`` (a policy-hook decline etc.).
+            Chooses the cancellation marker: user → abandonment, system →
+            neutral. Defaults to ``"user"`` so an untagged cancel always yields
+            the abandonment marker.
         Forward the interrupt to the harness FIRST — while its turn is still
         in-flight — so the harness's interrupt handler engages (cancels the turn
         and drops the claude-sdk session); THEN force-cancel the runner turn task
@@ -14077,6 +14123,11 @@ def create_runner_app(
         if isinstance(target, asyncio.Task) and target.done():
             return
         _interrupted_sessions.add(conv_id)
+        # User stop always wins: never let a later system-originated cancel
+        # overwrite a pending user origin and rewrite a real Esc into the
+        # neutral marker.
+        if origin == "user" or conv_id not in _cancel_origin:
+            _cancel_origin[conv_id] = origin
         await _forward_harness_interrupt(conv_id)
         # Floor: force-cancel the runner Task when we own one (background turn).
         # In stream-mode (None sentinel) there is no Task to cancel here — the
@@ -14159,7 +14210,7 @@ def create_runner_app(
             # leaving it set would taint the buffered continuation's own end.
             await _forward_harness_interrupt(conv_id)
         else:
-            await _cancel_inprocess_turn(conv_id)
+            await _cancel_inprocess_turn(conv_id, origin="system")
         # P2.11: surface the desync to the user when no continuation will run.
         # A buffered message starts a clean continuation turn instead (P1.7),
         # so stay silent there. ``runner_turn_context_desync`` is absent from
@@ -16434,7 +16485,7 @@ def create_runner_app(
             # In-process harness: mark interrupted, forward an interrupt to the
             # harness, and force-cancel the runner turn task so the turn ends
             # promptly even if the harness can't honor the interrupt in time.
-            await _cancel_inprocess_turn(conversation_id)
+            await _cancel_inprocess_turn(conversation_id, origin=body.get("origin", "user"))
             return Response(status_code=204)
 
         if body_type == "external_session_status":
@@ -16529,7 +16580,7 @@ def create_runner_app(
             if _harness == "kimi-native":
                 # Hard-kill the kimi tmux pane (the TUI is the runtime).
                 return await _handle_kimi_native_stop(conversation_id)
-            await _cancel_inprocess_turn(conversation_id)
+            await _cancel_inprocess_turn(conversation_id, origin=body.get("origin", "user"))
             return Response(status_code=204)
 
         if body_type == "effort_change":

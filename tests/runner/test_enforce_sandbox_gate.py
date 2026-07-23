@@ -314,3 +314,97 @@ async def test_enforce_sandbox_no_policy_leaves_spec_unchanged() -> None:
         f"Expected sandbox type 'none' (no policy), got '{sandbox['type']}'. "
         f"The gate is mutating specs even when no policy applies."
     )
+
+
+class _ModelOverrideServerClient(NullServerClient):
+    """Server client whose session GET returns a persisted model_override.
+
+    Mirrors the real server projecting the ``/model`` override in the
+    session snapshot, so ``create_session`` can seed the initial spawn.
+    """
+
+    def __init__(self, *, session_id: str, agent_id: str, model_override: str) -> None:
+        self._session_id = session_id
+        self._agent_id = agent_id
+        self._model_override = model_override
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """Return the snapshot for the session GET, empty 200 otherwise."""
+        del kwargs
+        if url == f"/v1/sessions/{self._session_id}":
+            body = {
+                "agent_id": self._agent_id,
+                "model_override": self._model_override,
+            }
+
+            class _SnapResponse:
+                status_code = 200
+
+                def json(self) -> dict[str, Any]:
+                    return body
+
+                def raise_for_status(self) -> None:
+                    """No-op: stub always succeeds."""
+
+            return _SnapResponse()
+        return self._Response()
+
+
+@pytest.mark.asyncio
+async def test_create_session_seeds_model_override_into_spawn_env() -> None:
+    """The persisted ``/model`` override seeds the initial spawn env.
+
+    Part 1 of issue #1907: without seeding, the first turn requests the
+    override model and forces a wasteful respawn. ``create_session`` now
+    projects the override from the session snapshot into the initial
+    spawn env, so the child spawns with the override model directly.
+    """
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="model-seed-agent",
+        executor=ExecutorSpec(
+            config={"harness": "claude-sdk"},
+            model="databricks-claude-sonnet-4-6",
+        ),
+        os_env=OSEnvSpec(
+            type="caller_process",
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    pm = _FakeProcessManager(_ScriptedHarnessClient())
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_ModelOverrideServerClient(  # type: ignore[arg-type]
+            session_id="conv_model_seed",
+            agent_id="ag_test",
+            model_override="model-x",
+        ),
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_model_seed", "agent_id": "ag_test"},
+        )
+
+    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    # Exactly one spawn at create time — the seed means the first turn
+    # will not need to respawn for the override model.
+    assert len(pm.get_client_calls) == 1, (
+        f"expected a single create-time spawn, got {pm.get_client_calls}"
+    )
+    _conv_id, _harness, env = pm.get_client_calls[-1]
+    assert env is not None
+    # The override is baked into the spawn env, so the child starts on it.
+    assert env.get("HARNESS_CLAUDE_SDK_MODEL") == "model-x", (
+        "create_session must seed the persisted model_override into the "
+        f"initial spawn env; got {env.get('HARNESS_CLAUDE_SDK_MODEL')!r}"
+    )
