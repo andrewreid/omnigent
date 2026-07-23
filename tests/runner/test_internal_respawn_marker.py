@@ -193,3 +193,35 @@ async def test_stop_session_untagged_uses_abandonment_marker() -> None:
         f"a user stop_session must keep the abandonment marker; got: {markers[0]!r}"
     )
     assert _NEUTRAL_SNIPPET not in markers[0]
+
+
+@pytest.mark.asyncio
+async def test_resync_respawn_uses_neutral_marker() -> None:
+    """An internal harness-respawn recovery yields the NEUTRAL marker.
+
+    #1026's ``_resync_turn_state`` cancels the in-flight turn on an internal
+    harness respawn (e.g. ``harness_respawn_agent_switch``). That cancel is
+    tagged ``origin="system"`` so #1907's neutral marker fires — otherwise a
+    resumed native sub-agent reads the false user-abandonment marker and drops
+    its task mid-work (the conv_41c69b48 failure this integration fixes).
+    """
+    gate = asyncio.Event()
+    app, _pm, _hc = _build_interrupt_app(gate)
+
+    async with _runner_client(app) as client:
+        conv_id = "conv_resync_neutral"
+        await _start_blocked_turn(client, conv_id)
+        # Drive the internal respawn-recovery entry directly (NOT an HTTP
+        # cancel — no client-supplied origin). The resync path itself must
+        # tag the cancel system-originated.
+        await app.state.resync_turn_state(conv_id, "harness_respawn_agent_switch")
+        gate.set()
+        await asyncio.sleep(0.2)
+
+    markers = _marker_texts(_session_histories_ref.get(conv_id, []))
+    assert len(markers) == 1, f"expected exactly one marker, got {markers}"
+    assert _NEUTRAL_SNIPPET in markers[0], (
+        "an internal harness-respawn recovery must inject the neutral marker, "
+        f"not the user-abandonment one; got: {markers[0]!r}"
+    )
+    assert _ABANDONMENT_SNIPPET not in markers[0]
