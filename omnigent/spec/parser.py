@@ -905,6 +905,7 @@ def _parse_os_env_sandbox(
     write_paths_raw = raw.get("write_paths")
     write_files_raw = raw.get("write_files")
     cwd_allow_hidden = _parse_cwd_allow_hidden(raw.get("cwd_allow_hidden"))
+    cwd_prune_dirs = _parse_cwd_prune_dirs(raw.get("cwd_prune_dirs"))
     max_entries = _parse_cwd_hidden_scan_max_entries(raw.get("cwd_hidden_scan_max_entries"))
     overflow = _parse_cwd_hidden_scan_overflow(raw.get("cwd_hidden_scan_overflow"))
     env_passthrough = _parse_env_passthrough(raw.get("env_passthrough"))
@@ -966,6 +967,7 @@ def _parse_os_env_sandbox(
         write_files=[str(p) for p in write_files_raw] if write_files_raw is not None else None,
         allow_network=bool(raw.get("allow_network", True)),
         cwd_allow_hidden=cwd_allow_hidden,
+        cwd_prune_dirs=cwd_prune_dirs,
         cwd_hidden_scan_max_entries=max_entries,
         cwd_hidden_scan_overflow=overflow,
         env_passthrough=env_passthrough,
@@ -1024,6 +1026,59 @@ def _parse_cwd_allow_hidden(raw: object) -> list[str] | None:
             )
         sanitized.append(entry)
     return sanitized
+
+
+def _parse_cwd_prune_dirs(raw: object) -> tuple[str, ...] | None:
+    """
+    Parse and validate the ``cwd_prune_dirs:`` field of
+    ``os_env.sandbox``.
+
+    Each entry is a directory basename (single path component, no
+    ``/`` / ``\\`` / ``.`` / ``..``) whose matching directories the
+    masker collapses to a single mask and does not descend into. Same
+    single-component discipline as :func:`_parse_cwd_allow_hidden` so a
+    misconfigured spec can't express a traversal.
+
+    Returns an immutable ``tuple`` to match
+    :attr:`OSEnvSandboxSpec.cwd_prune_dirs`, which is normalized to a
+    tuple by construction.
+
+    :param raw: Raw value from the YAML, e.g. ``["node_modules",
+        ".pnpm"]``, or ``None`` when absent.
+    :returns: Tuple of validated basenames, or ``None`` when ``raw`` is
+        ``None`` (no pruning — the default).
+    :raises OmnigentError: If ``raw`` isn't a list, contains a
+        non-string / empty entry, or contains an entry with a path
+        separator or traversal component.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise OmnigentError(
+            f"os_env.sandbox.cwd_prune_dirs must be a list, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    sanitized: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            raise OmnigentError(
+                "os_env.sandbox.cwd_prune_dirs entries must be strings, "
+                f"got {type(entry).__name__}: {entry!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not entry:
+            raise OmnigentError(
+                "os_env.sandbox.cwd_prune_dirs entries must not be empty strings",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if "/" in entry or "\\" in entry or entry in (".", ".."):
+            raise OmnigentError(
+                "os_env.sandbox.cwd_prune_dirs entries must be single path "
+                f"components (no separators or '.'/'..'): {entry!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        sanitized.append(entry)
+    return tuple(sanitized)
 
 
 _CWD_HIDDEN_SCAN_OVERFLOW_MODES = ("error", "warn", "unlimited")

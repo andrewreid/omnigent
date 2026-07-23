@@ -81,6 +81,14 @@ class SandboxPolicy:
         dotfile whose basename is not in this list); other backends
         ignore the field. ``None`` means the policy carries no
         allowlist and the consuming backend applies its own default.
+    :param cwd_prune_dirs: OPT-IN boundary basenames whose matching
+        real directories the dotfile/symlink masker collapses to a
+        single ``"dir"`` mask and does not descend into. Consumed by
+        both the bwrap and seatbelt backends. ``None`` / empty means no
+        pruning (the default), so agents that don't opt in are
+        unchanged. Used to collapse dependency / vendor farms
+        (``node_modules``, ``.pnpm``) whose escaping package symlinks
+        would otherwise emit one mask each.
     :param cwd_hidden_scan_max_entries: Cap on entries the bwrap
         backend's recursive cwd walker visits. Ignored by other
         backends. Pair with :attr:`cwd_hidden_scan_overflow` to
@@ -149,6 +157,13 @@ class SandboxPolicy:
     write_files: list[Path]
     allow_network: bool
     cwd_allow_hidden: list[str] | None = None
+    # Immutable by construction (see ``__post_init__``): every
+    # constructor / ``dataclasses.replace`` / clone path coerces this to
+    # a ``tuple``, so no clone can alias or mutate a shared list. ``None``
+    # stays ``None`` ("no pruning"); the backends read it as
+    # ``policy.cwd_prune_dirs or ()``, so ``None`` and ``()`` are
+    # equivalent downstream.
+    cwd_prune_dirs: tuple[str, ...] | None = None
     cwd_hidden_scan_max_entries: int = 50000
     cwd_hidden_scan_overflow: str = "warn"
     env_passthrough: list[str] | None = None
@@ -164,6 +179,17 @@ class SandboxPolicy:
     # secrets never touch the policy that serialises into logs / dumps.
     credential_proxy: CredentialProxySpec | None = None
 
+    def __post_init__(self) -> None:
+        # Normalize ``cwd_prune_dirs`` to an immutable tuple at EVERY
+        # construction point — including ``dataclasses.replace`` and the
+        # ``with_additional_*`` / clone helpers, which all route through
+        # ``__init__``. This closes the mutable-list-aliasing defect
+        # class by construction: a clone can never share (or let a caller
+        # mutate) the source's prune list, regardless of what iterable
+        # the caller passed. ``None`` is preserved as "no pruning".
+        if self.cwd_prune_dirs is not None and not isinstance(self.cwd_prune_dirs, tuple):
+            self.cwd_prune_dirs = tuple(self.cwd_prune_dirs)
+
     def to_jsonable(self) -> dict[str, JsonValue]:
         result: dict[str, JsonValue] = {
             "backend_type": self.backend_type,
@@ -176,6 +202,9 @@ class SandboxPolicy:
             "allow_network": self.allow_network,
             "cwd_allow_hidden": (
                 list(self.cwd_allow_hidden) if self.cwd_allow_hidden is not None else None
+            ),
+            "cwd_prune_dirs": (
+                list(self.cwd_prune_dirs) if self.cwd_prune_dirs is not None else None
             ),
             "cwd_hidden_scan_max_entries": self.cwd_hidden_scan_max_entries,
             "cwd_hidden_scan_overflow": self.cwd_hidden_scan_overflow,
@@ -211,6 +240,10 @@ class SandboxPolicy:
         cwd_allow_hidden: list[str] | None = None
         if isinstance(cwd_allow_hidden_data, list):
             cwd_allow_hidden = [str(name) for name in cwd_allow_hidden_data]
+        cwd_prune_dirs_data = data.get("cwd_prune_dirs")
+        cwd_prune_dirs: tuple[str, ...] | None = None
+        if isinstance(cwd_prune_dirs_data, list):
+            cwd_prune_dirs = tuple(str(name) for name in cwd_prune_dirs_data)
         # Narrow scan-cap fields defensively — ``data`` is a generic
         # JSON map that could carry any value at runtime even though
         # the spec parser already validated the source. The typed
@@ -248,6 +281,7 @@ class SandboxPolicy:
             write_files=[Path(str(path)) for path in write_files_data],
             allow_network=bool(data.get("allow_network", True)),
             cwd_allow_hidden=cwd_allow_hidden,
+            cwd_prune_dirs=cwd_prune_dirs,
             cwd_hidden_scan_max_entries=max_entries,
             cwd_hidden_scan_overflow=overflow,
             env_passthrough=env_passthrough,
@@ -474,6 +508,9 @@ def _clone_policy_with(
         cwd_allow_hidden=(
             list(policy.cwd_allow_hidden) if policy.cwd_allow_hidden is not None else None
         ),
+        # Immutable tuple (normalized in ``SandboxPolicy.__post_init__``);
+        # pass through directly — no defensive copy needed.
+        cwd_prune_dirs=policy.cwd_prune_dirs,
         cwd_hidden_scan_max_entries=policy.cwd_hidden_scan_max_entries,
         cwd_hidden_scan_overflow=policy.cwd_hidden_scan_overflow,
         env_passthrough=(
@@ -522,7 +559,17 @@ def with_additional_read_roots(
     extra_roots: Sequence[Path],
 ) -> SandboxPolicy:
     if policy.read_roots is None:
-        return policy
+        # Unrestricted reads: there are no read_roots to extend, but we
+        # must still return a FRESH policy so the caller never aliases
+        # the source's mutable fields (cwd_prune_dirs, write lists,
+        # etc.). Returning ``policy`` verbatim would let a later
+        # in-place mutation of the clone leak back into the original.
+        return _clone_policy_with(
+            policy,
+            read_roots=None,
+            write_roots=list(policy.write_roots),
+            write_files=list(policy.write_files),
+        )
 
     read_roots = list(policy.read_roots)
     for root in extra_roots:

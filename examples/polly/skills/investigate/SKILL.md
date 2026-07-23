@@ -5,6 +5,8 @@ description: Delegate read-only investigation, debugging, audit, search, or code
 
 # investigate — delegated read-only work
 
+**Audience: polly ONLY** — orchestration policy, never handed to a worker.
+
 Use for any read-only task: investigation, debugging, audit, search, code
 understanding, architecture comparison, failure analysis, or answering a
 repository-specific technical question.
@@ -45,3 +47,12 @@ repository-specific technical question.
   connector fetches, or terminal scrollback.
 - Keep task scopes narrow enough that each worker can return a concise report
   with evidence. Broad investigations should be split into parallel subtasks.
+- For heavy exploration on a large codebase, a worker with `codegraph` (an MCP
+  code-graph server) explores far more cheaply than one paging files by hand —
+  but each place it runs spins up a background daemon + on-disk index. See
+  `references/codegraph.md` for how to get the leverage without multiplying
+  daemons: run ONE daemon per implementer worktree, shared by the agents that
+  legitimately work IN that worktree (the isolated cross-review reviewer is NOT
+  one of them — it gets diff/contract/adjacency as text and runs no codegraph);
+  index only worktrees whose task benefits; and reap daemons on parcel-complete
+  / via an orphan sweep / under a concurrent-daemon budget.

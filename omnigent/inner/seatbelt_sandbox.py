@@ -431,6 +431,8 @@ class SeatbeltSandboxBackend(SandboxBackend):
             write_files=write_files,
             allow_network=sandbox_spec.allow_network,
             cwd_allow_hidden=cwd_allow_hidden,
+            # Immutable tuple on both spec and policy — pass through.
+            cwd_prune_dirs=sandbox_spec.cwd_prune_dirs,
             cwd_hidden_scan_max_entries=sandbox_spec.cwd_hidden_scan_max_entries,
             cwd_hidden_scan_overflow=sandbox_spec.cwd_hidden_scan_overflow,
             env_passthrough=(
@@ -982,6 +984,7 @@ def _build_profile(
         max_entries=policy.cwd_hidden_scan_max_entries,
         overflow=policy.cwd_hidden_scan_overflow,
         logger_name=__name__,
+        prune_dirs=policy.cwd_prune_dirs or (),
     )
     for entry in mask_entries:
         seen_mask_paths.add(str(entry.path))
@@ -1803,6 +1806,7 @@ def _scan_read_paths_mask_entries(
                 overflow=policy.cwd_hidden_scan_overflow,
                 logger_name=__name__,
                 scope_label="read_paths",
+                prune_dirs=policy.cwd_prune_dirs or (),
             )
         except OSError as err:
             # Re-raise with read_paths-specific advice, forwarding the

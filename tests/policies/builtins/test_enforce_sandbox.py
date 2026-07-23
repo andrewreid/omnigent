@@ -116,6 +116,51 @@ def test_enforce_sandbox_preserves_agent_write_paths() -> None:
     assert sandbox["write_paths"] == ["."]
 
 
+def test_enforce_sandbox_preserves_agent_cwd_prune_dirs() -> None:
+    """Agent's ``cwd_prune_dirs`` survives the enforce_sandbox merge.
+
+    The merge keeps only keys in ``_SANDBOX_OVERRIDE_KEYS``. If
+    ``cwd_prune_dirs`` is absent from that allowlist, enforce_sandbox
+    STRIPS the field before spawn, silently disabling the boundary-prune
+    fix and regressing Patricia / pnpm workspaces to the bwrap 9000-arg
+    crash. This pins the field into the merged output.
+    """
+    policy = enforce_sandbox()  # no cwd_prune_dirs override
+    event = _agent_start_event(
+        sandbox={"type": "linux_bwrap", "cwd_prune_dirs": ["node_modules", ".pnpm"]}
+    )
+    result = policy(event)
+    sandbox = result["data"]["arguments"]["sandbox"]
+    assert sandbox["type"] == "linux_bwrap"
+    assert sandbox["cwd_prune_dirs"] == ["node_modules", ".pnpm"]
+
+
+def test_enforce_sandbox_preserves_agent_cwd_family_keys() -> None:
+    """Every ``cwd_*`` sandbox key survives the enforce_sandbox merge.
+
+    Twin of the prune-dirs test covering the sibling knobs
+    (``cwd_allow_hidden``, ``cwd_hidden_scan_max_entries``,
+    ``cwd_hidden_scan_overflow``) so a future allowlist edit that drops
+    one is caught.
+    """
+    policy = enforce_sandbox()  # no cwd_* overrides
+    event = _agent_start_event(
+        sandbox={
+            "type": "linux_bwrap",
+            "cwd_allow_hidden": [".git"],
+            "cwd_prune_dirs": ["node_modules"],
+            "cwd_hidden_scan_max_entries": 12345,
+            "cwd_hidden_scan_overflow": "warn",
+        }
+    )
+    result = policy(event)
+    sandbox = result["data"]["arguments"]["sandbox"]
+    assert sandbox["cwd_allow_hidden"] == [".git"]
+    assert sandbox["cwd_prune_dirs"] == ["node_modules"]
+    assert sandbox["cwd_hidden_scan_max_entries"] == 12345
+    assert sandbox["cwd_hidden_scan_overflow"] == "warn"
+
+
 def test_enforce_sandbox_override_write_paths() -> None:
     """When the policy specifies ``write_paths``, it overrides the agent's.
 

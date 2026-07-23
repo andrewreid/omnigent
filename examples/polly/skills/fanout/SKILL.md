@@ -1,9 +1,11 @@
 ---
 name: fanout
-description: Run independent subtasks in parallel — one git worktree and one implementation sub-agent per task, each opening its own PR — then cross-review every PR. polly never merges; the human does.
+description: Run independent subtasks in parallel — one git worktree and one implementation sub-agent per task. Each task is cross-reviewed on its branch diff FIRST (see review-before-pr); the implementer opens its PR only after review is clean. polly never merges; the human does.
 ---
 
 # fanout — safe parallel execution
+
+**Audience: polly ONLY** — orchestration policy, never handed to a worker.
 
 Use ONLY for subtasks that are parallel-safe (no shared files, no ordering
 dependency).
@@ -19,7 +21,10 @@ dependency).
    worktree path>"})`. Use a short task-based title such as `auth-refactor` or
    `fix-sse-error`, never the raw vendor name. State the scope and that it must
    work only inside `.worktrees/<task_id>`. The worker drives the task to green
-   and opens its OWN PR for the branch. Every commit the worker authors must
+   and COMMITS to its branch, but MUST NOT push or open a PR yet (see
+   `review-before-pr`) — it reports its branch name + summary and waits. Review
+   runs on the local branch diff; the branch is pushed and the PR opened only
+   after the diff passes cross-review. Every commit the worker authors must
    end with a blank line followed by the exact co-sign trailer as its final
    line — `Co-authored-by: omnigent <noreply@omnigent.ai>`.
    Record each handle's `conversation_id`
@@ -32,10 +37,16 @@ dependency).
    PR URL in the registry. If the inbox result is empty/unclear, inspect that
    worker conversation with `sys_session_get_history` before deciding what to do
    next.
-4. Send each finished task's PR through `cross-review`.
-5. polly does NOT merge — the PR is the deliverable. When cross-review passes,
-   the task is done: mark it ready in the registry with its PR URL and leave it
-   for the human to review and merge. Never run `git merge` / `gh pr merge`.
+4. Send each finished task's BRANCH DIFF through `cross-review` — before any PR
+   exists (`git -C .worktrees/<task_id> diff main...HEAD`, not `gh pr diff`).
+5. polly does NOT merge — the PR is the deliverable. When cross-review passes
+   (gates green + zero blocking issues), FIRST record the reviewed commit in the
+   task's worktree so the implementer's `git push` + `gh pr create` clear the
+   `require_pr_review` gate —
+   `sys_os_shell("mkdir -p .worktrees/<task_id>/.polly && git -C .worktrees/<task_id> rev-parse HEAD > .worktrees/<task_id>/.polly/review-passed")`
+   — THEN tell the SAME implementer to push its branch and open its PR on the
+   now-reviewed commit. Mark it ready in the registry with its PR URL and leave
+   it for the human to review and merge. Never run `git merge` / `gh pr merge`.
 6. Remove a finished worktree (`git worktree remove`) only once its PR is open
    and review is clean — the branch lives on the remote, so the worktree is
    disposable. Don't remove a worktree that still has open fix-tasks.

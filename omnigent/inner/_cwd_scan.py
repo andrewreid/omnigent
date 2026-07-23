@@ -136,6 +136,7 @@ def scan_cwd_mask_entries(
     logger_name: str | None = None,
     scope_label: str = "cwd",
     deprioritize_names: Sequence[str] = _DEFAULT_DEPRIORITIZED_DIRS,
+    prune_dirs: Sequence[str] = (),
 ) -> list[MaskedEntry]:
     """
     Walk *cwd* and identify entries that must be masked from the helper.
@@ -209,6 +210,19 @@ def scan_cwd_mask_entries(
         take effect when also on *allow_hidden* (otherwise the dir is
         masked and pruned before this is consulted). Pass an empty
         sequence to walk in plain DFS order with no deprioritization.
+    :param prune_dirs: OPT-IN boundary list. Directory basenames whose
+        matching real directories are masked as a SINGLE ``"dir"`` entry
+        and NOT descended into. Matched by basename at any depth,
+        checked before the dotfile / escaping-symlink decision. Default
+        empty, so existing agents are unchanged. Use it to collapse a
+        dependency / vendor farm (``["node_modules", ".pnpm"]``) whose
+        thousands of escaping package symlinks would otherwise each emit
+        their own mask — the whole subtree becomes one masked dir. This
+        is safe precisely because it is opt-in: an agent that needs to
+        read a pruned tree simply does not list it. Unlike
+        *deprioritize_names* (which only reorders the walk), a pruned
+        directory's contents are never visited, so its subtree costs a
+        single entry against *max_entries* regardless of size.
     :returns: A list of :class:`MaskedEntry`. Empty when *cwd* has
         nothing worth masking or when *cwd* is not a directory.
     :raises OSError: When the cap is reached and *overflow* is
@@ -227,6 +241,7 @@ def scan_cwd_mask_entries(
     logger = logging.getLogger(logger_name) if logger_name else _LOGGER
 
     deprioritize = set(deprioritize_names)
+    prune = set(prune_dirs)
     seen: set[str] = set()
     # Primary work stack plus a deferred tier for deprioritized dirs
     # (e.g. ``node_modules``). The deferred tier is promoted into the
@@ -264,6 +279,21 @@ def scan_cwd_mask_entries(
                 break
 
             child_path = Path(child.path)
+
+            # OPT-IN boundary prune: a real directory whose basename is
+            # a configured boundary is masked as ONE dir entry and never
+            # descended into. Checked before the dotfile / escaping-
+            # symlink logic so a huge dependency farm (node_modules,
+            # .pnpm) collapses to a single mask instead of one mask per
+            # escaping package symlink inside it. ``prune`` is empty by
+            # default, so this is a no-op for agents that don't opt in.
+            if child.name in prune and child.is_dir(follow_symlinks=False):
+                key = str(child_path)
+                if key not in seen:
+                    seen.add(key)
+                    entries.append(MaskedEntry(path=child_path, kind="dir"))
+                continue
+
             should_mask = False
             if child.name.startswith(".") and child.name not in allow:
                 should_mask = True

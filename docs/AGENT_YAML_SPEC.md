@@ -203,6 +203,29 @@ same YAML works across platforms. For the full set of sandbox options, how to
 share one policy across `sys_os_*` and terminals, and how to set up network
 egress rules, see the `sandbox:` examples below and the sandbox source under `omnigent/inner/`.
 
+If an agent grounds on source only and never reads dependency trees, add
+`cwd_prune_dirs` to collapse those trees to a single mask each instead of one
+mask per file — this is the fix for the sandbox masker exploding on a
+cross-filesystem `pnpm` store (where every `node_modules` package is an escaping
+symlink and would otherwise blow past bwrap's ~9000-argument ceiling):
+
+```yaml
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: linux_bwrap
+    # Opt-in, default empty. Each listed directory basename is masked as ONE
+    # entry and never descended into. Do NOT set it for an agent that needs to
+    # read the pruned tree (e.g. a general coding agent using node_modules).
+    cwd_prune_dirs: [node_modules, .pnpm]
+```
+
+If the assembled bwrap argv would still exceed the limit, the launcher now fails
+loud before exec with an error naming the offending directories and the tunables
+(`cwd_prune_dirs`, `read_paths`, `cwd_hidden_scan_max_entries`) — instead of
+bwrap's cryptic `Exceeded maximum number of arguments 9000` crash.
+
 ## Tools
 
 Tools are declared under `tools` by name.
