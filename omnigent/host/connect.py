@@ -240,8 +240,10 @@ class _AdoptedPin:
     :param is_leader: Whether the pid led its own process group at pin time.
     :param condemned: Whether classification condemned it (ownerless).
     :param deferred_zombie: Pinned by the zombie drain because it died a
-        group leader with live members — held unreaped as the kernel pin
-        on its group until the sweep classifies it.
+        process-group leader — held unreaped as the kernel pin on its
+        pgid until the sweep classifies it. Pinned unconditionally: a
+        userspace scan cannot prove the group has no live members first,
+        so an empty group is pinned too and released on the next pass.
     :param termed_at: Monotonic time the first SIGTERM was delivered.
     """
 
@@ -1052,7 +1054,7 @@ class HostProcess:
 
         Skipped pids: tracked runners (their Popen owns the status) and
         :attr:`_adopted_pins` (an unreaped zombie is the kernel pin on its
-        pid/pgid). A zombie that died a group leader with live members is
+        pid/pgid). A zombie that died a process-group leader is
         *deferred* — pinned instead of consumed — so the adopted-orphan
         sweep can classify its group while the pgid is still provably its
         own; unknown deferrals are released after one sweep pass.
@@ -1121,8 +1123,8 @@ class HostProcess:
         ids = _pid_stat_ids(pid)
         if ids is None or ids[0] != pid:
             return False  # not a group leader — its pgid pins nothing
-        # Pin unconditionally. Whether the group still holds live (#2421)
-        # members cannot be decided by a userspace scan — a relay forks a
+        # Pin unconditionally. Whether the group still holds live members
+        # cannot be decided by a userspace scan — a relay forks a
         # replacement after any pid listing — so we never scan here: we
         # hold the zombie (the kernel handle on its pgid) and let the
         # adopted-sweep driver classify and release it. Empty groups cost
@@ -1523,16 +1525,12 @@ class HostProcess:
             else:
                 os.kill(pid, sig)
         except ProcessLookupError:
-            return True  # already gone — the kill's goal is met
+            return True  # already gone — the kill's goal is met (ESRCH)
         except OSError:
-            # The signal did not land. It is only "delivered enough" for a
-            # release decision if there was nothing LIVE to reach: some
-            # platforms (macOS) return EPERM for ``killpg`` on a group whose
-            # only remaining member is a zombie. A genuine live member the
-            # kill could not reach (a real EPERM survivor) leaves the group
-            # with live members and must block release.
-            if pin.is_leader and _proc.group_has_live_members(pid) is False:
-                return True
+            # Any OTHER error (e.g. EPERM) means the signal did not land.
+            # Never interpret it as success through a userspace scan — a
+            # relay hiding a live survivor makes such a scan false-empty.
+            # Report undelivered so the release gate retains the pin.
             _logger.warning(
                 "adopted-orphan reaper could not signal %s %d",
                 "group" if pin.is_leader else "pid",
