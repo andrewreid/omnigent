@@ -416,7 +416,7 @@ def test_upsert_on_connect_stamps_conn_session_id(host_store: HostStore) -> None
     host = host_store.upsert_on_connect(
         host_id="f153c32b03f0bc9f7d0f17eeacd8d866",
         name="laptop",
-        owner="alice@example.com",
+        user_id="alice@example.com",
         conn_session_id="session-current",
     )
 
@@ -432,7 +432,7 @@ def test_set_offline_expected_session_fences_stale_cleanup(host_store: HostStore
     host_store.upsert_on_connect(
         host_id="37e0d8ddda237247e70564601627b2ca",
         name="laptop",
-        owner="alice@example.com",
+        user_id="alice@example.com",
         conn_session_id="session-current",
     )
 
@@ -452,7 +452,7 @@ def test_set_offline_legacy_null_session_remains_offlinable(host_store: HostStor
     host_store.upsert_on_connect(
         host_id="aeffef1f87e41cee62ef84457667e697",
         name="laptop",
-        owner="alice@example.com",
+        user_id="alice@example.com",
     )
 
     assert host_store.set_offline("aeffef1f87e41cee62ef84457667e697", expected_session="new-session") == 1
@@ -463,7 +463,7 @@ def test_set_offline_legacy_null_session_remains_offlinable(host_store: HostStor
     host_store.upsert_on_connect(
         host_id="9091fcd50f9190bca4abb3873d382962",
         name="laptop-force",
-        owner="alice@example.com",
+        user_id="alice@example.com",
     )
     assert host_store.set_offline("9091fcd50f9190bca4abb3873d382962", expected_session=None) == 1
 
