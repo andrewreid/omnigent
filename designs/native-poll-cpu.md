@@ -353,10 +353,25 @@ only surfaced on an integration build.
 
 `_DIR_MTIME_RACY_WINDOW_NS` (2 s, comfortably past the 1-2 s filesystems)
 therefore forces a re-list while the mtime sits within that window of now —
-the same "racily clean" problem git solves for its index. It costs extra
-listings only just after a change and nothing once the directory is quiet, so
-the steady state this gate exists to make cheap is unaffected: measured
-unchanged at fan-out 6 and 100.
+the same "racily clean" problem git solves for its index.
+
+The window alone is not enough, because **a coarse mtime records the start of
+its bucket, not the moment of the change**. An entry landing late in a 2 s
+bucket can already read as older than the window by the time the next tick
+runs; with the directory key unchanged and the mtime no longer recent, nothing
+would re-list — and nothing ever moves that key again. So a listing taken while
+the mtime was racy is marked *provisional*, and that uncertainty is latched
+until one further listing is taken with the mtime settled.
+
+The age check is one-sided rather than a distance. A stamp from the future is
+untrustworthy however far ahead it is, and `abs()` would call one 5 s ahead
+"settled" simply because it is far from now — exactly inverting the intent for
+a clock-skewed network filesystem.
+
+Cost: extra listings only just after a change, plus one when the window
+expires, and nothing once the directory is quiet — so the steady state this
+gate exists to make cheap is unaffected, measured unchanged at fan-out 6
+and 100.
 
 ### 3.4 Blast radius, kill switches, observability
 
@@ -675,6 +690,13 @@ back with `os.utime` rather than racing for the collision, so it reproduces on
 any filesystem instead of only on a coarse one — the property the original test
 lacked.
 
+The first attempt at that window was itself incomplete, in two ways review
+caught by reproducing rather than reasoning: it did not carry the uncertainty
+forward, so a change landing late in a coarse bucket could age out of the
+window before the next tick and never be re-listed; and it used `abs()`, which
+called a future-dated stamp "settled" once it was far enough ahead. Both now
+have tests that fail against the versions that shipped past two review rounds.
+
 ### 7.4 Fifth round — cross-vendor review
 
 No blocking findings. Two fixes:
@@ -704,12 +726,13 @@ the real `wait` does.
    up to `max_interval` late (2 s claude-native, 5 s generic). Turn start,
    typing, and attach are all wake-triggered, so this only affects output that
    originates entirely inside the pane after ≥1 idle threshold of silence.
-2. **Clock skew defeats the racy window.** `_mtime_is_racy` compares the
-    filesystem's timestamp against the local clock, so a networked filesystem
-    whose server clock leads or lags by more than the window makes a fresh
-    change look settled, and membership falls back to mtime equality. Bounded
-    by the resync. Future-dated stamps are handled (the comparison is
-    absolute); a *lagging* server beyond 2 s is not.
+2. **A lagging filesystem clock defeats the racy window.** `_mtime_is_racy`
+    measures a timestamp's age against the local clock, so a networked
+    filesystem whose server clock *trails* ours by more than the window makes a
+    fresh change look already settled, and membership falls back to mtime
+    equality. Bounded by the resync. A *leading* clock is safe — the check is
+    one-sided, so any future-dated stamp reads as untrustworthy at any
+    distance.
 3. **Fingerprint blind spot.** A same-inode, same-size, same-`mtime_ns` rewrite
    would be missed for up to `_IDLE_RESYNC_SECONDS`. No current writer can
    produce one; the resync bounds it regardless.

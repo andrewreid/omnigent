@@ -829,14 +829,17 @@ def _mtime_is_racy(mtime_ns: int) -> bool:
     A change landing in the same filesystem timestamp tick as the previous
     stat is invisible to a later mtime comparison, so anything stamped within
     :data:`_DIR_MTIME_RACY_WINDOW_NS` of now has to be re-examined rather than
-    compared. The comparison is absolute so a timestamp in the *future* — an
-    NFS server whose clock leads ours — also reads as untrustworthy instead of
-    silently passing.
+    compared.
+
+    The check is one-sided — an *age*, not a distance. A timestamp from the
+    future is never trustworthy no matter how far ahead it is, and a
+    two-sided comparison would call a stamp 5 s ahead "settled" simply because
+    it is far from now, which is the opposite of the intent.
 
     :param mtime_ns: A stat's ``st_mtime_ns``.
     :returns: ``True`` when the caller must not rely on mtime equality.
     """
-    return abs(time.time_ns() - mtime_ns) < _DIR_MTIME_RACY_WINDOW_NS
+    return time.time_ns() - mtime_ns < _DIR_MTIME_RACY_WINDOW_NS
 
 
 class _BridgeInputPaths:
@@ -871,6 +874,10 @@ class _BridgeInputPaths:
         self._subagents_dir: str | None = None
         self._subagent_dir_key: tuple[int, int] | None = None
         self._subagent_targets: tuple[tuple[str, str], ...] = ()
+        # Whether the cached listing was taken while the directory's mtime was
+        # still racy, and so may already be stale. Latched until a listing is
+        # taken with the mtime settled — see :meth:`fingerprint`.
+        self._subagent_listing_provisional = False
 
     def set_transcript(self, transcript_path: Path | None) -> None:
         """
@@ -892,12 +899,17 @@ class _BridgeInputPaths:
             self._subagents_dir = str(_subagents_dir_for_transcript(transcript_path))
         self._subagent_dir_key = None
         self._subagent_targets = ()
+        self._subagent_listing_provisional = False
 
-    def _refresh_subagents(self, dir_key: tuple[int, int]) -> None:
+    def _refresh_subagents(self, dir_key: tuple[int, int], *, provisional: bool) -> None:
         """
-        Re-list the sub-agent transcripts after a membership change.
+        Re-list the sub-agent transcripts.
 
         :param dir_key: The directory stat identity this listing belongs to.
+        :param provisional: Whether the directory's mtime was still racy when
+            this listing was taken, meaning an entry could have landed after
+            the scan without moving the mtime. Latched so a later tick knows
+            to take one more listing once the mtime settles.
         :returns: None.
         """
         assert self._subagents_dir is not None
@@ -914,6 +926,7 @@ class _BridgeInputPaths:
         targets.sort()
         self._subagent_dir_key = dir_key
         self._subagent_targets = tuple(targets)
+        self._subagent_listing_provisional = provisional
 
     def fingerprint(self) -> _BridgeFingerprint:
         """
@@ -952,11 +965,19 @@ class _BridgeInputPaths:
                 # No sub-agent has been spawned yet; drop any stale listing.
                 self._subagent_dir_key = None
                 self._subagent_targets = ()
+                self._subagent_listing_provisional = False
             else:
                 fingerprint["subagents/"] = (info.st_mtime_ns, info.st_size, info.st_ino)
                 dir_key = (info.st_mtime_ns, info.st_ino)
-                if dir_key != self._subagent_dir_key or _mtime_is_racy(info.st_mtime_ns):
-                    self._refresh_subagents(dir_key)
+                racy = _mtime_is_racy(info.st_mtime_ns)
+                # The provisional latch is what makes the window sound. A
+                # coarse mtime records the START of its bucket, so a change
+                # late in the bucket can already look older than the window by
+                # the time the next tick runs — and with the key unchanged,
+                # nothing would ever re-list. Carrying the uncertainty forward
+                # forces exactly one more listing once the mtime settles.
+                if dir_key != self._subagent_dir_key or racy or self._subagent_listing_provisional:
+                    self._refresh_subagents(dir_key, provisional=racy)
                 for key, path in self._subagent_targets:
                     try:
                         info = stat(path)

@@ -7709,6 +7709,82 @@ def test_bridge_input_fingerprint_sees_a_subagent_added_within_one_mtime_tick(
     assert paths.fingerprint() != after_arrival
 
 
+def test_bridge_input_fingerprint_relists_once_the_racy_window_expires(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An entry that arrived during the racy window is picked up after it expires.
+
+    A coarse mtime records the START of its bucket, so a change landing late in
+    the bucket can already look older than the window by the time the next tick
+    runs. With the directory key unchanged and the mtime no longer recent,
+    nothing would re-list — and nothing ever moves that key again, so the
+    sub-agent would stay unwatched permanently. Sampling while racy therefore
+    has to latch the uncertainty and force one more listing once the mtime
+    settles.
+
+    :param tmp_path: Per-test temp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    # Shrink the window so "after it expires" is a sleep, not a wait.
+    monkeypatch.setattr(forwarder, "_DIR_MTIME_RACY_WINDOW_NS", 50_000_000)
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = _seed_transcript_with_subagents_dir(tmp_path)
+    subagents = _subagents_dir(transcript)
+    paths = _fingerprint_for(bridge_dir, transcript)
+
+    # First look: the directory was just touched, so this listing is racy.
+    frozen = time.time_ns()
+    os.utime(subagents, ns=(frozen, frozen))
+    paths.fingerprint()
+
+    # A sub-agent lands in the bucket already recorded, moving nothing.
+    child = subagents / "agent-late-in-bucket.jsonl"
+    child.write_text("{}\n", encoding="utf-8")
+    os.utime(subagents, ns=(frozen, frozen))
+
+    # The next tick lands after the window has expired.
+    time.sleep(0.15)
+    assert not forwarder._mtime_is_racy(frozen)
+
+    assert "subagent/agent-late-in-bucket.jsonl" in paths.fingerprint()
+
+
+def test_bridge_input_fingerprint_handles_a_future_dated_directory(
+    tmp_path: Path,
+) -> None:
+    """
+    A directory stamped in the future is never treated as settled.
+
+    A networked filesystem whose server clock leads ours stamps mtimes ahead of
+    local time. A two-sided comparison would call a stamp far enough ahead
+    "settled" precisely because it is distant from now, so a sub-agent arriving
+    under it would go unwatched — the same failure the window exists to prevent.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = _seed_transcript_with_subagents_dir(tmp_path)
+    subagents = _subagents_dir(transcript)
+    paths = _fingerprint_for(bridge_dir, transcript)
+
+    ahead = time.time_ns() + 5 * 1_000_000_000
+    os.utime(subagents, ns=(ahead, ahead))
+    assert forwarder._mtime_is_racy(ahead)
+    paths.fingerprint()
+
+    child = subagents / "agent-skewed.jsonl"
+    child.write_text("{}\n", encoding="utf-8")
+    os.utime(subagents, ns=(ahead, ahead))
+
+    assert "subagent/agent-skewed.jsonl" in paths.fingerprint()
+
+
 def test_mtime_is_racy_only_inside_the_granularity_window() -> None:
     """
     Recent and future timestamps are untrustworthy; settled ones are not.
@@ -7723,7 +7799,11 @@ def test_mtime_is_racy_only_inside_the_granularity_window() -> None:
     now = time.time_ns()
 
     assert forwarder._mtime_is_racy(now)
+    # Future stamps are untrustworthy at ANY distance — the check is an age,
+    # not a distance, so a badly skewed server cannot look settled.
     assert forwarder._mtime_is_racy(now + forwarder._DIR_MTIME_RACY_WINDOW_NS // 2)
+    assert forwarder._mtime_is_racy(now + forwarder._DIR_MTIME_RACY_WINDOW_NS * 100)
+    # A settled stamp is what lets the membership cache do its job.
     assert not forwarder._mtime_is_racy(now - forwarder._DIR_MTIME_RACY_WINDOW_NS * 2)
 
 
