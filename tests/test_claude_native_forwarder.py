@@ -7722,35 +7722,60 @@ def test_bridge_input_fingerprint_relists_once_the_racy_window_expires(
     nothing would re-list — and nothing ever moves that key again, so the
     sub-agent would stay unwatched permanently. Sampling while racy therefore
     has to latch the uncertainty and force one more listing once the mtime
-    settles.
+    settles — exactly one, or the membership cache stops paying for itself.
+
+    The clock is driven rather than slept through: a sleep-based version fails
+    whenever the scheduler pauses it during setup, which is indistinguishable
+    from the bug under test.
 
     :param tmp_path: Per-test temp directory.
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    # Shrink the window so "after it expires" is a sleep, not a wait.
-    monkeypatch.setattr(forwarder, "_DIR_MTIME_RACY_WINDOW_NS", 50_000_000)
+    clock = {"now": 1_700_000_000 * 1_000_000_000}
+    monkeypatch.setattr(forwarder, "_fingerprint_now_ns", lambda: clock["now"])
+
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     transcript = _seed_transcript_with_subagents_dir(tmp_path)
     subagents = _subagents_dir(transcript)
     paths = _fingerprint_for(bridge_dir, transcript)
 
-    # First look: the directory was just touched, so this listing is racy.
-    frozen = time.time_ns()
-    os.utime(subagents, ns=(frozen, frozen))
+    listings = 0
+    original = paths._refresh_subagents
+
+    def _counting(dir_key: tuple[int, int], *, provisional: bool) -> None:
+        nonlocal listings
+        listings += 1
+        original(dir_key, provisional=provisional)
+
+    paths._refresh_subagents = _counting  # type: ignore[method-assign]
+
+    # First look: the directory carries the current bucket, so this listing is
+    # racy and cannot be trusted to be complete.
+    bucket = clock["now"]
+    os.utime(subagents, ns=(bucket, bucket))
     paths.fingerprint()
+    listings_after_first = listings
 
     # A sub-agent lands in the bucket already recorded, moving nothing.
     child = subagents / "agent-late-in-bucket.jsonl"
     child.write_text("{}\n", encoding="utf-8")
-    os.utime(subagents, ns=(frozen, frozen))
+    os.utime(subagents, ns=(bucket, bucket))
 
-    # The next tick lands after the window has expired.
-    time.sleep(0.15)
-    assert not forwarder._mtime_is_racy(frozen)
+    # The next tick lands after the window has expired, so the directory now
+    # reads as settled even though its listing was taken while it was not.
+    clock["now"] = bucket + forwarder._DIR_MTIME_RACY_WINDOW_NS * 2
+    assert not forwarder._mtime_is_racy(bucket)
 
     assert "subagent/agent-late-in-bucket.jsonl" in paths.fingerprint()
+    assert listings == listings_after_first + 1, "expected exactly one settling re-list"
+
+    # ...and having settled, it stops re-listing.
+    settled = listings
+    for _ in range(5):
+        paths.fingerprint()
+    assert listings == settled
 
 
 def test_bridge_input_fingerprint_handles_a_future_dated_directory(

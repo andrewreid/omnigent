@@ -822,6 +822,21 @@ _APPENDING_SUBAGENT_SUFFIX = ".jsonl"
 _DIR_MTIME_RACY_WINDOW_NS = 2_000_000_000
 
 
+def _fingerprint_now_ns() -> int:
+    """
+    Wall-clock reading used to age filesystem timestamps.
+
+    Exists as a private indirection so tests can drive the racy-window boundary
+    deterministically instead of sleeping past a real one — a sleep-based test
+    fails whenever the scheduler pauses it during setup, which looks like the
+    bug it is meant to catch. Kept out of :func:`time.time_ns` monkeypatching
+    for the same module-singleton reason as :func:`_supervisor_monotonic`.
+
+    :returns: Nanoseconds since the epoch.
+    """
+    return time.time_ns()
+
+
 def _mtime_is_racy(mtime_ns: int) -> bool:
     """
     Report whether a timestamp is too recent to trust as a change signal.
@@ -839,7 +854,7 @@ def _mtime_is_racy(mtime_ns: int) -> bool:
     :param mtime_ns: A stat's ``st_mtime_ns``.
     :returns: ``True`` when the caller must not rely on mtime equality.
     """
-    return time.time_ns() - mtime_ns < _DIR_MTIME_RACY_WINDOW_NS
+    return _fingerprint_now_ns() - mtime_ns < _DIR_MTIME_RACY_WINDOW_NS
 
 
 class _BridgeInputPaths:

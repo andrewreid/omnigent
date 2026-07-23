@@ -697,6 +697,14 @@ window before the next tick and never be re-listed; and it used `abs()`, which
 called a future-dated stamp "settled" once it was far enough ahead. Both now
 have tests that fail against the versions that shipped past two review rounds.
 
+Those tests drive `_fingerprint_now_ns` rather than sleeping past a real
+window. The sleep-based first version had a failure mode of its own: a
+scheduler pause during setup ages the fixture out of the window before the
+first sample, so the test fails having never exercised the latch — noise
+indistinguishable from the bug. The indirection follows the same reasoning as
+`_supervisor_monotonic` and `_hold_monotonic`, which exist so tests need not
+monkeypatch a module singleton.
+
 ### 7.4 Fifth round — cross-vendor review
 
 No blocking findings. Two fixes:
