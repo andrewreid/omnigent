@@ -1613,7 +1613,12 @@ async def test_final_adoption_drain_reaps_condemned_trees_at_shutdown() -> None:
     )
     try:
         child_ident = test_procs.capture_identity(child.pid)
-        await host._final_adoption_drain(budget_s=5.0)
+        # A small budget: the condemned tree is TERM/KILLed in the first
+        # passes (grace 0); the rest of a large budget would just be spent
+        # retrying a release macOS cannot finalize (killpg EPERMs a
+        # zombie-only group). The manual reaper below drives it to the
+        # terminal state a Linux subreaper reaches on its own.
+        await host._final_adoption_drain(budget_s=0.5)
 
         # The drain killed the condemned tree.
         assert test_procs.wait_gone(child.pid, child_ident), "shutdown drain left the tree alive"

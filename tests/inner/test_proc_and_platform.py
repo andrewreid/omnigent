@@ -542,8 +542,6 @@ def test_group_kernel_present_survives_a_live_fork_relay() -> None:
                 time.sleep(0.02)
         with contextlib.suppress(OSError):
             os.unlink(script)
-        with contextlib.suppress(OSError):
-            os.unlink(script)
 
 
 def test_group_kernel_present_none_for_bad_pgid() -> None:
