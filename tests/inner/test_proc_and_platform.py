@@ -492,10 +492,14 @@ def test_group_kernel_present_survives_a_live_fork_relay() -> None:
     """
     # Generation 0 leads the group; each generation spawns the next INTO
     # the same group (no new session) and exits, so membership churns
-    # continuously rather than sitting on two static sleepers.
+    # continuously rather than sitting on two static sleepers. Generation
+    # 0 waits on a startup barrier (a byte on stdin) before starting the
+    # chain, so the parent captures a stable pgid while it is still alive.
     relay_src = (
         "import os, sys, time\n"
         "gen = int(sys.argv[1])\n"
+        "if gen == 0:\n"
+        "    sys.stdin.read(1)\n"  # barrier: wait until the parent has our pgid
         "if gen < 400:\n"
         "    nxt = [sys.executable, __file__, str(gen + 1)]\n"
         "    os.posix_spawn(sys.executable, nxt, os.environ)\n"
@@ -508,9 +512,14 @@ def test_group_kernel_present_survives_a_live_fork_relay() -> None:
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
         fh.write(relay_src)
         script = fh.name
-    relay = subprocess.Popen([sys.executable, script, "0"], start_new_session=True)
-    pgid = os.getpgid(relay.pid)
+    relay = subprocess.Popen(
+        [sys.executable, script, "0"], start_new_session=True, stdin=subprocess.PIPE
+    )
+    pgid = os.getpgid(relay.pid)  # gen 0 is blocked on the barrier — stable
     try:
+        assert relay.stdin is not None
+        relay.stdin.write(b"go")  # release the barrier; the chain begins
+        relay.stdin.flush()
         # Sample across many handoffs; the kernel check never false-empties.
         for _ in range(30):
             assert _proc.group_kernel_present(pgid) is not False
@@ -520,6 +529,19 @@ def test_group_kernel_present_survives_a_live_fork_relay() -> None:
             os.killpg(pgid, signal.SIGKILL)
         with contextlib.suppress(Exception):
             relay.wait(timeout=10)
+        # Reap the whole group's adopted descendants: under a
+        # PR_SET_CHILD_SUBREAPER pytest each generation reparents to us as
+        # it orphans, so waitpid(-pgid) collects them; ECHILD ends it.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                reaped, _ = os.waitpid(-pgid, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if reaped == 0:
+                time.sleep(0.02)
+        with contextlib.suppress(OSError):
+            os.unlink(script)
         with contextlib.suppress(OSError):
             os.unlink(script)
 

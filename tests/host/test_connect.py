@@ -1408,22 +1408,15 @@ def test_drive_condemned_pin_retains_when_final_kill_fails(
     pin = _AdoptedPin(identity="leader-id", is_leader=True, deferred_zombie=True)
     host._adopted_pins[7000] = pin
 
-    # Past its grace, leader dead, but a LIVE group member survives — the
-    # exact case a failed kill must not release over. The escalation scan
-    # is stubbed empty (a relay hiding it); only the delivery status of the
-    # failed kill keeps the pin.
+    # Past its grace, leader dead. The escalation and post-kill scans BOTH
+    # report the group empty — a relay could make them false-empty — yet
+    # the whole-group SIGKILL fails (EPERM). A failed kill must never be
+    # laundered into a "drained" release by that raceable scan: retain.
     pin.termed_at = 1.0
-    live_members = {"value": [8001]}
     monkeypatch.setattr(connect_mod._proc, "process_identity_state", lambda _p, _i: "gone")
     monkeypatch.setattr(connect_mod, "_pid_is_zombie", lambda _p: False)
-    monkeypatch.setattr(
-        connect_mod, "_live_group_member_pids", lambda _p, exclude=None: []
-    )  # escalation grace-scan: relay hides the survivor
-    # But the kill's own delivery check sees the survivor via killpg EPERM
-    # + a non-empty live-member view; model that through group_has_live_members.
-    monkeypatch.setattr(
-        connect_mod._proc, "group_has_live_members", lambda _p: bool(live_members["value"])
-    )
+    monkeypatch.setattr(connect_mod, "_live_group_member_pids", lambda _p, exclude=None: [])
+    monkeypatch.setattr(connect_mod._proc, "group_has_live_members", lambda _p: False)
 
     released: list[int] = []
     monkeypatch.setattr(host, "_release_pin", lambda pid: released.append(pid))
@@ -1431,11 +1424,10 @@ def test_drive_condemned_pin_retains_when_final_kill_fails(
 
     driving = host._drive_condemned_pin(7000, pin, now=100.0, grace_s=0.0)
 
-    assert driving is True, "a failed kill over a live survivor must keep driving"
-    assert released == [], "the pin must not be released when a live member survives"
+    assert driving is True, "a failed kill must keep driving even if the scan says empty"
+    assert released == [], "a failed kill must never be released over a raceable empty scan"
 
-    # The survivor exits and the kill now lands: the drained group releases.
-    live_members["value"] = []
+    # Once the kill lands, the same drained group releases.
     monkeypatch.setattr(connect_mod.os, "killpg", lambda _pg, _s: None)
     driving = host._drive_condemned_pin(7000, pin, now=100.0, grace_s=0.0)
     assert driving is False
@@ -1620,15 +1612,26 @@ async def test_final_adoption_drain_reaps_condemned_trees_at_shutdown() -> None:
         start_new_session=True,
     )
     try:
+        child_ident = test_procs.capture_identity(child.pid)
         await host._final_adoption_drain(budget_s=5.0)
-        assert child.pid not in host._adopted_pins
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and _pid_alive_probe(child.pid):
+
+        # The drain killed the condemned tree.
+        assert test_procs.wait_gone(child.pid, child_ident), "shutdown drain left the tree alive"
+
+        # A leader zombie keeps its group present, so the pin releases only
+        # once a foreign reaper collects the corpse. Under a real subreaper
+        # host (Linux) that is the host itself; here (the child reparented
+        # to this pytest) act as that reaper, then re-drive until released —
+        # exactly the terminal state a Linux subreaper reaches on its own.
+        deadline = time.monotonic() + 10.0
+        while child.pid in host._adopted_pins and time.monotonic() < deadline:
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(child.pid, os.WNOHANG)
+            host._reap_adopted_orphans_once(grace_s=0.0)
             await asyncio.sleep(0.05)
-        assert not _pid_alive_probe(child.pid), "shutdown drain left the tree alive"
+        assert child.pid not in host._adopted_pins, "pin not released after tree drained"
     finally:
-        with contextlib.suppress(OSError):
-            os.kill(child.pid, signal.SIGKILL)
+        test_procs.safe_kill(child.pid, child_ident)
         with contextlib.suppress(Exception):
             child.wait(timeout=10)
 
