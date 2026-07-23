@@ -160,28 +160,6 @@ def _normalize_usage_for_engine(usage: dict[str, float]) -> dict[str, float]:
     return usage
 
 
-def _subtree_usage_seed(
-    conversation_id: str,
-    conversation_store: ConversationStore,
-) -> dict[str, float]:
-    """
-    SUBTREE-scoped usage seed for the per-subagent cost budget.
-
-    Unlike :func:`_policy_usage_seed` (which seeds from the whole session
-    tree via ``root_conversation_id``), this seeds from ``conversation_id``
-    itself — so the budget gates on this conversation's own subtree cost
-    (itself + its descendants), not the whole session.
-
-    :param conversation_id: Conversation to seed the subtree usage for,
-        e.g. ``"conv_child"``.
-    :param conversation_store: Store to read the subtree usage from.
-    :returns: Subtree usage seed dict; when an enforcement cost exists its
-        ``total_cost_usd`` is the enforcement total.
-    """
-    usage = load_session_usage(conversation_id, conversation_store)
-    return _normalize_usage_for_engine(usage)
-
-
 def _resolve_session_owner_cached(
     conversation_id: str,
     conversation_store: ConversationStore,
@@ -284,6 +262,7 @@ def build_policy_engine(
     spec: AgentSpec,
     conversation_id: str,
     conversation_store: ConversationStore,
+    conversation: Conversation | None = None,
     connection_override: dict[str, str] | None = None,
     default_policies: list[PolicySpec] | None = None,
     policy_store: PolicyStore | None = None,
@@ -324,6 +303,13 @@ def build_policy_engine(
     :param spec: The parsed agent spec.
     :param conversation_id: The conversation this workflow is
         running on, e.g. ``"conv_abc123"``.
+    :param conversation: The already-loaded conversation row for
+        ``conversation_id``, when the caller holds a current one — skips
+        the builder's own read. The engine snapshots labels /
+        session_state from this row, so callers that rebuild an engine
+        specifically to observe concurrent writes (e.g. the native ASK
+        gate's post-lock re-evaluation) must pass ``None`` and let the
+        builder read fresh.
     :param conversation_store: The store used for label reads
         and writes. Held by the engine for the life of the
         workflow.
@@ -364,7 +350,11 @@ def build_policy_engine(
     # children. Load root policies and prepend them (root policies run
     # first, then any child-specific overrides, matching the cost-budget
     # root-seeding pattern below).
-    conv = conversation_store.get_conversation(conversation_id)
+    conv = (
+        conversation
+        if conversation is not None
+        else conversation_store.get_conversation(conversation_id)
+    )
     root_conversation_id = conv.root_conversation_id if conv is not None else conversation_id
     if root_conversation_id != conversation_id:
         root_policy_specs = _load_session_policy_specs(root_conversation_id, policy_store)
@@ -384,22 +374,43 @@ def build_policy_engine(
     all_policy_specs.append(_ASK_ON_ADD_POLICY_SPEC)
 
     label_defs = (guardrails.labels or {}) if guardrails else {}
+    # One conversation read (``conv``, resolved above for policy
+    # inheritance) and ONE spawn-tree load feed everything below: labels,
+    # session state (own + inherited root keys), both usage seeds, and the
+    # model override. The helpers each re-fetched the same rows before —
+    # ~4x conversation reads plus two identical tree loads per build, the
+    # dominant cost of a policies/evaluate call.
+    tree = (
+        _load_tree_conversations(root_conversation_id, conversation_store)
+        if conv is not None
+        else []
+    )
+    root_conv = (
+        conv
+        if root_conversation_id == conversation_id
+        else next((c for c in tree if c.id == root_conversation_id), None)
+    )
+    if root_conv is None and conv is not None and root_conversation_id != conversation_id:
+        # The tree scan excludes archived rows, so an archived root would
+        # vanish here — but gating and approval inheritance must survive
+        # archiving (get_conversation reads archived rows fine). One extra
+        # read, paid only in this edge.
+        root_conv = conversation_store.get_conversation(root_conversation_id)
     initial_labels = _seed_and_load_labels(
         conversation_id=conversation_id,
         label_defs=label_defs,
         conversation_store=conversation_store,
+        existing=dict(conv.labels) if conv is not None else {},
     )
-    initial_session_state = _load_session_state(conversation_id, conversation_store)
+    initial_session_state = dict(conv.session_state) if conv is not None else {}
     # The cost-budget approval is per-SESSION: the whole spawn tree shares one
     # soft-threshold gate. A sub-agent runs as its own conversation, so seed its
     # approved-checkpoint from the ROOT conversation — otherwise approving on the
     # parent wouldn't carry to the sub-agent and it would re-ask at the same
     # threshold. Other session_state stays per-conversation; the matching
     # write-back is routed to the root by PolicyEngine.apply_state_updates.
-    # (conv and root_conversation_id already resolved above for policy
-    # inheritance — reuse them here.)
     if root_conversation_id != conversation_id:
-        root_state = _load_session_state(root_conversation_id, conversation_store)
+        root_state = dict(root_conv.session_state) if root_conv is not None else {}
         for _root_key in (
             SESSION_COST_ASK_APPROVED_STATE_KEY,
             SESSION_COST_UNPRICED_APPROVED_KEY,
@@ -409,15 +420,24 @@ def build_policy_engine(
     # Gating is SESSION-wide: seed from the whole spawn-tree total so a
     # sub-agent gates against the session's full spend (parent + siblings),
     # not just its own subtree. The cost read is the enforcement total
-    # (in-flight sub-agent spend); see _policy_usage_seed.
-    initial_usage = _policy_usage_seed(conversation_id, conversation_store)
-    # Conditional injection (#1a): only compute subtree usage when a
-    # subagent_cost_budget policy is present.
-    initial_subtree_usage = (
-        _subtree_usage_seed(conversation_id, conversation_store)
-        if _needs_subtree_usage(all_policy_specs)
-        else None
+    # (in-flight sub-agent spend); see _policy_usage_seed, whose semantics
+    # (including the empty seed when the root row is missing) this
+    # preserves while reusing the single tree load.
+    initial_usage = (
+        _normalize_usage_for_engine(_sum_subtree_usage(tree, root_conversation_id))
+        if conv is not None and root_conv is not None
+        else {}
     )
+    # Conditional injection (#1a): only compute subtree usage when a
+    # subagent_cost_budget policy is present. Per-node DISPLAY-rooted seed:
+    # same tree, rooted at the evaluated node instead of the root.
+    initial_subtree_usage: dict[str, float] | None = None
+    if _needs_subtree_usage(all_policy_specs):
+        initial_subtree_usage = (
+            _normalize_usage_for_engine(_sum_subtree_usage(tree, conversation_id))
+            if conv is not None
+            else {}
+        )
     # Conditional injection (#1): only pay the owner + daily-cost lookups
     # when a per-user daily cost-budget policy is actually present.
     initial_user_daily_cost = (
@@ -425,7 +445,14 @@ def build_policy_engine(
         if _needs_user_daily_cost(all_policy_specs)
         else None
     )
-    initial_model = _resolve_session_model(conversation_id, conversation_store, spec)
+    # Session model: the conversation's model_override (set when a user
+    # picks a model mid-session) wins over the spec's llm.model; None when
+    # neither is available and cost policies treat it as undeterminable.
+    initial_model = (
+        conv.model_override
+        if conv is not None and conv.model_override
+        else (spec.llm.model if spec.llm else None)
+    )
     # Pass the full ModelPricing so the engine can price cache-read and
     # cache-write tokens at their own rates via compute_llm_cost().
     token_pricing = fetch_model_pricing(spec.llm.model) if spec.llm else None
@@ -682,6 +709,7 @@ def _seed_and_load_labels(
     conversation_id: str,
     label_defs: dict[str, LabelDef],
     conversation_store: ConversationStore,
+    existing: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """
     Seed declared initial values and return the current snapshot.
@@ -698,10 +726,14 @@ def _seed_and_load_labels(
         labels start unset until a policy writes them).
     :param conversation_store: Target for both the read and
         the seed UPSERT.
+    :param existing: Pre-loaded current label snapshot, passed by callers
+        that already hold the conversation row (saves a re-read).
+        ``None`` loads it here.
     :returns: Full post-seed snapshot of the conversation's
         labels.
     """
-    existing = _load_existing_labels(conversation_id, conversation_store)
+    if existing is None:
+        existing = _load_existing_labels(conversation_id, conversation_store)
     to_seed = {
         key: ldef.initial
         for key, ldef in label_defs.items()
@@ -761,36 +793,6 @@ def _load_session_state(
     return dict(conv.session_state)
 
 
-def _resolve_session_model(
-    conversation_id: str,
-    conversation_store: ConversationStore,
-    spec: AgentSpec,
-) -> str | None:
-    """
-    Resolve the model the session is currently using.
-
-    Prefers the conversation's ``model_override`` (set when a user
-    picks a model mid-session via ``/model`` or the web model picker)
-    and falls back to the agent spec's ``llm.model``. ``None`` when
-    neither is available — the conversation does not exist yet, has no
-    override, and the spec declares no ``llm`` block — in which case
-    cost policies treat the model as undeterminable.
-
-    :param conversation_id: Conversation to read the override from,
-        e.g. ``"conv_abc123"``.
-    :param conversation_store: Store to read the conversation from.
-    :param spec: The parsed agent spec (its ``llm.model`` is the
-        fallback when no override is set).
-    :returns: The active model id, e.g. ``"databricks-claude-opus-4-8"``
-        or the native tier alias ``"opus"``; ``None`` when
-        undeterminable.
-    """
-    conv = conversation_store.get_conversation(conversation_id)
-    if conv is not None and conv.model_override:
-        return conv.model_override
-    return spec.llm.model if spec.llm else None
-
-
 # Page size for walking a spawn tree when summing sub-agent usage.
 # Sub-agent trees are small in practice, but we still paginate so a
 # large tree is not silently truncated (see load_session_usage).
@@ -841,6 +843,8 @@ def _merge_by_model(
 def load_session_usage(
     conversation_id: str,
     conversation_store: ConversationStore,
+    *,
+    root_conversation_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Load cumulative session usage for a conversation **plus all of its
@@ -864,6 +868,11 @@ def load_session_usage(
     :param conversation_id: Conversation to load,
         e.g. ``"conv_abc123"``.
     :param conversation_store: Store to read from.
+    :param root_conversation_id: The conversation's tree root, when the
+        caller already holds the conversation row. Skips the internal
+        conversation read (the root binding is immutable, so a
+        caller-supplied value can never be stale). ``None`` resolves it
+        here.
     :returns: Summed usage dict with keys ``input_tokens``,
         ``output_tokens``, ``total_tokens``, ``total_cost_usd`` (the
         DISPLAY cost sum — statusLine ``S`` for claude-native), and
@@ -877,10 +886,35 @@ def load_session_usage(
         the policy seed (:func:`_policy_usage_seed`) reads
         ``policy_cost_usd`` (both unaffected by ``by_model``).
     """
-    conv = conversation_store.get_conversation(conversation_id)
-    if conv is None:
-        return {}
-    tree = _load_tree_conversations(conv.root_conversation_id, conversation_store)
+    if root_conversation_id is None:
+        conv = conversation_store.get_conversation(conversation_id)
+        if conv is None:
+            return {}
+        root_conversation_id = conv.root_conversation_id
+    tree = _load_tree_conversations(root_conversation_id, conversation_store)
+    return _sum_subtree_usage(tree, conversation_id)
+
+
+def _sum_subtree_usage(
+    tree: list[Conversation],
+    conversation_id: str,
+) -> dict[str, Any]:
+    """
+    Sum usage across the subtree of *tree* rooted at *conversation_id*.
+
+    Pure aggregation over an already-loaded spawn tree — no store reads.
+    :func:`build_policy_engine` loads the tree once and derives both the
+    session-wide gating seed (rooted at the tree root) and the per-node
+    subtree seed (rooted at the evaluated node) from the same list;
+    :func:`load_session_usage` wraps this for callers that start from a
+    conversation id. See :func:`load_session_usage` for the shape of the
+    returned dict.
+
+    :param tree: All conversations in the spawn tree (from
+        :func:`_load_tree_conversations`); order-independent.
+    :param conversation_id: The subtree root to sum from.
+    :returns: Summed usage dict (see :func:`load_session_usage`).
+    """
     subtree_ids = _subtree_conversation_ids(tree, conversation_id)
     totals: dict[str, Any] = {}
     # Per-model breakdown summed across the subtree, parallel to the flat sums.

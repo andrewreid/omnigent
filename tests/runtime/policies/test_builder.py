@@ -961,7 +961,7 @@ def test_normalize_usage_for_engine_drops_display_fields() -> None:
     """
     _normalize_usage_for_engine removes by_model and promotes policy_cost_usd.
 
-    Both _policy_usage_seed and _subtree_usage_seed use this helper to
+    Both the session-wide and subtree usage seeds use this helper to
     prepare usage for the engine: strip the display-only ``by_model``
     breakdown, and swap ``policy_cost_usd`` to ``total_cost_usd`` for
     enforcement cost (falling back to ``total_cost_usd`` when no enforcement
@@ -1001,3 +1001,174 @@ def test_normalize_usage_for_engine_drops_display_fields() -> None:
     assert "by_model" not in normalized3
     assert "policy_cost_usd" not in normalized3
     assert normalized3["input_tokens"] == 0
+
+
+def test_build_loads_conversation_and_tree_once(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Regression: one engine build does one conversation read and ONE spawn-tree
+    load, even when both usage seeds are computed.
+
+    The builder previously re-fetched the conversation ~4x and walked the
+    tree twice (once per seed) — 32 queries / 21 pool checkouts per
+    policies/evaluate call. Both seeds must still be correct: session-wide
+    gating from the whole tree, subtree display from the node's own subtree.
+    """
+    import collections
+
+    from omnigent.spec.types import FunctionPolicySpec, FunctionRef
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
+    )
+    sibling = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
+    )
+    conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 0.05})
+    conversation_store.set_session_usage(sibling.id, {"total_cost_usd": 0.03})
+
+    calls: collections.Counter[str] = collections.Counter()
+
+    class _CountingStore:
+        def __init__(self, inner: SqlAlchemyConversationStore) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str):
+            attr = getattr(self._inner, name)
+            if not callable(attr):
+                return attr
+
+            def _wrapper(*args: object, **kwargs: object) -> object:
+                calls[name] += 1
+                return attr(*args, **kwargs)
+
+            return _wrapper
+
+    subagent_budget = FunctionPolicySpec(
+        name="subtree_budget",
+        on=None,
+        function=FunctionRef(
+            path="omnigent.policies.builtins.cost.subagent_cost_budget",
+            arguments={"max_cost_usd": 10.0},
+        ),
+    )
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="child"),
+        conversation_id=child.id,
+        conversation_store=_CountingStore(conversation_store),  # type: ignore[arg-type]
+        default_policies=[subagent_budget],
+    )
+
+    # Semantics preserved: session-wide gate vs per-subtree display.
+    assert engine.usage["total_cost_usd"] == pytest.approx(0.18)
+    assert engine._subtree_usage is not None
+    assert engine._subtree_usage["total_cost_usd"] == pytest.approx(0.05)
+    # Load-once: one conversation read, one paged tree scan.
+    assert calls["get_conversation"] == 1, calls
+    assert calls["list_conversations"] == 1, calls
+
+
+def test_build_gates_and_inherits_approval_when_root_archived(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Archiving the root mid-session must not reset cost gating or the
+    inherited approval checkpoint for still-running sub-agents.
+
+    The spawn-tree scan excludes archived rows, so a sub-agent build could
+    lose the root entirely; the builder falls back to a direct read. (The
+    archived root's own spend disappearing from the tree sum is longstanding
+    behavior, unchanged here — this pins the seed and state inheritance.)
+    """
+    from omnigent.policies.schema import SESSION_COST_ASK_APPROVED_STATE_KEY
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
+    )
+    conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 0.05})
+    conversation_store.set_session_state(parent.id, {SESSION_COST_ASK_APPROVED_STATE_KEY: 9.99})
+    conversation_store.update_conversation(parent.id, archived=True)
+
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="child"),
+        conversation_id=child.id,
+        conversation_store=conversation_store,
+    )
+
+    assert engine.usage["total_cost_usd"] == pytest.approx(0.05)
+    assert engine.session_state[SESSION_COST_ASK_APPROVED_STATE_KEY] == pytest.approx(9.99)
+
+
+def test_build_with_preloaded_conversation_skips_own_read(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A caller-supplied conversation row eliminates the builder's own
+    read entirely (one tree scan remains) and yields identical seeds."""
+    import collections
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
+    )
+    conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 0.05})
+    child_row = conversation_store.get_conversation(child.id)
+
+    calls: collections.Counter[str] = collections.Counter()
+
+    class _CountingStore:
+        def __init__(self, inner: SqlAlchemyConversationStore) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str):
+            attr = getattr(self._inner, name)
+            if not callable(attr):
+                return attr
+
+            def _wrapper(*args: object, **kwargs: object) -> object:
+                calls[name] += 1
+                return attr(*args, **kwargs)
+
+            return _wrapper
+
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="child"),
+        conversation_id=child.id,
+        conversation_store=_CountingStore(conversation_store),  # type: ignore[arg-type]
+        conversation=child_row,
+    )
+    baseline = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="child"),
+        conversation_id=child.id,
+        conversation_store=conversation_store,
+    )
+
+    assert calls["get_conversation"] == 0, calls
+    assert calls["list_conversations"] == 1, calls
+    assert dict(engine.usage) == dict(baseline.usage)
+    assert engine.session_state == baseline.session_state
+
+
+def test_load_session_usage_with_preloaded_root_matches_self_resolved(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Passing the (immutable) root id skips the conversation read but
+    returns the identical subtree sum."""
+    from omnigent.runtime.policies.builder import load_session_usage
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
+    )
+    conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 0.05})
+
+    resolved = load_session_usage(child.id, conversation_store)
+    preloaded = load_session_usage(child.id, conversation_store, root_conversation_id=parent.id)
+    assert preloaded == resolved
+    assert preloaded["total_cost_usd"] == pytest.approx(0.05)

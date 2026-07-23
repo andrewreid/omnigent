@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import mimetypes
@@ -2478,6 +2479,7 @@ def _targeted_elicitation_event(
 def _ancestor_session_ids(
     conv_store: ConversationStore,
     session_id: str,
+    conv: Conversation | None = None,
 ) -> list[str]:
     """
     Return ancestor session ids for a session, nearest parent first.
@@ -2485,12 +2487,15 @@ def _ancestor_session_ids(
     :param conv_store: Store used to read conversation parent links.
     :param session_id: Session to walk upward from, e.g.
         ``"conv_child123"``.
+    :param conv: The session's already-loaded conversation row, when the
+        caller holds one — skips the first read, which makes the
+        top-level case (no parent) read-free.
     :returns: Ancestor ids in parent-to-root order. Empty when the
         session is top-level or missing.
     """
     ancestors: list[str] = []
     seen = {session_id}
-    current = conv_store.get_conversation(session_id)
+    current = conv if conv is not None else conv_store.get_conversation(session_id)
     while current is not None and current.parent_conversation_id is not None:
         parent_id = current.parent_conversation_id
         if parent_id in seen:
@@ -2540,6 +2545,7 @@ def _publish_elicitation_resolved_to_ancestors(
 def _publish_subtree_cost_to_ancestors(
     conv_store: ConversationStore,
     session_id: str,
+    conv: Conversation | None = None,
 ) -> None:
     """
     Re-publish each ancestor's subtree-summed cost after a child usage update.
@@ -2560,10 +2566,16 @@ def _publish_subtree_cost_to_ancestors(
         ancestor's subtree usage.
     :param session_id: The child session whose usage just changed, e.g.
         ``"conv_child123"``.
+    :param conv: The child's already-loaded conversation row, when the
+        caller holds one. Makes the top-level case (no ancestors)
+        read-free, and lets each ancestor's subtree sum skip its root
+        resolution — every ancestor shares this row's (immutable)
+        ``root_conversation_id``.
     :returns: None.
     """
-    for ancestor_id in _ancestor_session_ids(conv_store, session_id):
-        ancestor_usage = load_session_usage(ancestor_id, conv_store)
+    root_id = conv.root_conversation_id if conv is not None else None
+    for ancestor_id in _ancestor_session_ids(conv_store, session_id, conv):
+        ancestor_usage = load_session_usage(ancestor_id, conv_store, root_conversation_id=root_id)
         subtree_cost = _priced_cost_for_display(ancestor_usage)
         usage_by_model = _usage_by_model_for_display(ancestor_usage)
         if subtree_cost is None and usage_by_model is None:
@@ -3703,6 +3715,7 @@ def _coerce_cumulative_field(
 
 async def _persist_external_session_usage(
     session_id: str,
+    conv: Conversation,
     body: SessionEventInput,
     conversation_store: ConversationStore,
 ) -> int | None:
@@ -3714,6 +3727,9 @@ async def _persist_external_session_usage(
     (:func:`_persist_native_cumulative_usage`) must be present.
 
     :param session_id: Session/conversation identifier.
+    :param conv: The already-loaded conversation row; only its immutable
+        ``root_conversation_id`` is read (so a request-start row is safe),
+        letting the subtree recompute skip one conversation read.
     :param body: External session-usage event body.
     :param conversation_store: Store used to upsert the labels.
     :returns: The persisted ``context_tokens`` when present, else ``None``.
@@ -3776,7 +3792,14 @@ async def _persist_external_session_usage(
     # hide in-flight sub-agent spend until the next child flush (the badge would
     # oscillate own ⇄ subtree). For a childless session the subtree is just
     # itself, so this equals own cost — one indexed tree query per flush.
-    subtree_usage = await asyncio.to_thread(load_session_usage, session_id, conversation_store)
+    subtree_usage = await asyncio.to_thread(
+        functools.partial(
+            load_session_usage,
+            session_id,
+            conversation_store,
+            root_conversation_id=conv.root_conversation_id,
+        )
+    )
     subtree_cost = _priced_cost_for_display(subtree_usage)
     usage_by_model = _usage_by_model_for_display(subtree_usage)
     # Only include fields that were sent; the client treats absent
@@ -3807,6 +3830,7 @@ async def _persist_external_session_usage(
         _publish_subtree_cost_to_ancestors,
         conversation_store,
         session_id,
+        conv,
     )
     return raw_tokens
 
@@ -6366,6 +6390,8 @@ def _publish_session_superseded(session_id: str, target_conversation_id: str) ->
 async def _get_runner_client(
     session_id: str,
     runner_router: RunnerRouter | None,
+    *,
+    conv: Conversation | None = None,
 ) -> httpx.AsyncClient | None:
     """
     Get an HTTP client for the runner bound to a session.
@@ -6377,6 +6403,12 @@ async def _get_runner_client(
         e.g. ``"conv_abc123"``.
     :param runner_router: The ``RunnerRouter`` instance, or
         ``None`` for in-process setups.
+    :param conv: The already-loaded conversation row, when the caller
+        holds a current one. Its ``runner_id`` lets the router skip
+        re-reading the conversation per call — the event hot path
+        resolves a runner per streamed chunk. Callers must pass a row
+        read *after* any wake/relaunch that could rebind the runner;
+        an unpinned row falls back to the router's own fresh read.
     :returns: An ``httpx.AsyncClient`` pointed at the runner,
         or ``None`` if no runner is available.
     """
@@ -6384,9 +6416,12 @@ async def _get_runner_client(
 
     if runner_router is not None:
         try:
-            routed = runner_router.client_for_session_resources(
-                session_id,
-            )
+            if conv is not None and conv.runner_id:
+                routed = runner_router.client_for_bound_runner(session_id, conv.runner_id)
+            else:
+                routed = runner_router.client_for_session_resources(
+                    session_id,
+                )
             return routed.client
         except (LookupError, httpx.HTTPError, OmnigentError):
             _logger.debug(
@@ -8570,6 +8605,8 @@ async def _forward_session_change_to_runner(
     session_id: str,
     runner_router: Any,
     event: dict[str, Any],
+    *,
+    conv: Conversation | None = None,
 ) -> _RunnerForwardResult | None:
     """
     Best-effort POST a control event to the bound runner.
@@ -8609,6 +8646,9 @@ async def _forward_session_change_to_runner(
         ``{"type": "effort_change", "effort": "high"}``,
         ``{"type": "model_change", "model": "claude-opus-4-7"}``, or
         ``{"type": "compact"}``.
+    :param conv: Optional already-loaded conversation row, forwarded to
+        :func:`_get_runner_client` so the per-chunk status forward skips
+        the router's conversation re-read.
     :returns: The runner's HTTP status/body, or ``None`` when no
         runner client could be resolved or the POST failed at the
         transport layer (in both cases the AP-side persisted value /
@@ -8616,7 +8656,7 @@ async def _forward_session_change_to_runner(
     """
     from omnigent.runtime import get_runner_client
 
-    runner_client = await _get_runner_client(session_id, runner_router)
+    runner_client = await _get_runner_client(session_id, runner_router, conv=conv)
     if runner_client is None:
         runner_client = cast("httpx.AsyncClient | None", get_runner_client())
     if runner_client is None:
@@ -17489,7 +17529,7 @@ def create_sessions_router(
             _caps.policy_llm_connection_factory() if _caps.policy_llm_connection_factory else None
         )
 
-        def _build_engine() -> PolicyEngine:
+        def _build_engine(preloaded_conv: Conversation | None = None) -> PolicyEngine:
             """
             Build a policy engine for this session from the loaded spec.
 
@@ -17498,6 +17538,10 @@ def create_sessions_router(
             does not re-query it during ``evaluate``, so a fresh build is the
             only way to observe a concurrent sibling's just-recorded approval.
 
+            :param preloaded_conv: The conversation row this handler already
+                loaded, passed on the FIRST build only to skip the builder's
+                re-read. Rebuilds that must observe concurrent writes (the
+                ASK-gate re-evaluation) pass ``None`` for a fresh read.
             :returns: A :class:`PolicyEngine` seeded with the latest
                 persisted state for ``session_id``.
             """
@@ -17505,13 +17549,14 @@ def create_sessions_router(
                 spec=loaded.spec,
                 conversation_id=session_id,
                 conversation_store=conversation_store,
+                conversation=preloaded_conv,
                 default_policies=_caps.default_policies,
                 policy_store=get_policy_store(),
                 server_llm=_caps.llm,
                 host_connection=_host_conn,
             )
 
-        engine = _build_engine()
+        engine = _build_engine(conv)
         # Use the turn-initiating human's identity (persisted at forward time)
         # so per-user policies gate on the correct actor even when the HTTP
         # caller is the runner's service-account credential.  Falls back to
@@ -20756,6 +20801,7 @@ def create_sessions_router(
                 session_id,
                 runner_router,
                 forward_body,
+                conv=conv,
             )
             if (
                 conv.kind == "sub_agent"
@@ -20851,6 +20897,7 @@ def create_sessions_router(
             # post-hoc here — a logged output cannot be un-logged.)
             await _persist_external_session_usage(
                 session_id,
+                conv,
                 body,
                 conversation_store,
             )

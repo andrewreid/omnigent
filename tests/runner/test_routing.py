@@ -249,3 +249,41 @@ async def test_runner_router_existing_conversation_returns_none_when_unpinned() 
         assert router.client_for_existing_conversation("conv_test") is None
     finally:
         await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_client_for_bound_runner_skips_conversation_read() -> None:
+    """A caller-supplied runner binding routes without touching the store.
+
+    The event hot path resolves a runner per streamed chunk; passing the
+    already-loaded binding must not re-read the conversation row."""
+    registry = TunnelRegistry()
+    registry.register("runner_one", _FakeWebSocket(), _hello(harnesses=["codex"]))
+
+    class _ExplodingStore:
+        def get_conversation(self, conversation_id: str) -> None:
+            raise AssertionError("client_for_bound_runner must not read the store")
+
+    router = RunnerRouter(registry=registry, conversation_store=_ExplodingStore())  # type: ignore[arg-type]
+    try:
+        routed = router.client_for_bound_runner("conv_test", "runner_one")
+        assert routed.runner_id == "runner_one"
+    finally:
+        await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_client_for_bound_runner_offline_raises_runner_unavailable() -> None:
+    """An offline pinned runner raises the same error as the re-reading path."""
+    registry = TunnelRegistry()
+    router = RunnerRouter(
+        registry=registry,
+        conversation_store=_ConversationStore({}),  # type: ignore[arg-type]
+    )
+    try:
+        with pytest.raises(OmnigentError) as excinfo:
+            router.client_for_bound_runner("conv_test", "runner_gone")
+
+        _assert_omnigent_error(excinfo, code=ErrorCode.RUNNER_UNAVAILABLE)
+    finally:
+        await router.aclose()
