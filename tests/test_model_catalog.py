@@ -797,7 +797,14 @@ def test_cli_config_listing_is_static_and_unverified(
     listing = list_models_for_worker(_worker_spec("codex-native"), "codex-native")
     assert listing.source == "static"
     assert listing.verified is False
-    assert [m.id for m in listing.models] == ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+    assert [m.id for m in listing.models] == [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+    ]
     # The note must say the CLI resolves the credential itself — this row
     # is a working worker, not a credentials preflight failure.
     assert "resolved by the CLI at launch" in listing.note
@@ -821,6 +828,35 @@ def test_cursor_listing_is_static_with_curated_base_models(
     # it is regenerated when cursor ships models.
     assert "composer-2.5" in ids
     assert "cannot run here" not in listing.note
+
+
+def test_codex_subscription_listing_is_static_and_unverified(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The codex CLI login yields the curated static list, ``verified=False``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n  codex:\n    kind: subscription\n    cli: codex\n    default: true\n",
+    )
+    listing = list_models_for_worker(_worker_spec("codex-native"), "codex-native")
+    assert listing.source == "static"
+    assert listing.verified is False
+    # Exactly the curated codex tiers — these are aliases the codex CLI
+    # advertises for the logged-in plan, not a live list.
+    assert [m.id for m in listing.models] == [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+    ]
+    assert "CLI login" in listing.note
 
 
 def test_none_listing_explains_dead_worker(
