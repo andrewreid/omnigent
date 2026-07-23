@@ -24,6 +24,7 @@ import logging
 import os
 import signal
 import subprocess
+import time
 from contextlib import suppress
 from typing import Protocol
 
@@ -302,23 +303,8 @@ def process_is_zombie(pid: int) -> bool:
         return False
 
 
-def group_has_live_members(pgid: int) -> bool | None:
-    """
-    Whether process group *pgid* has any live (non-zombie) members.
-
-    Zombies are ignored: they hold no resources and their collection
-    belongs to a foreign reaper on its own schedule — counting them (as a
-    plain ``killpg(pgid, 0)`` probe does) would veto settlement forever
-    under a subreaper that has not drained yet. Fail-closed: a scan that
-    cannot be completed (unenumerable pid table, an unreadable confirmed
-    member) yields ``None`` — callers must retain, not release.
-
-    :param pgid: The process group to probe.
-    :returns: ``True`` when a live member exists, ``False`` only for a
-        complete scan that found none, ``None`` when indeterminate.
-    """
-    if pgid <= 0 or _getpgid_fn is None:
-        return None
+def _scan_group_live(pgid: int) -> bool | None:
+    """One pass of :func:`group_has_live_members` (see its contract)."""
     try:
         pids = psutil.pids()
     except (psutil.Error, OSError):
@@ -327,8 +313,10 @@ def group_has_live_members(pgid: int) -> bool | None:
         try:
             if _getpgid_fn(pid) != pgid:
                 continue
+        except ProcessLookupError:
+            continue  # exited mid-scan — definitively not a member anymore
         except OSError:
-            continue  # gone, or not ours to inspect — not a member of ours
+            return None  # membership unknowable — scan incomplete
         try:
             if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
                 continue
@@ -338,6 +326,32 @@ def group_has_live_members(pgid: int) -> bool | None:
             return None  # a confirmed member is unreadable — inconclusive
         return True
     return False
+
+
+def group_has_live_members(pgid: int) -> bool | None:
+    """
+    Whether process group *pgid* has any live (non-zombie) members.
+
+    Zombies are ignored: they hold no resources and their collection
+    belongs to a foreign reaper on its own schedule. Fail-closed on
+    incomplete scans, and "no live members" requires TWO consecutive
+    complete empty scans: a member can fork a survivor after one pid
+    listing and then exit, hiding the survivor from that single pass —
+    but any survivor chain alive across the first pass must appear in
+    the second listing, so escaping both requires lifetimes shorter than
+    a /proc readdir.
+
+    :param pgid: The process group to probe.
+    :returns: ``True`` when a live member exists, ``False`` only when two
+        consecutive complete scans found none, ``None`` if indeterminate.
+    """
+    if pgid <= 0 or _getpgid_fn is None:
+        return None
+    first = _scan_group_live(pgid)
+    if first is not False:
+        return first
+    time.sleep(0.02)
+    return _scan_group_live(pgid)
 
 
 def kill_verified(pid: int, identity: str, sig: int) -> bool:

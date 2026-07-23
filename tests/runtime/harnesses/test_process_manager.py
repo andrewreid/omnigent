@@ -49,6 +49,7 @@ from omnigent.runtime.harnesses.process_manager import (
     _pids_holding_socket,
     _SubprocessEntry,
 )
+from tests._helpers import procs as test_procs
 
 _TEST_HARNESS_NAME = "test"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_harness"
@@ -1272,9 +1273,11 @@ async def test_orphan_sweep_kills_whole_detached_harness_tree(
         start_new_session=True,
     )
     child_pid: int | None = None
+    child_ident: str | None = None
     try:
         assert leader.stdout is not None
         child_pid = int(leader.stdout.readline().strip())
+        child_ident = test_procs.capture_identity(child_pid)
 
         sweep_task = asyncio.create_task(pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent))
         # Reap the leader promptly so the sweep's death verification can
@@ -1284,16 +1287,15 @@ async def test_orphan_sweep_kills_whole_detached_harness_tree(
 
         assert swept == 1
         assert not instance_dir.exists()
-        deadline = time.monotonic() + 5.0
-        while _pid_alive(child_pid) and time.monotonic() < deadline:
-            await asyncio.sleep(0.05)
-        assert not _pid_alive(child_pid), "harness child survived the sweep"
+        # Identity-based, zombie-tolerant: under a subreaper the killed
+        # child's corpse may await a foreign reaper, and its raw pid can
+        # be recycled on a busy host.
+        assert test_procs.wait_gone(child_pid, child_ident), "harness child survived the sweep"
     finally:
-        for pid in [child_pid, leader.pid]:
-            if pid is not None:
-                with contextlib.suppress(OSError):
-                    os.kill(pid, signal.SIGKILL)
+        if child_pid is not None and child_ident is not None:
+            test_procs.safe_kill(child_pid, child_ident)
         if leader.poll() is None:
+            leader.kill()
             leader.wait(timeout=10)
 
 
