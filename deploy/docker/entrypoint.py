@@ -347,6 +347,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     permission_store = SqlAlchemyPermissionStore(database_url)
     host_store = HostStore(database_url)
     policy_store = SqlAlchemyPolicyStore(database_url)
+    project_store = SqlAlchemyProjectStore(database_url)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(database_url)
     project_store = SqlAlchemyProjectStore(database_url)
     # Fail startup loud on a malformed `sandbox:` section (an operator
