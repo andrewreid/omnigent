@@ -7376,30 +7376,37 @@ def _fingerprint_for(bridge_dir: Path, transcript: Path | None = None):
 
 def test_fingerprint_classifies_every_bridge_file() -> None:
     """
-    Every bridge file is either watched for changes or explicitly ours.
+    Every bridge-dir filename is either watched for changes or explicitly ours.
 
     The fingerprint stats a fixed list of names rather than scanning the
-    directory, which is ~2x cheaper but stops being self-maintaining: a bridge
-    file added later would go unwatched, and its changes would only surface on
-    the periodic resync. This pins the classification so adding one without
+    directory, which is ~2x cheaper but stops being self-maintaining: a file
+    added later would go unwatched, and its changes would only surface on the
+    periodic resync. This pins the classification so adding one without
     deciding which side it falls on fails here instead of in production.
+
+    Both modules that name bridge-dir files are swept, not just the bridge:
+    the forwarder declares filenames too, so a new *input* constant added
+    beside its cursor files would otherwise slip through unwatched.
 
     :returns: None.
     """
-    declared = {
-        value
-        for name, value in vars(bridge_module).items()
-        if name.endswith("_FILE") and isinstance(value, str)
-    }
+    declared: dict[str, str] = {}
+    for module in (bridge_module, forwarder):
+        for name, value in vars(module).items():
+            if name.endswith("_FILE") and isinstance(value, str):
+                declared[value] = f"{module.__name__}.{name}"
     assert declared, "no bridge file constants found — has the naming changed?"
 
     watched = set(forwarder._WATCHED_BRIDGE_FILES)
     owned = set(forwarder._FORWARDER_OWNED_BRIDGE_FILES)
 
-    unclassified = declared - watched - owned
+    unclassified = {
+        value: origin for value, origin in declared.items() if value not in watched | owned
+    }
     assert not unclassified, (
-        f"bridge file(s) {sorted(unclassified)} are neither watched by the poll "
-        "loop's fingerprint nor declared forwarder-owned; add them to "
+        f"bridge file(s) {sorted(unclassified)} "
+        f"(declared at {sorted(unclassified.values())}) are neither watched by "
+        "the poll loop's fingerprint nor declared forwarder-owned; add them to "
         "_WATCHED_BRIDGE_FILES (an input) or _FORWARDER_OWNED_BRIDGE_FILES (our output)"
     )
     # A file cannot be both: watching our own output re-opens the gate on work
