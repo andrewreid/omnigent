@@ -348,6 +348,21 @@ def _make_session(root: Path, index: int, *, fanout: int) -> tuple[Path, str]:
                 encoding="utf-8",
             )
 
+    # The rest of the bridge dir a live session accumulates. Without these the
+    # directory is far smaller than in production, which understates every
+    # per-tick cost that scales with how many files sit beside the transcript.
+    for name, payload in (
+        ("server.json", {"base_url": "http://127.0.0.1:6767"}),
+        ("tool_relay.json", {"port": 8123}),
+        ("tmux.json", {"socket_path": str(workspace / "tmux.sock"), "target": "main"}),
+        ("permission_hook.json", {"enabled": True}),
+    ):
+        (bridge_dir / name).write_text(json.dumps(payload), encoding="utf-8")
+    (bridge_dir / "message_deltas.jsonl").write_text(
+        json.dumps({"message_id": "m1", "text": "hi", "final": True}) + "\n",
+        encoding="utf-8",
+    )
+
     # A statusLine snapshot, so the model/cost scans have real input.
     (bridge_dir / "context.json").write_text(
         json.dumps(

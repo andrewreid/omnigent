@@ -759,100 +759,167 @@ def _idle_gate_enabled() -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
-# Entries in a ``subagents/`` directory whose *content* the loop re-reads as it
-# grows. The sibling ``agent-*.meta.json`` is read once, when the sub-agent is
-# first discovered, and never again — so its arrival must change the
-# fingerprint but its bytes need not be stat'ed. At high fan-out that halves
-# the per-tick syscalls, since every sub-agent ever spawned stays on disk.
+# Bridge-owned files the poll loop reads. Stat'ed by name rather than found
+# with a directory scan: ``os.scandir`` plus a ``DirEntry.stat`` per entry
+# measures ~4.3us an entry against ~1.3us for a plain ``os.stat``, and the scan
+# also picked up the forwarder's own cursor files below — so writing one
+# churned the fingerprint and bought an extra full tick for no new input.
+#
+# Conservative on purpose: a couple of these are launch-time files the loop
+# never re-reads. Watching them costs one stat and cannot cause a miss, whereas
+# pruning the list to "what the loop reads today" would.
+_WATCHED_BRIDGE_FILES = (
+    "bridge.json",
+    "server.json",
+    "state.json",
+    "hooks.jsonl",
+    "tool_relay.json",
+    "tmux.json",
+    "permission_hook.json",
+    "context.json",
+    MESSAGE_DELTAS_FILE,
+)
+
+# Bridge files this module writes. Deliberately unwatched — they change only
+# because the loop just did work, so watching them would re-open the gate on
+# the forwarder's own output.
+_FORWARDER_OWNED_BRIDGE_FILES = (
+    _FORWARDER_STATE_FILE,
+    _HOOK_STATE_FILE,
+    _SUBAGENT_STATE_FILE,
+    _DELTA_STATE_FILE,
+)
+
+# Sub-agent transcripts grow; their sibling ``agent-*.meta.json`` is read once
+# at discovery and never again. Membership changes (either file appearing) move
+# the directory's own mtime, which is in the fingerprint, so only the
+# transcripts need stat'ing for content.
 _APPENDING_SUBAGENT_SUFFIX = ".jsonl"
 
-# Placeholder recorded for an entry whose name matters but whose content does
-# not. Membership changes still move the fingerprint; content changes cannot.
-_UNSTATTED_ENTRY = (0, 0, 0)
 
-
-def _scan_into_fingerprint(
-    directory: Path,
-    prefix: str,
-    out: _BridgeFingerprint,
-    *,
-    stat_suffix: str | None = None,
-) -> None:
+class _BridgeInputPaths:
     """
-    Stamp every visible entry of *directory* into a fingerprint.
+    Pre-resolved stat targets for one session's poll loop.
 
-    Dot-prefixed names are skipped: the bridge's atomic writer creates
-    ``.<name>.<rand>.tmp`` scratch files, and letting those churn the
-    fingerprint would defeat the gate on every state write.
+    The fingerprint runs four times a second forever, so everything that does
+    not change between ticks is resolved once here: the bridge dir's watched
+    files, the transcript, and the sub-agent transcripts. Paths are kept as
+    plain strings — building ``bridge_dir / name`` per tick costs more than
+    the ``os.stat`` it feeds, which is what made an earlier by-name version
+    slower than the directory scan it replaced.
 
-    :param directory: Directory to scan, e.g. the bridge dir.
-    :param prefix: Namespace for the keys, e.g. ``"bridge/"``.
-    :param out: Fingerprint mapping to update in place.
-    :param stat_suffix: When given, only entries with this suffix are
-        stat'ed; the rest contribute their name alone. ``None`` stats
-        everything.
-    :returns: None.
+    Sub-agent membership is refreshed only when the directory's own mtime
+    moves. Every sub-agent a session ever spawned stays on disk, so re-listing
+    at 4 Hz is the dominant fingerprint cost under fan-out; creating, removing
+    or renaming an entry moves that mtime, and the directory's stat is itself
+    in the fingerprint, so an arrival is never missed.
     """
-    try:
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                if entry.name.startswith("."):
-                    continue
-                if stat_suffix is not None and not entry.name.endswith(stat_suffix):
-                    out[prefix + entry.name] = _UNSTATTED_ENTRY
-                    continue
-                try:
-                    info = entry.stat()
-                except OSError:
-                    continue
-                out[prefix + entry.name] = (info.st_mtime_ns, info.st_size, info.st_ino)
-    except OSError:
-        return
 
+    def __init__(self, bridge_dir: Path) -> None:
+        """
+        Resolve the fixed stat targets for *bridge_dir*.
 
-def _bridge_input_fingerprint(
-    bridge_dir: Path,
-    transcript_path: Path | None,
-    subagents_dir: Path | None,
-) -> _BridgeFingerprint:
-    """
-    Snapshot every file the poll loop reads, cheaply enough to do every tick.
-
-    Inode is part of the triple because the bridge writes its JSON state via
-    a temp file plus ``os.replace``, so every write lands a new inode even
-    when the size and timestamp would look unchanged. Append-only files
-    (hook events, message deltas, transcripts) always grow their size. Between
-    them there is no writer here that can mutate an input invisibly.
-
-    The whole bridge directory is scanned rather than a list of known names so
-    a file added to the bridge later is covered without anyone remembering to
-    update this.
-
-    :param bridge_dir: Native Claude bridge directory.
-    :param transcript_path: Transcript last resolved by the loop, or ``None``
-        before hooks have reported one.
-    :param subagents_dir: The transcript's ``subagents/`` directory, resolved
-        by the caller so it is not rebuilt on every tick. ``None`` when there
-        is no transcript yet.
-    :returns: Fingerprint of the loop's inputs.
-    """
-    fingerprint: _BridgeFingerprint = {}
-    _scan_into_fingerprint(bridge_dir, "bridge/", fingerprint)
-    if transcript_path is not None:
-        try:
-            info = transcript_path.stat()
-        except OSError:
-            pass
-        else:
-            fingerprint["transcript"] = (info.st_mtime_ns, info.st_size, info.st_ino)
-    if subagents_dir is not None:
-        _scan_into_fingerprint(
-            subagents_dir,
-            "subagent/",
-            fingerprint,
-            stat_suffix=_APPENDING_SUBAGENT_SUFFIX,
+        :param bridge_dir: Native Claude bridge directory.
+        """
+        root = str(bridge_dir)
+        self._bridge_targets: tuple[tuple[str, str], ...] = tuple(
+            ("bridge/" + name, os.path.join(root, name)) for name in _WATCHED_BRIDGE_FILES
         )
-    return fingerprint
+        self._transcript: str | None = None
+        self._subagents_dir: str | None = None
+        self._subagent_dir_key: tuple[int, int] | None = None
+        self._subagent_targets: tuple[tuple[str, str], ...] = ()
+
+    def set_transcript(self, transcript_path: Path | None) -> None:
+        """
+        Point the fingerprint at a new transcript, dropping stale sub-agents.
+
+        Called when hooks first report a transcript and again after a /clear
+        or /fork rotation, which resolves a different ``subagents/`` directory
+        — so the cached membership belongs to the previous session and must go.
+
+        :param transcript_path: Transcript JSONL, or ``None`` when hooks have
+            not reported one yet.
+        :returns: None.
+        """
+        if transcript_path is None:
+            self._transcript = None
+            self._subagents_dir = None
+        else:
+            self._transcript = str(transcript_path)
+            self._subagents_dir = str(_subagents_dir_for_transcript(transcript_path))
+        self._subagent_dir_key = None
+        self._subagent_targets = ()
+
+    def _refresh_subagents(self, dir_key: tuple[int, int]) -> None:
+        """
+        Re-list the sub-agent transcripts after a membership change.
+
+        :param dir_key: The directory stat identity this listing belongs to.
+        :returns: None.
+        """
+        assert self._subagents_dir is not None
+        targets: list[tuple[str, str]] = []
+        try:
+            with os.scandir(self._subagents_dir) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if name.startswith(".") or not name.endswith(_APPENDING_SUBAGENT_SUFFIX):
+                        continue
+                    targets.append(("subagent/" + name, entry.path))
+        except OSError:
+            return
+        targets.sort()
+        self._subagent_dir_key = dir_key
+        self._subagent_targets = tuple(targets)
+
+    def fingerprint(self) -> _BridgeFingerprint:
+        """
+        Snapshot every file the poll loop reads.
+
+        Inode is part of the triple because the bridge writes its JSON state
+        via a temp file plus ``os.replace``, so every write lands a new inode
+        even when the size and timestamp would look unchanged. Append-only
+        files (hook events, message deltas, transcripts) always grow their
+        size. Between them there is no writer here that can mutate an input
+        invisibly.
+
+        :returns: Fingerprint of the loop's inputs.
+        """
+        fingerprint: _BridgeFingerprint = {}
+        stat = os.stat
+        for key, path in self._bridge_targets:
+            try:
+                info = stat(path)
+            except OSError:
+                continue
+            fingerprint[key] = (info.st_mtime_ns, info.st_size, info.st_ino)
+        if self._transcript is not None:
+            try:
+                info = stat(self._transcript)
+            except OSError:
+                pass
+            else:
+                fingerprint["transcript"] = (info.st_mtime_ns, info.st_size, info.st_ino)
+        if self._subagents_dir is not None:
+            try:
+                info = stat(self._subagents_dir)
+            except OSError:
+                # No sub-agent has been spawned yet; drop any stale listing.
+                self._subagent_dir_key = None
+                self._subagent_targets = ()
+            else:
+                fingerprint["subagents/"] = (info.st_mtime_ns, info.st_size, info.st_ino)
+                dir_key = (info.st_mtime_ns, info.st_ino)
+                if dir_key != self._subagent_dir_key:
+                    self._refresh_subagents(dir_key)
+                for key, path in self._subagent_targets:
+                    try:
+                        info = stat(path)
+                    except OSError:
+                        continue
+                    fingerprint[key] = (info.st_mtime_ns, info.st_size, info.st_ino)
+        return fingerprint
 
 
 def _forwarder_tick_is_needed(
@@ -976,7 +1043,7 @@ async def forward_claude_transcript_to_session(
     gate_enabled = _idle_gate_enabled()
     fingerprint: _BridgeFingerprint | None = None
     known_transcript_path: Path | None = None
-    known_subagents_dir: Path | None = None
+    bridge_inputs = _BridgeInputPaths(bridge_dir)
     last_input_change_at = time.monotonic()
     last_full_poll_at = 0.0
     # Whether the last tick skipped its body. Tracked only so the two
@@ -992,9 +1059,7 @@ async def forward_claude_transcript_to_session(
             try:
                 if gate_enabled:
                     now = time.monotonic()
-                    current = _bridge_input_fingerprint(
-                        bridge_dir, known_transcript_path, known_subagents_dir
-                    )
+                    current = bridge_inputs.fingerprint()
                     if fingerprint is None or current != fingerprint:
                         fingerprint = current
                         last_input_change_at = now
@@ -1135,11 +1200,7 @@ async def forward_claude_transcript_to_session(
                 # transcript and its sub-agent dir without re-deriving either.
                 if transcript_path != known_transcript_path:
                     known_transcript_path = transcript_path
-                    known_subagents_dir = (
-                        _subagents_dir_for_transcript(transcript_path)
-                        if transcript_path is not None
-                        else None
-                    )
+                    bridge_inputs.set_transcript(transcript_path)
                 if transcript_path is not None:
                     state = await _ensure_state_for_transcript(
                         bridge_dir=bridge_dir,

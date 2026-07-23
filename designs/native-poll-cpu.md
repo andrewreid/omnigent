@@ -286,6 +286,36 @@ file change:
 **Latency impact: none.** The poll interval is untouched, and any change to any
 input file is seen on the very next 0.25 s tick.
 
+### 3.3.1 The detector must not watch its own outputs
+
+The first version fingerprinted the bridge directory with `os.scandir` plus a
+`DirEntry.stat` per entry, which is self-maintaining — a bridge file added
+later is covered without anyone remembering. It also swept in the forwarder's
+own cursor files, and that turned out to matter: writing a cursor moves the
+fingerprint, which runs the next tick's body, which can write the cursor
+again. On an idle session with a `message_deltas.jsonl` present the gate
+engaged only **54 %** of ticks instead of settling.
+
+So the inputs are now stat'ed by name, from `_WATCHED_BRIDGE_FILES`, with the
+four `_FORWARDER_OWNED_BRIDGE_FILES` deliberately excluded. That trades the
+self-maintaining property for an explicit contract, so
+`test_fingerprint_classifies_every_bridge_file` pins it: every `*_FILE`
+constant in the bridge module must be classified as watched or
+forwarder-owned, and the two sets must be disjoint. A new bridge file fails
+CI rather than going silently unwatched.
+
+Paths are pre-resolved once per session into `_BridgeInputPaths` and held as
+plain strings. This is not incidental: a by-name version that built
+`bridge_dir / name` per tick measured *slower* than the directory scan it
+replaced, because `pathlib` construction costs more than the `os.stat` it
+feeds.
+
+Sub-agent membership is cached and re-listed only when the `subagents/`
+directory's own mtime moves — creating, removing or renaming an entry moves
+it, and that directory's stat is itself in the fingerprint, so an arrival is
+never missed. Appends to an existing transcript move neither, which is why the
+cached transcripts are still stat'ed individually every tick.
+
 ### 3.4 Blast radius, kill switches, observability
 
 | knob | default | effect when disabled |
@@ -338,6 +368,12 @@ defaulting past each loop's settle period. Without it the window captures the
 tail of the last activity burst instead of steady-state idle, which understates
 the win by roughly 3x.
 
+The forwarder scenario builds the full bridge directory a live session
+accumulates (~9 files including `message_deltas.jsonl`). An earlier version
+created only 4, which made every per-file cost look smaller than production
+and hid the self-triggering gate in §3.3.1 entirely — the deltas path never
+ran, so the cursor it churns was never written.
+
 ### Results
 
 Pre-change source vs this branch, macOS 27 / M-series, Python 3.12.13, 30 s
@@ -356,6 +392,23 @@ Extrapolating to the reported host (~20 sessions with fan-out): the forwarder
 alone goes from ~29 % of a core to ~3 %, and 16 live terminals from ~99 % to
 ~6.7 %. That is consistent with the 20-25 %/runner attributed to each loop in
 the issues.
+
+### Detector fix (§3.3.1), re-measured on the realistic fixture
+
+Deployed code vs this branch, 60 s window, 8 sessions (4 at fan-out 100),
+everything idle:
+
+| scenario | deployed | after | factor |
+|---|---|---|---|
+| forwarder, no fan-out | **0.47 %** of a core / session | **0.13 %** | **3.7x** |
+| forwarder, fan-out 6 | **0.79 %** of a core / session | **0.17 %** | **4.6x** |
+| forwarder, fan-out 100 | **2.85 %** of a core / session | **0.65 %** | **4.4x** |
+| gate engagement, no fan-out | 54 % of ticks | **97.5 %** | — |
+
+Most of that is the gate finally settling rather than the detector being
+cheaper; the fingerprint itself is ~2x cheaper (28.7 → 14.1 µs at fan-out 0,
+252 → 149 µs at fan-out 100). The remaining 2.5 % of ungated ticks is the
+10 s resync, as designed.
 
 ### High-fan-out budget
 
@@ -530,6 +583,30 @@ No blocking findings. Two fixes:
    them.
 2. **The watcher docstring still described Claude/Pi only** while eight roles
    were supported. It now points at `PTY_STATUS_OWNING_TERMINAL_ROLES`.
+
+### 7.3.1 Post-deploy: the detector became the cost
+
+Field profile of the shipped fix on an idle runner reported the change
+*detector* as the top leaf — `_scan_into_fingerprint` and
+`_bridge_input_fingerprint` together ~41 % of forwarder on-CPU time — with the
+caveat that the sample was small and the ratios directional only. Re-profiled
+here over a 60 s steady-state window: the fingerprint was **61 %** of forwarder
+CPU, so the report was right and if anything understated.
+
+Two things came out of measuring rather than assuming:
+
+- The suspicion that the failing `scandir` on a missing `subagents/` directory
+  was expensive was **wrong** — 1.17 µs, noise.
+- Making the benchmark's bridge directory realistic (it had 4 files where
+  production has ~9-13, and no `message_deltas.jsonl`) exposed the
+  self-triggering gate above. The original "after" numbers in §4 were
+  measured against that sparse fixture and so were optimistic.
+
+The suggested fix of backing the poll interval off while idle was **declined**.
+It trades streaming latency, and unlike the terminal watcher there is no wake
+to recover it: `claude_native.py` runs `supervise_forwarder` in the native CLI
+wrapper process, so the runner-side turn-start wake cannot reach it. Cheapening
+the detector gets a larger win at zero latency cost.
 
 ### 7.4 Fifth round — cross-vendor review
 
