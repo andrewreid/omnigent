@@ -803,6 +803,41 @@ _FORWARDER_OWNED_BRIDGE_FILES = (
 # transcripts need stat'ing for content.
 _APPENDING_SUBAGENT_SUFFIX = ".jsonl"
 
+# How recent a directory mtime has to be before it stops being trustworthy as
+# a change signal.
+#
+# ``st_mtime_ns`` reports nanoseconds but filesystems do not store them: Linux
+# stamps directory mtimes from the jiffy clock (4ms at the common CONFIG_HZ=250),
+# and older filesystems round to 1-2s. An entry created within one tick of the
+# previous stat therefore leaves the recorded mtime *unchanged* — and because
+# nothing moves it afterwards either, comparing mtimes alone would leave that
+# sub-agent unwatched until the resync. Measured on a CONFIG_HZ=250 box: adding
+# an entry left the directory mtime unchanged 194 times out of 200.
+#
+# So a directory whose mtime sits inside this window of now is re-listed
+# regardless of whether the mtime moved. The window is wide enough for the 1-2s
+# filesystems; it costs extra listings only just after a change, and nothing at
+# all once the directory has been quiet — which is the steady state this whole
+# gate exists to make cheap.
+_DIR_MTIME_RACY_WINDOW_NS = 2_000_000_000
+
+
+def _mtime_is_racy(mtime_ns: int) -> bool:
+    """
+    Report whether a timestamp is too recent to trust as a change signal.
+
+    A change landing in the same filesystem timestamp tick as the previous
+    stat is invisible to a later mtime comparison, so anything stamped within
+    :data:`_DIR_MTIME_RACY_WINDOW_NS` of now has to be re-examined rather than
+    compared. The comparison is absolute so a timestamp in the *future* — an
+    NFS server whose clock leads ours — also reads as untrustworthy instead of
+    silently passing.
+
+    :param mtime_ns: A stat's ``st_mtime_ns``.
+    :returns: ``True`` when the caller must not rely on mtime equality.
+    """
+    return abs(time.time_ns() - mtime_ns) < _DIR_MTIME_RACY_WINDOW_NS
+
 
 class _BridgeInputPaths:
     """
@@ -815,11 +850,11 @@ class _BridgeInputPaths:
     the ``os.stat`` it feeds, which is what made an earlier by-name version
     slower than the directory scan it replaced.
 
-    Sub-agent membership is refreshed only when the directory's own mtime
-    moves. Every sub-agent a session ever spawned stays on disk, so re-listing
-    at 4 Hz is the dominant fingerprint cost under fan-out; creating, removing
-    or renaming an entry moves that mtime, and the directory's stat is itself
-    in the fingerprint, so an arrival is never missed.
+    Sub-agent membership is refreshed when the directory's own mtime moves, or
+    while that mtime is too recent to trust. Every sub-agent a session ever
+    spawned stays on disk, so re-listing at 4 Hz is the dominant fingerprint
+    cost under fan-out — but mtime inequality alone is not a sound dirtiness
+    signal, see :data:`_DIR_MTIME_RACY_WINDOW_NS`.
     """
 
     def __init__(self, bridge_dir: Path) -> None:
@@ -920,7 +955,7 @@ class _BridgeInputPaths:
             else:
                 fingerprint["subagents/"] = (info.st_mtime_ns, info.st_size, info.st_ino)
                 dir_key = (info.st_mtime_ns, info.st_ino)
-                if dir_key != self._subagent_dir_key:
+                if dir_key != self._subagent_dir_key or _mtime_is_racy(info.st_mtime_ns):
                     self._refresh_subagents(dir_key)
                 for key, path in self._subagent_targets:
                     try:
