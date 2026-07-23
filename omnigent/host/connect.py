@@ -316,16 +316,10 @@ def _group_provably_empty(members: list[int] | None) -> bool:
 def _pid_is_zombie(pid: int) -> bool:
     """Whether *pid* is an unreaped zombie (dead for drain purposes).
 
-    A pinned zombie's /proc metadata stays readable on Linux, so identity
-    probes report "match" — liveness needs this separate check.
-
     :param pid: The pid to probe.
     :returns: ``True`` for an unreaped zombie.
     """
-    try:
-        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
-    except (psutil.Error, OSError):
-        return False
+    return _proc.process_is_zombie(pid)
 
 
 def _adopted_child_cmdline(pid: int) -> str:
