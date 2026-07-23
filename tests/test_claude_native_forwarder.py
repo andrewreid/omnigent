@@ -7400,9 +7400,8 @@ def test_fingerprint_classifies_every_declared_bridge_file() -> None:
     periodic resync. This pins the classification so adding one without
     deciding which side it falls on fails here instead of in production.
 
-    Paired with the live-session test below, which grounds the same contract in
-    what a session actually writes — this one depends on the producing module
-    being listed, and that list has been the weak link.
+    Sees only what a listed module declares, so it is paired with the
+    live-session test below, which checks what producers actually write.
 
     :returns: None.
     """
@@ -7419,20 +7418,25 @@ def test_fingerprint_classifies_every_declared_bridge_file() -> None:
 @pytest.mark.asyncio
 async def test_fingerprint_classifies_every_file_a_live_session_writes(tmp_path: Path) -> None:
     """
-    Whatever a real session leaves in the bridge dir is classified.
+    Files a session actually writes are classified, not only declared ones.
 
-    The by-name sweep depends on someone listing the producing module, and that
-    list has missed one three review rounds running — most recently the shared
-    dead-letter sink, which no naming convention tied to this module. This
-    grounds the same contract in the filesystem: drive the real producers, then
-    require every file they leave behind to be accounted for.
+    The by-name sweep can only see filenames declared as a ``*_FILE`` constant
+    in a module it was told to look at, so it is blind to a producer nobody
+    listed and to a path built inline. Driving the producers and checking what
+    they leave on disk fails for a different set of mistakes.
+
+    Complementary rather than exhaustive: this sees only the producers and
+    branches the scenario below reaches, so a conditional output on an
+    unexercised path still escapes both checks. Together they narrow the gap;
+    neither closes it.
 
     :param tmp_path: Per-test temp directory.
     :returns: None.
     """
     bridge_dir, _transcript = _seed_idle_session(tmp_path)
 
-    # Every producer that writes into a bridge dir, driven for real.
+    # Drive each producer through its real entry point, so the filenames come
+    # from the producers rather than from this test restating them.
     claude_native_status._write_context_atomic(bridge_dir, {"context_window_size": 200000})
     delta_payload = json.dumps(
         {"hook_event_name": "MessageDisplay", "message_id": "m1", "final": True, "delta": "hi"}
