@@ -1105,8 +1105,10 @@ async def test_runner_subprocess_exits_when_spawning_parent_exits(
             client = await mgr.get_client('conv_parent_death', {_TEST_HARNESS_NAME!r})
             pid = (await client.get('/pid')).json()['pid']
             from omnigent.inner import _proc
+            identity = _proc.process_start_identity(pid)
+            assert identity is not None, 'runner identity must be readable'
             print(pid, flush=True)
-            print(_proc.process_start_identity(pid), flush=True)
+            print(identity, flush=True)
             os._exit(0)
 
         asyncio.run(main())
@@ -1122,6 +1124,7 @@ async def test_runner_subprocess_exits_when_spawning_parent_exits(
     )
     runner_pid_line, runner_identity = proc.stdout.strip().splitlines()[-2:]
     runner_pid = int(runner_pid_line)
+    assert runner_identity and runner_identity != "None", "identity handoff failed"
 
     def _runner_exited() -> bool:
         """Identity-based death probe: load-proof and pid-reuse-proof.
@@ -1143,10 +1146,9 @@ async def test_runner_subprocess_exits_when_spawning_parent_exits(
             await asyncio.sleep(0.1)
         assert _runner_exited(), "runner outlived its spawning parent"
     finally:
-        if _proc.process_identity_state(runner_pid, runner_identity) == "match":
-            # Only ever signal the incarnation we spawned.
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(runner_pid, signal.SIGKILL)
+        # kill_verified re-checks identity under a pidfd pin on Linux, so
+        # a pid recycled between check and kill can never be signaled.
+        _proc.kill_verified(runner_pid, runner_identity, signal.SIGKILL)
 
 
 async def test_runner_subprocess_hard_exits_when_sigterm_shutdown_wedges(
@@ -1536,7 +1538,7 @@ async def test_orphan_sweep_retains_dir_while_recorded_group_still_occupied(
     from omnigent.runtime.harnesses import process_manager as pm_mod
 
     monkeypatch.setattr(pm_mod, "_ORPHAN_SIGTERM_GRACE_S", 0.0)
-    monkeypatch.setattr(pm_mod._proc, "group_populated", lambda _pgid: True)
+    monkeypatch.setattr(pm_mod._proc, "group_has_live_members", lambda _pgid: True)
 
     dead = short_tmp_parent / "ap-dead"
     dead.mkdir(mode=0o700)
