@@ -54,6 +54,7 @@ from omnigent.runner.identity import (
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
 )
+from tests._helpers import procs as test_procs
 
 pytestmark = pytest.mark.asyncio
 
@@ -1231,6 +1232,7 @@ async def test_drain_defers_dead_leader_and_adopted_sweep_drains_group(
         start_new_session=True,
     )
     child_pid: int | None = None
+    child_ident: str | None = None
     try:
         assert leader.stdout is not None
         assert leader.stdout.readline().strip() == "ready"
@@ -1238,6 +1240,7 @@ async def test_drain_defers_dead_leader_and_adopted_sweep_drains_group(
         # standing in for any unclean owner death) leaving the late fork.
         os.kill(leader.pid, signal.SIGTERM)
         child_pid = int(leader.stdout.readline().strip())
+        child_ident = test_procs.capture_identity(child_pid)
 
         # Let the leader become a zombie WITHOUT reaping it ourselves.
         deadline = time.monotonic() + 5.0
@@ -1264,24 +1267,23 @@ async def test_drain_defers_dead_leader_and_adopted_sweep_drains_group(
         host._reap_adopted_orphans_once()
         host._reap_adopted_orphans_once()
         deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and _pid_alive_probe(child_pid):
+        while time.monotonic() < deadline and test_procs.alive(child_pid, child_ident):
             host._reap_adopted_orphans_once()
             await asyncio.sleep(0.05)
-        assert not _pid_alive_probe(child_pid), "late-forked child survived the pinned drain"
+        assert not test_procs.alive(child_pid, child_ident), (
+            "late-forked child survived the pinned drain"
+        )
 
         # Drained group: the pin is released and the zombie reaped.
         host._reap_adopted_orphans_once()
         assert leader.pid not in host._adopted_pins
     finally:
         host._adoption_active = False
-        import contextlib as ctx
-
-        if child_pid is not None:
-            with ctx.suppress(OSError):
-                os.kill(child_pid, signal.SIGKILL)
-        with ctx.suppress(OSError):
-            os.kill(leader.pid, signal.SIGKILL)
-        with ctx.suppress(Exception):
+        if child_pid is not None and child_ident is not None:
+            test_procs.safe_kill(child_pid, child_ident)
+        if leader.poll() is None:
+            leader.kill()
+        with contextlib.suppress(Exception):
             leader.wait(timeout=10)
 
 
@@ -1332,23 +1334,24 @@ async def test_adopted_sweep_kills_condemned_live_leader_and_its_group(
         start_new_session=True,
     )
     child_pid: int | None = None
+    child_ident: str | None = None
     try:
         assert leader.stdout is not None
         child_pid = int(leader.stdout.readline().strip())
+        child_ident = test_procs.capture_identity(child_pid)
 
         host._reap_adopted_orphans_once()  # TERM pass (leader dies)
         await asyncio.to_thread(leader.wait, 10)
         deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and _pid_alive_probe(child_pid):
+        while time.monotonic() < deadline and test_procs.alive(child_pid, child_ident):
             host._reap_adopted_orphans_once()  # KILL passes drain the group
             await asyncio.sleep(0.05)
-        assert not _pid_alive_probe(child_pid), "group member survived the drain"
+        assert not test_procs.alive(child_pid, child_ident), "group member survived the drain"
     finally:
-        if child_pid is not None:
-            with contextlib.suppress(OSError):
-                os.kill(child_pid, signal.SIGKILL)
-        with contextlib.suppress(OSError):
-            os.kill(leader.pid, signal.SIGKILL)
+        if child_pid is not None and child_ident is not None:
+            test_procs.safe_kill(child_pid, child_ident)
+        if leader.poll() is None:
+            leader.kill()
         with contextlib.suppress(Exception):
             leader.wait(timeout=10)
 

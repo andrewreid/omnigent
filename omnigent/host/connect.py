@@ -1119,8 +1119,9 @@ class HostProcess:
         ids = _pid_stat_ids(pid)
         if ids is None or ids[0] != pid:
             return False
-        members = _live_group_member_pids(pid, exclude=pid)
-        if _group_provably_empty(members):
+        # Release-deciding emptiness must survive fork-after-snapshot:
+        # only the double-scanned probe may skip the deferral.
+        if _proc.group_has_live_members(pid) is False:
             return False
         identity = _proc.process_start_identity(pid)
         self._adopted_pins[pid] = _AdoptedPin(
@@ -1476,9 +1477,11 @@ class HostProcess:
                     self._signal_pinned(pid, pin, kill_sig)
                 return True
             # Group provably empty: final atomic kill closes the fork
-            # race, then the deciding rescan confirms before release.
+            # race, then the deciding rescan — double-scanned, so a
+            # survivor forked around one pid listing cannot hide —
+            # confirms before release.
             self._signal_pinned(pid, pin, kill_sig)
-            if not _group_provably_empty(_live_group_member_pids(pid, exclude=pid)):
+            if _proc.group_has_live_members(pid) is not False:
                 return True
             self._release_pin(pid)
             return False

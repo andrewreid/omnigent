@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from omnigent import codex_native_process_registry as registry
+from tests._helpers import procs as test_procs
 
 fcntl = pytest.importorskip("fcntl")
 
@@ -370,6 +371,7 @@ def test_escalation_kills_surviving_child_after_leader_exits(tmp_path: Path, mon
         start_new_session=True,
     )
     child_pid: int | None = None
+    child_ident: str | None = None
     try:
         assert leader.stdout is not None
         child_pid = int(leader.stdout.readline().strip())
@@ -387,29 +389,23 @@ def test_escalation_kills_surviving_child_after_leader_exits(tmp_path: Path, mon
         deadline = time_mod.monotonic() + 5.0
         while registry._pid_alive(leader.pid) and time_mod.monotonic() < deadline:
             time_mod.sleep(0.05)
-        assert registry._pid_alive(child_pid), "child should have ignored the SIGTERM"
+        child_ident = test_procs.capture_identity(child_pid)
+        assert test_procs.alive(child_pid, child_ident), "child should have ignored the SIGTERM"
 
         # Pass 2 after grace: leader gone, but the snapshotted child's
         # identity still matches — SIGKILL it instead of dropping the
         # entry, and retain the entry until absence is verified.
         monkeypatch.setattr(registry, "_SIGKILL_GRACE_S", 0.0)
         assert registry.reconcile_codex_native_process_registry(registry_path=path) == 1
-        deadline = time_mod.monotonic() + 5.0
-        while registry._pid_alive(child_pid) and time_mod.monotonic() < deadline:
-            time_mod.sleep(0.05)
-        assert not registry._pid_alive(child_pid), "surviving group child leaked"
+        assert test_procs.wait_gone(child_pid, child_ident), "surviving group child leaked"
         assert len(_registry_payload(path)) == 1
 
         # Pass 3: every member is verifiably gone — the entry is dropped.
         assert registry.reconcile_codex_native_process_registry(registry_path=path) == 0
         assert _registry_payload(path) == []
     finally:
-        import contextlib
-        import os
-
-        if child_pid is not None:
-            with contextlib.suppress(OSError):
-                os.kill(child_pid, signal.SIGKILL)
+        if child_pid is not None and child_ident is not None:
+            test_procs.safe_kill(child_pid, child_ident)
         if leader.poll() is None:
             leader.kill()
         leader.wait(timeout=10)
@@ -500,8 +496,6 @@ def test_fallback_tier_never_chases_children_it_did_not_record(
     empty. On subreaper hosts the adopted-orphan reaper —
     exercised in the host tests — is what actually drains such children.
     """
-    import contextlib
-    import os as os_mod
     import subprocess
     import sys
     import time as time_mod
@@ -532,6 +526,7 @@ def test_fallback_tier_never_chases_children_it_did_not_record(
         start_new_session=True,
     )
     child_pid: int | None = None
+    child_ident: str | None = None
     try:
         assert leader.stdout is not None
         assert leader.stdout.readline().strip() == "ready"
@@ -556,19 +551,21 @@ def test_fallback_tier_never_chases_children_it_did_not_record(
         # tier cannot prove ownership of, so the entry is RETAINED and
         # the child is deliberately NOT chased.
         assert len(_registry_payload(path)) == 1
-        assert registry._pid_alive(child_pid), "fallback must not guess at unrecorded pids"
+        child_ident = test_procs.capture_identity(child_pid)
+        assert test_procs.alive(child_pid, child_ident), (
+            "fallback must not guess at unrecorded pids"
+        )
 
         # Once the occupant is gone the entry drains normally.
-        os_mod.kill(child_pid, signal.SIGKILL)
+        test_procs.safe_kill(child_pid, child_ident)
         deadline = time_mod.monotonic() + 5.0
         while _registry_payload(path) and time_mod.monotonic() < deadline:
             registry.reconcile_codex_native_process_registry(registry_path=path)
             time_mod.sleep(0.05)
         assert _registry_payload(path) == []
     finally:
-        if child_pid is not None:
-            with contextlib.suppress(OSError):
-                os_mod.kill(child_pid, signal.SIGKILL)
+        if child_pid is not None and child_ident is not None:
+            test_procs.safe_kill(child_pid, child_ident)
         if leader.poll() is None:
             leader.kill()
         leader.wait(timeout=10)
