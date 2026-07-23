@@ -1105,25 +1105,28 @@ class HostProcess:
             return []
 
     def _defer_dead_leader(self, pid: int) -> bool:
-        """Pin (instead of reap) a zombie that led a still-live group.
+        """Pin (instead of reap) a zombie that led a process group.
 
         Leaders usually die on their own — the parent-death watchdog
         self-exits a harness the moment its runner dies — long before any
         sweep could condemn them. Consuming such a zombie would release
-        the only kernel handle on its group's pgid; holding it unreaped
-        keeps ``killpg`` provably scoped to the orphaned tree.
+        the only kernel handle on its group's pgid, and no userspace scan
+        can soundly prove the group empty first (a relay forks after any
+        listing), so every zombie group leader is pinned and the driver
+        decides ownership. Non-leaders pin nothing and reap normally.
 
         :param pid: A zombie direct-child pid.
         :returns: ``True`` when the zombie was pinned.
         """
         ids = _pid_stat_ids(pid)
         if ids is None or ids[0] != pid:
-            return False
-        # A conservative live-scan: it may only err toward "live"
-        # (defer), never toward a false "empty", so a fork racing it just
-        # defers the pin — the drive loop then settles the group.
-        if _proc.group_has_live_members(pid) is False:
-            return False
+            return False  # not a group leader — its pgid pins nothing
+        # Pin unconditionally. Whether the group still holds live (#2421)
+        # members cannot be decided by a userspace scan — a relay forks a
+        # replacement after any pid listing — so we never scan here: we
+        # hold the zombie (the kernel handle on its pgid) and let the
+        # adopted-sweep driver classify and release it. Empty groups cost
+        # only a transient pin the driver drops on its next pass.
         identity = _proc.process_start_identity(pid)
         self._adopted_pins[pid] = _AdoptedPin(
             identity=identity, is_leader=True, deferred_zombie=True
@@ -1485,7 +1488,13 @@ class HostProcess:
             # pass), never toward a false "empty" release. The pinned
             # leader keeps the pgid stable across passes, so killpg's ESRCH
             # can't be used here (the pin itself keeps the group present).
-            self._signal_pinned(pid, pin, kill_sig)
+            if not self._signal_pinned(pid, pin, kill_sig):
+                # The whole-group SIGKILL did not reach a live member, so
+                # the scan below cannot prove the group drained — retain.
+                return True
+            # The kill reached every live member (or none remained), so a
+            # post-kill "no live members" scan is trustworthy — a pending
+            # SIGKILL prevents any survivor from forking a new generation.
             if _proc.group_has_live_members(pid) is not False:
                 return True
             self._release_pin(pid)
@@ -1497,27 +1506,47 @@ class HostProcess:
         self._release_pin(pid)
         return False
 
-    def _signal_pinned(self, pid: int, pin: _AdoptedPin, sig: int) -> None:
+    def _signal_pinned(self, pid: int, pin: _AdoptedPin, sig: int) -> bool:
         """Deliver *sig* to a pinned pid (whole group for leaders).
 
         :param pid: The pinned pid.
         :param pin: Its pin bookkeeping.
         :param sig: The signal to deliver.
+        :returns: ``True`` when the signal was delivered (``ESRCH`` — the
+            target is already gone — also counts as delivered); ``False``
+            when delivery failed (e.g. ``EPERM``), so a release gate that
+            depends on the kill having landed must retain the pin.
         """
         try:
             if pin.is_leader and hasattr(os, "killpg"):
                 os.killpg(pid, sig)
             else:
                 os.kill(pid, sig)
+        except ProcessLookupError:
+            return True  # already gone — the kill's goal is met
         except OSError:
-            pass
-        else:
-            _logger.info(
-                "adopted-orphan reaper sent signal %d to %s %d",
-                sig,
+            # The signal did not land. It is only "delivered enough" for a
+            # release decision if there was nothing LIVE to reach: some
+            # platforms (macOS) return EPERM for ``killpg`` on a group whose
+            # only remaining member is a zombie. A genuine live member the
+            # kill could not reach (a real EPERM survivor) leaves the group
+            # with live members and must block release.
+            if pin.is_leader and _proc.group_has_live_members(pid) is False:
+                return True
+            _logger.warning(
+                "adopted-orphan reaper could not signal %s %d",
                 "group" if pin.is_leader else "pid",
                 pid,
+                exc_info=True,
             )
+            return False
+        _logger.info(
+            "adopted-orphan reaper sent signal %d to %s %d",
+            sig,
+            "group" if pin.is_leader else "pid",
+            pid,
+        )
+        return True
 
     def _release_pin(self, pid: int) -> None:
         """Reap (if a zombie remains) and forget one pin.

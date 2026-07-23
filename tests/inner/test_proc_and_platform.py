@@ -481,35 +481,47 @@ def test_group_kernel_present_tracks_real_group_lifecycle() -> None:
 
 
 @pytest.mark.skipif(_platform.IS_WINDOWS, reason="POSIX process groups")
-def test_group_kernel_present_survives_a_fork_relay() -> None:
-    """A member forking a survivor keeps the group kernel-present.
+def test_group_kernel_present_survives_a_live_fork_relay() -> None:
+    """A group that continuously hands off generations stays kernel-present.
 
-    The exact adversarial shape a fixed-count userspace scan could not
-    handle: repeated relays never make killpg-0 report the group absent
-    while any generation is live.
+    The exact adversarial shape a fixed-count userspace scan cannot
+    handle: each generation forks its successor into the group and then
+    exits, so at every instant exactly one short-lived member exists and
+    any single pid listing can miss it. ``killpg(pgid, 0)`` — a kernel
+    check — never reports the group absent while the relay runs.
     """
-    relay = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import os, subprocess, sys, time\n"
-                # Keep a survivor generation alive in the group.
-                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
-                "time.sleep(30)\n"
-            ),
-        ],
-        start_new_session=True,
+    # Generation 0 leads the group; each generation spawns the next INTO
+    # the same group (no new session) and exits, so membership churns
+    # continuously rather than sitting on two static sleepers.
+    relay_src = (
+        "import os, sys, time\n"
+        "gen = int(sys.argv[1])\n"
+        "if gen < 400:\n"
+        "    nxt = [sys.executable, __file__, str(gen + 1)]\n"
+        "    os.posix_spawn(sys.executable, nxt, os.environ)\n"
+        "    time.sleep(0.01)\n"  # hand off, then exit — one live member at a time
+        "else:\n"
+        "    time.sleep(5)\n"
     )
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+        fh.write(relay_src)
+        script = fh.name
+    relay = subprocess.Popen([sys.executable, script, "0"], start_new_session=True)
     pgid = os.getpgid(relay.pid)
     try:
-        for _ in range(5):
-            assert _proc.group_kernel_present(pgid) is True
-            time.sleep(0.02)
+        # Sample across many handoffs; the kernel check never false-empties.
+        for _ in range(30):
+            assert _proc.group_kernel_present(pgid) is not False
+            time.sleep(0.01)
     finally:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(pgid, signal.SIGKILL)
-        relay.wait(timeout=10)
+        with contextlib.suppress(Exception):
+            relay.wait(timeout=10)
+        with contextlib.suppress(OSError):
+            os.unlink(script)
 
 
 def test_group_kernel_present_none_for_bad_pgid() -> None:

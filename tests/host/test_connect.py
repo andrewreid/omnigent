@@ -1356,6 +1356,97 @@ async def test_adopted_sweep_kills_condemned_live_leader_and_its_group(
             leader.wait(timeout=10)
 
 
+def test_defer_dead_leader_pins_unconditionally_no_occupancy_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zombie group leader is pinned without any occupancy scan.
+
+    Regression for the fork-after-snapshot race: a relay forking a
+    survivor after a userspace pid listing would make an occupancy scan
+    report the group empty, so the drain would reap the leader and lose
+    the kernel handle on its group. The defer must never consult such a
+    scan — it pins every zombie group leader and lets the driver classify.
+    """
+    from omnigent.host import connect as connect_mod
+
+    host = _make_host_process()
+    host._is_subreaper = True
+    # Leader looks like a group leader (pgid == pid == sid).
+    monkeypatch.setattr(connect_mod, "_pid_stat_ids", lambda _pid: (4242, 4242))
+    monkeypatch.setattr(connect_mod._proc, "process_start_identity", lambda _pid: "leader-id")
+
+    def _scan_must_not_run(*_a: object, **_k: object) -> object:
+        raise AssertionError("the defer decision must not consult an occupancy scan")
+
+    monkeypatch.setattr(connect_mod._proc, "group_has_live_members", _scan_must_not_run)
+
+    assert host._defer_dead_leader(4242) is True
+    pin = host._adopted_pins[4242]
+    assert pin.deferred_zombie and pin.is_leader
+
+    # A non-leader zombie (pgid != pid) pins nothing.
+    monkeypatch.setattr(connect_mod, "_pid_stat_ids", lambda _pid: (999, 999))
+    assert host._defer_dead_leader(5555) is False
+    assert 5555 not in host._adopted_pins
+
+
+def test_drive_condemned_pin_retains_when_final_kill_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed whole-group SIGKILL retains the pin, never releases it.
+
+    Regression: the release scan is only meaningful if the preceding
+    killpg landed. When killpg raises (e.g. EPERM), the sweep must keep
+    driving and hold the pin rather than trust a scan of a group it never
+    actually killed.
+    """
+    from omnigent.host import connect as connect_mod
+    from omnigent.host.connect import _AdoptedPin
+
+    host = _make_host_process()
+    host._is_subreaper = True
+    pin = _AdoptedPin(identity="leader-id", is_leader=True, deferred_zombie=True)
+    host._adopted_pins[7000] = pin
+
+    # Past its grace, leader dead, but a LIVE group member survives — the
+    # exact case a failed kill must not release over. The escalation scan
+    # is stubbed empty (a relay hiding it); only the delivery status of the
+    # failed kill keeps the pin.
+    pin.termed_at = 1.0
+    live_members = {"value": [8001]}
+    monkeypatch.setattr(connect_mod._proc, "process_identity_state", lambda _p, _i: "gone")
+    monkeypatch.setattr(connect_mod, "_pid_is_zombie", lambda _p: False)
+    monkeypatch.setattr(
+        connect_mod, "_live_group_member_pids", lambda _p, exclude=None: []
+    )  # escalation grace-scan: relay hides the survivor
+    # But the kill's own delivery check sees the survivor via killpg EPERM
+    # + a non-empty live-member view; model that through group_has_live_members.
+    monkeypatch.setattr(
+        connect_mod._proc, "group_has_live_members", lambda _p: bool(live_members["value"])
+    )
+
+    released: list[int] = []
+    monkeypatch.setattr(host, "_release_pin", lambda pid: released.append(pid))
+    monkeypatch.setattr(connect_mod.os, "killpg", _raise_eperm)
+
+    driving = host._drive_condemned_pin(7000, pin, now=100.0, grace_s=0.0)
+
+    assert driving is True, "a failed kill over a live survivor must keep driving"
+    assert released == [], "the pin must not be released when a live member survives"
+
+    # The survivor exits and the kill now lands: the drained group releases.
+    live_members["value"] = []
+    monkeypatch.setattr(connect_mod.os, "killpg", lambda _pg, _s: None)
+    driving = host._drive_condemned_pin(7000, pin, now=100.0, grace_s=0.0)
+    assert driving is False
+    assert released == [7000]
+
+
+def _raise_eperm(*_a: object, **_k: object) -> None:
+    """killpg stub that fails as if the caller lacked permission."""
+    raise PermissionError(1, "Operation not permitted")
+
+
 async def test_adopted_sweep_leaves_unknown_children_untouched() -> None:
     """An adopted child matching no family signature is never signaled.
 

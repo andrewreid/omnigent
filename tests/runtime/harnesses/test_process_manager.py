@@ -1295,9 +1295,12 @@ async def test_orphan_sweep_kills_whole_detached_harness_tree(
         # it) and re-sweep until the evidence is released.
         deadline = time.monotonic() + 10.0
         while instance_dir.exists() and time.monotonic() < deadline:
+            # Reap ONLY this child (under a PR_SET_CHILD_SUBREAPER pytest it
+            # reparented to us). ECHILD means it is not our child — an init
+            # container collects it — so let that happen. Never waitpid(-1):
+            # that would steal an unrelated test's child exit status.
             with contextlib.suppress(ChildProcessError):
-                while os.waitpid(-1, os.WNOHANG)[0]:
-                    pass
+                os.waitpid(child_pid, os.WNOHANG)
             await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
             await asyncio.sleep(0.05)
         assert not instance_dir.exists(), "dir not released after the group went absent"
