@@ -17,6 +17,7 @@ import asyncio
 import logging
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -240,6 +241,8 @@ class HostConnection:
         ``error_code``, and ``error``.
     :param pending_model_options: Per-``request_id`` futures for pre-launch
         model catalogs resolved by the selected host.
+    :param session_id: Per-connection ownership token used to fence
+        disconnect cleanup against newer replacement connections.
     """
 
     workspace_id: int
@@ -289,6 +292,7 @@ class HostConnection:
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 class HostRegistry:
@@ -313,6 +317,8 @@ class HostRegistry:
         hello: HostHelloFrame,
         owner: str | None,
         workspace_id: int | None = None,
+        *,
+        session_id: str | None = None,
     ) -> HostConnection:
         """Register a host connection (newest wins).
 
@@ -336,6 +342,8 @@ class HostRegistry:
             (``0`` in single-tenant deployments); captured into the
             connection so ``send_text`` need not read request context
             from the sender loop.
+        :param session_id: Optional preallocated ownership token. The
+            host tunnel passes the token already written to the DB row.
         :returns: The new :class:`HostConnection`. Its ``host_id`` is
             the canonical form (see :func:`_canonical_host_id`).
         """
@@ -351,6 +359,7 @@ class HostRegistry:
             outbound_queue=asyncio.Queue(),
             connected_at=now,
             last_frame_at=now,
+            session_id=session_id or uuid.uuid4().hex,
         )
         with self._lock:
             key = (ws_id, host_id)
@@ -365,19 +374,33 @@ class HostRegistry:
             self._hosts[key] = conn
         return conn
 
-    def deregister(self, host_id: str, workspace_id: int | None = None) -> None:
+    def deregister(self, host_id: str, conn: HostConnection | None = None, workspace_id: int | None = None) -> bool:
         """Remove a host connection.
+
+        When ``conn`` is given, removes the entry only if it is still the
+        current connection (no-op if a newer connection replaced it). When
+        ``conn`` is ``None``, removes unconditionally — the spelling used by
+        callers that hold no connection handle (e.g. session teardown).
 
         No-op if ``(workspace_id, host_id)`` is not registered.
 
         :param host_id: Host identifier to remove, in any accepted
             spelling (see :func:`_canonical_host_id`).
+        :param conn: Connection attempting cleanup, or ``None`` to remove
+            unconditionally.
         :param workspace_id: Tenant partition; defaults to
             :func:`current_workspace_id`.
+        :returns: ``True`` if an entry was removed, otherwise ``False``.
         """
         ws_id = current_workspace_id() if workspace_id is None else workspace_id
         with self._lock:
-            self._hosts.pop((ws_id, _canonical_host_id(host_id)), None)
+            key = (ws_id, _canonical_host_id(host_id))
+            if conn is None:
+                return self._hosts.pop(key, None) is not None
+            if self._hosts.get(key) is conn:
+                del self._hosts[key]
+                return True
+            return False
 
     def get(self, host_id: str, workspace_id: int | None = None) -> HostConnection | None:
         """Look up a live host connection.

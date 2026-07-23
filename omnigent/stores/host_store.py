@@ -82,6 +82,7 @@ class Host:
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    conn_session_id: str | None = None
 
 
 def host_is_live(host: Host, now: int | None = None) -> bool:
@@ -150,7 +151,14 @@ def _row_to_host(row: SqlHost) -> Host:
         sandbox_provider=row.sandbox_provider,
         sandbox_id=row.sandbox_id,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
+        conn_session_id=row.conn_session_id,
     )
+
+
+def _result_rowcount(result: object) -> int:
+    """Return rowcount from SQLAlchemy update results without relying on typing."""
+    rowcount = getattr(result, "rowcount", 0)
+    return rowcount if isinstance(rowcount, int) else 0
 
 
 def hash_host_launch_token(token: str) -> str:
@@ -195,6 +203,7 @@ class HostStore:
         *,
         allow_host_id_reown: bool = False,
         configured_harnesses: dict[str, HarnessAvailability] | None = None,
+        conn_session_id: str | None = None,
     ) -> Host:
         """
         Register or update a host on WebSocket connect.
@@ -234,6 +243,8 @@ class HostStore:
             Written on every connect — including ``None`` from an older
             host that doesn't report it, which correctly resets any
             stale value back to "unknown".
+        :param conn_session_id: Per-connection ownership token to write
+            atomically with the online connect state.
         :returns: The upserted :class:`Host`.
         """
         now = now_epoch()
@@ -260,6 +271,7 @@ class HostStore:
                 row.status = encode_host_status("online")
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
+                row.conn_session_id = conn_session_id
                 return _row_to_host(row)
 
             # host_id is new — check whether (workspace_id, user_id, name)
@@ -274,10 +286,10 @@ class HostStore:
                     name=name,
                     user_id=user_id,
                     configured_harnesses_json=harnesses_json,
+                    conn_session_id=conn_session_id,
                 )
                 if reowned is not None:
                     return reowned
-
             existing_by_name = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),
@@ -290,7 +302,14 @@ class HostStore:
                 # host_id is now part of the PK, so we can't UPDATE it via the
                 # ORM — delete the old row and insert a fresh one that carries
                 # the new host_id while preserving created_at.
-                row = self._rotate_host_id(session, existing_by_name, host_id, now, harnesses_json)
+                row = self._rotate_host_id(
+                    session,
+                    existing_by_name,
+                    host_id,
+                    now,
+                    harnesses_json,
+                    conn_session_id,
+                )
                 return _row_to_host(row)
 
             # Genuinely new host: plain INSERT.
@@ -302,6 +321,7 @@ class HostStore:
                 created_at=now,
                 updated_at=now,
                 configured_harnesses=harnesses_json,
+                conn_session_id=conn_session_id,
             )
             session.add(row)
             return _row_to_host(row)
@@ -313,6 +333,7 @@ class HostStore:
         new_host_id: str,
         now: int,
         harnesses_json: str | None,
+        conn_session_id: str | None,
     ) -> SqlHost:
         """Replace a host row's host_id while repointing its conversations.
 
@@ -333,6 +354,7 @@ class HostStore:
         :param new_host_id: The host_id the host reconnected with.
         :param now: Unix epoch seconds for the updated_at timestamp.
         :param harnesses_json: JSON-encoded harness readiness, or None.
+        :param conn_session_id: Connecting tunnel's ownership token.
         :returns: The newly inserted :class:`SqlHost` row.
         """
         old_host_id = row.host_id
@@ -386,6 +408,7 @@ class HostStore:
             sandbox_provider=sandbox_provider,
             sandbox_id=sandbox_id,
             configured_harnesses=harnesses_json,
+            conn_session_id=conn_session_id,
         )
         session.add(new_row)
         session.flush()
@@ -411,6 +434,7 @@ class HostStore:
         name: str,
         user_id: str,
         configured_harnesses_json: str | None = None,
+        conn_session_id: str | None = None,
     ) -> Host | None:
         """Re-own an existing host_id row under a new ``(user_id, name)``.
 
@@ -435,6 +459,8 @@ class HostStore:
             ``'{"claude-sdk": true}'``, or ``None`` when unreported.
             Written like the normal connect paths so a re-owned row
             carries fresh (not stale) readiness.
+        :param conn_session_id: Per-connection ownership token to write
+            atomically with the online connect state.
         :returns: The re-owned :class:`Host`, or ``None`` if no row holds
             *host_id* (caller falls through to a normal insert).
         """
@@ -459,6 +485,7 @@ class HostStore:
                 status=encode_host_status("online"),
                 updated_at=now,
                 configured_harnesses=configured_harnesses_json,
+                conn_session_id=conn_session_id,
             )
         )
         return Host(
@@ -471,27 +498,39 @@ class HostStore:
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
+            conn_session_id=conn_session_id,
         )
 
-    def set_offline(self, host_id: str) -> None:
+    def set_offline(self, host_id: str, expected_session: str | None = None) -> int:
         """
         Mark a host as offline when its WebSocket disconnects.
 
         No-op if the host does not exist (the disconnect callback
-        may fire after a failed registration).
+        may fire after a failed registration) or if *expected_session*
+        names a connection that no longer owns the row.
 
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
+        :param expected_session: Expected live connection token. ``None``
+            intentionally bypasses the fence for legacy/admin paths.
+        :returns: Number of rows updated.
         """
         with self._session() as session:
-            row = session.execute(
-                select(SqlHost).where(
-                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+            stmt = (
+                update(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
                 )
-            ).scalar_one_or_none()
-            if row is not None:
-                row.status = encode_host_status("offline")
-                row.updated_at = now_epoch()
+                .values(status=encode_host_status("offline"), updated_at=now_epoch())
+            )
+            if expected_session is not None:
+                stmt = stmt.where(
+                    (SqlHost.conn_session_id.is_(None))
+                    | (SqlHost.conn_session_id == expected_session)
+                )
+            result = session.execute(stmt)
+            return _result_rowcount(result)
 
     def update_harness_readiness(
         self,
@@ -516,33 +555,45 @@ class HostStore:
                 )
             )
 
-    def heartbeat(self, host_id: str) -> None:
+    def heartbeat(self, host_id: str, *, session_id: str) -> int:
         """
         Refresh a host's last-seen timestamp while its tunnel is alive.
 
         Bumps ``updated_at`` to now so the liveness freshness gate
         (see :data:`HOST_LIVENESS_TTL_S`) keeps treating the host as
         online. Called from the host tunnel's ping loop every
-        ``PING_INTERVAL_S``. Does not change ``status`` — a host whose
-        ping loop is running is, by construction, still ``"online"``.
+        ``PING_INTERVAL_S``. Also restores ``status`` to ``"online"``
+        when the caller still owns the row.
 
-        No-op if the host does not exist.
+        No-op if the host does not exist or a newer connection has
+        stamped a different ownership token.
 
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
+        :param session_id: Per-connection ownership token to refresh
+            alongside liveness.
+        :returns: Number of rows updated.
         """
         # Single UPDATE rather than SELECT-then-mutate: this runs every
         # ping interval for every connected host, so the extra read is
         # pure overhead. A missing host simply matches no rows (a no-op).
         with self._session() as session:
-            session.execute(
+            result = session.execute(
                 update(SqlHost)
                 .where(
                     SqlHost.workspace_id == current_workspace_id(),
                     SqlHost.host_id == host_id,
                 )
-                .values(updated_at=now_epoch())
+                .where(
+                    (SqlHost.conn_session_id.is_(None)) | (SqlHost.conn_session_id == session_id)
+                )
+                .values(
+                    status=encode_host_status("online"),
+                    updated_at=now_epoch(),
+                    conn_session_id=session_id,
+                )
             )
+            return _result_rowcount(result)
 
     def is_online(self, host_id: str) -> bool:
         """
