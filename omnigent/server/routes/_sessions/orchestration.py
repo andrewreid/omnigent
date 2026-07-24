@@ -8,6 +8,7 @@ imported by the router in ``sessions.py``."""
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import secrets
 import time
@@ -1186,6 +1187,7 @@ def _persist_native_cumulative_usage(
 
 async def _persist_external_session_usage(
     session_id: str,
+    conv: Conversation,
     body: SessionEventInput,
     conversation_store: ConversationStore,
 ) -> int | None:
@@ -1197,6 +1199,9 @@ async def _persist_external_session_usage(
     (:func:`_persist_native_cumulative_usage`) must be present.
 
     :param session_id: Session/conversation identifier.
+    :param conv: The already-loaded conversation row; only its immutable
+        ``root_conversation_id`` is read (so a request-start row is safe),
+        letting the subtree recompute skip one conversation read.
     :param body: External session-usage event body.
     :param conversation_store: Store used to upsert the labels.
     :returns: The persisted ``context_tokens`` when present, else ``None``.
@@ -1259,7 +1264,14 @@ async def _persist_external_session_usage(
     # hide in-flight sub-agent spend until the next child flush (the badge would
     # oscillate own ⇄ subtree). For a childless session the subtree is just
     # itself, so this equals own cost — one indexed tree query per flush.
-    subtree_usage = await asyncio.to_thread(load_session_usage, session_id, conversation_store)
+    subtree_usage = await asyncio.to_thread(
+        functools.partial(
+            load_session_usage,
+            session_id,
+            conversation_store,
+            root_conversation_id=conv.root_conversation_id,
+        )
+    )
     subtree_cost = _priced_cost_for_display(subtree_usage)
     usage_by_model = _usage_by_model_for_display(subtree_usage)
     # Only include fields that were sent; the client treats absent
@@ -1290,6 +1302,7 @@ async def _persist_external_session_usage(
         _publish_subtree_cost_to_ancestors,
         conversation_store,
         session_id,
+        conv,
     )
     return raw_tokens
 
