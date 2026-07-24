@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING
 
 import yaml
 
+from omnigent._yaml_compat import safe_load as _yaml_safe_load
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import (
@@ -229,7 +230,7 @@ def is_omnigent_yaml(path: Path) -> bool:
     if path.suffix.lower() not in {".yaml", ".yml"}:
         return False
     try:
-        raw = yaml.safe_load(path.read_text())
+        raw = _yaml_safe_load(path.read_text())
     except yaml.YAMLError:
         return False
     if not isinstance(raw, dict):
@@ -271,6 +272,10 @@ def diagnose_yaml_rejection(path: Path) -> str:
     try:
         raw = yaml.safe_load(path.read_text())
     except yaml.YAMLError as exc:
+        # Pure-Python loader on purpose: this runs once, only to explain a
+        # file the user already got wrong, and its error echoes the offending
+        # source line with a caret. libyaml reports line/column but drops
+        # that echo, so the faster parser would make the diagnosis worse.
         # Strip trailing whitespace so the message stays one line —
         # PyYAML embeds the source location in its error string,
         # which is exactly what the user needs to fix the typo.
