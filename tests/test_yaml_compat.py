@@ -157,6 +157,31 @@ def test_load_does_not_reparse_documents_that_succeed() -> None:
     assert calls == [_ConfigYamlLoader]
 
 
+def test_load_does_not_substitute_constructor_errors() -> None:
+    """A loader's own constructor error must reach the caller intact.
+
+    The reparse only ever runs stock ``SafeLoader``, which knows nothing of
+    a caller's custom tags. Retrying a constructor failure would swap a
+    precise error for the stock loader's unrelated "could not determine a
+    constructor for the tag" — so construction-stage failures are not
+    retried at all.
+    """
+
+    class _CustomLoader(_ConfigYamlLoader):  # type: ignore[valid-type,misc]
+        pass
+
+    def _reject(loader: object, node: object) -> object:
+        raise yaml.constructor.ConstructorError(None, None, "tag !secret is not permitted here")
+
+    _CustomLoader.add_constructor("!secret", _reject)
+
+    with pytest.raises(yaml.constructor.ConstructorError) as excinfo:
+        load("token: !secret abc\n", _CustomLoader)
+    message = str(excinfo.value)
+    assert "tag !secret is not permitted here" in message, message
+    assert "could not determine a constructor" not in message, message
+
+
 def test_pure_python_fallback_when_libyaml_is_absent() -> None:
     """A PyYAML built without libyaml must still import and resolve correctly.
 
@@ -168,7 +193,11 @@ def test_pure_python_fallback_when_libyaml_is_absent() -> None:
         """
         import yaml
 
-        del yaml.CSafeLoader  # simulate a source install without libyaml
+        # Simulate a source install without libyaml. Guarded because this
+        # test must also pass where libyaml is genuinely absent — the very
+        # environment it exists to cover.
+        if hasattr(yaml, "CSafeLoader"):
+            del yaml.CSafeLoader
 
         from omnigent._yaml_compat import USING_LIBYAML, SafeLoaderBase
         from omnigent.inner.loader import _OmnigentYamlLoader
