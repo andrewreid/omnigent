@@ -10,6 +10,8 @@ from typing import Any, TypeAlias
 
 import yaml
 
+from omnigent._yaml_compat import SafeLoaderBase
+
 from .datamodel import (
     AgentDef,
     ExecutorSpec,
@@ -47,18 +49,25 @@ YamlData: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 DynamicCallable: TypeAlias = Callable[..., object]  # type: ignore[explicit-any]
 
 
-class _OmnigentYamlLoader(yaml.SafeLoader):
+class _OmnigentYamlLoader(SafeLoaderBase):
     """YAML loader with YAML 1.2-style booleans.
 
     PyYAML's default YAML 1.1 resolver treats unquoted keys like ``on`` as a
     boolean. That breaks policy definitions such as ``on: [tool_call]``.
     Keep ``true``/``false`` boolean parsing, but stop treating ``on``/``off``
     and similar legacy literals as booleans.
+
+    The base is libyaml-backed where available (see
+    ``omnigent._yaml_compat``); libyaml's parser calls back into the Python
+    resolver, so the override below applies either way.
     """
 
 
+# Copy before mutating — the resolver dict is shared by reference across
+# every PyYAML loader, so an in-place edit would strip bool parsing
+# process-wide.
 _OmnigentYamlLoader.yaml_implicit_resolvers = {
-    key: value[:] for key, value in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    key: value[:] for key, value in SafeLoaderBase.yaml_implicit_resolvers.items()
 }
 for key, resolvers in list(_OmnigentYamlLoader.yaml_implicit_resolvers.items()):
     _OmnigentYamlLoader.yaml_implicit_resolvers[key] = [

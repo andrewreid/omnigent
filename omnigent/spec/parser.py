@@ -12,6 +12,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
 
+from omnigent._yaml_compat import SafeLoaderBase
+from omnigent._yaml_compat import safe_load as _yaml_safe_load
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.datamodel import (
     DEFAULT_BASIC_USERNAME,
@@ -60,7 +62,7 @@ _CONTEXT_FILE_PRIORITY: tuple[str, ...] = ("AGENTS.md", "CLAUDE.md", ".cursorrul
 _FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n(.*)", re.DOTALL)
 
 
-class _ConfigYamlLoader(yaml.SafeLoader):
+class _ConfigYamlLoader(SafeLoaderBase):
     """
     SafeLoader variant that does NOT treat ``on``/``off``/
     ``yes``/``no`` as booleans.
@@ -77,6 +79,10 @@ class _ConfigYamlLoader(yaml.SafeLoader):
     YAML 1.2 drops these bool aliases entirely; this override
     makes our loader YAML-1.2-aligned for the narrow set of
     aliases that matter here.
+
+    The base is libyaml-backed where available (see
+    ``omnigent._yaml_compat``). libyaml's parser calls back into
+    the Python resolver, so the override below applies either way.
     """
 
 
@@ -92,10 +98,11 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 _STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
 
 # Copy the resolver dict onto the subclass before mutating — it's inherited
-# from SafeLoader by reference, so in-place edits below would strip
-# SafeLoader's bool resolver process-wide.
+# from PyYAML's shared Resolver by reference (the same dict object backs
+# SafeLoader and CSafeLoader), so in-place edits below would strip the bool
+# resolver process-wide.
 _ConfigYamlLoader.yaml_implicit_resolvers = {
-    key: value[:] for key, value in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    key: value[:] for key, value in SafeLoaderBase.yaml_implicit_resolvers.items()
 }
 for _ch in list(_ConfigYamlLoader.yaml_implicit_resolvers.keys()):
     _ConfigYamlLoader.yaml_implicit_resolvers[_ch] = [
@@ -2143,6 +2150,9 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
         )
     frontmatter_str, content = match.groups()
     try:
+        # Pure-Python loader on purpose: frontmatter is a few hundred bytes,
+        # so libyaml buys nothing measurable, and its errors drop the source
+        # line and caret that make a malformed SKILL.md easy to fix.
         frontmatter = yaml.safe_load(frontmatter_str)
     except yaml.YAMLError as exc:
         raise OmnigentError(
@@ -2393,7 +2403,7 @@ def _discover_mcp_servers(
         return []
     servers: list[MCPServerConfig] = []
     for yaml_file in sorted(mcp_dir.glob("*.yaml")):
-        raw = yaml.safe_load(yaml_file.read_text())
+        raw = _yaml_safe_load(yaml_file.read_text())
         if not isinstance(raw, dict):
             raise OmnigentError(
                 f"MCP config must be a YAML mapping: {yaml_file}",
