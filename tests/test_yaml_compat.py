@@ -8,9 +8,14 @@ loaders rely on is asserted here against whichever base is actually active.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
+
+import pytest
 import yaml
 
-from omnigent._yaml_compat import USING_LIBYAML, SafeLoaderBase, safe_load
+from omnigent._yaml_compat import USING_LIBYAML, SafeLoaderBase, load, safe_load
 from omnigent.inner.loader import _OmnigentYamlLoader
 from omnigent.spec.parser import _ConfigYamlLoader
 
@@ -95,21 +100,106 @@ def test_safe_load_handles_empty_and_non_mapping_documents() -> None:
         assert safe_load(source) == yaml.safe_load(source), source
 
 
+# A description with an unquoted colon — the classic hand-authoring typo.
+_BROKEN = "name: agent\ndescription: has: unquoted colon\n"
+
+
 def test_parse_errors_stay_marked_yaml_errors() -> None:
     """Call sites catch ``yaml.YAMLError`` and report the mark's line/column.
 
-    libyaml words its messages differently and drops the echoed source line,
-    but the exception type and the mark must survive — ``diagnose_yaml_rejection``
-    promises the user a location.
+    ``diagnose_yaml_rejection`` promises the user a location, so the exception
+    type and the mark must survive whichever parser produced them.
     """
-    broken = "name: agent\ndescription: has: unquoted colon\n"
-    for load in (safe_load, lambda s: yaml.load(s, Loader=_ConfigYamlLoader)):
-        try:
-            load(broken)
-        except yaml.YAMLError as exc:
-            assert isinstance(exc, yaml.MarkedYAMLError)
-            assert exc.problem_mark is not None
-            assert exc.problem_mark.line == 1
-            assert exc.problem_mark.column == 16
-        else:  # pragma: no cover - the document is malformed by construction
-            raise AssertionError("expected a YAMLError")
+    for parse in (safe_load, lambda s: load(s, _ConfigYamlLoader)):
+        with pytest.raises(yaml.YAMLError) as excinfo:
+            parse(_BROKEN)
+        exc = excinfo.value
+        assert isinstance(exc, yaml.MarkedYAMLError)
+        assert exc.problem_mark is not None
+        assert exc.problem_mark.line == 1
+        assert exc.problem_mark.column == 16
+
+
+def test_load_keeps_the_source_excerpt_in_parse_errors() -> None:
+    """A failed parse must still echo the offending line and caret.
+
+    libyaml reports line/column but drops that echo, which is the part that
+    makes a typo obvious. :func:`load` reparses failures with the pure-Python
+    scanner so the diagnostic never regresses — the whole reason spec parsing
+    can take the fast path at all.
+    """
+    for parse in (safe_load, lambda s: load(s, _ConfigYamlLoader)):
+        with pytest.raises(yaml.YAMLError) as excinfo:
+            parse(_BROKEN)
+        message = str(excinfo.value)
+        assert "description: has: unquoted colon" in message, message
+        assert "^" in message, message
+        # The retry must not print the libyaml attempt above the real
+        # diagnosis — one traceback, one error.
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__suppress_context__ is True
+
+
+def test_load_does_not_reparse_documents_that_succeed() -> None:
+    """The retry is failure-only, so the hot path pays nothing for it."""
+    calls: list[object] = []
+    real_load = yaml.load
+
+    def counting_load(stream: object, Loader: object) -> object:
+        calls.append(Loader)
+        return real_load(stream, Loader=Loader)  # type: ignore[arg-type]
+
+    yaml.load = counting_load  # type: ignore[assignment]
+    try:
+        assert load("a: 1\n", _ConfigYamlLoader) == {"a": 1}
+    finally:
+        yaml.load = real_load  # type: ignore[assignment]
+    assert calls == [_ConfigYamlLoader]
+
+
+def test_pure_python_fallback_when_libyaml_is_absent() -> None:
+    """A PyYAML built without libyaml must still import and resolve correctly.
+
+    Runs in a subprocess that deletes ``yaml.CSafeLoader`` before omnigent is
+    imported, which is the only way to exercise the fallback branch: the base
+    is chosen once at import time.
+    """
+    script = textwrap.dedent(
+        """
+        import yaml
+
+        del yaml.CSafeLoader  # simulate a source install without libyaml
+
+        from omnigent._yaml_compat import USING_LIBYAML, SafeLoaderBase
+        from omnigent.inner.loader import _OmnigentYamlLoader
+        from omnigent.spec.parser import _ConfigYamlLoader
+
+        assert SafeLoaderBase is yaml.SafeLoader, SafeLoaderBase
+        assert USING_LIBYAML is False
+
+        src = "a: on\\nb: off\\nc: yes\\nd: no\\ne: true\\nf: false\\n"
+        expected = {"a": "on", "b": "off", "c": "yes", "d": "no", "e": True, "f": False}
+        for loader in (_ConfigYamlLoader, _OmnigentYamlLoader):
+            assert issubclass(loader, yaml.SafeLoader), loader
+            got = yaml.load(src, Loader=loader)
+            assert got == expected, (loader, got)
+            assert got["e"] is True and got["f"] is False, loader
+            assert (
+                loader.yaml_implicit_resolvers
+                is not yaml.SafeLoader.yaml_implicit_resolvers
+            )
+
+        assert yaml.safe_load("on") is True
+        assert yaml.safe_load("false") is False
+        print("OK")
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("OK")

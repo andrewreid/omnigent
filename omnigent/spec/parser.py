@@ -12,7 +12,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
 
-from omnigent._yaml_compat import SafeLoaderBase
+from omnigent._yaml_compat import SafeLoaderBase, narrow_bools_to_yaml_1_2
+from omnigent._yaml_compat import load as _yaml_load
 from omnigent._yaml_compat import safe_load as _yaml_safe_load
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.datamodel import (
@@ -82,47 +83,15 @@ class _ConfigYamlLoader(SafeLoaderBase):
 
     The base is libyaml-backed where available (see
     ``omnigent._yaml_compat``). libyaml's parser calls back into
-    the Python resolver, so the override below applies either way.
+    the Python resolver, so the override applies either way.
     """
 
 
-# Replace the YAML 1.1 bool resolver pattern with a YAML 1.2
-# pattern that accepts only ``true`` / ``false`` (and their
-# title/upper-case variants). Strip the old bool resolvers
-# first, then add back the narrowed one.
-_BOOL_TAG = "tag:yaml.org,2002:bool"
-_YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
+narrow_bools_to_yaml_1_2(_ConfigYamlLoader)
 
 # ``executor.config`` keys kept as their nested YAML structure instead of
 # string-coerced — their consumers read the nested mapping/list shape.
 _STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
-
-# Copy the resolver dict onto the subclass before mutating — it's inherited
-# from PyYAML's shared Resolver by reference (the same dict object backs
-# SafeLoader and CSafeLoader), so in-place edits below would strip the bool
-# resolver process-wide.
-_ConfigYamlLoader.yaml_implicit_resolvers = {
-    key: value[:] for key, value in SafeLoaderBase.yaml_implicit_resolvers.items()
-}
-for _ch in list(_ConfigYamlLoader.yaml_implicit_resolvers.keys()):
-    _ConfigYamlLoader.yaml_implicit_resolvers[_ch] = [
-        (tag, regexp)
-        for tag, regexp in _ConfigYamlLoader.yaml_implicit_resolvers[_ch]
-        if tag != _BOOL_TAG
-    ]
-# Re-register a narrowed bool resolver keyed on ``t`` / ``T`` /
-# ``f`` / ``F`` only (the YAML 1.1 aliases keyed on o/O/y/Y/n/N
-# are now gone, so those characters parse as plain strings).
-# mypy flags BaseResolver.add_implicit_resolver as untyped
-# (PyYAML lacks type stubs on this classmethod); the call
-# is the only way to register an implicit resolver, so the
-# ignore is narrowly scoped to this YAML-1.2 compatibility
-# override.
-_ConfigYamlLoader.add_implicit_resolver(  # type: ignore[no-untyped-call]
-    _BOOL_TAG,
-    _YAML_1_2_BOOL_RE,
-    list("tTfF"),
-)
 
 
 def _parse_int_field(raw: object, field_name: str) -> int:
@@ -189,7 +158,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     if not config_path.exists():
         raise FileNotFoundError(f"config.yaml not found in {root}")
 
-    raw = yaml.load(config_path.read_text(), Loader=_ConfigYamlLoader)
+    raw = _yaml_load(config_path.read_text(), _ConfigYamlLoader)
     if not isinstance(raw, dict):
         raise OmnigentError(
             f"config.yaml must be a YAML mapping, got {type(raw).__name__}",
