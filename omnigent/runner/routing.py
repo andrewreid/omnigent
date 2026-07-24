@@ -151,6 +151,33 @@ class RunnerRouter:
             code=ErrorCode.CONFLICT,
         )
 
+    def client_for_bound_runner(self, conversation_id: str, runner_id: str) -> RoutedRunner:
+        """
+        Return a runner client for a session whose binding the caller holds.
+
+        Same semantics as the pinned branch of
+        :meth:`client_for_session_resources`, minus the conversation read:
+        callers that already loaded the conversation row pass its
+        ``runner_id`` so the event hot path (one call per streamed chunk)
+        doesn't re-read the row per event.
+
+        :param conversation_id: Conversation/session id (for the error
+            message only), e.g. ``"conv_0123456789abcdef"``.
+        :param runner_id: The conversation's pinned runner id.
+        :returns: Selected runner id and client.
+        :raises OmnigentError: If the pinned runner is offline.
+        """
+        session = self._registry.get(runner_id)
+        if session is None:
+            raise OmnigentError(
+                f"runner {runner_id!r} is offline for conversation {conversation_id!r}",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        return RoutedRunner(
+            runner_id=runner_id,
+            client=self._client_for_runner(runner_id),
+        )
+
     def client_for_existing_conversation(self, conversation_id: str) -> RoutedRunner | None:
         """
         Return the pinned runner client for an already-started conversation.

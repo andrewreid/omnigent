@@ -149,7 +149,7 @@ async def test_record_publish_delivers_wake_message_to_parent(
     # is stubbed so no transport is needed.
     sentinel_client = object()
 
-    async def _fake_get_runner_client(session_id: str, runner_router: Any) -> object:
+    async def _fake_get_runner_client(session_id: str, runner_router: Any, **_kwargs: object) -> object:
         return sentinel_client
 
     async def _record_dispatch(
@@ -246,7 +246,7 @@ async def test_record_publish_no_wake_when_no_runner_bound(
     expected_attempts = 1 + subagent_block_notifier._WAKE_RETRIES
     all_attempts_done = asyncio.Event()
 
-    async def _no_runner_client(session_id: str, runner_router: Any) -> None:
+    async def _no_runner_client(session_id: str, runner_router: Any, **_kwargs: object) -> None:
         nonlocal lookups
         lookups += 1
         if lookups >= expected_attempts:
