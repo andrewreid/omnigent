@@ -38,6 +38,17 @@ else:
 # need to report which base they exercised.
 USING_LIBYAML = SafeLoaderBase is not yaml.SafeLoader
 
+# Failures raised while reading the document's structure, before any tag is
+# resolved or any constructor runs. Both parsers raise these same classes,
+# and at this stage a loader's resolver and constructor tables cannot have
+# influenced the outcome — which is what makes the reparse in :func:`load`
+# a faithful substitution.
+_PARSE_STAGE_ERRORS = (
+    yaml.scanner.ScannerError,
+    yaml.parser.ParserError,
+    yaml.composer.ComposerError,
+)
+
 _BOOL_TAG = "tag:yaml.org,2002:bool"
 # YAML 1.2 spellings only — the 1.1 aliases keyed on o/O/y/Y/n/N are dropped.
 _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
@@ -88,10 +99,13 @@ def load(text: str, loader: type[yaml.SafeLoader]) -> Any:  # type: ignore[expli
     hot path, so reparsing it with the pure-Python scanner costs nothing
     in the success case and restores the better message.
 
-    The retry uses stock ``SafeLoader`` rather than a pure-Python twin of
-    *loader*: scanner and parser errors are raised before any tag is
-    resolved, so a narrowed bool resolver cannot change whether — or
-    where — a document fails.
+    Only :data:`_PARSE_STAGE_ERRORS` are retried, and the retry uses stock
+    ``SafeLoader`` rather than a pure-Python twin of *loader*. Those errors
+    are raised before any tag is resolved, so *loader*'s resolver and
+    constructor tables cannot have affected whether — or where — the
+    document failed. Constructor errors are left alone: a loader carrying
+    its own constructors would see its real error replaced by an unrelated
+    "could not determine a constructor" from the stock loader.
 
     :param text: The YAML source. Must be text rather than a stream, so
         the retry can reread it.
@@ -102,12 +116,12 @@ def load(text: str, loader: type[yaml.SafeLoader]) -> Any:  # type: ignore[expli
     """
     try:
         return yaml.load(text, Loader=loader)
-    except yaml.YAMLError as fast_error:
+    except _PARSE_STAGE_ERRORS as fast_error:
         if not USING_LIBYAML:
             raise
         try:
             yaml.load(text, Loader=yaml.SafeLoader)
-        except yaml.YAMLError as detailed_error:
+        except _PARSE_STAGE_ERRORS as detailed_error:
             # Same failure, better message. Drop the libyaml error from the
             # chain so the traceback shows one diagnosis, not two.
             raise detailed_error from None
