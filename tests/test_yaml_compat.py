@@ -182,6 +182,31 @@ def test_load_does_not_substitute_constructor_errors() -> None:
     assert "could not determine a constructor" not in message, message
 
 
+# Inputs the two parsers classify into different stages: libyaml rejects the
+# tag while scanning, pure-Python scans it clean and then fails in the
+# constructor. The retry must not swap one diagnosis for the other.
+_STAGE_DIVERGENT = ("!] ", "!]", "!!] x", "a: !] b\n")
+
+
+@pytest.mark.parametrize("source", _STAGE_DIVERGENT)
+def test_load_keeps_libyaml_error_when_the_parsers_disagree(source: str) -> None:
+    """A retry that fails somewhere else entirely must not replace the original.
+
+    ``!]`` is a scanner error for libyaml but a constructor error for the
+    pure-Python parser. Reporting the latter would point the user at a
+    "could not determine a constructor" problem the document does not have.
+    """
+    with pytest.raises(yaml.YAMLError) as excinfo:
+        load(source, _ConfigYamlLoader)
+    exc = excinfo.value
+    assert "could not determine a constructor" not in str(exc), str(exc)
+    if USING_LIBYAML:
+        assert isinstance(exc, yaml.scanner.ScannerError), type(exc)
+        # One diagnosis, not a chain of two.
+        assert exc.__suppress_context__ is True
+        assert exc.__cause__ is None
+
+
 def test_pure_python_fallback_when_libyaml_is_absent() -> None:
     """A PyYAML built without libyaml must still import and resolve correctly.
 
