@@ -6510,7 +6510,16 @@ async def _get_session_snapshot(
     # is persisted on its own child conversation, not the parent's, so the
     # parent's own session_usage would under-report. Off the event loop
     # because it pages the conversation tree from the store.
-    subtree_usage = await asyncio.to_thread(load_session_usage, conv.id, conv_store)
+    # The row in hand supplies the (immutable) tree root, so the helper
+    # skips its own conversation re-read; the tree scan itself stays fresh.
+    subtree_usage = await asyncio.to_thread(
+        functools.partial(
+            load_session_usage,
+            conv.id,
+            conv_store,
+            root_conversation_id=conv.root_conversation_id,
+        )
+    )
     # Static signal telling the open view a host-bound, host-down session is a
     # resumable managed host it can wake by sending a message, vs a terminal
     # host_offline dead-end. Computed independently of liveness_lookup (the web
