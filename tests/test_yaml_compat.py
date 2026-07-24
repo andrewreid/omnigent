@@ -134,10 +134,12 @@ def test_load_keeps_the_source_excerpt_in_parse_errors() -> None:
         message = str(excinfo.value)
         assert "description: has: unquoted colon" in message, message
         assert "^" in message, message
-        # The retry must not print the libyaml attempt above the real
-        # diagnosis — one traceback, one error.
-        assert excinfo.value.__cause__ is None
-        assert excinfo.value.__suppress_context__ is True
+        if USING_LIBYAML:
+            # The retry must not print the libyaml attempt above the real
+            # diagnosis — one traceback, one error. Without libyaml nothing
+            # is retried, so there is no chained attempt to suppress.
+            assert excinfo.value.__cause__ is None
+            assert excinfo.value.__suppress_context__ is True
 
 
 def test_load_does_not_reparse_documents_that_succeed() -> None:
@@ -188,6 +190,11 @@ def test_load_does_not_substitute_constructor_errors() -> None:
 _STAGE_DIVERGENT = ("!] ", "!]", "!!] x", "a: !] b\n")
 
 
+@pytest.mark.skipif(
+    not USING_LIBYAML,
+    reason="no libyaml here, so there is no second parser to disagree with — "
+    "pure-Python's constructor error is then the document's genuine diagnosis",
+)
 @pytest.mark.parametrize("source", _STAGE_DIVERGENT)
 def test_load_keeps_libyaml_error_when_the_parsers_disagree(source: str) -> None:
     """A retry that fails somewhere else entirely must not replace the original.
@@ -196,15 +203,13 @@ def test_load_keeps_libyaml_error_when_the_parsers_disagree(source: str) -> None
     pure-Python parser. Reporting the latter would point the user at a
     "could not determine a constructor" problem the document does not have.
     """
-    with pytest.raises(yaml.YAMLError) as excinfo:
+    with pytest.raises(yaml.scanner.ScannerError) as excinfo:
         load(source, _ConfigYamlLoader)
     exc = excinfo.value
     assert "could not determine a constructor" not in str(exc), str(exc)
-    if USING_LIBYAML:
-        assert isinstance(exc, yaml.scanner.ScannerError), type(exc)
-        # One diagnosis, not a chain of two.
-        assert exc.__suppress_context__ is True
-        assert exc.__cause__ is None
+    # One diagnosis, not a chain of two.
+    assert exc.__suppress_context__ is True
+    assert exc.__cause__ is None
 
 
 def test_pure_python_fallback_when_libyaml_is_absent() -> None:
