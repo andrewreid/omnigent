@@ -125,9 +125,16 @@ def load(text: str, loader: type[yaml.SafeLoader]) -> Any:  # type: ignore[expli
             # Same failure, better message. Drop the libyaml error from the
             # chain so the traceback shows one diagnosis, not two.
             raise detailed_error from None
-        # Only the C parser objected. Nothing better to report, so surface
-        # the original rather than pretending the document was fine.
-        raise fast_error
+        except Exception:  # noqa: BLE001 - any other outcome is not our failure
+            # The two parsers disagree about where the document breaks: ``!] ``
+            # fails libyaml's scanner but scans clean for pure-Python, which
+            # then dies in the constructor. That diagnosis describes a
+            # different problem, so it must not be substituted.
+            pass
+        # The retry either succeeded or failed elsewhere. Either way libyaml's
+        # error is the accurate one; surface it rather than pretending the
+        # document was fine or reporting an unrelated failure.
+        raise fast_error from None
 
 
 def safe_load(text: str) -> Any:  # type: ignore[explicit-any]
