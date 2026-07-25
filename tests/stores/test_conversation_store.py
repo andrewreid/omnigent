@@ -5315,6 +5315,82 @@ def _acl_perms(db_uri: str):
     return perms
 
 
+def _spread_created_at(store: SqlAlchemyConversationStore, ids: list[str]) -> None:
+    """Give *ids* strictly decreasing ``created_at`` values, newest first.
+
+    Conversations created in the same second tie on ``created_at``, and the
+    tiebreaker differs by dialect (SQLite ``rowid`` = insertion order,
+    PostgreSQL the random uuid ``id``), so any order-sensitive assertion
+    must not depend on creation order. Spreading the timestamps makes the
+    expected order identical on every dialect.
+    """
+    from sqlalchemy import update as sa_update
+
+    from omnigent.db.db_models import SqlConversation as _Conv
+
+    base = 2_000_000_000
+    with store._conv_session() as session:
+        for offset, conv_id in enumerate(ids):
+            session.execute(
+                sa_update(_Conv)
+                .where(_Conv.id == conv_id)
+                .values(created_at=base - offset, updated_at=base - offset)
+            )
+
+
+def _bulk_seed_conversations_and_grants(
+    store: SqlAlchemyConversationStore,
+    user_id: str,
+    *,
+    count: int,
+    granted_ratio: float,
+) -> None:
+    """Insert *count* conversations (and grants for a fraction of them).
+
+    Core bulk inserts, not per-row store calls, so a plan test can reach a
+    realistic row count without a slow fixture.
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import insert as sa_insert
+
+    from omnigent.db.db_models import SqlConversation as _Conv
+    from omnigent.db.db_models import SqlSessionPermission as _Perm
+
+    base = 1_900_000_000
+    conv_rows = []
+    perm_rows = []
+    for i in range(count):
+        cid = _uuid.uuid4().hex
+        conv_rows.append(
+            {
+                "workspace_id": 0,
+                "id": cid,
+                "created_at": base + i,
+                "updated_at": base + i,
+                "title": f"seed-{i}",
+                "parent_conversation_id": None,
+                "root_conversation_id": cid,
+                "next_position": 0,
+                "agent_id": None,
+                "archived": i % 5 == 0,
+            }
+        )
+        if i < int(count * granted_ratio):
+            perm_rows.append(
+                {
+                    "workspace_id": 0,
+                    "user_id": user_id,
+                    "conversation_id": cid,
+                    "level": 4,
+                }
+            )
+    with store._conv_session() as session:
+        session.execute(sa_insert(_Conv), conv_rows)
+    with store._session() as session:
+        session.execute(sa_insert(_Perm), perm_rows)
+
+
 def test_list_conversations_accessible_by_excludes_non_granted(
     conversation_store: SqlAlchemyConversationStore, db_uri: str
 ) -> None:
@@ -5393,35 +5469,40 @@ def test_single_db_acl_uses_exists_pushdown_not_prefetch(
 def test_list_conversations_acl_with_cursor_pagination(
     conversation_store: SqlAlchemyConversationStore, db_uri: str
 ) -> None:
-    """Cursor pagination composes with the ACL filter: pages never leak
-    non-granted rows, never overlap, and a non-granted conversation id
-    still works as a cursor."""
+    """Cursor pagination composes with the ACL filter: walking every page
+    yields exactly the granted rows (no leak, no overlap, none lost), and a
+    NON-granted conversation used as the cursor still returns the granted
+    rows that follow it — an empty page would not satisfy this."""
     convs = [conversation_store.create_conversation(title=f"c{i}") for i in range(6)]
-    granted = {c.id for c in convs[:4]}
+    # Newest first: c0, c1, ... c5. Deterministic on every dialect.
+    _spread_created_at(conversation_store, [c.id for c in convs])
+    granted = {c.id for c in (convs[0], convs[1], convs[4], convs[5])}
     perms = _acl_perms(db_uri)
-    for c in convs[:4]:
-        perms.grant("alice@example.com", c.id, 4)
+    for conv_id in granted:
+        perms.grant("alice@example.com", conv_id, 4)
 
-    page1 = conversation_store.list_conversations(accessible_by="alice@example.com", limit=2)
-    page2 = conversation_store.list_conversations(
-        accessible_by="alice@example.com", limit=2, after=page1.last_id
-    )
-    ids1 = {c.id for c in page1.data}
-    ids2 = {c.id for c in page2.data}
-    assert ids1 <= granted and ids2 <= granted
-    assert not ids1 & ids2
-    assert len(ids1) == 2 and len(ids2) == 2
-    assert page2.has_more is False
+    # Full walk in pages of 2 must reproduce exactly the granted set.
+    seen: list[str] = []
+    cursor: str | None = None
+    for _ in range(10):  # bounded; 4 rows / 2 per page = 2 pages
+        page = conversation_store.list_conversations(
+            accessible_by="alice@example.com", limit=2, after=cursor
+        )
+        seen.extend(c.id for c in page.data)
+        if not page.has_more:
+            break
+        cursor = page.last_id
+    assert len(seen) == len(set(seen)), f"pages overlap: {seen}"
+    assert set(seen) == granted
+    assert seen == [convs[0].id, convs[1].id, convs[4].id, convs[5].id]
 
-    # A non-granted conversation as the cursor filters position only —
-    # the returned rows are still ACL-scoped. convs[4] sorts after the
-    # four granted rows (default created_at DESC + insertion tiebreaker),
-    # so every granted row lies after the cursor: the page must contain
-    # exactly all four, not slip through empty.
+    # A non-granted conversation (c2, positioned between granted rows) as
+    # the cursor: position filter only, ACL still applied — so the result is
+    # exactly the granted rows after it, not an empty page.
     page3 = conversation_store.list_conversations(
-        accessible_by="alice@example.com", limit=10, after=convs[4].id
+        accessible_by="alice@example.com", limit=10, after=convs[2].id
     )
-    assert {c.id for c in page3.data} == granted
+    assert [c.id for c in page3.data] == [convs[4].id, convs[5].id]
 
 
 def test_list_projects_single_db_uses_exists_pushdown(
@@ -5467,27 +5548,92 @@ def test_default_created_at_listing_uses_ordering_index(
     longer materializing ids for the PK, created_at DESC ordering must be
     servable by ix_conversations_archived_created rather than a full
     scan-and-sort of the workspace's rows.
+
+    Dialect-aware: ``EXPLAIN QUERY PLAN`` is SQLite-only syntax and is a
+    hard SyntaxError on PostgreSQL, which the repo runs as its own CI lane
+    (and which is the production target). Each dialect gets the assertion
+    its plan output supports; anything else is skipped rather than
+    silently asserting nothing.
     """
+    import json
+
     from sqlalchemy import text as sql_text
 
-    conv = conversation_store.create_conversation(title="plan-check")
-    perms = _acl_perms(db_uri)
-    perms.grant("alice@example.com", conv.id, 4)
+    # A plan assertion needs a dataset the planner would actually use an
+    # index for: on a handful of rows a sequential scan is correct and the
+    # assertion would be a coin flip. Seed in bulk (two statements).
+    _acl_perms(db_uri)  # ensures the user row exists for the grants below
+    _bulk_seed_conversations_and_grants(
+        conversation_store, "alice@example.com", count=600, granted_ratio=0.5
+    )
 
-    with conversation_store._conv_session() as session:
-        plan_rows = session.execute(
-            sql_text(
-                "EXPLAIN QUERY PLAN "
-                "SELECT c.id FROM conversations c "
-                "WHERE c.workspace_id = 0 AND c.archived = 0 AND EXISTS ("
-                "  SELECT 1 FROM session_permissions sp"
-                "  WHERE sp.workspace_id = c.workspace_id"
-                "    AND sp.conversation_id = c.id AND sp.user_id = :u) "
-                "ORDER BY c.created_at DESC LIMIT 21"
-            ),
-            {"u": "alice@example.com"},
-        ).all()
-    plan = " | ".join(str(row) for row in plan_rows)
-    assert "ix_conversations_archived_created" in plan, plan
-    # Index provides the order — no separate sort step over the scan.
-    assert "USE TEMP B-TREE FOR ORDER BY" not in plan, plan
+    query = (
+        "SELECT c.id FROM conversations c "
+        "WHERE c.workspace_id = 0 AND c.archived = {false_lit} AND EXISTS ("
+        "  SELECT 1 FROM session_permissions sp"
+        "  WHERE sp.workspace_id = c.workspace_id"
+        "    AND sp.conversation_id = c.id AND sp.user_id = :u) "
+        "ORDER BY c.created_at DESC, c.id DESC LIMIT 21"
+    )
+    dialect = conversation_store._conv_engine.dialect.name
+
+    if dialect == "sqlite":
+        with conversation_store._conv_session() as session:
+            rows = session.execute(
+                sql_text("EXPLAIN QUERY PLAN " + query.format(false_lit="0")),
+                {"u": "alice@example.com"},
+            ).all()
+        plan = " | ".join(str(row) for row in rows)
+        assert "ix_conversations_archived_created" in plan, plan
+        # SQLite spells the sort step several ways ("USE TEMP B-TREE FOR
+        # ORDER BY", "... FOR LAST TERM OF ORDER BY"): reject any of them.
+        assert "TEMP B-TREE" not in plan, plan
+        return
+
+    if dialect == "postgresql":
+        with conversation_store._conv_session() as session:
+            # ANALYZE first: on an unanalysed table PostgreSQL has no
+            # statistics and legitimately prefers a seq scan, which would
+            # make this assertion a coin flip rather than a contract.
+            session.execute(sql_text("ANALYZE conversations"))
+            session.execute(sql_text("ANALYZE session_permissions"))
+            raw = session.execute(
+                sql_text("EXPLAIN (FORMAT JSON) " + query.format(false_lit="false")),
+                {"u": "alice@example.com"},
+            ).scalar_one()
+        plan_json = json.dumps(raw if isinstance(raw, (list, dict)) else json.loads(raw))
+        assert "ix_conversations_archived_created" in plan_json, plan_json
+        # The index supplies the order, so the plan must not add a Sort.
+        assert '"Node Type": "Sort"' not in plan_json, plan_json
+        return
+
+    pytest.skip(f"no plan assertion implemented for dialect {dialect!r}")
+
+
+def test_deep_cursor_uses_index_range_not_residual_filter(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    The cursor predicate must be emitted as a row-values comparison so
+    PostgreSQL can use it as an index RANGE condition. The equivalent
+    ``ts < :ts OR (ts = :ts AND id < :id)`` form is left as a residual
+    Filter, making a deep cursor re-read and discard every row above it
+    (cost growing with cursor depth). Asserted on the compiled SQL so it
+    holds on every dialect.
+    """
+    from sqlalchemy import select as sa_select
+
+    from omnigent.db.db_models import SqlConversation as SqlConv
+
+    stmt = conversation_store._apply_cursor(
+        sa_select(SqlConv),
+        "0" * 32,
+        SqlConv.created_at,
+        is_desc=True,
+        tiebreaker_col=SqlConv.id,
+        forward=True,
+    )
+    sql = str(stmt.compile(conversation_store._conv_engine))
+    normalized = " ".join(sql.split())
+    assert "(conversations.created_at, conversations.id) <" in normalized, normalized
+    assert " OR " not in normalized.upper().replace("OR REPLACE", ""), normalized
