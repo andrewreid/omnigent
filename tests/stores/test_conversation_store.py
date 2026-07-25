@@ -5300,6 +5300,7 @@ def test_sqlalchemy_store_implements_the_whole_abstract_contract() -> None:
             f"{name}: implementation is missing {sorted(base_params - impl_params)}"
         )
 
+
 # ── ACL EXISTS pushdown (single-DB) ────────────────────
 
 
@@ -5413,8 +5414,80 @@ def test_list_conversations_acl_with_cursor_pagination(
     assert page2.has_more is False
 
     # A non-granted conversation as the cursor filters position only —
-    # the returned rows are still ACL-scoped.
+    # the returned rows are still ACL-scoped. convs[4] sorts after the
+    # four granted rows (default created_at DESC + insertion tiebreaker),
+    # so every granted row lies after the cursor: the page must contain
+    # exactly all four, not slip through empty.
     page3 = conversation_store.list_conversations(
         accessible_by="alice@example.com", limit=10, after=convs[4].id
     )
-    assert {c.id for c in page3.data} <= granted
+    assert {c.id for c in page3.data} == granted
+
+
+def test_list_projects_single_db_uses_exists_pushdown(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """Single-DB list_projects pushes ACL as EXISTS — no standalone
+    session_permissions prefetch — and still scopes correctly."""
+    from sqlalchemy import event
+
+    assert conversation_store._conv_engine is conversation_store._engine
+    mine = conversation_store.create_conversation(title="mine")
+    other = conversation_store.create_conversation(title="other")
+    conversation_store.set_labels(mine.id, {"omni_project": "Mine"})
+    conversation_store.set_labels(other.id, {"omni_project": "Other"})
+    perms = _acl_perms(db_uri)
+    perms.grant("alice@example.com", mine.id, 4)
+    perms.grant("bob@example.com", other.id, 4)
+
+    statements: list[str] = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(conversation_store._engine, "before_cursor_execute", _capture)
+    try:
+        projects = conversation_store.list_projects(accessible_by="alice@example.com")
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", _capture)
+
+    assert projects == ["Mine"]
+    perm_stmts = [s for s in statements if "session_permissions" in s]
+    assert perm_stmts, "expected the labels query to reference session_permissions"
+    for stmt in perm_stmts:
+        assert "conversation_labels" in stmt
+        assert "EXISTS" in stmt
+
+
+def test_default_created_at_listing_uses_ordering_index(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """
+    Plan regression for the EXISTS-era default listing: with the ACL no
+    longer materializing ids for the PK, created_at DESC ordering must be
+    servable by ix_conversations_archived_created rather than a full
+    scan-and-sort of the workspace's rows.
+    """
+    from sqlalchemy import text as sql_text
+
+    conv = conversation_store.create_conversation(title="plan-check")
+    perms = _acl_perms(db_uri)
+    perms.grant("alice@example.com", conv.id, 4)
+
+    with conversation_store._conv_session() as session:
+        plan_rows = session.execute(
+            sql_text(
+                "EXPLAIN QUERY PLAN "
+                "SELECT c.id FROM conversations c "
+                "WHERE c.workspace_id = 0 AND c.archived = 0 AND EXISTS ("
+                "  SELECT 1 FROM session_permissions sp"
+                "  WHERE sp.workspace_id = c.workspace_id"
+                "    AND sp.conversation_id = c.id AND sp.user_id = :u) "
+                "ORDER BY c.created_at DESC LIMIT 21"
+            ),
+            {"u": "alice@example.com"},
+        ).all()
+    plan = " | ".join(str(row) for row in plan_rows)
+    assert "ix_conversations_archived_created" in plan, plan
+    # Index provides the order — no separate sort step over the scan.
+    assert "USE TEMP B-TREE FOR ORDER BY" not in plan, plan
