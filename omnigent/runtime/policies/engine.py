@@ -13,6 +13,7 @@ The orchestration here handles composition.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import replace
 from typing import Any
 
@@ -27,7 +28,7 @@ from omnigent.spec.types import (
     StateUpdate,
     StateUpdateAction,
 )
-from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store import ConversationNotFoundError, ConversationStore
 
 # Number of recent conversation items the engine fetches from
 # the conversation store and threads onto :class:`EvaluationContext`
@@ -590,9 +591,14 @@ class PolicyEngine:
         """
         # Same atomic merge as the per-conversation path: a sibling sub-agent
         # approving concurrently must not lose this checkpoint (or vice versa).
-        self._store.mutate_session_state(
-            self._root_conversation_id, lambda state: _apply_one(state, op)
-        )
+        # A root deleted while this sub-agent runs has nowhere to hold the
+        # checkpoint. Recording it here was always best-effort (a lost approval
+        # re-prompts, it does not overspend), so keep the in-memory mirror below
+        # and let the turn continue rather than failing the tool call.
+        with contextlib.suppress(ConversationNotFoundError):
+            self._store.mutate_session_state(
+                self._root_conversation_id, lambda state: _apply_one(state, op)
+            )
         # Also mirror into this engine's hot in-memory state so a subsequent
         # evaluate() within the same sub-agent turn sees the approval (its
         # session_state was seeded from the root at construction, but a fresh
