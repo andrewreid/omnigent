@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import contextvars
 import threading
 from collections.abc import Iterator
@@ -280,14 +282,117 @@ def test_scope_keeps_statement_spans_single_connect_span(tmp_path: Path) -> None
     assert names.count("connect") == 1
 
 
-def test_release_returns_connections_and_scope_keeps_working(engine: Engine) -> None:
+def test_unpinned_region_holds_nothing_across_a_park(engine: Engine) -> None:
     """
-    release_scoped_connections hands idle held connections back to the
-    pool (for requests about to park on a human wait) while the scope
-    stays usable — the next session checks out fresh.
+    While unpinned, the scope holds no connection AND cannot re-pin one:
+    a store call inside the region (the real bug — the ancestor mirror ran
+    between the old release and the park) borrows and returns immediately,
+    so a request parked on a human verdict leaves the pool untouched.
     """
-    from omnigent.db.utils import release_scoped_connections
+    from omnigent.db.utils import db_connections_unpinned
 
+    session_maker = make_managed_session_maker(engine)
+    checkins: list[object] = []
+    checkouts_ev: list[object] = []
+
+    @event.listens_for(engine, "checkin")
+    def _on_checkin(dbapi_conn: object, conn_record: object) -> None:
+        checkins.append(dbapi_conn)
+
+    @event.listens_for(engine, "checkout")
+    def _on_checkout(dbapi_conn: object, rec: object, proxy: object) -> None:
+        checkouts_ev.append(dbapi_conn)
+
+    try:
+        with db_connection_scope():
+            with session_maker() as session:
+                session.execute(text("SELECT 1"))
+            assert len(checkins) == 0, "scope should be holding the connection"
+
+            with db_connections_unpinned():
+                assert len(checkins) == 1, "entering the region must hand it back"
+                # A store call mid-region must NOT re-pin for the park.
+                with session_maker() as session:
+                    session.execute(text("SELECT 1"))
+                assert len(checkins) == 2, "mid-region call must return its connection"
+                # This is the park: nothing of ours is checked out here.
+                held = len(checkouts_ev) - len(checkins)
+                assert held == 0, f"parked request still holds {held} connection(s)"
+
+            # Pinning resumes afterwards.
+            with session_maker() as session:
+                session.execute(text("SELECT 1"))
+            assert len(checkouts_ev) - len(checkins) == 1
+    finally:
+        event.remove(engine, "checkin", _on_checkin)
+        event.remove(engine, "checkout", _on_checkout)
+
+
+def test_parked_requests_do_not_exhaust_a_small_pool(tmp_path: Path) -> None:
+    """
+    Bounded-pool regression for the self-deadlock: with more concurrently
+    parked requests than the pool can serve, an unrelated request must
+    still get a connection (the approval that ends a park needs one).
+    """
+    from omnigent.db.utils import db_connections_unpinned
+
+    eng = create_engine(
+        f"sqlite:///{tmp_path / 'pool.db'}",
+        connect_args={"check_same_thread": False},
+        pool_size=2,
+        max_overflow=0,
+        pool_timeout=1,
+    )
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE kv (k TEXT PRIMARY KEY)"))
+    session_maker = make_managed_session_maker(eng)
+
+    parked: list[contextlib.ExitStack] = []
+    try:
+        for _ in range(4):  # 2x the pool
+            stack = contextlib.ExitStack()
+            stack.enter_context(db_connection_scope())
+            with session_maker() as session:
+                session.execute(text("SELECT 1"))  # pins, pre-park
+            stack.enter_context(db_connections_unpinned())  # the park
+            parked.append(stack)
+
+        # The unparking request must not block on an exhausted pool.
+        with db_connection_scope():
+            with session_maker() as session:
+                assert session.execute(text("SELECT 1")).scalar_one() == 1
+    finally:
+        for stack in reversed(parked):
+            stack.close()
+        eng.dispose()
+
+
+def test_nested_unpinned_regions_restore_pinning_once(engine: Engine) -> None:
+    """Nested regions are safe: pinning returns only after the outermost."""
+    from omnigent.db.utils import db_connections_unpinned
+
+    session_maker = make_managed_session_maker(engine)
+    checkouts = _count_checkouts(engine)
+
+    with db_connection_scope():
+        with db_connections_unpinned():
+            with db_connections_unpinned():
+                with session_maker() as session:
+                    session.execute(text("SELECT 1"))
+            with session_maker() as session:
+                session.execute(text("SELECT 1"))
+        # Outermost exited: pinning is back, so these two share one.
+        with session_maker() as session:
+            session.execute(text("SELECT 1"))
+        with session_maker() as session:
+            session.execute(text("SELECT 1"))
+
+    # 2 unpinned (one each) + 1 pinned reused by the last two.
+    assert len(checkouts) == 3
+
+
+def test_cancelled_session_inside_scope_does_not_leak(engine: Engine) -> None:
+    """A cancellation mid-session returns the connection, not leaks it."""
     session_maker = make_managed_session_maker(engine)
     checkins: list[object] = []
 
@@ -296,33 +401,26 @@ def test_release_returns_connections_and_scope_keeps_working(engine: Engine) -> 
         checkins.append(dbapi_conn)
 
     try:
-        with db_connection_scope():
-            with session_maker() as session:
-                session.execute(text("SELECT 1"))
-            assert len(checkins) == 0  # held by the scope
-            release_scoped_connections()
-            assert len(checkins) == 1  # handed back for the park
-            # Scope still works: next call re-checks out and re-pins.
-            with session_maker() as session:
-                session.execute(text("SELECT 1"))
+        with pytest.raises(asyncio.CancelledError):
+            with db_connection_scope():
+                with session_maker() as session:
+                    session.execute(text("INSERT INTO kv (k, v) VALUES ('x', '1')"))
+                    raise asyncio.CancelledError()
+        assert len(checkins) >= 1, "scope teardown must return the connection"
+        # Rolled back, not committed.
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT count(*) FROM kv")).scalar_one() == 0
     finally:
         event.remove(engine, "checkin", _on_checkin)
 
 
-def test_release_without_scope_is_noop() -> None:
-    """Calling the release helper outside any scope must not raise."""
-    from omnigent.db.utils import release_scoped_connections
-
-    release_scoped_connections()
-
-
-def test_idle_held_connection_expires_and_rechecks_out(
+def test_held_connection_expires_on_absolute_age(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    A connection idle in the scope longer than the max idle window is
-    dropped on the next lend and replaced by a fresh pool checkout —
-    bounding how long the scope bypasses checkout-time pre-ping.
+    A held connection older than the max window is dropped on the next
+    lend and replaced by a fresh pool checkout — bounding how long the
+    scope can bypass checkout-time pre-ping / pool_recycle.
     """
     import omnigent.db.utils as db_utils
 
@@ -335,8 +433,36 @@ def test_idle_held_connection_expires_and_rechecks_out(
     with db_connection_scope():
         with session_maker() as session:
             session.execute(text("SELECT 1"))
-        fake_now[0] += db_utils._SCOPE_IDLE_MAX_SECONDS + 1
+        fake_now[0] += db_utils._SCOPE_HELD_MAX_SECONDS + 1
         with session_maker() as session:
             session.execute(text("SELECT 1"))
 
     assert len(checkouts) == 2, "expired idle connection must trigger a fresh checkout"
+
+
+def test_held_connection_age_is_not_reset_by_steady_traffic(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Age is absolute from checkout, so a request making calls more often
+    than the window cannot keep one connection forever (which would
+    bypass pool_pre_ping / pool_recycle indefinitely).
+    """
+    import omnigent.db.utils as db_utils
+
+    session_maker = make_managed_session_maker(engine)
+    checkouts = _count_checkouts(engine)
+
+    fake_now = [1000.0]
+    monkeypatch.setattr(db_utils.time, "monotonic", lambda: fake_now[0])
+
+    with db_connection_scope():
+        # Calls every 10s across 60s: never idle >30s, but total age >30s.
+        for _ in range(7):
+            with session_maker() as session:
+                session.execute(text("SELECT 1"))
+            fake_now[0] += 10.0
+
+    assert len(checkouts) >= 2, (
+        "absolute age must retire the held connection even under steady traffic"
+    )

@@ -44,6 +44,11 @@ resources:
             value_from: artifact_volume
           - name: OTEL_TRACES_SAMPLER
             value: 'always_on'
+          # Per-request DB connection reuse. Set to '0' to fall back to
+          # checkout-per-store-call (kill switch for suspected pool
+          # saturation); redeploy for it to take effect.
+          - name: OMNIGENT_DB_CONNECTION_SCOPE
+            value: '1'
       resources:
         - name: postgres
           postgres:

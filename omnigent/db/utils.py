@@ -574,12 +574,13 @@ _connection_scope_var: ContextVar[_ConnectionScope | None] = ContextVar(
 
 
 # A held connection bypasses the pool's checkout-time ``pool_pre_ping``
-# for as long as it stays in the scope. Bound that window: an idle held
-# connection older than this many seconds is dropped and re-checked-out
-# (which pre-pings), so a database restart or failover during a long
-# request degrades back to the pool's own recovery behaviour instead of
-# guaranteeing the next store call a dead connection.
-_SCOPE_IDLE_MAX_SECONDS = 30.0
+# (and its ``pool_recycle`` age check) for as long as the scope keeps it.
+# Bound that window by ABSOLUTE age since checkout — not by idle time
+# between calls, which a steady request stream would keep resetting
+# forever. Past this age the held connection is dropped and the next call
+# takes a fresh, pre-pinged checkout, so a database restart or failover
+# is recovered from within one window instead of never.
+_SCOPE_HELD_MAX_SECONDS = 30.0
 
 
 class _ConnectionScope:
@@ -587,34 +588,45 @@ class _ConnectionScope:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        # engine -> (connection, monotonic time it was checked out)
         self._idle: dict[Engine, tuple[Connection, float]] = {}
         self._closed = False
+        # connection -> monotonic checkout time, preserved across
+        # lend/restore cycles so age is absolute, not per-idle-period.
+        self._checked_out_at: dict[Connection, float] = {}
+        # >0 while the request is parked on a non-DB wait: no connection
+        # may be pinned to the scope, so store calls borrow from the pool
+        # and return it immediately (see :func:`db_connections_unpinned`).
+        self._suspend_depth = 0
 
     def lend(self, engine: Engine) -> Connection | None:
         """
         Return a connection for *engine*, checking one out if needed.
 
-        Returns ``None`` when the scope is already closed — the caller
-        should fall back to a plain pooled session. While a connection is
-        lent out it is absent from the idle map, so an overlapping call for
-        the same engine checks out its own connection instead of sharing.
-        Held connections idle longer than ``_SCOPE_IDLE_MAX_SECONDS`` are
-        dropped and replaced by a fresh (pre-pinged) checkout.
+        Returns ``None`` when the scope is closed or currently suspended —
+        the caller falls back to a plain pooled session. While a
+        connection is lent out it is absent from the idle map, so an
+        overlapping call for the same engine checks out its own connection
+        instead of sharing. A held connection older than
+        ``_SCOPE_HELD_MAX_SECONDS`` (measured from its checkout, not from
+        its last use) is dropped and replaced by a fresh, pre-pinged
+        checkout.
         """
         with self._lock:
-            if self._closed:
+            if self._closed or self._suspend_depth:
                 return None
             entry = self._idle.pop(engine, None)
         conn = entry[0] if entry is not None else None
         if conn is not None and (
             conn.closed
             or conn.invalidated
-            or time.monotonic() - entry[1] > _SCOPE_IDLE_MAX_SECONDS
+            or time.monotonic() - entry[1] > _SCOPE_HELD_MAX_SECONDS
         ):
             conn.close()
             conn = None
         if conn is None:
             conn = engine.connect()
+            self._checked_out_at[conn] = time.monotonic()
         return conn
 
     def restore(self, engine: Engine, conn: Connection) -> None:
@@ -637,26 +649,35 @@ class _ConnectionScope:
         except Exception:  # noqa: BLE001 — any failure here means: don't retain the connection
             conn.close()
             return
+        checked_out_at = self._checked_out_at.pop(conn, time.monotonic())
         with self._lock:
-            if not self._closed and engine not in self._idle:
-                self._idle[engine] = (conn, time.monotonic())
+            if not self._closed and not self._suspend_depth and engine not in self._idle:
+                self._idle[engine] = (conn, checked_out_at)
+                self._checked_out_at[conn] = checked_out_at
                 return
         conn.close()
 
-    def release_idle(self) -> None:
-        """Return idle held connections to their pools; keep the scope open.
+    def suspend(self) -> None:
+        """Stop pinning connections and hand back the ones held now.
 
-        For request paths about to park on a human or network wait
-        (policy ASK gates hold up to a day): the connections go back to
-        the pool for the wait's duration, and the next managed session in
-        this scope simply checks out (and re-pins) a fresh one.
-        Connections currently lent to an in-flight session are unaffected.
+        Entered before a request parks on a non-DB wait. Returning the
+        idle connections is not enough on its own: a store call between
+        the release and the actual wait would pin a new one for the whole
+        park, so pinning stays disabled until :meth:`resume`.
         """
         with self._lock:
+            self._suspend_depth += 1
             entries = list(self._idle.values())
             self._idle.clear()
         for conn, _ in entries:
+            self._checked_out_at.pop(conn, None)
             conn.close()
+
+    def resume(self) -> None:
+        """Re-enable pinning after a parked wait ends."""
+        with self._lock:
+            if self._suspend_depth:
+                self._suspend_depth -= 1
 
     def close(self) -> None:
         """Release all held connections back to their pools."""
@@ -665,22 +686,60 @@ class _ConnectionScope:
             self._idle.clear()
             self._closed = True
         for conn, _ in entries:
+            self._checked_out_at.pop(conn, None)
             conn.close()
 
 
-def release_scoped_connections() -> None:
-    """Release the active scope's idle connections back to the pool.
+def suspend_scoped_connection_pinning() -> None:
+    """Stop pinning DB connections to the active request scope.
 
-    Call before parking a request on an unbounded human/network wait
-    (e.g. a policy ASK gate) so the request doesn't pin a pooled
-    connection for the wait's duration — at pool exhaustion the approval
-    that would unpark it can't read the database, a self-deadlock. No-op
-    when no scope is active; the scope keeps working afterwards (the
-    next managed session checks out fresh).
+    The imperative half of :func:`db_connections_unpinned`, for regions
+    whose entry and exit are already separated by an existing
+    ``try`` / ``finally`` (re-indenting those to fit a ``with`` would
+    bury the change in whitespace). Every call must be paired with
+    :func:`resume_scoped_connection_pinning` in a ``finally``.
+
+    No-op when no scope is active.
     """
     scope = _connection_scope_var.get()
     if scope is not None:
-        scope.release_idle()
+        scope.suspend()
+
+
+def resume_scoped_connection_pinning() -> None:
+    """Re-enable pinning after :func:`suspend_scoped_connection_pinning`.
+
+    No-op when no scope is active.
+    """
+    scope = _connection_scope_var.get()
+    if scope is not None:
+        scope.resume()
+
+
+@contextmanager
+def db_connections_unpinned() -> Iterator[None]:
+    """Hold no pooled connection for the duration of a non-DB wait.
+
+    Wrap any region that awaits a human verdict, a runner round-trip, or
+    a host handshake. On entry the request's held connections go back to
+    the pool and pinning is disabled; store calls inside the region still
+    work, borrowing from the pool per call and returning immediately.
+    Pinning resumes on exit.
+
+    Without this, a request parked on a wait keeps its connection: enough
+    parked requests exhaust the pool, and the approval (or handshake)
+    that would end the wait cannot get a connection to do its own reads —
+    a self-deadlock that resolves only on timeout. Waits reach up to a
+    day (a policy ASK gate), so this boundary is what keeps the
+    request-scoped lease safe.
+
+    No-op when no scope is active. Nests safely.
+    """
+    suspend_scoped_connection_pinning()
+    try:
+        yield
+    finally:
+        resume_scoped_connection_pinning()
 
 
 @contextmanager

@@ -11,6 +11,7 @@ from fastapi import (
     Request,
 )
 
+from omnigent.db.utils import db_connections_unpinned
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import (
     session_stream,
@@ -113,11 +114,14 @@ def register_browser_routes(
             from omnigent.server.routes import sessions as _sessions_facade
 
             _sessions_facade.session_stream.publish(session_id, event.model_dump())
-            done, _pending = await asyncio.wait(
-                {future},
-                timeout=_sessions_facade._BROWSER_ACTION_AWAIT_S,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            # Waiting on the renderer, not the DB: don't hold a pooled
+            # connection for the round-trip.
+            with db_connections_unpinned():
+                done, _pending = await asyncio.wait(
+                    {future},
+                    timeout=_sessions_facade._BROWSER_ACTION_AWAIT_S,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
             if future in done and not future.cancelled():
                 return future.result()
             # Timed out/cancelled with no renderer result (no subscribed app).
