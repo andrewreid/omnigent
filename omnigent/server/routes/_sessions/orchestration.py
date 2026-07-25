@@ -4423,10 +4423,20 @@ async def _relay_runner_stream(
                         # surfaces tokens). context_tokens/window already ride
                         # on the response.completed event. Threaded: store
                         # reads + SSE fan-out.
-                        _subtree_usage = await asyncio.to_thread(
-                            load_session_usage,
-                            session_id,
-                            conversation_store,
+                        _conv_row = await asyncio.to_thread(
+                            conversation_store.get_conversation, session_id
+                        )
+                        _subtree_usage = (
+                            await asyncio.to_thread(
+                                functools.partial(
+                                    load_session_usage,
+                                    session_id,
+                                    conversation_store,
+                                    root_conversation_id=_conv_row.root_conversation_id,
+                                )
+                            )
+                            if _conv_row is not None
+                            else {}
                         )
                         _subtree_cost = _priced_cost_for_display(_subtree_usage)
                         _usage_by_model = _usage_by_model_for_display(_subtree_usage)
@@ -4447,6 +4457,7 @@ async def _relay_runner_stream(
                                 _publish_subtree_cost_to_ancestors,
                                 conversation_store,
                                 session_id,
+                                _conv_row,
                             )
 
                     # Reset the turn-scoped response_id on any

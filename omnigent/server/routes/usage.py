@@ -122,7 +122,13 @@ def _build_usage_report(
         for conv in page.data:
             if conv.agent_id is None:
                 continue
-            usage = load_session_usage(conv.id, conversation_store)
+            # The listed row supplies the (immutable) tree root, so the
+            # helper skips one conversation re-read per listed session.
+            usage = load_session_usage(
+                conv.id,
+                conversation_store,
+                root_conversation_id=conv.root_conversation_id,
+            )
             sessions.append(
                 SessionUsage(
                     id=conv.id,
