@@ -66,8 +66,9 @@ policies:
 > (`omnigent/spec/parser.py`), which uses the same grammar as an agent bundle's
 > `guardrails.policies:` and does **not** understand `factory_params`. Neither
 > parser rejects unknown keys, so a `factory_params:` block is silently
-> discarded and the factory then runs on its defaults, with no error and no log
-> line. `factory_params` is real only on the REST/DB row path and in the legacy
+> discarded. A factory whose parameters are all optional then runs on its
+> defaults, silently and with no log line; a factory with a required parameter
+> fails later instead, at build time. `factory_params` is real only on the REST/DB row path and in the legacy
 > single-file omnigent YAML (`omnigent/spec/omnigent.py`).
 
 **4. Start the server.**

@@ -168,9 +168,12 @@ END REVIEWER-MANDATE-V1
    *Unopened branch* (the normal one): `git -C .worktrees/<task_id> diff
    main...HEAD`. The implementer has committed and stopped; nothing is pushed.
    *Already-open PR* (a pre-existing PR, or a fix round on one you released
-   earlier): read its diff with the `github` MCP tool `pull_request_read` —
-   it is a read, and reads prefer MCP. The work is already published, so review
-   gates the NEXT push rather than the first one. The implementer has committed and stopped; the
+   earlier): review the LOCAL delta that is about to be pushed —
+   `git -C .worktrees/<task_id> diff origin/<branch>...HEAD` — because that is
+   the unreviewed part. `pull_request_read` returns the published diff only, so
+   reviewing it would approve what is already on the remote and miss the commit
+   you are about to add. Use MCP here for review THREADS and their resolution
+   state, not for the diff. Review gates the next push rather than the first. The implementer has committed and stopped; the
    commit has not been pushed.
 
 2. **Gates first — ALL of them, before any reviewer is involved.** Discover the

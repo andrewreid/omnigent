@@ -54,5 +54,5 @@ os_env:
   sandbox:
     type: none
 
-# Publication is orchestrator-sequenced: commit and stop. Nothing here
-# blocks a push; the ordering is prompt discipline.
+# Publication is orchestrator-sequenced: commit and stop. The ordering is
+# prompt discipline, not a mechanism.
