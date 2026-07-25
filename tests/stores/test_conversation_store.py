@@ -5348,3 +5348,36 @@ def test_two_real_writers_race_on_one_metadata_row(
         f"one writer's increment was lost: {persisted} — the two transactions "
         f"were not serialised on the metadata row"
     )
+
+
+def test_get_runner_ids_omits_conversations_with_orphaned_metadata(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A deleted conversation must not be reachable through its binding.
+
+    Deletion is ordered AP-row-first, metadata-second, and a failed second
+    transaction deliberately leaves orphaned metadata (documented as
+    acceptable). That is only acceptable while reachability checks consult
+    the AP row: a metadata-only binding lookup reports the OLD runner for a
+    conversation that no longer exists, so events route to it instead of
+    404-ing. This pins the AP row as the existence authority.
+    """
+    from sqlalchemy import delete as sa_delete
+
+    from omnigent.db.db_models import SqlConversation as _Conv
+
+    conv = conversation_store.create_conversation(title="orphan")
+    conversation_store.set_runner_id(conv.id, "runner_old")
+    assert conversation_store.get_runner_ids([conv.id]) == {conv.id: "runner_old"}
+
+    # Simulate the documented partial-failure state: AP row gone, metadata
+    # left behind.
+    with conversation_store._conv_session() as session:
+        session.execute(sa_delete(_Conv).where(_Conv.id == conv.id))
+
+    assert conversation_store.get_runner_ids([conv.id]) == {}, (
+        "orphaned metadata must not make a deleted conversation routable"
+    )
+    # And the full read agrees — the two must not disagree about existence.
+    assert conversation_store.get_conversation(conv.id) is None
