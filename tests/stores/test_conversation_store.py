@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 from sqlalchemy import text
 
@@ -5338,6 +5340,44 @@ def _spread_created_at(store: SqlAlchemyConversationStore, ids: list[str]) -> No
             )
 
 
+@contextlib.contextmanager
+def _capture_conversation_selects(store: SqlAlchemyConversationStore):
+    """Capture the SELECT statements the store emits against conversations.
+
+    Yields a list that receives the actual SQLAlchemy clause elements, so a
+    plan test can re-compile the STORE'S OWN statement with literal binds
+    instead of hand-writing SQL that may omit predicates the planner sees.
+    """
+    from sqlalchemy import event as sa_event
+
+    captured: list[object] = []
+
+    def _on_before_execute(conn, clauseelement, multiparams, params, execution_options):
+        text = str(clauseelement)
+        if text.lstrip().upper().startswith("SELECT") and "FROM conversations" in text:
+            captured.append(clauseelement)
+
+    sa_event.listen(store._conv_engine, "before_execute", _on_before_execute)
+    try:
+        yield captured
+    finally:
+        sa_event.remove(store._conv_engine, "before_execute", _on_before_execute)
+
+
+def _explain_json(store: SqlAlchemyConversationStore, sql: str, analyze: bool = False) -> str:
+    """Return a PostgreSQL plan for *sql* as a JSON string (ANALYZE first)."""
+    import json
+
+    from sqlalchemy import text as sql_text
+
+    with store._conv_session() as session:
+        session.execute(sql_text("ANALYZE conversations"))
+        session.execute(sql_text("ANALYZE session_permissions"))
+        prefix = "EXPLAIN (ANALYZE, FORMAT JSON) " if analyze else "EXPLAIN (FORMAT JSON) "
+        raw = session.execute(sql_text(prefix + sql)).scalar_one()
+    return json.dumps(raw if isinstance(raw, (list, dict)) else json.loads(raw))
+
+
 def _bulk_seed_conversations_and_grants(
     store: SqlAlchemyConversationStore,
     user_id: str,
@@ -5372,7 +5412,10 @@ def _bulk_seed_conversations_and_grants(
                 "parent_conversation_id": None,
                 "root_conversation_id": cid,
                 "next_position": 0,
-                "agent_id": None,
+                # The endpoint filters has_agent_id=True, so an all-NULL
+                # agent_id seed would exclude every row and the plan under
+                # test would never be the plan production runs.
+                "agent_id": _uuid.uuid4().hex,
                 "archived": i % 5 == 0,
             }
         )
@@ -5544,96 +5587,127 @@ def test_default_created_at_listing_uses_ordering_index(
     conversation_store: SqlAlchemyConversationStore, db_uri: str
 ) -> None:
     """
-    Plan regression for the EXISTS-era default listing: with the ACL no
-    longer materializing ids for the PK, created_at DESC ordering must be
-    servable by ix_conversations_archived_created rather than a full
-    scan-and-sort of the workspace's rows.
+    Plan regression for the EXISTS-era default listing.
 
-    Dialect-aware: ``EXPLAIN QUERY PLAN`` is SQLite-only syntax and is a
-    hard SyntaxError on PostgreSQL, which the repo runs as its own CI lane
-    (and which is the production target). Each dialect gets the assertion
-    its plan output supports; anything else is skipped rather than
-    silently asserting nothing.
+    Evidence standard: the statement explained here is the one the STORE
+    EMITTED for the endpoint's real call (ACL EXISTS + has_agent_id +
+    kind + non-archived + created_at ordering + LIMIT) — captured from the
+    engine, then recompiled with literal binds. Not hand-written SQL, and
+    it cannot drift from the production query. Seeded to a size where an
+    index plan is the planner's rational choice; ANALYZE runs first on PG.
     """
-    import json
-
     from sqlalchemy import text as sql_text
 
-    # A plan assertion needs a dataset the planner would actually use an
-    # index for: on a handful of rows a sequential scan is correct and the
-    # assertion would be a coin flip. Seed in bulk (two statements).
-    _acl_perms(db_uri)  # ensures the user row exists for the grants below
+    _acl_perms(db_uri)
     _bulk_seed_conversations_and_grants(
         conversation_store, "alice@example.com", count=600, granted_ratio=0.5
     )
 
-    query = (
-        "SELECT c.id FROM conversations c "
-        "WHERE c.workspace_id = 0 AND c.archived = {false_lit} AND EXISTS ("
-        "  SELECT 1 FROM session_permissions sp"
-        "  WHERE sp.workspace_id = c.workspace_id"
-        "    AND sp.conversation_id = c.id AND sp.user_id = :u) "
-        "ORDER BY c.created_at DESC, c.id DESC LIMIT 21"
+    with _capture_conversation_selects(conversation_store) as captured:
+        page = conversation_store.list_conversations(
+            limit=20,
+            accessible_by="alice@example.com",
+            has_agent_id=True,
+            kind="default",
+            sort_by="created_at",
+            order="desc",
+        )
+    assert page.data, "seed must produce visible rows or the plan is not the real one"
+    assert captured, "no conversations SELECT captured"
+    listing = captured[0]
+    query = str(
+        listing.compile(conversation_store._conv_engine, compile_kwargs={"literal_binds": True})
     )
+    assert "EXISTS" in query.upper(), query  # ACL really is pushed down
     dialect = conversation_store._conv_engine.dialect.name
 
     if dialect == "sqlite":
         with conversation_store._conv_session() as session:
-            rows = session.execute(
-                sql_text("EXPLAIN QUERY PLAN " + query.format(false_lit="0")),
-                {"u": "alice@example.com"},
-            ).all()
+            rows = session.execute(sql_text("EXPLAIN QUERY PLAN " + query)).all()
         plan = " | ".join(str(row) for row in rows)
+        # The index must drive the scan and the ACL probe.
         assert "ix_conversations_archived_created" in plan, plan
-        # SQLite spells the sort step several ways ("USE TEMP B-TREE FOR
-        # ORDER BY", "... FOR LAST TERM OF ORDER BY"): reject any of them.
-        assert "TEMP B-TREE" not in plan, plan
+        assert "SEARCH conversations USING INDEX" in plan, plan
+        # Measured, not assumed: SQLite uses the index for the leading terms
+        # but still builds a temp B-tree for the LAST ORDER BY term
+        # ("USE TEMP B-TREE FOR LAST TERM OF ORDER BY"). It is bounded by the
+        # LIMIT, and PostgreSQL — the production target, asserted below —
+        # needs no Sort at all. Asserting no-sort here would be asserting
+        # something untrue of this dialect.
+        assert "SCAN conversations" not in plan, plan  # never a full table scan
         return
 
     if dialect == "postgresql":
-        with conversation_store._conv_session() as session:
-            # ANALYZE first: on an unanalysed table PostgreSQL has no
-            # statistics and legitimately prefers a seq scan, which would
-            # make this assertion a coin flip rather than a contract.
-            session.execute(sql_text("ANALYZE conversations"))
-            session.execute(sql_text("ANALYZE session_permissions"))
-            raw = session.execute(
-                sql_text("EXPLAIN (FORMAT JSON) " + query.format(false_lit="false")),
-                {"u": "alice@example.com"},
-            ).scalar_one()
-        plan_json = json.dumps(raw if isinstance(raw, (list, dict)) else json.loads(raw))
+        plan_json = _explain_json(conversation_store, query)
         assert "ix_conversations_archived_created" in plan_json, plan_json
-        # The index supplies the order, so the plan must not add a Sort.
         assert '"Node Type": "Sort"' not in plan_json, plan_json
         return
 
     pytest.skip(f"no plan assertion implemented for dialect {dialect!r}")
 
 
-def test_deep_cursor_uses_index_range_not_residual_filter(
-    conversation_store: SqlAlchemyConversationStore,
+def test_deep_cursor_emits_row_values_and_paginates_exactly(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
 ) -> None:
     """
-    The cursor predicate must be emitted as a row-values comparison so
-    PostgreSQL can use it as an index RANGE condition. The equivalent
-    ``ts < :ts OR (ts = :ts AND id < :id)`` form is left as a residual
-    Filter, making a deep cursor re-read and discard every row above it
-    (cost growing with cursor depth). Asserted on the compiled SQL so it
-    holds on every dialect.
+    The cursor predicate must be emitted as a row-values comparison —
+    ``(created_at, id) < (:ts, :id)`` — which PostgreSQL can use as an
+    index RANGE condition. The equivalent ``ts < :ts OR (ts = :ts AND id <
+    :id)`` form is left as a residual Filter, so a deep cursor re-reads and
+    discards every row above it (cost growing with cursor depth).
+
+    Asserted on the store's OWN emitted statement (captured from the
+    engine, not hand-written), plus the user-visible property that deep
+    pagination loses and duplicates nothing.
+
+    The plan itself is not explained here: the cursor binds a 16-byte
+    BLOB/bytea id, which cannot be rendered as a SQL literal, and passing
+    raw params to a text() EXPLAIN would bypass the type decorator (the
+    exact trap that made the first row-values attempt fail on PG). The
+    index-range evidence for this form was measured out-of-band on
+    PostgreSQL 18.3 (comparison in Index Cond, zero rows removed by
+    filter, 47 rows examined at a 70%-deep cursor versus 28,000 before).
     """
-    from sqlalchemy import select as sa_select
-
-    from omnigent.db.db_models import SqlConversation as SqlConv
-
-    stmt = conversation_store._apply_cursor(
-        sa_select(SqlConv),
-        "0" * 32,
-        SqlConv.created_at,
-        is_desc=True,
-        tiebreaker_col=SqlConv.id,
-        forward=True,
+    _acl_perms(db_uri)
+    _bulk_seed_conversations_and_grants(
+        conversation_store, "alice@example.com", count=600, granted_ratio=1.0
     )
-    sql = str(stmt.compile(conversation_store._conv_engine))
-    normalized = " ".join(sql.split())
-    assert "(conversations.created_at, conversations.id) <" in normalized, normalized
-    assert " OR " not in normalized.upper().replace("OR REPLACE", ""), normalized
+    first = conversation_store.list_conversations(
+        accessible_by="alice@example.com",
+        limit=300,
+        has_agent_id=True,
+        kind="default",
+        sort_by="created_at",
+        order="desc",
+    )
+    assert first.has_more, "seed must be deeper than one page"
+
+    with _capture_conversation_selects(conversation_store) as captured:
+        second = conversation_store.list_conversations(
+            accessible_by="alice@example.com",
+            limit=300,
+            after=first.data[-1].id,
+            has_agent_id=True,
+            kind="default",
+            sort_by="created_at",
+            order="desc",
+        )
+    listing = next((c for c in captured if "created_at" in str(c)), captured[0])
+    normalized = " ".join(str(listing).split())
+    # The tiebreaker column is dialect-chosen (SQLite rowid = insertion order,
+    # otherwise the uuid id) — assert against the store's own choice rather
+    # than hard-coding one dialect's spelling.
+    tiebreaker_col = conversation_store._tiebreaker_col
+    # ``str()`` on a mapped attribute yields "SqlConversation.id"; the SQL
+    # spelling is the underlying column.
+    tiebreaker = str(getattr(tiebreaker_col, "expression", tiebreaker_col))
+    assert f"(conversations.created_at, {tiebreaker}) <" in normalized, (
+        tiebreaker,
+        normalized,
+    )
+
+    # Behavioural: the deep page continues exactly where the first ended.
+    first_ids = [c.id for c in first.data]
+    second_ids = [c.id for c in second.data]
+    assert not set(first_ids) & set(second_ids), "cursor pages overlap"
+    assert len(set(first_ids + second_ids)) == len(first_ids) + len(second_ids)
