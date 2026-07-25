@@ -1391,7 +1391,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param mutate: Callable applied in place to the freshly read state
             dict. Runs inside the locked transaction, so it must not
             perform store calls of its own.
-        :returns: The merged state as persisted.
+        :returns: The merged state, as persisted.
+        :raises ConversationNotFoundError: When the conversation has no
+            metadata row. Nothing can be persisted in that case, so
+            returning a merged state would report a write that never
+            happened.
         """
         import json
 
@@ -1403,8 +1407,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             if self._meta_supports_for_update:
                 q = q.with_for_update()
             meta = session.scalars(q).first()
+            if meta is None:
+                # Previously this treated a missing row as ``{}``, applied the
+                # mutation, issued an UPDATE that matched nothing, and returned
+                # the mutated dict "as persisted" — reporting a write that did
+                # not happen. Fail loudly instead.
+                raise ConversationNotFoundError(
+                    f"Cannot mutate session state for {conversation_id!r}: no metadata row exists."
+                )
             current: dict[str, Any] = (
-                dict(json.loads(meta.session_state)) if meta and meta.session_state else {}
+                dict(json.loads(meta.session_state)) if meta.session_state else {}
             )
             mutate(current)
             session.execute(
