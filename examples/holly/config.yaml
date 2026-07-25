@@ -1,14 +1,12 @@
 spec_version: 1
-name: polly
+name: holly
 description: >-
   A coding orchestrator that breaks your goal into pieces and hands them
-  to a team of Claude Code, Codex, OpenCode, Cursor, Hermes, and Pi sub-agents
-  to build. Polly
+  to a team of Claude Code, Codex, and Pi sub-agents to build. Holly
   writes no code itself — it plans and splits up the work, delegates all
   of it (investigation / implementation / review), then has a separate
-  independent different-model reviewer double-check the work before
-  putting it all together. Best for bigger tasks you want planned and
-  split up.
+  independent different-vendor reviewer double-check the work BEFORE it
+  is pushed. Best for bigger tasks you want planned and split up.
 
 # Beyond the declared sub-agents (tools.agents below), polly may also spawn
 # child sessions it defines itself: spawn: true registers
@@ -312,9 +310,6 @@ tools:
   agents:
     - claude_code
     - codex
-    - opencode
-    - cursor
-    - hermes
     - pi
 
 # Mechanism-layer enforcement — runner-side tool gate, no server change.
