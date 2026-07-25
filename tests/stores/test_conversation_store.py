@@ -5299,3 +5299,20 @@ def test_sqlalchemy_store_implements_the_whole_abstract_contract() -> None:
         assert base_params <= impl_params, (
             f"{name}: implementation is missing {sorted(base_params - impl_params)}"
         )
+
+
+def test_mutate_session_state_reports_a_missing_row(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A missing metadata row must raise, not report a phantom write.
+
+    The earlier implementation treated the absent row as ``{}``, applied
+    the mutation, ran an UPDATE that matched nothing, and returned the
+    mutated dict as if persisted.
+    """
+    from omnigent.stores.conversation_store import ConversationNotFoundError
+
+    with pytest.raises(ConversationNotFoundError, match="no metadata row"):
+        conversation_store.mutate_session_state(
+            "0" * 32, lambda state: state.__setitem__("counter", 1)
+        )
