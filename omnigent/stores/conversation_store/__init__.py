@@ -3,6 +3,7 @@
 import hashlib
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -972,6 +973,29 @@ class ConversationStore(ABC):
             e.g. ``"conv_abc123"``.
         :param state: The complete session-state dict to persist.
             Serialized as JSON. Empty dict is stored as ``"{}"``.
+        """
+        ...
+
+    @abstractmethod
+    def mutate_session_state(
+        self,
+        conversation_id: str,
+        mutate: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        """
+        Apply *mutate* to the persisted session state atomically.
+
+        Read-merge-write under a row lock, so two concurrent writers
+        cannot lose each other's updates. Prefer this over
+        :meth:`set_session_state` whenever the new value depends on the
+        old one (counters, appends, checkpoints); a snapshot-then-write
+        pair drops anything persisted in between.
+
+        :param conversation_id: The conversation to update.
+        :param mutate: Callable applied in place to the freshly read
+            state, inside the locked transaction. Must not make store
+            calls of its own.
+        :returns: The merged state as persisted.
         """
         ...
 

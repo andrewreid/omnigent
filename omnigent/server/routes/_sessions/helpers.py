@@ -6249,6 +6249,10 @@ def _build_policy_engine_from_spec_impl(
         conversation_id=session_id,
         conversation_store=conversation_store,
         conversation=conversation,
+        # The spec was resolved from this row's agent binding; the builder
+        # confirms it against its own fresh read and fails closed if a
+        # switch-agent landed in between.
+        expected_agent_id=conversation.agent_id if conversation is not None else None,
         default_policies=caps.default_policies,
         policy_store=get_policy_store(),
         server_llm=caps.llm,

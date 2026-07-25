@@ -1168,8 +1168,20 @@ async def test_llm_response_allow_when_no_matching_policy(
     ("event", "why"),
     [
         ({"type": ["not", "hashable"]}, "unhashable event.type"),
-        ({"type": "TOOL_CALL", "data": "a string"}, "non-dict data for a tool phase"),
-        ({"type": "TOOL_CALL", "data": {"name": "Bash"}, "context": 7}, "non-dict context"),
+        ({"type": "PHASE_TOOL_CALL", "data": "a string"}, "non-dict data"),
+        ({"type": "PHASE_TOOL_CALL", "data": None}, "null data"),
+        ({"type": "PHASE_TOOL_CALL", "data": False}, "false data"),
+        ({"type": "PHASE_TOOL_CALL", "data": 0}, "zero data"),
+        ({"type": "PHASE_TOOL_CALL", "data": ""}, "empty-string data"),
+        ({"type": "PHASE_TOOL_CALL", "data": []}, "empty-list data"),
+        ({"type": "PHASE_TOOL_CALL", "data": {}}, "empty object (no tool name)"),
+        ({"type": "PHASE_TOOL_CALL", "data": {"name": ""}}, "empty tool name"),
+        ({"type": "PHASE_TOOL_CALL", "data": {"name": 7}}, "non-string tool name"),
+        (
+            {"type": "PHASE_TOOL_CALL", "data": {"name": "Bash"}, "context": 7},
+            "non-dict context",
+        ),
+        ({"type": "PHASE_TOOL_RESULT", "data": {"result": "ok"}}, "missing request_data.name"),
     ],
 )
 @pytest.mark.asyncio
@@ -1178,17 +1190,22 @@ async def test_policy_evaluate_rejects_malformed_event_shapes(
     event: dict[str, object],
     why: str,
 ) -> None:
-    """Malformed hook payloads must be 4xx client errors, not 500s.
+    """
+    Malformed hook payloads must be rejected with a structured 400.
 
-    Each shape previously reached a dict lookup or ``.get`` on a
-    non-mapping and surfaced as an internal error.
+    Every falsy ``data`` here used to normalize to ``{}`` before validation
+    and return 200/UNSPECIFIED — on a TOOL_CALL that means tool-name-scoped
+    policies were skipped entirely on a BLOCKING hook (fail-open), which is
+    worse than the 500s the earlier guards were added for. The phase strings
+    are the wire values (``PHASE_*``); using the internal names silently
+    short-circuited at the unknown-type check and never reached these
+    guards, so the suite stayed green with the validation deleted.
     """
     from tests.server.helpers import create_test_session
 
-    snap = await create_test_session(client, title=f"malformed-{abs(hash(why)) % 1000}")
+    snap = await create_test_session(client, title=f"malformed-{abs(hash(why)) % 10000}")
     resp = await client.post(
         f"/v1/sessions/{snap['id']}/policies/evaluate",
         json={"event": event},
     )
-    assert resp.status_code < 500, f"{why} produced {resp.status_code}: {resp.text}"
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 400, f"{why} returned {resp.status_code}: {resp.text}"

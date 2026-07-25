@@ -557,9 +557,21 @@ class PolicyEngine:
             else:
                 session_ops.append(op)
         if session_ops:
-            for op in session_ops:
-                _apply_one(self._session_state, op)
-            self._store.set_session_state(self._conversation_id, self._session_state)
+            # Merge under a row lock rather than overwriting the whole blob
+            # from this engine's snapshot: concurrent evaluations (parallel
+            # tool calls on one session) each hold their own snapshot, and a
+            # blind write dropped the other's counter increments / appends.
+            def _merge(state: dict[str, Any]) -> None:
+                for op in session_ops:
+                    _apply_one(state, op)
+
+            merged = self._store.mutate_session_state(self._conversation_id, _merge)
+            # Hot cache: persisted truth wins for every key the store holds
+            # (so concurrent writers are visible), while keys that exist only
+            # in this engine's snapshot — the root-inherited cost approvals,
+            # and anything injected at construction — survive, preserving the
+            # documented shallow-merge semantics.
+            self._session_state = {**self._session_state, **merged}
 
     def _record_root_cost_ask_approved(self, op: StateUpdate) -> None:
         """
@@ -576,10 +588,11 @@ class PolicyEngine:
         :param op: The ``SET`` op carrying the approved checkpoint value, e.g.
             ``StateUpdate(key=..., action=StateUpdateAction.SET, value=0.05)``.
         """
-        root_conv = self._store.get_conversation(self._root_conversation_id)
-        root_state = dict(root_conv.session_state) if root_conv is not None else {}
-        _apply_one(root_state, op)
-        self._store.set_session_state(self._root_conversation_id, root_state)
+        # Same atomic merge as the per-conversation path: a sibling sub-agent
+        # approving concurrently must not lose this checkpoint (or vice versa).
+        self._store.mutate_session_state(
+            self._root_conversation_id, lambda state: _apply_one(state, op)
+        )
         # Also mirror into this engine's hot in-memory state so a subsequent
         # evaluate() within the same sub-agent turn sees the approval (its
         # session_state was seeded from the root at construction, but a fresh
