@@ -131,10 +131,13 @@ class RunnerRouter:
             pinned runner is offline, or no online runner is available.
         """
         # Only the runner binding is needed here, and it must be current —
-        # the event hot path resolves a runner per streamed chunk and a
-        # concurrent rebind/host handoff must route to the NEW runner. One
-        # indexed single-column read instead of the full conversation +
-        # metadata + labels load.
+        # the event hot path resolves a runner per streamed chunk, so a
+        # rebind or host handoff that has already landed must route to the
+        # NEW runner. One indexed single-column read instead of the full
+        # conversation + metadata + labels load. Note this makes the
+        # RESOLUTION current; it does not fence the window between
+        # resolving and the caller's request, which would need a binding
+        # generation carried on the wire.
         runner_ids = self._conversation_store.get_runner_ids([conversation_id])
         if conversation_id not in runner_ids:
             raise OmnigentError("conversation not found", code=ErrorCode.NOT_FOUND)
