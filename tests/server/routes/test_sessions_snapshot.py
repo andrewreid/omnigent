@@ -6,8 +6,10 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
 import pytest
 
+from omnigent.db.utils import _engine_cache
 from omnigent.entities import Conversation, ConversationItem, MessageData, PagedList
 from omnigent.server.routes import sessions as _sessions_mod
 from omnigent.server.routes.sessions import (
@@ -19,6 +21,7 @@ from omnigent.server.routes.sessions import (
     _truncate_label,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests.server.helpers import count_conversation_selects
 
 
 async def _drain_runner_skills(session_id: str) -> None:
@@ -1962,4 +1965,75 @@ async def test_persist_error_labels_short_message_stored_verbatim() -> None:
     assert (
         captured["d6e1678fb446a1cf5a892e0df60aaba3"]["omnigent.last_task_error_code"]
         == "runner_error"
+    )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_subtree_usage_reuses_conversation_row(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    The snapshot's subtree-usage recompute derives the tree root from the
+    row in hand instead of re-reading the conversation. Remaining SELECTs:
+    the handler's own row, the tree page scan, and the two deliberate
+    child-indicator / liveness id scans.
+    """
+    from tests.server.helpers import create_test_session
+
+    snap = await create_test_session(client, title="snapshot-load-once")
+    sid = snap["id"]
+    engine = _engine_cache[db_uri]
+    await client.get(f"/v1/sessions/{sid}")  # warm
+
+    with count_conversation_selects(engine) as selects:
+        resp = await client.get(f"/v1/sessions/{sid}")
+
+    assert resp.status_code == 200
+    # EXACT, not a ceiling: a ceiling let the test pass with the supplied-root
+    # argument removed (measured 5 without it, 4 with). The four are the
+    # handler's own row, the child-indicator id scan, the liveness id scan,
+    # and the subtree tree page — no per-session root re-resolution.
+    assert len(selects) == 4, [str(q)[:90] for q in selects]
+
+
+@pytest.mark.asyncio
+async def test_archived_descendant_spend_counts_toward_displayed_total(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Archived spend is still spend, and it shows in the displayed total.
+
+    This is a deliberate product decision, not an accident of the
+    cost-enforcement fix that motivated it. Including archived rows in the
+    spawn-tree load was required to stop an archive-after-preload seeding a
+    $0 budget and ALLOWing over-budget tool calls. The same tree feeds the
+    DISPLAY roll-up, so an archived sub-agent's spend now appears in the
+    parent's total as well.
+
+    The alternative — two tree loads with different archived semantics, one
+    for enforcement and one for display — would let the badge disagree with
+    the gate, which is worse than the change being visible. Pinned here so
+    the display behaviour cannot be altered silently in either direction.
+    """
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from tests.server.helpers import create_test_session
+
+    snap = await create_test_session(client, title="archived-display")
+    sid = snap["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=sid, title="archived:child"
+    )
+    store.set_session_usage(sid, {"total_cost_usd": 1.0})
+    store.set_session_usage(child.id, {"total_cost_usd": 2.0})
+    store.update_conversation(child.id, archived=True)
+
+    resp = await client.get(f"/v1/sessions/{sid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["total_cost_usd"] == pytest.approx(3.0), (
+        "archived descendant spend must remain in the displayed subtree total"
     )

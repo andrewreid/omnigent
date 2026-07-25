@@ -4450,12 +4450,10 @@ async def _relay_runner_stream(
                         # reads + SSE fan-out.
                         _subtree_usage = (
                             await asyncio.to_thread(
-                                functools.partial(
-                                    load_session_usage,
-                                    session_id,
-                                    conversation_store,
-                                    root_conversation_id=_conv_row.root_conversation_id,
-                                )
+                                load_session_usage,
+                                session_id,
+                                conversation_store,
+                                root_conversation_id=_conv_row.root_conversation_id,
                             )
                             if _conv_row is not None
                             else {}
@@ -6556,12 +6554,10 @@ async def _get_session_snapshot(
     # The row in hand supplies the (immutable) tree root, so the helper
     # skips its own conversation re-read; the tree scan itself stays fresh.
     subtree_usage = await asyncio.to_thread(
-        functools.partial(
-            load_session_usage,
-            conv.id,
-            conv_store,
-            root_conversation_id=conv.root_conversation_id,
-        )
+        load_session_usage,
+        conv.id,
+        conv_store,
+        root_conversation_id=conv.root_conversation_id,
     )
     # Static signal telling the open view a host-bound, host-down session is a
     # resumable managed host it can wake by sending a message, vs a terminal
