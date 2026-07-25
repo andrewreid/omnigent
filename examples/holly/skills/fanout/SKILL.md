@@ -1,6 +1,7 @@
 ---
 name: fanout
 description: Run independent subtasks in parallel — one git worktree and one implementation sub-agent per task, each opening its own PR — then cross-review every PR. holly never merges; the human does.
+user-invocable: false
 ---
 
 # fanout — safe parallel execution

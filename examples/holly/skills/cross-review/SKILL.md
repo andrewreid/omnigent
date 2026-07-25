@@ -1,6 +1,7 @@
 ---
 name: cross-review
 description: The review lifecycle - gates, an INDEPENDENT different-vendor reviewer, the fix loop, servicing an external review bot, and releasing the branch. Review runs on the local branch diff BEFORE anything reaches the remote.
+user-invocable: false
 ---
 
 # cross-review — independent verification before the remote

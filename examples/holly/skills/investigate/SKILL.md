@@ -1,6 +1,7 @@
 ---
 name: investigate
 description: Delegate read-only investigation, debugging, audit, search, or code-understanding tasks to sub-agents; synthesize only from their structured reports.
+user-invocable: false
 ---
 
 # investigate — delegated read-only work
