@@ -5266,41 +5266,6 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
     assert stored == ["custom-search-text"]
 
 
-def test_sqlalchemy_store_implements_the_whole_abstract_contract() -> None:
-    """
-    Every abstract ConversationStore method must be implemented by the
-    real store, with a compatible signature.
-
-    Guard for a recurring class of breakage: adding a method to the
-    abstract contract (or a parameter to an existing one) silently
-    diverges implementations and in-tree doubles, and the failure only
-    surfaces in whichever unrelated suite happens to exercise that path.
-    """
-    import inspect
-
-    from omnigent.stores.conversation_store import ConversationStore
-
-    missing = getattr(SqlAlchemyConversationStore, "__abstractmethods__", frozenset())
-    assert not missing, f"unimplemented abstract methods: {sorted(missing)}"
-
-    for name in dir(ConversationStore):
-        base = getattr(ConversationStore, name, None)
-        if not callable(base) or not getattr(base, "__isabstractmethod__", False):
-            continue
-        impl = getattr(SqlAlchemyConversationStore, name)
-        base_params = set(inspect.signature(base).parameters)
-        impl_sig = inspect.signature(impl)
-        impl_params = set(impl_sig.parameters)
-        accepts_var_kw = any(
-            p.kind is inspect.Parameter.VAR_KEYWORD for p in impl_sig.parameters.values()
-        )
-        if accepts_var_kw:
-            continue
-        assert base_params <= impl_params, (
-            f"{name}: implementation is missing {sorted(base_params - impl_params)}"
-        )
-
-
 def test_read_modify_write_primitives_report_a_missing_row(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

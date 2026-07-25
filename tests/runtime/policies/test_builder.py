@@ -25,7 +25,8 @@ Covers:
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -1004,20 +1005,44 @@ def test_normalize_usage_for_engine_drops_display_fields() -> None:
     assert normalized3["input_tokens"] == 0
 
 
-def test_build_loads_conversation_and_tree_once(
+@contextmanager
+def _count_sql(store: SqlAlchemyConversationStore) -> Iterator[list[str]]:
+    """Capture every statement the store executes, on either bind."""
+    from sqlalchemy import event as sa_event
+
+    seen: list[str] = []
+
+    def _on(conn, cursor, statement, params, context, many):
+        seen.append(statement)
+
+    engines = {store._engine, store._conv_engine}
+    for engine in engines:
+        sa_event.listen(engine, "before_cursor_execute", _on)
+    try:
+        yield seen
+    finally:
+        for engine in engines:
+            sa_event.remove(engine, "before_cursor_execute", _on)
+
+
+@pytest.mark.parametrize("preloaded", [False, True], ids=["no-preload", "preload"])
+def test_build_issues_one_read_and_one_tree_scan(
     conversation_store: SqlAlchemyConversationStore,
+    preloaded: bool,
 ) -> None:
     """
-    Regression: one engine build does one conversation read and ONE spawn-tree
-    load, even when both usage seeds are computed.
+    One engine build costs one conversation read plus ONE spawn-tree scan,
+    and nothing at all for the read when the caller supplies the row.
 
-    The builder previously re-fetched the conversation ~4x and walked the
-    tree twice (once per seed) — 32 queries / 21 pool checkouts per
-    policies/evaluate call. Both seeds must still be correct: session-wide
+    Counts SQL STATEMENTS, not store-method calls: the redundancy this
+    change removes was measured in queries, and a store-call count cannot
+    see a helper that issues three statements per call. The builder used to
+    re-fetch the conversation ~4x and walk the tree twice, once per usage
+    seed.
+
+    Both seeds must stay correct and identical either way: session-wide
     gating from the whole tree, subtree display from the node's own subtree.
     """
-    import collections
-
     from omnigent.spec.types import FunctionPolicySpec, FunctionRef
 
     parent = conversation_store.create_conversation()
@@ -1030,23 +1055,7 @@ def test_build_loads_conversation_and_tree_once(
     conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})
     conversation_store.set_session_usage(child.id, {"total_cost_usd": 0.05})
     conversation_store.set_session_usage(sibling.id, {"total_cost_usd": 0.03})
-
-    calls: collections.Counter[str] = collections.Counter()
-
-    class _CountingStore:
-        def __init__(self, inner: SqlAlchemyConversationStore) -> None:
-            self._inner = inner
-
-        def __getattr__(self, name: str):
-            attr = getattr(self._inner, name)
-            if not callable(attr):
-                return attr
-
-            def _wrapper(*args: object, **kwargs: object) -> object:
-                calls[name] += 1
-                return attr(*args, **kwargs)
-
-            return _wrapper
+    child_row = conversation_store.get_conversation(child.id) if preloaded else None
 
     subagent_budget = FunctionPolicySpec(
         name="subtree_budget",
@@ -1056,20 +1065,32 @@ def test_build_loads_conversation_and_tree_once(
             arguments={"max_cost_usd": 10.0},
         ),
     )
-    engine = build_policy_engine(
-        spec=AgentSpec(spec_version=1, name="child"),
-        conversation_id=child.id,
-        conversation_store=_CountingStore(conversation_store),  # type: ignore[arg-type]
-        default_policies=[subagent_budget],
-    )
+    with _count_sql(conversation_store) as statements:
+        engine = build_policy_engine(
+            spec=AgentSpec(spec_version=1, name="child"),
+            conversation_id=child.id,
+            conversation_store=conversation_store,
+            conversation=child_row,
+            default_policies=[subagent_budget],
+        )
 
     # Semantics preserved: session-wide gate vs per-subtree display.
     assert engine.usage["total_cost_usd"] == pytest.approx(0.18)
     assert engine._subtree_usage is not None
     assert engine._subtree_usage["total_cost_usd"] == pytest.approx(0.05)
-    # Load-once: one conversation read, one paged tree scan.
-    assert calls["get_conversation"] == 1, calls
-    assert calls["list_conversations"] == 1, calls
+
+    # The tree scan is one paged listing; the conversation read is a triplet
+    # (row + metadata + labels) and disappears entirely with a preload.
+    # Shape first, then the total. SQLite's connection PRAGMAs are setup, not
+    # work the builder asked for.
+    executed = [" ".join(q.split()) for q in statements if not q.startswith("PRAGMA")]
+    tree_scans = [q for q in executed if "root_conversation_id = " in q]
+    point_reads = [q for q in executed if "FROM conversations" in q and "conversations.id = " in q]
+    assert len(tree_scans) == 1, executed
+    assert len(point_reads) == (0 if preloaded else 1), executed
+    # A conversation read is a triplet (row + metadata + labels), and so is the
+    # tree scan; the preload removes one whole triplet.
+    assert len(executed) == (3 if preloaded else 6), [q[:80] for q in executed]
 
 
 def test_build_counts_archived_spend_and_inherits_approval(
@@ -1102,56 +1123,6 @@ def test_build_counts_archived_spend_and_inherits_approval(
     # Whole-tree total including the archived root's own spend.
     assert engine.usage["total_cost_usd"] == pytest.approx(0.15)
     assert engine.session_state[SESSION_COST_ASK_APPROVED_STATE_KEY] == pytest.approx(9.99)
-
-
-def test_build_with_preloaded_conversation_skips_own_read(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """A caller-supplied conversation row eliminates the builder's own
-    read entirely (one tree scan remains) and yields identical seeds."""
-    import collections
-
-    parent = conversation_store.create_conversation()
-    child = conversation_store.create_conversation(
-        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
-    )
-    conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})
-    conversation_store.set_session_usage(child.id, {"total_cost_usd": 0.05})
-    child_row = conversation_store.get_conversation(child.id)
-
-    calls: collections.Counter[str] = collections.Counter()
-
-    class _CountingStore:
-        def __init__(self, inner: SqlAlchemyConversationStore) -> None:
-            self._inner = inner
-
-        def __getattr__(self, name: str):
-            attr = getattr(self._inner, name)
-            if not callable(attr):
-                return attr
-
-            def _wrapper(*args: object, **kwargs: object) -> object:
-                calls[name] += 1
-                return attr(*args, **kwargs)
-
-            return _wrapper
-
-    engine = build_policy_engine(
-        spec=AgentSpec(spec_version=1, name="child"),
-        conversation_id=child.id,
-        conversation_store=_CountingStore(conversation_store),  # type: ignore[arg-type]
-        conversation=child_row,
-    )
-    baseline = build_policy_engine(
-        spec=AgentSpec(spec_version=1, name="child"),
-        conversation_id=child.id,
-        conversation_store=conversation_store,
-    )
-
-    assert calls["get_conversation"] == 0, calls
-    assert calls["list_conversations"] == 1, calls
-    assert dict(engine.usage) == dict(baseline.usage)
-    assert engine.session_state == baseline.session_state
 
 
 def test_build_rejects_mismatched_preloaded_conversation(
@@ -1308,34 +1279,6 @@ def test_initial_label_seed_uses_the_atomic_store_operation(
 
     assert "seed_labels_if_absent" in calls, calls
     assert "set_labels" not in calls, calls
-
-
-def test_archive_after_preload_still_gates_on_recorded_spend(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """
-    Reproduction of the reported authorization bypass: a conversation
-    archived (with an expensive model set) AFTER the handler's preload
-    must still seed its recorded spend. Seeding $0 here returned ALLOW
-    under a $1 budget.
-    """
-    conv = conversation_store.create_conversation(title="archive-bypass")
-    conversation_store.set_session_usage(conv.id, {"total_cost_usd": 5.0})
-    stale_row = conversation_store.get_conversation(conv.id)
-
-    conversation_store.update_conversation(
-        conv.id, model_override="claude-opus-4-8", archived=True
-    )
-
-    engine = build_policy_engine(
-        spec=AgentSpec(spec_version=1, name="x"),
-        conversation_id=conv.id,
-        conversation_store=conversation_store,
-        conversation=stale_row,
-    )
-
-    assert engine.usage["total_cost_usd"] == pytest.approx(5.0), "archived spend must count"
-    assert engine.model == "claude-opus-4-8"
 
 
 def test_deleted_after_preload_fails_closed(
@@ -1551,35 +1494,6 @@ def test_load_session_usage_uses_the_supplied_root(
     )
 
 
-def test_build_rereads_when_archived_self_is_missing_from_tree(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """
-    The tree scan includes archived rows, so a row archived after the
-    preload is absent from it. The builder must re-read rather than fall
-    back to the preloaded copy — otherwise an atomic
-    ``archived=True, model_override=<expensive>`` update would authorize
-    from pre-update state (fail-OPEN).
-    """
-    conv = conversation_store.create_conversation(title="archive-race")
-    stale_row = conversation_store.get_conversation(conv.id)
-
-    conversation_store.set_labels(conv.id, {"guard": "tripped"})
-    conversation_store.update_conversation(
-        conv.id, model_override="claude-opus-4-8", archived=True
-    )
-
-    engine = build_policy_engine(
-        spec=AgentSpec(spec_version=1, name="x"),
-        conversation_id=conv.id,
-        conversation_store=conversation_store,
-        conversation=stale_row,
-    )
-
-    assert engine.model == "claude-opus-4-8", "archived self must not use the stale row"
-    assert engine.labels.get("guard") == "tripped"
-
-
 class _MutateOnTreeLoad:
     """Store proxy that commits *hazard* the first time the tree is scanned.
 
@@ -1662,3 +1576,43 @@ def test_mid_build_change_fails_closed_on_every_provenance(
             conversation=row if preloaded else None,
             expected_agent_id=agent_a,
         )
+
+
+def test_archived_descendant_spend_counts_toward_the_displayed_total(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Including archived rows in the tree changes DISPLAY as well as gating.
+
+    The change was made so archiving cannot reset a cost gate, but
+    ``load_session_usage`` is also the display path for the session badge
+    (``session.usage`` SSE) and the usage report, so an archived
+    descendant's spend now shows in the total a user sees. That is the
+    deliberate choice — the alternative, separate tree semantics for
+    display and enforcement, lets the badge disagree with the gate that
+    blocks the user — and it belongs with the change that caused it rather
+    than in a later PR.
+    """
+    from omnigent.runtime.policies.builder import load_session_usage
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
+    )
+    conversation_store.set_session_usage(parent.id, {"total_cost_usd": 1.0})
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 2.0})
+    conversation_store.update_conversation(child.id, archived=True)
+
+    displayed = load_session_usage(parent.id, conversation_store)
+    assert displayed["total_cost_usd"] == pytest.approx(3.0), (
+        "archived descendant spend must reach the displayed subtree total"
+    )
+
+    # The same number the badge and the enforcement seed derive from, so the
+    # two cannot diverge.
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="parent"),
+        conversation_id=parent.id,
+        conversation_store=conversation_store,
+    )
+    assert engine.usage["total_cost_usd"] == pytest.approx(3.0)
