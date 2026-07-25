@@ -278,3 +278,65 @@ def test_scope_keeps_statement_spans_single_connect_span(tmp_path: Path) -> None
     names = [span.name for span in exporter.get_finished_spans()]
     assert len([n for n in names if n.startswith("SELECT")]) >= 3
     assert names.count("connect") == 1
+
+
+def test_release_returns_connections_and_scope_keeps_working(engine: Engine) -> None:
+    """
+    release_scoped_connections hands idle held connections back to the
+    pool (for requests about to park on a human wait) while the scope
+    stays usable — the next session checks out fresh.
+    """
+    from omnigent.db.utils import release_scoped_connections
+
+    session_maker = make_managed_session_maker(engine)
+    checkins: list[object] = []
+
+    @event.listens_for(engine, "checkin")
+    def _on_checkin(dbapi_conn: object, conn_record: object) -> None:
+        checkins.append(dbapi_conn)
+
+    try:
+        with db_connection_scope():
+            with session_maker() as session:
+                session.execute(text("SELECT 1"))
+            assert len(checkins) == 0  # held by the scope
+            release_scoped_connections()
+            assert len(checkins) == 1  # handed back for the park
+            # Scope still works: next call re-checks out and re-pins.
+            with session_maker() as session:
+                session.execute(text("SELECT 1"))
+    finally:
+        event.remove(engine, "checkin", _on_checkin)
+
+
+def test_release_without_scope_is_noop() -> None:
+    """Calling the release helper outside any scope must not raise."""
+    from omnigent.db.utils import release_scoped_connections
+
+    release_scoped_connections()
+
+
+def test_idle_held_connection_expires_and_rechecks_out(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A connection idle in the scope longer than the max idle window is
+    dropped on the next lend and replaced by a fresh pool checkout —
+    bounding how long the scope bypasses checkout-time pre-ping.
+    """
+    import omnigent.db.utils as db_utils
+
+    session_maker = make_managed_session_maker(engine)
+    checkouts = _count_checkouts(engine)
+
+    fake_now = [1000.0]
+    monkeypatch.setattr(db_utils.time, "monotonic", lambda: fake_now[0])
+
+    with db_connection_scope():
+        with session_maker() as session:
+            session.execute(text("SELECT 1"))
+        fake_now[0] += db_utils._SCOPE_IDLE_MAX_SECONDS + 1
+        with session_maker() as session:
+            session.execute(text("SELECT 1"))
+
+    assert len(checkouts) == 2, "expired idle connection must trigger a fresh checkout"

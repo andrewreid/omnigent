@@ -233,6 +233,7 @@ trusts whatever value reaches it.
 | `OMNIGENT_AUTH_ENABLED` | `1` (in compose) | Master auth switch. `1` → accounts (or oidc if `OMNIGENT_OIDC_ISSUER` is set); `0` → single-user local mode (every request is the shared `local` user — local dev only, never shared deploys). |
 | `OMNIGENT_AUTH_PROVIDER` | unset | Escape hatch to pin a mode explicitly: `header` / `accounts` / `oidc`. Overrides the `AUTH_ENABLED` auto-selection. |
 | `OMNIGENT_AUTH_HEADER` | `X-Forwarded-Email` | Header-mode only: name of the trusted identity header. Set for proxies that use another name, e.g. `Cf-Access-Authenticated-User-Email` (Cloudflare Access). |
+| `OMNIGENT_DB_CONNECTION_SCOPE` | `1` | Per-request DB connection reuse. Set `0` to restore checkout-per-store-call behaviour (kill switch for suspected pool saturation); takes effect on restart. |
 | `OMNIGENT_AUTH_HEADER_STRIP_PREFIX` | unset (strip nothing) | Header-mode only: prefix removed from the identity header value. Set to `accounts.google.com:` for Google IAP's `X-Goog-Authenticated-User-Email`. |
 | `OMNIGENT_OIDC_*` | unset | OIDC config — required in oidc mode (issuer set, or `AUTH_PROVIDER=oidc`). See `.env.example`. |
 | `PYPI_INDEX_URL` | `https://pypi.org/simple` | Build-time PyPI index — override only behind a corporate proxy. |
