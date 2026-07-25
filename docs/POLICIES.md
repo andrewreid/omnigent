@@ -48,24 +48,27 @@ policy_modules:
 policies:
   session_budget:
     type: function
-    handler: omnigent.policies.builtins.cost.cost_budget
-    factory_params:
-      max_cost_usd: 10.00
-      ask_thresholds_usd: [5.00]
+    function:
+      path: omnigent.policies.builtins.cost.cost_budget
+      arguments:
+        max_cost_usd: 10.00
+        ask_thresholds_usd: [5.00]
   global_rate_limit:
     type: function
-    handler: omnigent.policies.builtins.safety.max_tool_calls_per_session
-    factory_params:
-      limit: 200
+    function:
+      path: omnigent.policies.builtins.safety.max_tool_calls_per_session
+      arguments:
+        limit: 200
 ```
 
-> **Server config and agent bundles use different dialects.** The
-> `handler:` + `factory_params:` form above is server-config syntax, translated
-> at `omnigent/spec/omnigent.py`. A policy declared inside an **agent bundle**
-> must use `function: {path, arguments}` instead. Bundle parsing accepts
-> `handler:` but never translates `factory_params`, and it rejects no unknown
-> keys — so copying this stanza into a bundle silently drops your parameters and
-> invokes the factory on its defaults, with no error.
+> **Use `function: {path, arguments}`, not `factory_params:`.** The server
+> config's `policies:` mapping is parsed by `parse_default_policies`
+> (`omnigent/spec/parser.py`), which uses the same grammar as an agent bundle's
+> `guardrails.policies:` and does **not** understand `factory_params`. Neither
+> parser rejects unknown keys, so a `factory_params:` block is silently
+> discarded and the factory then runs on its defaults, with no error and no log
+> line. `factory_params` is real only on the REST/DB row path and in the legacy
+> single-file omnigent YAML (`omnigent/spec/omnigent.py`).
 
 **4. Start the server.**
 

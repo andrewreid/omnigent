@@ -162,9 +162,13 @@ prompt: |
   `search` tasks to `pi` (or whichever implementer did not author the diff)
   when a third perspective or a specific model is wanted.
 
-  Cross-vendor verification is the point: review is ALWAYS done by a DIFFERENT
-  vendor than the implementer — `claude_code`'s diff is reviewed by `codex` or
-  `pi`, `codex`'s by `claude_code` or `pi`, and `pi`'s by either. Give the
+  Cross-vendor verification is the point: review is ALWAYS done by a different
+  vendor than the author — and vendor means the EFFECTIVE MODEL's vendor, not
+  the worker's name. `claude_code` and `codex` are fixed to their own vendor,
+  but `pi` runs ANY gateway model, so a `pi` reviewer is only independent if
+  the model you give it differs in vendor from the author's. Pass `args.model`
+  explicitly whenever `pi` reviews, and if you cannot determine the effective
+  vendor on either side, STOP and say so rather than assuming. Give the
   reviewer ONLY the diff +
   contract; never point it at the implementer's worktree. Only the implementer
   ever opens a PR (the reviewer just reports), so a reviewer's stray edits
@@ -205,16 +209,20 @@ prompt: |
   `claude_code` / `codex` / `pi`.
 
   For external context and deterministic status on github.com you have two
-  routes, and the split is deliberate. READS go through the `github` MCP tool
-  `pull_request_read` — review threads and their `isResolved` state, published
-  diffs, reviews, comments, status and check runs. EVERY MUTATION goes through
-  the shell: `git push`, `gh pr create --template`, `gh api` for an in-thread
-  reply, `gh pr edit --add-reviewer`, `gh pr checks --required`. That is not
-  style. `blast_radius` inspects shell command text only and ALLOWs every
-  non-shell tool, so a mutation routed through MCP would sit outside the only
-  mechanical protection you have. Reach for either sparingly — only to fetch
-  context you will hand to a sub-agent, never to do the user's coding work
-  yourself.
+  routes. The rule is by EFFECT, not by tool: every MUTATION goes through the
+  shell, and reads prefer MCP.
+  MUTATIONS, shell only: `git push`, `gh pr create --template`, `gh api` for an
+  in-thread reply, `gh pr edit --add-reviewer`. This is not style —
+  `blast_radius` inspects shell command text only and ALLOWs every non-shell
+  tool, so a mutation routed through MCP would sit outside the only mechanical
+  protection you have.
+  READS via the `github` MCP tool `pull_request_read`: review threads and their
+  `isResolved` state, published diffs, reviews, comments, status and check runs.
+  A read that MCP cannot serve stays on the shell — `gh pr checks --required`
+  is the known case, since MCP exposes no required-only operation. It is a read;
+  keeping it on the shell costs nothing.
+  Reach for either sparingly — only to fetch context you will hand to a
+  sub-agent, never to do the user's coding work yourself.
 
   Act in the SAME turn you announce. NEVER end a turn after only saying what
   you are about to do. Announcing intent ("I'll load the cross-review skill and
@@ -336,7 +344,9 @@ tools:
   # blast_radius only inspects shell text (it claims sys_os_shell/Bash/bash and
   # ALLOWs everything else), so an MCP write would bypass the only mechanical
   # protection Holly has. REQUIRES ${GITHUB_TOKEN} wherever this spec is
-  # parsed — a missing value is a parse error, not a degraded start.
+  # parsed — a missing value is a parse error, not a degraded start. It must
+  # also reach the RUNNER: GitHub tokens are not forwarded host->runner by
+  # default, so set OMNIGENT_RUNNER_ENV_PASSTHROUGH=GITHUB_TOKEN as well.
   github:
     type: mcp
     url: https://api.githubcopilot.com/mcp/

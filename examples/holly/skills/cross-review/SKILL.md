@@ -165,8 +165,9 @@ END REVIEWER-MANDATE-V1
 ## Procedure
 
 1. **Diff — local, before the remote.** `git -C .worktrees/<task_id> diff
-   main...HEAD`. Use `gh pr diff <pr>` only for a PR that already exists and
-   that you did not just create. The implementer has committed and stopped; the
+   main...HEAD`. For a PR that already exists and that you did not just create,
+   read its diff with the `github` MCP tool `pull_request_read` rather than
+   `gh pr diff` — it is a read, and reads prefer MCP. The implementer has committed and stopped; the
    commit has not been pushed.
 
 2. **Gates first — ALL of them, before any reviewer is involved.** Discover the
@@ -182,11 +183,14 @@ END REVIEWER-MANDATE-V1
    `grep -c 'def test_'`: it counts functions, not collected cases, and misses
    parametrized expansion.
 
-3. **Dispatch a DIFFERENT-vendor reviewer.** Pick any AVAILABLE worker whose
-   vendor differs from the author's — `claude_code` built it → `codex` or `pi`;
-   `codex` built it → `claude_code` or `pi`; `pi` built it → either. For a doc
-   or skill Holly authored directly, the author is Holly's own model family, so
-   pick a different vendor from that. Task-based title, never the vendor name:
+3. **Dispatch a reviewer whose EFFECTIVE MODEL vendor differs from the
+   author's.** Vendor is a property of the model, not of the worker name:
+   `claude_code` and `codex` are fixed, but `pi` runs any gateway model, so a
+   `pi` reviewer is independent only if you pass it `args.model` from a
+   different vendor than the author's. For a doc or skill Holly authored
+   directly, the author's vendor is Holly's own model family. If the effective
+   vendor on either side cannot be determined, or resolves to the same vendor,
+   STOP and escalate — do not dispatch and call it independent. Task-based title, never the vendor name:
    `sys_session_send(agent=..., title="review-<task_slug>", args={purpose:
    "review", input: "<diff> + <contract>" + the mandate block above, verbatim,
    delimiters included})`. Give the diff plus adjacency as text; withhold the

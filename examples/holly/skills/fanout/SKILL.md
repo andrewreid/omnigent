@@ -1,6 +1,6 @@
 ---
 name: fanout
-description: Run independent subtasks in parallel — one git worktree and one implementation sub-agent per task, each opening its own PR — then cross-review every PR. holly never merges; the human does.
+description: Run independent subtasks in parallel — one git worktree and one implementation sub-agent per task. Each branch is cross-reviewed BEFORE its PR opens. holly never merges; the human does.
 user-invocable: false
 ---
 
@@ -19,8 +19,8 @@ dependency).
    args={purpose: "implement", input: "<task + acceptance contract +
    worktree path>"})`. Use a short task-based title such as `auth-refactor` or
    `fix-sse-error`, never the raw vendor name. State the scope and that it must
-   work only inside `.worktrees/<task_id>`. The worker drives the task to green
-   and opens its OWN PR for the branch. Every commit the worker authors must
+   work only inside `.worktrees/<task_id>`. The worker drives the task to green,
+   commits, and STOPS — it does not push and does not open a PR. Every commit it authors must
    end with a blank line followed by the exact co-sign trailer as its final
    line — `Co-authored-by: omnigent <noreply@omnigent.ai>`.
    Record each handle's `conversation_id`
@@ -30,10 +30,10 @@ dependency).
    parallel-safe set, THEN (and only then) END YOUR TURN. Do not poll.
 3. Each sub-agent runs autonomously and notifies you through the inbox when it
    finishes. Collect its structured result with `sys_read_inbox` and record the
-   PR URL in the registry. If the inbox result is empty/unclear, inspect that
+   branch in the registry. If the inbox result is empty/unclear, inspect that
    worker conversation with `sys_session_get_history` before deciding what to do
    next.
-4. Send each finished task's PR through `cross-review`.
+4. Send each finished task's local branch diff through `cross-review`.
 5. Each implementer commits and STOPS. Cross-review runs on the local branch
    diff; only after it is clean do you tell that implementer to push and open
    its PR. holly does NOT merge — the PR is the deliverable. When cross-review passes,
