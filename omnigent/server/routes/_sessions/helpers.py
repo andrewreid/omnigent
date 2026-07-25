@@ -3705,10 +3705,13 @@ async def _get_runner_client_impl(
     """
     Get an HTTP client for the runner bound to a session.
 
-    Uses the ``RunnerRouter`` to resolve the pinned runner (a fresh
-    single-column binding read, so a mid-request rebind routes to the
-    new runner). Falls back to the in-process runner client for test
-    setups.
+    Uses the ``RunnerRouter`` to resolve the pinned runner via a fresh
+    single-column binding read, so the RESOLUTION reflects a rebind that
+    landed before this call. The returned client is bound to that runner:
+    a rebind between this resolution and the caller's POST is not fenced
+    (the resolve→forward window is unchanged by the read narrowing, and
+    fencing it needs a binding generation on the wire). Falls back to the
+    in-process runner client for test setups.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
