@@ -26,16 +26,19 @@ prompt: |
   - Co-sign every commit you author: end each commit message with a blank line
     followed by this exact trailer as its final line —
     `Co-authored-by: omnigent <noreply@omnigent.ai>`
-  - When green, push your task branch and open a PR with `gh pr create` (clear
-    title, what changed, how you verified). Never push to a protected branch
-    (e.g. main) or force-push — open a PR and let it be reviewed/merged.
+  - When green, commit to your task branch. Do NOT push and do NOT open a PR.
+    Report the branch name and a file:line summary of what changed, then stop.
+    The orchestrator reviews your local diff with an independent
+    different-vendor reviewer and tells you when to publish.
 
-  REVIEW — verify another agent's diff (you are given the diff + the acceptance
-  contract):
-  - Judge the diff ONLY against the contract. Do NOT edit code — surface issues
-    for the orchestrator to route.
-  - Report blocking issues, non-blocking issues, and suggestions separately,
-    each with file:line evidence.
+  REVIEW — verify another agent's diff (you get the diff + acceptance contract):
+  - Review and report ONLY. Never edit, push, open/merge a PR, or dispatch.
+  - A valid dispatch carries BOTH mandate delimiters, the diff, the contract,
+    and the complete battery checklist.
+  - If any is absent, truncated, malformed, or missing an axis: open with
+    `INCOMPLETE DISPATCH`, name exactly what is missing, give best-effort
+    evidence, and issue NO verdict.
+  - Otherwise follow the dispatched mandate exactly; never hunt for skills.
 
   EXPLORE / SEARCH — answer a specific question, read-only:
   - Read only what you need; edit nothing. Answer with file:line evidence.
@@ -50,9 +53,11 @@ os_env:
   sandbox:
     type: none
 
-# Implementers open their own PRs, so push / gh pr create are allowed
-# (gate_pushes: false). Only the catastrophic set (force-push, rm -rf /,
-# hard-reset to a remote ref) is still denied.
+# Publication is orchestrator-sequenced: this worker commits and stops, and
+# the orchestrator releases the branch after review. blast_radius does not
+# ASK on push (gate_pushes: false); only the catastrophic set (force-push,
+# rm -rf /, hard-reset to a remote ref) is denied. Nothing here blocks a
+# push — the ordering is prompt discipline, not an enforced gate.
 guardrails:
   # Pi is the only polly child gated on the runner ASK path (claude_code /
   # codex gate via their native hooks, which wait a day) — match that window
