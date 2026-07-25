@@ -33,7 +33,9 @@ dependency).
    worker conversation with `sys_session_get_history` before deciding what to do
    next.
 4. Send each finished task's PR through `cross-review`.
-5. holly does NOT merge — the PR is the deliverable. When cross-review passes,
+5. Each implementer commits and STOPS. Cross-review runs on the local branch
+   diff; only after it is clean do you tell that implementer to push and open
+   its PR. holly does NOT merge — the PR is the deliverable. When cross-review passes,
    the task is done: mark it ready in the registry with its PR URL and leave it
    for the human to review and merge. Never run `git merge` / `gh pr merge`.
 6. Remove a finished worktree (`git worktree remove`) only once its PR is open
