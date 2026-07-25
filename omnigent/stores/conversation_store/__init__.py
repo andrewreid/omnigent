@@ -879,9 +879,13 @@ class ConversationStore(ABC):
         validation lives in ``PolicyEngine.apply_label_writes``).
 
         Callers that need "insert only if missing" semantics
-        (initial-value seeding — POLICIES.md §10) should check
-        ``conversation.labels`` first and filter the updates
-        to keys not already present; this method always
+        (initial-value seeding — POLICIES.md §10) must use
+        :meth:`seed_labels_if_absent`, NOT this method. Reading
+        ``conversation.labels`` and filtering the updates to the keys
+        that look missing is a check-then-write race: a value persisted
+        between the read and the write is overwritten by the initial
+        value. The insert-if-absent path leaves that decision to the
+        database, inside the same statement. This method always
         overwrites.
 
         :param conversation_id: The conversation to update,

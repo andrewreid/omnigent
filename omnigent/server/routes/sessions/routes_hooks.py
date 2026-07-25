@@ -418,6 +418,15 @@ def register_hooks_routes(
         # events). The prompt text rides in ``event.data.text``.
         "PHASE_REQUEST": Phase.REQUEST,
     }
+    # Phases whose gate is scoped by a tool name, and where that name
+    # lives: (container key on the event, dotted path for the error).
+    # Both tool phases must be here — TOOL_RESULT reads its name from
+    # ``request_data``, and omitting it let an empty name through, which
+    # silently skipped every tool-scoped selector.
+    _REQUIRED_NON_EMPTY_NAME_BY_PHASE: dict[Phase, tuple[str, str]] = {
+        Phase.TOOL_CALL: ("data", "event.data.name"),
+        Phase.TOOL_RESULT: ("request_data", "event.request_data.name"),
+    }
     _PHASE_TO_PROTO_ACTION: dict[PolicyAction, str] = {
         PolicyAction.ALLOW: "POLICY_ACTION_ALLOW",
         PolicyAction.DENY: "POLICY_ACTION_DENY",
@@ -517,39 +526,38 @@ def register_hooks_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             hook_elicitation_id = raw_elicitation_id
-        # Validate the RAW value: normalizing with ``or {}`` first would turn
-        # null / false / 0 / "" / [] into an empty object and let a malformed
-        # frame through as a well-formed one. On a TOOL_CALL that yields
-        # ``tool_name=None``, which SKIPS every tool-name-scoped policy on a
-        # blocking hook — failing open — instead of rejecting the frame.
+        # Payload validation is driven from ONE per-phase table rather than a
+        # chain of conditionals: the previous shape validated TOOL_CALL's tool
+        # name but let TOOL_RESULT through with an empty one, because each
+        # phase's rule lived in its own branch. Adding a phase now means
+        # adding a row.
+        #
+        # Validate the RAW value before normalizing: ``or {}`` turns
+        # null / false / 0 / "" / [] into an empty object, and a TOOL_CALL
+        # with no name evaluates with ``tool_name=None``, which SKIPS every
+        # tool-name-scoped policy on a blocking hook — failing open.
         raw_data = event.get("data")
-        if phase in (Phase.TOOL_CALL, Phase.TOOL_RESULT):
-            if not isinstance(raw_data, dict):
+        required = _REQUIRED_NON_EMPTY_NAME_BY_PHASE.get(phase)
+        if required is not None:
+            container_key, field_path = required
+            container = raw_data if container_key == "data" else event.get(container_key)
+            if not isinstance(container, dict):
                 raise OmnigentError(
-                    f"Policy evaluate 'event.data' must be an object for "
-                    f"{event_type!r}; got {type(raw_data).__name__}.",
+                    f"Policy evaluate {field_path!r} requires "
+                    f"'event.{container_key}' to be an object for "
+                    f"{event_type!r}; got {type(container).__name__}.",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            # The gate is scoped by tool name; without one there is nothing to
-            # scope and silently allowing is the wrong default.
-            if phase == Phase.TOOL_CALL:
-                tool_name = raw_data.get("name")
-                if not isinstance(tool_name, str) or not tool_name:
-                    raise OmnigentError(
-                        f"Policy evaluate 'event.data.name' must be a non-empty "
-                        f"string for {event_type!r}.",
-                        code=ErrorCode.INVALID_INPUT,
-                    )
-            else:
-                request_data = event.get("request_data")
-                if not isinstance(request_data, dict) or not isinstance(
-                    request_data.get("name"), str
-                ):
-                    raise OmnigentError(
-                        f"Policy evaluate 'event.request_data.name' must be a "
-                        f"string for {event_type!r}.",
-                        code=ErrorCode.INVALID_INPUT,
-                    )
+            name = container.get("name")
+            if not isinstance(name, str) or not name:
+                # A gate scoped by tool name cannot run without one, and
+                # allowing by default is the wrong direction on a blocking
+                # hook.
+                raise OmnigentError(
+                    f"Policy evaluate {field_path!r} must be a non-empty string "
+                    f"for {event_type!r}.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
         elif raw_data is not None and not isinstance(raw_data, (dict, str)):
             raise OmnigentError(
                 f"Policy evaluate 'event.data' must be an object or string; "
