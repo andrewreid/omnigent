@@ -838,30 +838,61 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker() -> None
 @pytest.mark.asyncio
 async def test_relay_completion_with_usage_rolls_up_subtree_cost(db_uri: str) -> None:
     """
-    A relay turn that reports usage must price it, persist it, and publish
-    the SUBTREE total — parent plus sub-agent spend.
+    A relay turn reporting usage must price it, persist it, and publish the
+    SUBTREE total resolved from the TREE ROOT — not from the reporting
+    conversation.
 
-    The relay completion path was reworked to read the conversation once
-    and share it between the pricing lookup and the subtree roll-up, but
-    every existing relay test deliberately omits ``usage`` to stay off the
-    cost path, so that rework had no coverage at all. Deleting the roll-up
-    (or letting it recompute from the wrong root) leaves the badge showing
-    own-cost instead of the subtree total.
+    Deliberately runs the relay on a SUB-AGENT. On the root conversation,
+    "own id" and "tree root" are the same value, so a roll-up that used the
+    wrong one behaved identically and the test could not fail for its stated
+    reason (it didn't). Here the sibling's spend only appears if the
+    tree-root argument is correct: rooting the tree at the reporting child
+    matches no rows at all.
+
+    Also counts conversation reads, so collapsing the shared row back into a
+    second read is caught too — a behavioural assertion alone cannot see it.
     """
-    from omnigent.runtime import session_stream  # noqa: F401 — parity with siblings
+    from contextlib import contextmanager
+
+    from sqlalchemy import event as sa_event
+
+    from omnigent.db.utils import _engine_cache
     from omnigent.server.routes import sessions as sessions_module
+
+    @contextmanager
+    def _count_conv_selects(engine):
+        seen: list[str] = []
+
+        def _on(conn, cursor, statement, params, context, many):  # noqa: ANN001
+            if (
+                statement.lstrip().upper().startswith("SELECT")
+                and "FROM conversations" in statement
+                and "conversation_item" not in statement
+                and "conversation_label" not in statement
+            ):
+                seen.append(statement)
+
+        sa_event.listen(engine, "before_cursor_execute", _on)
+        try:
+            yield seen
+        finally:
+            sa_event.remove(engine, "before_cursor_execute", _on)
 
     sessions_module._runner_relay_tasks.clear()
     store = SqlAlchemyConversationStore(db_uri)
-    parent = store.create_conversation()
-    child = store.create_conversation(
-        kind="sub_agent",
-        parent_conversation_id=parent.id,
-        title="relay:child",
+    root = store.create_conversation()
+    reporter = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=root.id, title="relay:reporter"
     )
-    # The sub-agent already spent: the published total must include it.
-    store.set_session_usage(child.id, {"total_cost_usd": 0.25})
-    session_id = parent.id
+    descendant = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=reporter.id, title="relay:grandchild"
+    )
+    # Spend on a DESCENDANT of the reporter: inside the reporter's subtree,
+    # but only visible if the tree is loaded from the real root — its
+    # ``root_conversation_id`` is the root's, so a tree rooted at the
+    # reporter matches no rows at all.
+    store.set_session_usage(descendant.id, {"total_cost_usd": 0.25})
+    session_id = reporter.id
 
     response_id = "resp_relay_usage_1"
     turn_events: list[dict[str, Any]] = [
@@ -896,30 +927,32 @@ async def test_relay_completion_with_usage_rolls_up_subtree_cost(db_uri: str) ->
         )
         assert handle is not None
         collector = await start_session_stream_collector(session_id)
-        release.set()
 
-        usage_events: list[dict[str, Any]] = []
-        seen: list[str] = []
-        while not seen or seen[-1] != "response.completed":
-            event = await collector.next_event()
-            seen.append(event["type"])
-            if event["type"] == "session.usage":
-                usage_events.append(event)
+        with _count_conv_selects(_engine_cache[db_uri]) as conv_selects:
+            release.set()
+            usage_events: list[dict[str, Any]] = []
+            seen: list[str] = []
+            while not seen or seen[-1] != "response.completed":
+                event = await collector.next_event()
+                seen.append(event["type"])
+                if event["type"] == "session.usage":
+                    usage_events.append(event)
 
-        # The turn's own usage was accumulated onto the parent.
-        parent_usage = dict(store.get_conversation(session_id).session_usage)
-        assert parent_usage.get("total_tokens") == 1500, parent_usage
+        # The turn's own tokens landed on the reporting conversation.
+        reporter_usage = dict(store.get_conversation(session_id).session_usage)
+        assert reporter_usage.get("total_tokens") == 1500, reporter_usage
 
         assert usage_events, f"no session.usage published; saw {seen}"
         published = usage_events[-1].get("total_cost_usd")
-        # The parent's own turn is unpriced here (test model is not in the
-        # pricing catalog), so its own cost contributes nothing. The
-        # published figure is therefore exactly the CHILD's spend — which
-        # is the sharpest available evidence that the published total comes
-        # from the subtree scan and not from this conversation's row: an
-        # own-cost publication would have been absent or 0.
-        assert parent_usage.get("total_cost_usd") in (None, 0, 0.0), parent_usage
-        assert published == pytest.approx(0.25), (published, parent_usage)
+        # The reporter's own turn is unpriced (test model is not in the
+        # pricing catalog), so the ONLY way a total appears is the tree-root
+        # scan reaching the descendant. Rooting the tree at the reporter
+        # matches no rows, so nothing would be published at all.
+        assert published == pytest.approx(0.25), (published, reporter_usage)
+
+        # One conversation read shared by pricing and the roll-up. Splitting
+        # it back into two reads shows up here.
+        assert len(conv_selects) == 5, [q.split("\n")[0][:70] for q in conv_selects]
     finally:
         if collector is not None:
             await collector.stop()
