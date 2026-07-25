@@ -14,10 +14,12 @@ from sqlalchemy import (
     delete,
     desc,
     func,
+    literal,
     literal_column,
     or_,
     select,
     text,
+    tuple_,
     update,
 )
 from sqlalchemy.orm import QueryableAttribute, Session, aliased
@@ -2620,17 +2622,29 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
         # "after" (forward=True) = further in sort direction;
         # "before" (forward=False) = opposite of sort direction.
-        if forward:
-            ts_cmp = sort_col < sub if is_desc else sort_col > sub
-            id_cmp = (
-                tiebreaker_col < tiebreaker_val if is_desc else tiebreaker_col > tiebreaker_val
-            )
-        else:
-            ts_cmp = sort_col > sub if is_desc else sort_col < sub
-            id_cmp = (
-                tiebreaker_col > tiebreaker_val if is_desc else tiebreaker_col < tiebreaker_val
-            )
-        return stmt.where(or_(ts_cmp, and_(sort_col == sub, id_cmp)))
+        #
+        # Emitted as a ROW-VALUES comparison — ``(sort, tiebreak) < (:ts, :id)``
+        # — not the equivalent ``sort < :ts OR (sort = :ts AND tiebreak < :id)``.
+        # The two are semantically identical, but PostgreSQL can only turn the
+        # row-values form into an index range condition; the OR form is left as
+        # a residual Filter, so a deep cursor re-reads and discards every row
+        # between the index start and the cursor (cost growing with cursor
+        # depth, not page size). Row values are supported by every dialect the
+        # store targets (PostgreSQL, SQLite >= 3.15, MySQL).
+        row = tuple_(sort_col, tiebreaker_col)
+        # Bind the tiebreaker with its column's type. Inside ``tuple_`` a bare
+        # Python value gets no type context, so the ``Uuid16`` decorator never
+        # runs and PostgreSQL is handed a hex string against a ``bytea``
+        # column ("operator does not exist: bytea < character varying"). The
+        # SQLite-rowid branch passes a scalar subquery, which is already typed.
+        cursor_tiebreaker = (
+            literal(tiebreaker_val, tiebreaker_col.type)
+            if isinstance(tiebreaker_col, QueryableAttribute)
+            else tiebreaker_val
+        )
+        cursor_row = tuple_(sub, cursor_tiebreaker)
+        descending_scan = is_desc if forward else not is_desc
+        return stmt.where(row < cursor_row if descending_scan else row > cursor_row)
 
     def update_conversation(
         self,
