@@ -11,44 +11,60 @@ Publication ordering is prompt discipline, not enforcement: nothing in the
 runtime blocks a ``git push``. ``blast_radius`` runs with ``gate_pushes: false``
 and inspects shell text only.
 
-WHAT THIS FILE DELIBERATELY NO LONGER DOES
-------------------------------------------
-Earlier revisions carried a general natural-language scanner that tried to
-detect any claim that some mechanism blocked publication. It was rebuilt three
-times and failed in both directions each time:
+WHAT THIS FILE DELIBERATELY DOES NOT DO
+---------------------------------------
+Earlier revisions tried to detect, by pattern, whether a sentence made a false
+claim about enforcement. Four rebuilds later the conclusion is that the class
+of check does not work: judging what a sentence asserts is not decidable by
+lexical matching, and every version failed in BOTH directions —
 
-* false negatives — ``The policy, not the reviewer, blocks every push.`` passed,
-  because a negation anywhere inside a matched claim exempted the whole claim;
-  ``If no reviewer is available, accept a same-vendor review.`` passed because
-  the verb was missing from an allowlist.
-* false positives — it rejected ``Review is a requirement before publishing.``
-  and ``blast_radius blocks force-pushes while allowing ordinary
-  publication.``, both true, and the first the kind of sentence this file's own
-  rules called legal.
+* it passed false claims: ``The policy, not the reviewer, blocks every push.``
+  ``Before review, push the branch.``  ``A same-vendor review may suffice.``
+* it failed true ones: ``Review is a requirement before publishing.``
+  ``Pushing the branch before review is forbidden.``  ``You must never merge.``
 
-The false positives are the worse half: a check that fails true sentences
-pressures authors into indirect wording, degrading exactly the prose the
-honesty term exists to protect. After four rounds the residual kept moving
-rather than shrinking, so the general scanner is REMOVED rather than weakened.
+The false positives are the worse half. A check that rejects true sentences
+pushes authors into indirect wording, degrading exactly the prose the honesty
+term exists to protect. Narrowing the patterns did not fix it — the narrowed
+successors (a PR-first ordering prohibition, a readiness-follows-gate
+relationship, an exception-phrase blocklist) were the same defect in smaller
+clothing and were removed for the same reason.
 
-What remains here is only what is decidable: literal tokens naming mechanisms
-that do not exist, a prohibition on PR-first ordering, and the worker-file
-checks. Judging whether a sentence overstates enforcement is now a REVIEWER'S
-question, asked per diff, not a regex asked per commit.
+Every assertion that remains is decidable — exact comparison, set equality, or
+presence of a fixed string (sometimes one of a fixed set of alternatives).
+Nothing here classifies an unseen sentence.
 
-The cost is real and is not hedged. No test in this repo now catches a newly
-introduced false enforcement claim, in any phrasing — for example::
+The presence checks have one honest caveat, which is churn rather than
+misjudgement: they require particular text to BE there, so rewording a mandate
+axis or a procedure step fails this file until the expected text is updated.
+They never approve or reject a sentence they have not been told about, which is
+the property the removed scanners lacked.
 
-    The blast_radius policy blocks every push until review lands.
-    The policy will not allow a push before review.
-    Every push is gated by the policy layer.
-    The review step is mandatory and automatic.
-    There is a gate. It stops every push.
+WHAT THAT COSTS — the full list, not a summary
+----------------------------------------------
+1. A newly introduced FALSE ENFORCEMENT CLAIM is caught by no test, in any
+   phrasing: ``The blast_radius policy blocks every push until review lands.``
+   ``The policy will not allow a push before review.``  ``Every push is gated by
+   the policy layer.``  ``The review step is mandatory and automatic.``
+   ``There is a gate. It stops every push.``
+2. The same, INSIDE THE WORKER CONFIGS specifically — the files workers read,
+   and where the predecessor defect actually did its damage.
+3. PR-FIRST ORDERING is no longer detected. ``Push the branch and open its PR
+   first; run cross-review afterward.`` added to any file passes.
+4. MARKER-BEFORE-GATE is no longer detected. ``Set READY on the registry before
+   gates`` passes; nothing asserts that readiness follows the gate.
+5. SAME-VENDOR / SKIPPED-REVIEW EXCEPTIONS are no longer detected. ``A
+   same-vendor review may suffice.`` added to the root prompt passes, and so
+   does a permission to merge.
+6. The worker-obligation check proves only that the canonical instruction is
+   PRESENT. It does not prove that a CONTRADICTING instruction is absent: a
+   prompt keeping ``Do NOT push and do NOT open a PR.`` while adding ``Push the
+   branch before reporting.`` passes.
+7. The banned-token check is an unconditional ban on three spellings, so it
+   also rejects a truthful sentence that names one of them. That is a
+   deliberate reserved-word rule, not a claim about meaning.
 
-Each of those is false about this bundle, each would have been caught by the
-removed scanner, and each now depends entirely on review. That is the trade:
-the scanner also rejected true sentences, and a check that fails true sentences
-pushes authors away from writing plainly, which costs more than it saves.
+All seven now depend on review rather than on CI.
 """
 
 from __future__ import annotations
@@ -116,45 +132,28 @@ def _bundle_files() -> dict[str, str]:
     return files
 
 
-# ───────────────────────────── text helpers ─────────────────────────────
-#
-# These flatten layout so a rule cannot be evaded by reformatting. They do NOT
-# attempt to understand claims — see the module docstring.
+def _flatten(text: str) -> str:
+    """
+    Collapse every whitespace run to one space.
+
+    Lets an exact-string check survive re-wrapping, which is a layout change
+    rather than a wording change. It does not otherwise transform the text.
+
+    :param text: Raw text.
+    :returns: The same text on one line with single spaces.
+    """
+    return " ".join(text.split())
+
 
 _BULLET = re.compile(r"^\s*(?:[-*]|\d+\.)\s")
-_BULLET_PREFIX = re.compile(r"^(?:[-*]|\d+\.)\s+")
-_SENTINEL = "\x00"
-
-# Used only by the narrow checks below, as a short adjacency test: is this
-# instruction immediately prohibited? It is not a negation-scope model.
-_PROHIBITION = re.compile(r"\b(not|never|no|nor)\b|n't", re.IGNORECASE)
-
-
-def _normalized(text: str) -> str:
-    """
-    Flatten hard wraps, list markers and comment markers into one string.
-
-    :param text: Raw file contents.
-    :returns: Normalized text with sentinels at former item boundaries.
-    """
-    parts: list[str] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            parts.append(_SENTINEL)
-            continue
-        if _BULLET.match(line):
-            parts.append(_SENTINEL)
-            stripped = _BULLET_PREFIX.sub("", stripped)
-        if stripped.startswith("#"):
-            stripped = stripped.lstrip("#").strip()
-        parts.append(stripped)
-    return " ".join(parts)
 
 
 def _segments(text: str) -> list[str]:
     """
     Unwrap prose into one segment per paragraph or list item.
+
+    Used by the lifecycle anchors so that each procedure step is examined on its
+    own and deleting a step is detectable.
 
     :param text: Raw file contents.
     :returns: Single-line segments preserving paragraph and bullet boundaries.
@@ -176,126 +175,22 @@ def _segments(text: str) -> list[str]:
     return segments
 
 
-def _unprohibited(text: str, pattern: re.Pattern[str], window: int = 30) -> list[str]:
-    """
-    Find matches that no prohibition word immediately precedes.
-
-    The window is short and local on purpose: this answers "is this instruction
-    prohibited right here", not "what does this sentence mean". "Do NOT push and
-    do NOT open a PR" is prohibited; a publication instruction with no nearby
-    prohibition is not.
-
-    The lookback stops at the start of the current sentence or list item.
-    Without that bound it reached into the PREVIOUS sentence and a "never"
-    there exempted a fresh instruction in the next one — which is how four
-    publication mutations passed.
-
-    :param text: Raw file contents.
-    :param pattern: Compiled pattern for the instruction being looked for.
-    :param window: Characters to look back for a prohibition word.
-    :returns: Quoted excerpts for each unprohibited match.
-    """
-    normalized = _normalized(text)
-    hits: list[str] = []
-    for match in pattern.finditer(normalized):
-        boundary = max(
-            normalized.rfind(char, 0, match.start()) for char in (".", "!", "?", _SENTINEL)
-        )
-        back = normalized[max(boundary + 1, match.start() - window) : match.start()]
-        if _PROHIBITION.search(back):
-            continue
-        excerpt = normalized[max(0, match.start() - 40) : match.end() + 40]
-        hits.append(excerpt.replace(_SENTINEL, " | ").strip())
-    return hits
-
-
-# Literal tokens that name a mechanism which does not exist. No context makes
-# them honest, so no interpretation is needed to reject them.
+# Reserved spellings. This is an UNCONDITIONAL ban on three strings, not a
+# judgement about what any sentence means: the tokens name mechanisms that do
+# not exist in this codebase, and reserving the spellings keeps them from
+# reappearing as if they did. The cost is stated in the module docstring —
+# a truthful sentence naming one of them must be reworded, which is the normal
+# cost of a reserved word and is why the rule is worth stating as one.
 #
 # ``require_pr_review`` — a predecessor design named exactly this policy as the
 #   thing blocking ``git push``. It exists in no builtin and was never
-#   evaluated; its return is that defect coming back.
-# ``review-passed`` / ``review_passed`` — a machine-checked "review passed" flag
-#   that publication is conditioned on. No such state is recorded or read.
+#   evaluated.
+# ``review-passed`` / ``review_passed`` — a machine-checked "review passed"
+#   flag that publication is conditioned on. No such state is recorded or read.
 _BANNED_TOKENS: tuple[tuple[str, str], ...] = (
     ("require_pr_review", "names a policy that does not exist and is never evaluated"),
     ("review-passed", "implies a machine-checked gate state that is never recorded"),
     ("review_passed", "implies a machine-checked gate state that is never recorded"),
-)
-
-# Publication instructions, by effect. Used for the worker prohibition and the
-# PR-first ordering prohibition.
-_PUBLICATION = re.compile(
-    r"\b(push|pushes|pushed|pushing|publish|publishes|published|publishing|ship|ships|"
-    r"shipped|shipping|land|lands|landed|landing|upload|uploads|uploading)\b"
-    r"[^.!?;:—]{0,40}?"
-    r"\b(branch|commit|commits|code|diff|work|change|changes|it|them|upstream|remote|"
-    r"origin|PR|pull request)\b"
-    r"|\b(open|opens|opening|create|creates|creating|file|files|raise|raises)\b"
-    r"[^.!?;:—]{0,25}?\b(PR|pull request)\b"
-    r"|\bgit push\b|\bgh pr (?:create|merge)\b",
-    re.IGNORECASE,
-)
-
-# Grouped before concatenation: _PUBLICATION is a top-level alternation, so
-# appending a suffix directly would bind it to the LAST alternative only and
-# every other alternative would match on its own.
-_PUB = f"(?:{_PUBLICATION.pattern})"
-
-# PR-first ordering: a publication instruction marked as coming BEFORE review.
-# Three literal orderings, not a general reading of the sentence.
-_PR_FIRST: tuple[tuple[str, re.Pattern[str]], ...] = (
-    (
-        "publication marked as the first step",
-        re.compile(_PUB + r"[^.!?]{0,60}?\bfirst\b", re.IGNORECASE),
-    ),
-    (
-        "publication ordered before review",
-        re.compile(
-            _PUB + r"[^.!?]{0,60}?\bbefore\b[^.!?]{0,40}?\brevie\w+\b",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "review deferred until after publication",
-        re.compile(
-            _PUB + r"[^.!?]{0,80}?\b(then|afterwards?|later)\b[^.!?]{0,40}?\brevie\w+\b",
-            re.IGNORECASE,
-        ),
-    ),
-)
-
-# Exception wordings ratified as forbidden. A short phrase blocklist, NOT a
-# semantic check: it rejects these exact permissions and nothing else. Honest
-# prose stays legal because the prohibition forms ("is never acceptable",
-# "never accept") do not contain these phrases adjacently.
-_BANNED_EXCEPTION_PHRASES: tuple[tuple[str, re.Pattern[str]], ...] = (
-    (
-        "permits a same-vendor review",
-        re.compile(
-            r"\b(same[- ]vendor|same model)\b[^.!?;:—]{0,30}?"
-            r"\b(review|reviewer)\b[^.!?;:—]{0,20}?"
-            r"\b(is|are)\s+(acceptable|allowed|permitted|fine|ok|okay|enough|sufficient)\b"
-            r"|\b(accept|allow|permit|use|fall back to|settle for)\b[^.!?;:—]{0,25}?"
-            r"\b(same[- ]vendor|same model)\b[^.!?;:—]{0,20}?\b(review|reviewer)\b",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "permits skipping review",
-        re.compile(
-            r"\b(skip|skipping|forgo|forego|omit|waive)\b[^.!?;:—]{0,25}?"
-            r"\b(the )?revie\w+\b",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "permits holly to merge",
-        re.compile(
-            r"\b(holly|you)\b[^.!?;:—]{0,25}?\b(may|can|should|must)\b[^.!?;:—]{0,15}?\bmerge\b",
-            re.IGNORECASE,
-        ),
-    ),
 )
 
 
@@ -343,6 +238,11 @@ def test_reviewer_mandate_delimiters_are_intact(holly_spec: AgentSpec) -> None:
 # contract; these obligations are. An axis body reduced to "mention the input
 # domain and report clear" still parses, still carries its heading, still
 # matches its checklist label — and asks the reviewer for nothing.
+#
+# These are PRESENCE checks over a fixed vocabulary, so they are decidable: each
+# either appears in the axis body or does not. They do not judge whether the
+# body means the right thing, and rewording an axis will require updating the
+# vocabulary here.
 _AXIS_REQUIREMENTS: tuple[tuple[int, str, tuple[str, ...]], ...] = (
     (1, "blast-radius", (r"caller|consum", r"chang|renam|emit", r"did not|mirror|decod|match")),
     (
@@ -469,9 +369,13 @@ def test_root_policy_arguments_are_pinned(holly_spec: AgentSpec) -> None:
         "sys_session_create",
     }
 
-    assert set(
-        policies["headless_subagent_purpose_guard"].function.arguments["allowed_purposes"]
-    ) == {"implement", "review", "explore", "search"}
+    purpose_args = policies["headless_subagent_purpose_guard"].function.arguments
+    assert set(purpose_args["allowed_purposes"]) == {
+        "implement",
+        "review",
+        "explore",
+        "search",
+    }
 
 
 def test_policy_factory_paths_resolve(holly_spec: AgentSpec) -> None:
@@ -512,200 +416,137 @@ def test_no_sub_agent_declares_a_policy_layer(holly_spec: AgentSpec) -> None:
         )
 
 
-def test_no_file_names_a_mechanism_that_does_not_exist() -> None:
+def test_no_file_uses_a_reserved_spelling() -> None:
     """
-    No bundle file uses a banned literal token.
+    No bundle file contains a reserved token.
 
-    This is what survives of the removed claim scanner, and it survives because
-    it needs no interpretation: each token names a specific mechanism that is
-    absent from the codebase, so there is no context in which writing it is
-    honest. Everything softer — whether a sentence overstates what a policy
-    does — is now a reviewer-checklist question, for the reasons in the module
-    docstring.
+    Unconditional: the three spellings name mechanisms absent from this
+    codebase, and the ban keeps them from reappearing as though they existed.
+    It is a reserved-word rule, so it also rejects a truthful sentence that
+    happens to name one — that cost is stated in the module docstring and is
+    the price of the rule being decidable rather than interpretive.
     """
     for rel_path, text in _bundle_files().items():
         lowered = text.lower()
         for token, why in _BANNED_TOKENS:
-            assert token not in lowered, f"{rel_path}: banned token {token!r} — {why}"
+            assert token not in lowered, f"{rel_path}: reserved spelling {token!r} — {why}"
 
 
-def test_no_file_orders_publication_before_review() -> None:
-    """
-    No file instructs publishing before review — a whole-parcel PROHIBITION.
-
-    Anchoring only that the correct ordering appears SOMEWHERE is not enough:
-    adding "Push the branch and open its PR first; run cross-review afterward."
-    to the root config left the correct ordering intact everywhere else and
-    every other assertion green, while inverting the sequence holly actually
-    follows. Review-before-push is the entire product, and a PR opened first
-    can never be un-opened.
-
-    Narrow by construction: three literal orderings of a publication
-    instruction relative to review (marked "first", placed "before review", or
-    with review deferred to "then"/"afterward"). It does not judge whether a
-    sentence is otherwise accurate.
-    """
-    for rel_path, text in _bundle_files().items():
-        for label, pattern in _PR_FIRST:
-            violations = _unprohibited(text, pattern)
-            assert not violations, (
-                f"{rel_path}: {label} — ...{violations[0]}... Review runs on the "
-                f"local branch diff BEFORE anything reaches the remote; a PR "
-                f"opened first cannot be un-opened."
-            )
-
-
-def test_no_file_grants_a_banned_exception() -> None:
-    """
-    No file grants an exception the ratified rules forbid.
-
-    The review rules have parallel live consumers — cross-review is the
-    playbook, the root prompt restates them, and holly acts on whichever it is
-    reading — so a permission added to one file quietly wins wherever it is read
-    while the other file's hard stop stays on the page looking authoritative.
-
-    This is a short phrase blocklist, not a semantic check. It rejects the
-    ratified-forbidden wordings (permitting a same-vendor review, permitting a
-    skipped review, permitting holly to merge) and nothing else. Stating the
-    prohibitions stays legal because the prohibition forms do not contain these
-    phrases adjacently.
-    """
-    for rel_path, text in _orchestration_files().items():
-        for label, pattern in _BANNED_EXCEPTION_PHRASES:
-            violations = _unprohibited(text, pattern, window=15)
-            assert not violations, (
-                f"{rel_path}: {label} — ...{violations[0]}... The rule is stated in "
-                f"more than one live consumer; an exception here overrides the "
-                f"other file wherever holly happens to read this one."
-            )
-
-
-# What every worker must be told. The IMPLEMENT half is the positive contract —
-# "commit and stop" is a two-part instruction, and dropping either half is
-# invisible to a check that only looks for publication. The REVIEW half is the
-# dispatch-integrity taxonomy: a reviewer that does not know what a complete
-# dispatch contains cannot detect an incomplete one, and the whole truncation
-# defence rests on it refusing rather than guessing.
+# The canonical worker instructions, asserted as EXACT strings.
 #
-# Matched with PROXIMITY, not keyword presence: "commit" and "branch" both
-# survive a prompt that tells the worker to leave its worktree uncommitted, so
-# an obligation checking only for the two words passed that edit.
-_NEAR = r"[^.!?;:—]"
-_NEAR_COLON = r"[^.!?;—]"
-
-_WORKER_OBLIGATIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+# The earlier form pattern-matched around these ("commit" near "branch") and was
+# weakened further during the module split into a plain search, at which point
+# a prompt saying "do NOT commit to your task branch" satisfied every one of
+# them. Deciding whether an instruction has been inverted is the undecidable
+# problem again; deciding whether a known sentence is present is not. So the
+# sentence itself is the assertion.
+#
+# This proves PRESENCE only. It does not prove that a contradicting instruction
+# is absent — see cost item 6 in the module docstring. Rewording a worker prompt
+# requires updating the string here, which is the intended trade: the check is
+# exact, and it fails loudly rather than silently drifting.
+_WORKER_INSTRUCTIONS: tuple[tuple[str, str, str], ...] = (
     (
-        "commit-to-its-branch",
-        "an uncommitted worktree leaves nothing for the orchestrator to review",
-        (rf"\bcommit\b{_NEAR}{{0,40}}?\b(?:task )?branch\b",),
-    ),
-    (
-        "report-and-stop",
-        "a worker that keeps going after reporting drifts outside its scope",
-        (rf"\breport\b{_NEAR_COLON}{{0,90}}?\bstop\b",),
-    ),
-    (
-        "co-sign-commits",
-        "commits lose the trailer that marks them as agent-authored",
-        (r"co-?authored-by|co-?sign",),
+        "scope-discipline",
+        "a worker refactors beyond the task and the diff stops matching the contract",
+        "Stay strictly within the files/scope named in your task and acceptance contract.",
     ),
     (
         "drive-to-green",
         "the orchestrator gets a diff that was never run",
-        (rf"\bgreen\b{_NEAR_COLON}{{0,90}}?\b(lint|typecheck)\b",),
+        "Make the change, then drive it to green: run the relevant tests, lint, and "
+        "typecheck for the code you touched.",
     ),
     (
         "exact-test-command-and-file-set",
         "reported counts cannot be reconciled against the same gate",
-        (
-            rf"exact command{_NEAR}{{0,40}}?file set",
-            rf"collected{_NEAR}{{0,40}}?test function",
-        ),
+        "When you report test results, include the exact command and file set.",
     ),
     (
-        "dispatch-requires-both-delimiters",
-        "a truncated mandate is indistinguishable from a complete one",
-        (rf"\bboth\b{_NEAR}{{0,30}}?delimiter",),
+        "collected-cases-vs-functions",
+        "a parametrized suite is mislabelled as an over-report",
+        "If you mention counts, distinguish collected test cases from test functions.",
     ),
     (
-        "dispatch-requires-diff-and-contract",
-        "the reviewer judges a diff against a contract it never received",
-        (rf"\bdiff\b{_NEAR}{{0,40}}?\bcontract\b",),
+        "co-sign-commits",
+        "commits lose the trailer that marks them as agent-authored",
+        "Co-sign every commit you author:",
     ),
     (
-        "dispatch-requires-checklist",
-        "the battery can be silently narrowed at dispatch time",
-        (r"\b(checklist|battery)\b",),
+        "commit-to-its-branch",
+        "an uncommitted worktree leaves nothing for the orchestrator to review",
+        "When green, commit to your task branch.",
     ),
     (
-        "malformed-dispatch-handling",
-        "a partial dispatch gets treated as a complete one",
-        (rf"absent{_NEAR}{{0,60}}?(truncated|malformed)",),
+        "no-publication-by-the-worker",
+        "publication escapes holly's sequencing and the skipped review cannot be re-inserted",
+        "Do NOT push and do NOT open a PR.",
     ),
     (
-        "incomplete-dispatch-banner",
-        "holly cannot detect the refusal it is told to check for",
-        (r"INCOMPLETE DISPATCH",),
+        "report-and-stop",
+        "a worker that keeps going after reporting drifts outside its scope",
+        "Report the branch name and a file:line summary of what changed, then stop.",
     ),
     (
-        "best-effort-evidence-on-refusal",
-        "a refusal returns nothing usable and the round is wasted",
-        (rf"best-?effort{_NEAR}{{0,30}}?evidence",),
-    ),
-    (
-        "no-verdict-on-incomplete",
-        "a verdict issued on a partial mandate reads as a pass",
-        (r"\bno verdict\b",),
+        "publication-is-orchestrator-sequenced",
+        "the worker does not know who releases its branch, so it waits forever or publishes",
+        "The orchestrator reviews your local diff with an independent different-vendor "
+        "reviewer and tells you when to publish.",
     ),
     (
         "review-is-report-only",
         "a reviewer edits the diff it is judging and independence is gone",
-        (r"report ONLY|review and report",),
+        "Review and report ONLY. Never edit, push, open/merge a PR, or dispatch.",
+    ),
+    (
+        "dispatch-completeness-definition",
+        "a reviewer that cannot say what a complete dispatch contains cannot detect a partial one",
+        "A valid dispatch carries BOTH mandate delimiters, the diff, the contract, and "
+        "the complete battery checklist.",
+    ),
+    (
+        "incomplete-dispatch-handling",
+        "a truncated mandate yields a verdict instead of a refusal, and reads as a pass",
+        "If any is absent, truncated, malformed, or missing an axis: open with "
+        "`INCOMPLETE DISPATCH`, name exactly what is missing, give best-effort "
+        "evidence, and issue NO verdict.",
+    ),
+    (
+        "follow-the-dispatched-mandate",
+        "a worker substitutes a repo skill for the mandate it was handed",
+        "Otherwise follow the dispatched mandate exactly; never hunt for skills.",
     ),
     (
         "explore-is-read-only",
         "a read-only task mutates the repo",
-        # The section HEADING says "read-only" too, so bind to the instruction.
-        (
-            r"\b(edit nothing|change nothing|make no edits|do not edit|edits? nothing)\b",
-            r"file:line|evidence",
-        ),
+        "Read only what you need; edit nothing. Answer with file:line evidence.",
     ),
 )
 
 
-def test_workers_commit_and_stop(holly_spec: AgentSpec) -> None:
+def test_workers_carry_their_canonical_instructions(holly_spec: AgentSpec) -> None:
     """
-    Each worker is told to commit and stop, carries the dispatch-integrity
-    taxonomy, and is never told to publish.
+    Every worker prompt contains each canonical instruction verbatim.
 
-    The negative half alone was evadable: changing "commit to your task branch"
-    to "leave the worktree uncommitted" instructs no publication at all and
-    passed cleanly, while destroying the thing holly reviews. So the positive
-    contract is asserted directly, and so is the REVIEW taxonomy — both
-    delimiters, the diff, the contract, the checklist, what counts as malformed,
-    the ``INCOMPLETE DISPATCH`` banner, best-effort evidence, and no verdict.
+    Exact-string presence, because the alternative — asking whether an
+    instruction has been negated, inverted or contradicted — is the undecidable
+    problem this file no longer attempts. The three worker prompts are identical
+    apart from the vendor name, so the same strings apply to all three.
 
-    Asserted on parsed ``instructions`` rather than raw YAML so the file's
-    explanatory comments are not mistaken for instructions to the model.
+    Presence only: a prompt that keeps every string below and ALSO adds a
+    contradicting instruction passes. That gap is cost item 6 in the module
+    docstring and is now a reviewer's responsibility.
     """
     by_name = {a.name: a for a in holly_spec.sub_agents}
     for name in _WORKERS:
-        instructions = by_name[name].instructions or ""
-        assert instructions.strip(), f"{name}: no instructions at all"
-
-        for obligation, consequence, patterns in _WORKER_OBLIGATIONS:
-            for pattern in patterns:
-                assert re.search(pattern, instructions, re.IGNORECASE), (
-                    f"{name}: worker no longer carries {obligation!r}. Without it: {consequence}."
-                )
-
-        violations = _unprohibited(instructions, _PUBLICATION)
-        assert not violations, (
-            f"{name}: publication instruction with no prohibition beside it — "
-            f"...{violations[0]}... Workers commit and stop; holly releases the "
-            f"branch after gates and an independent review."
-        )
+        instructions = _flatten(by_name[name].instructions or "")
+        assert instructions, f"{name}: no instructions at all"
+        for obligation, consequence, canonical in _WORKER_INSTRUCTIONS:
+            assert canonical in instructions, (
+                f"{name}: canonical instruction {obligation!r} is missing or reworded.\n"
+                f"  expected verbatim: {canonical!r}\n"
+                f"  Without it: {consequence}."
+            )
 
 
 # ───────────────── review-lifecycle branches (D3 / D5 / D6) ─────────────────
@@ -719,6 +560,9 @@ def test_workers_commit_and_stop(holly_spec: AgentSpec) -> None:
 # file, because the prose deliberately restates several rules in more than one
 # place — good redundancy, but the restatement is not the procedure, so deleting
 # the procedural step must fail even while the restatement lives.
+#
+# Like the axis requirements, these are PRESENCE checks over a fixed vocabulary:
+# decidable, and they say nothing about whether a block means the right thing.
 _LIFECYCLE_ANCHORS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
     (
         "diff-of-the-unopened-branch",
@@ -950,51 +794,6 @@ def test_review_lifecycle_branches_survive() -> None:
         assert any(all(c.search(block) for c in compiled) for block in blocks), (
             f"review-lifecycle branch {branch!r} is gone from {owner}. Without it: {consequence}."
         )
-
-
-# Readiness must FOLLOW the gate. Anchoring "green release" and "registry
-# readiness" as two independent facts let "Before gates run, mark the registry
-# entry ready" pass — both facts were still present somewhere. The ratified
-# relationship is an ordering, so the ordering is what gets asserted.
-_READINESS = re.compile(
-    r"\bmark\b[^.!?]{0,40}?\bready\b|\bregistry\b[^.!?]{0,60}?\bready\b", re.IGNORECASE
-)
-# The gate is stated two ways across the bundle — cross-review names the gates
-# and the finding count, fanout names the review outcome. Both are the same
-# precondition, so both count.
-_GATE_CONDITION = re.compile(
-    r"\bgreen\b[^.!?]{0,60}?\b(zero|no) blocking\b"
-    r"|\b(zero|no) blocking\b[^.!?]{0,60}?\bgreen\b"
-    r"|\brevie\w+\b[^.!?]{0,60}?\b(passes|passed|is clean|clean|green)\b",
-    re.IGNORECASE,
-)
-
-
-def test_registry_readiness_follows_the_gate() -> None:
-    """
-    Every block that marks the registry ready states the gate condition first.
-
-    Readiness is the signal the human acts on. If a block can declare a task
-    ready without the green-gates-and-zero-blocking precondition preceding it,
-    then "ready" stops meaning "reviewed" — and the human merges on that word.
-    Asserted as a relationship rather than as two independent anchors, because
-    both anchors survive an edit that simply moves readiness earlier.
-    """
-    for rel_path, text in _orchestration_files().items():
-        for block in _segments(text):
-            readiness = _READINESS.search(block)
-            if not readiness:
-                continue
-            gate = _GATE_CONDITION.search(block)
-            assert gate is not None, (
-                f"{rel_path}: a block marks the registry ready without stating the "
-                f"green-gates-and-zero-blocking precondition — {block[:120]!r}"
-            )
-            assert gate.start() < readiness.start(), (
-                f"{rel_path}: readiness is marked before the gate condition — "
-                f"{block[:120]!r}. Readiness must follow the gate, or 'ready' "
-                f"stops meaning 'reviewed'."
-            )
 
 
 def test_contract_authoring_requirements_survive() -> None:
