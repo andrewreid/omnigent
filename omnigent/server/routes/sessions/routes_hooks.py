@@ -517,23 +517,46 @@ def register_hooks_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             hook_elicitation_id = raw_elicitation_id
-        data = event.get("data") or {}
-        # The context builder indexes ``data`` for the tool phases and
-        # ``event.context`` unconditionally; a non-mapping there is a client
-        # mistake, so reject it here rather than raising AttributeError deep
-        # in the builder (a 500 for malformed input).
-        if phase in (Phase.TOOL_CALL, Phase.TOOL_RESULT) and not isinstance(data, dict):
-            raise OmnigentError(
-                f"Policy evaluate 'event.data' must be an object for "
-                f"{event_type!r}; got {type(data).__name__}.",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        if not isinstance(data, (dict, str)):
+        # Validate the RAW value: normalizing with ``or {}`` first would turn
+        # null / false / 0 / "" / [] into an empty object and let a malformed
+        # frame through as a well-formed one. On a TOOL_CALL that yields
+        # ``tool_name=None``, which SKIPS every tool-name-scoped policy on a
+        # blocking hook — failing open — instead of rejecting the frame.
+        raw_data = event.get("data")
+        if phase in (Phase.TOOL_CALL, Phase.TOOL_RESULT):
+            if not isinstance(raw_data, dict):
+                raise OmnigentError(
+                    f"Policy evaluate 'event.data' must be an object for "
+                    f"{event_type!r}; got {type(raw_data).__name__}.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            # The gate is scoped by tool name; without one there is nothing to
+            # scope and silently allowing is the wrong default.
+            if phase == Phase.TOOL_CALL:
+                tool_name = raw_data.get("name")
+                if not isinstance(tool_name, str) or not tool_name:
+                    raise OmnigentError(
+                        f"Policy evaluate 'event.data.name' must be a non-empty "
+                        f"string for {event_type!r}.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+            else:
+                request_data = event.get("request_data")
+                if not isinstance(request_data, dict) or not isinstance(
+                    request_data.get("name"), str
+                ):
+                    raise OmnigentError(
+                        f"Policy evaluate 'event.request_data.name' must be a "
+                        f"string for {event_type!r}.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+        elif raw_data is not None and not isinstance(raw_data, (dict, str)):
             raise OmnigentError(
                 f"Policy evaluate 'event.data' must be an object or string; "
-                f"got {type(data).__name__}.",
+                f"got {type(raw_data).__name__}.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        data = raw_data or {}
         raw_event_context = event.get("context")
         if raw_event_context is not None and not isinstance(raw_event_context, dict):
             raise OmnigentError(
@@ -630,6 +653,9 @@ def register_hooks_routes(
                 conversation_id=session_id,
                 conversation_store=conversation_store,
                 conversation=preloaded_conv,
+                # ``agent`` below was resolved from conv.agent_id; the builder
+                # re-reads the row and fails closed if it was rebound since.
+                expected_agent_id=agent.id,
                 default_policies=_caps.default_policies,
                 policy_store=get_policy_store(),
                 server_llm=_caps.llm,

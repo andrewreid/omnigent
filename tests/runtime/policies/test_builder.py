@@ -1071,17 +1071,15 @@ def test_build_loads_conversation_and_tree_once(
     assert calls["list_conversations"] == 1, calls
 
 
-def test_build_gates_and_inherits_approval_when_root_archived(
+def test_build_counts_archived_spend_and_inherits_approval(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """
-    Archiving the root mid-session must not reset cost gating or the
-    inherited approval checkpoint for still-running sub-agents.
-
-    The spawn-tree scan excludes archived rows, so a sub-agent build could
-    lose the root entirely; the builder falls back to a direct read. (The
-    archived root's own spend disappearing from the tree sum is longstanding
-    behavior, unchanged here — this pins the seed and state inheritance.)
+    Archiving must not move a budget gate. An archived root's own spend
+    still counts toward the session total, and its approval checkpoint is
+    still inherited — archiving is a listing concern, not an accounting
+    one. (This previously asserted the opposite, codifying an omission
+    that let an archive-after-preload seed $0 and ALLOW over budget.)
     """
     from omnigent.policies.schema import SESSION_COST_ASK_APPROVED_STATE_KEY
 
@@ -1100,7 +1098,8 @@ def test_build_gates_and_inherits_approval_when_root_archived(
         conversation_store=conversation_store,
     )
 
-    assert engine.usage["total_cost_usd"] == pytest.approx(0.05)
+    # Whole-tree total including the archived root's own spend.
+    assert engine.usage["total_cost_usd"] == pytest.approx(0.15)
     assert engine.session_state[SESSION_COST_ASK_APPROVED_STATE_KEY] == pytest.approx(9.99)
 
 
@@ -1276,3 +1275,149 @@ guardrails:
     assert engine.labels["integrity"] == "7", "seed overwrote a concurrent write"
     persisted = conversation_store.get_conversation(conv.id)
     assert dict(persisted.labels)["integrity"] == "7"
+
+
+def test_archive_after_preload_still_gates_on_recorded_spend(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Reproduction of the reported authorization bypass: a conversation
+    archived (with an expensive model set) AFTER the handler's preload
+    must still seed its recorded spend. Seeding $0 here returned ALLOW
+    under a $1 budget.
+    """
+    conv = conversation_store.create_conversation(title="archive-bypass")
+    conversation_store.set_session_usage(conv.id, {"total_cost_usd": 5.0})
+    stale_row = conversation_store.get_conversation(conv.id)
+
+    conversation_store.update_conversation(
+        conv.id, model_override="claude-opus-4-8", archived=True
+    )
+
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="x"),
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+        conversation=stale_row,
+    )
+
+    assert engine.usage["total_cost_usd"] == pytest.approx(5.0), "archived spend must count"
+    assert engine.model == "claude-opus-4-8"
+
+
+def test_deleted_after_preload_fails_closed(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A row deleted after the preload must fail closed, not authorize
+    from the stale snapshot nor from empty ($0) state."""
+    import asyncio
+
+    from omnigent.errors import OmnigentError
+
+    conv = conversation_store.create_conversation(title="deleted")
+    conversation_store.set_session_usage(conv.id, {"total_cost_usd": 5.0})
+    stale_row = conversation_store.get_conversation(conv.id)
+    asyncio.run(conversation_store.delete_conversation(conv.id))
+
+    with pytest.raises(OmnigentError, match="disappeared"):
+        build_policy_engine(
+            spec=AgentSpec(spec_version=1, name="x"),
+            conversation_id=conv.id,
+            conversation_store=conversation_store,
+            conversation=stale_row,
+        )
+
+
+def test_agent_rebind_after_spec_resolution_fails_closed(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``agent_id`` selects the spec, so it is read before the engine exists
+    and cannot be re-derived. Passing it lets the builder confirm it
+    against the fresh row: a switch-agent in that window must fail closed
+    rather than enforce the old agent's guardrails on the new agent's turn.
+    """
+    from omnigent.errors import OmnigentError
+
+    conv = conversation_store.create_conversation(title="rebind", agent_id="1" * 32)
+
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="x"),
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+        expected_agent_id="1" * 32,
+    )
+    assert engine is not None  # matching agent proceeds
+
+    conversation_store.switch_conversation_agent(
+        conv.id,
+        new_agent_id="2" * 32,
+        new_agent_name="other",
+        new_agent_bundle_location="other/bundle",
+        new_agent_description=None,
+        copy_model_settings=False,
+        carry_history_into_native=False,
+        presentation_labels={},
+        previous_builtin_id=None,
+    )
+    with pytest.raises(OmnigentError, match="rebound from agent"):
+        build_policy_engine(
+            spec=AgentSpec(spec_version=1, name="x"),
+            conversation_id=conv.id,
+            conversation_store=conversation_store,
+            expected_agent_id="1" * 32,
+        )
+
+
+def test_concurrent_state_increments_do_not_lose_updates(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Reproduction of the reported lost update: two engines built from
+    independent snapshots each INCREMENT the same key. A blind
+    whole-blob write persisted 1; the atomic merge persists 2.
+    """
+    from omnigent.spec.types import StateUpdate, StateUpdateAction
+
+    conv = conversation_store.create_conversation(title="state-race")
+    spec = AgentSpec(spec_version=1, name="x")
+    engine_a = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    engine_b = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+
+    op = StateUpdate(key="risk", action=StateUpdateAction.INCREMENT, value=1)
+    engine_a.apply_state_updates([op])
+    engine_b.apply_state_updates([op])
+
+    persisted = conversation_store.get_conversation(conv.id)
+    assert dict(persisted.session_state)["risk"] == 2
+
+
+def test_concurrent_state_updates_preserve_other_keys(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A second engine's SET must not drop a key the first one wrote."""
+    from omnigent.spec.types import StateUpdate, StateUpdateAction
+
+    conv = conversation_store.create_conversation(title="state-keys")
+    spec = AgentSpec(spec_version=1, name="x")
+    engine_a = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    engine_b = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+
+    engine_a.apply_state_updates(
+        [StateUpdate(key="from_a", action=StateUpdateAction.SET, value="a")]
+    )
+    engine_b.apply_state_updates(
+        [StateUpdate(key="from_b", action=StateUpdateAction.SET, value="b")]
+    )
+
+    state = dict(conversation_store.get_conversation(conv.id).session_state)
+    assert state["from_a"] == "a", state
+    assert state["from_b"] == "b", state

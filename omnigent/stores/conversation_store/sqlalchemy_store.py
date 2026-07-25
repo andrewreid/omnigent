@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import (
@@ -1365,6 +1366,56 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 .values(session_state=json.dumps(state))
             )
+
+    def mutate_session_state(
+        self,
+        conversation_id: str,
+        mutate: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        """
+        Apply *mutate* to the persisted session state under a row lock.
+
+        Read-merge-write in ONE locked transaction, so concurrent writers
+        cannot lose each other's updates. ``set_session_state`` overwrites
+        the whole blob from a snapshot the caller read earlier, which drops
+        anything written in between — two policies each incrementing a
+        counter by 1 persisted 1, not 2.
+
+        Locking mirrors :meth:`increment_session_usage`: ``SELECT … FOR
+        UPDATE`` where supported, and ``BEGIN IMMEDIATE`` on SQLite (via
+        the immediate session maker) so the read cannot race a second
+        writer's read.
+
+        :param conversation_id: The conversation to update,
+            e.g. ``"conv_abc123"``.
+        :param mutate: Callable applied in place to the freshly read state
+            dict. Runs inside the locked transaction, so it must not
+            perform store calls of its own.
+        :returns: The merged state as persisted.
+        """
+        import json
+
+        with self._session_immediate() as session:
+            q = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                q = q.with_for_update()
+            meta = session.scalars(q).first()
+            current: dict[str, Any] = (
+                dict(json.loads(meta.session_state)) if meta and meta.session_state else {}
+            )
+            mutate(current)
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+                .values(session_state=json.dumps(current))
+            )
+            return current
 
     def set_session_usage(
         self,

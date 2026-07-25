@@ -4,11 +4,13 @@ workflow.
 
 Called at the top of ``_run_agent_loop``. Seeds any
 ``LabelDef.initial`` values that are not already present in
-``conversation_labels`` using an
-``INSERT ... ON CONFLICT DO NOTHING`` semantic so that two
-concurrent workflows on the same conversation (the v2 case
-tracked in POLICIES.md Open Q #6) never clobber each other's
-view of a label's first value.
+``conversation_labels`` via
+:meth:`ConversationStore.seed_labels_if_absent`, whose
+``INSERT ... ON CONFLICT DO NOTHING`` semantics mean two concurrent
+workflows on the same conversation (the v2 case tracked in
+POLICIES.md Open Q #6) never clobber each other's view of a label's
+first value — the database decides which keys are missing, not a
+snapshot taken before the write.
 
 Phase 2 scope: zero-policy and declared-policy paths both work;
 concrete Policy subclasses land in Phases 3+, and this builder
@@ -263,6 +265,7 @@ def build_policy_engine(
     conversation_id: str,
     conversation_store: ConversationStore,
     conversation: Conversation | None = None,
+    expected_agent_id: str | None = None,
     connection_override: dict[str, str] | None = None,
     default_policies: list[PolicySpec] | None = None,
     policy_store: PolicyStore | None = None,
@@ -305,11 +308,23 @@ def build_policy_engine(
         running on, e.g. ``"conv_abc123"``.
     :param conversation: The already-loaded conversation row for
         ``conversation_id``, when the caller holds a current one — skips
-        the builder's own read. The engine snapshots labels /
-        session_state from this row, so callers that rebuild an engine
-        specifically to observe concurrent writes (e.g. the native ASK
-        gate's post-lock re-evaluation) must pass ``None`` and let the
-        builder read fresh.
+        the builder's own read.
+
+        **Preload contract** (one rule, applied at every preload site):
+        a preloaded row may supply only IMMUTABLE identity — its ``id``
+        and ``root_conversation_id``. Every mutable field the engine
+        depends on (labels, session_state, model_override) is re-derived
+        from a fresh read taken here. A row that has since disappeared
+        fails closed rather than authorizing from the snapshot. Callers
+        that rebuild an engine specifically to observe concurrent writes
+        (the native ASK gate's post-lock re-evaluation) pass ``None``.
+    :param expected_agent_id: The ``agent_id`` the caller resolved *spec*
+        from. ``agent_id`` is mutable (switch-agent) but selects the spec,
+        so it must be read before the engine exists and cannot be
+        re-derived here. Passing it lets the builder confirm it against
+        the fresh row and fail closed on a mismatch, instead of
+        authorizing an evaluation under the previous agent's guardrails.
+        ``None`` skips the check (callers with no spec/agent coupling).
     :param conversation_store: The store used for label reads
         and writes. Held by the engine for the life of the
         workflow.
@@ -382,6 +397,23 @@ def build_policy_engine(
     # is no longer reachable since all_policy_specs is never empty).
     all_policy_specs.append(_ASK_ON_ADD_POLICY_SPEC)
 
+    if (
+        expected_agent_id is not None
+        and conv is not None
+        and conv.agent_id is not None
+        and conv.agent_id != expected_agent_id
+    ):
+        # A switch-agent landed between the caller resolving the spec and this
+        # build. The engine would enforce the OLD agent's guardrails against
+        # the NEW agent's turn, so the caller must re-resolve rather than
+        # proceed on either half.
+        raise OmnigentError(
+            f"Session {conversation_id!r} was rebound from agent "
+            f"{expected_agent_id!r} to {conv.agent_id!r} while building its "
+            f"policy engine; re-resolve the agent spec and retry.",
+            code=ErrorCode.CONFLICT,
+        )
+
     label_defs = (guardrails.labels or {}) if guardrails else {}
     # One conversation read (``conv``, resolved above for policy
     # inheritance) and ONE spawn-tree load feed everything below: labels,
@@ -409,6 +441,16 @@ def build_policy_engine(
         fresh_self = next((c for c in tree if c.id == conversation_id), None)
         if fresh_self is None:
             fresh_self = conversation_store.get_conversation(conversation_id)
+        if fresh_self is None:
+            # The caller vouched for this conversation, and it is now gone
+            # (deleted mid-request). Authorizing from the preloaded copy would
+            # decide against state that no longer exists; authorizing from
+            # empty state would seed a $0 budget and ALLOW. Fail closed.
+            raise OmnigentError(
+                f"Conversation {conversation_id!r} disappeared while building its "
+                f"policy engine; refusing to authorize from a stale snapshot.",
+                code=ErrorCode.CONFLICT,
+            )
         conv = fresh_self
     root_conv = (
         conv
@@ -416,10 +458,9 @@ def build_policy_engine(
         else next((c for c in tree if c.id == root_conversation_id), None)
     )
     if root_conv is None and conv is not None and root_conversation_id != conversation_id:
-        # The tree scan excludes archived rows, so an archived root would
-        # vanish here — but gating and approval inheritance must survive
-        # archiving (get_conversation reads archived rows fine). One extra
-        # read, paid only in this edge.
+        # The tree now includes archived rows, so a missing root means the row
+        # is genuinely gone (deleted mid-request). Read once to confirm before
+        # deciding — never silently proceed on an absent root.
         root_conv = conversation_store.get_conversation(root_conversation_id)
     initial_labels = _seed_and_load_labels(
         conversation_id=conversation_id,
@@ -1038,6 +1079,13 @@ def _load_tree_conversations(
             # (not just "default") are included in the tree.
             kind=None,
             root_conversation_id=root_conversation_id,
+            # Archived conversations still hold spend, and archiving must not
+            # move a budget gate: excluding them let an archive-after-preload
+            # (or an archived mid-tree node, which orphaned its descendants
+            # from the walk) seed the enforcement total as $0 and ALLOW a tool
+            # call over budget. The tree is an accounting structure, not a
+            # user-facing listing.
+            include_archived=True,
         )
         convs.extend(page.data)
         if not page.has_more or page.last_id is None:
