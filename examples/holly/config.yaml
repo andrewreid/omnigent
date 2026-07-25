@@ -389,9 +389,10 @@ guardrails:
         path: omnigent.inner.nessie.policies.spawn_bounds
         arguments:
           max_dispatches_per_turn: 6
-          # sys_session_create counts too: with spawn: true holly can
-          # launch self-defined children, and an uncounted create would
-          # bypass the per-turn fan-out cap.
+          # sys_session_create is listed too: with spawn: true holly can
+          # launch self-defined children, and they belong in the same count.
+          # Advisory only - the counter restarts each request (see above), so
+          # respect the cap yourself rather than relying on it.
           dispatch_tools: [sys_session_send, sys_session_create]
     headless_subagent_purpose_guard:
       type: function
