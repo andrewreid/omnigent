@@ -25,6 +25,7 @@ Covers:
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -1577,3 +1578,87 @@ def test_build_rereads_when_archived_self_is_missing_from_tree(
 
     assert engine.model == "claude-opus-4-8", "archived self must not use the stale row"
     assert engine.labels.get("guard") == "tripped"
+
+
+class _MutateOnTreeLoad:
+    """Store proxy that commits *hazard* the first time the tree is scanned.
+
+    The builder reads the conversation, then scans the spawn tree. Anything
+    committed in between makes the earlier read stale — which is the window
+    the freshness refresh exists to close, whoever performed that read.
+    """
+
+    def __init__(self, inner: object, hazard: Callable[[], None]) -> None:
+        self._inner = inner
+        self._hazard = hazard
+        self._fired = False
+
+    def list_conversations(self, *args: object, **kwargs: object) -> object:
+        if not self._fired:
+            self._fired = True
+            self._hazard()
+        return self._inner.list_conversations(*args, **kwargs)  # type: ignore[attr-defined]
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+@pytest.mark.parametrize("preloaded", [True, False], ids=["preload", "no-preload"])
+@pytest.mark.parametrize("hazard", ["switch", "delete"])
+def test_mid_build_change_fails_closed_on_every_provenance(
+    conversation_store: SqlAlchemyConversationStore,
+    preloaded: bool,
+    hazard: str,
+) -> None:
+    """
+    A change landing between the conversation read and the tree scan must
+    fail closed — regardless of who performed that read.
+
+    Parametrized over provenance on purpose. An earlier revision gated the
+    refresh on ``conversation is not None``, so the caller-preload path was
+    closed and the builder's own read had the identical window wide open: a
+    switch enforced the old agent's spec, a deletion seeded empty usage and
+    authorized a $0 budget. Provenance is a row here, not a separate test,
+    so a third way of acquiring the row is covered by construction.
+    """
+    import asyncio
+
+    from omnigent.errors import OmnigentError
+
+    agent_a = "2" * 32
+    conv = conversation_store.create_conversation(title=f"mid-build-{hazard}", agent_id=agent_a)
+    conversation_store.set_session_usage(conv.id, {"total_cost_usd": 5.0})
+    row = conversation_store.get_conversation(conv.id)
+
+    if hazard == "switch":
+
+        def _apply() -> None:
+            conversation_store.switch_conversation_agent(
+                conv.id,
+                new_agent_id=uuid.uuid4().hex,
+                new_agent_name="other",
+                new_agent_bundle_location="other/bundle",
+                new_agent_description=None,
+                copy_model_settings=False,
+                carry_history_into_native=False,
+                presentation_labels={},
+                previous_builtin_id=None,
+            )
+
+        expected = "no longer resolves to agent"
+    else:
+
+        def _apply() -> None:
+            asyncio.run(conversation_store.delete_conversation(conv.id))
+
+        expected = "disappeared"
+
+    store = _MutateOnTreeLoad(conversation_store, _apply)
+    with pytest.raises(OmnigentError, match=expected):
+        build_policy_engine(
+            spec=AgentSpec(spec_version=1, name="x"),
+            conversation_id=conv.id,
+            conversation_store=store,  # type: ignore[arg-type]
+            conversation=row if preloaded else None,
+            expected_agent_id=agent_a,
+        )

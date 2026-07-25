@@ -410,36 +410,44 @@ def build_policy_engine(
         if conv is not None
         else []
     )
-    # Freshness contract for the preloaded row: ONLY immutable identity
-    # (id, root_conversation_id) is trusted from it. Every mutable field —
-    # labels, session_state, model_override — comes from a fresh read.
-    # Normally that is this conversation's row in the tree just loaded.
-    # The tree load includes archived rows (archived conversations still
-    # hold spend), so a row missing from the tree has genuinely been
-    # deleted. Re-read to confirm, then fail closed below — never fall back
-    # to the preloaded copy, which would authorize from state captured
-    # before whatever removed the row.
-    if conversation is not None:
+    # Freshness contract, applied to EVERY row this function decides from,
+    # regardless of how it arrived: ONLY immutable identity (id,
+    # root_conversation_id) survives from the row read above. Every mutable
+    # field — labels, session_state, model_override, agent_id — is taken from
+    # the tree load, which happened later and is therefore the newest read.
+    #
+    # The provenance of the earlier row does not change the hazard. A caller's
+    # preload and this function's own ``get_conversation`` are both snapshots
+    # taken before the tree scan, so both can be stale by the time a decision
+    # is made; gating the refresh on ``conversation is not None`` closed the
+    # window on one path and left the identical window open on the other.
+    #
+    # The tree load includes archived rows (archived conversations still hold
+    # spend), so a row missing from the tree has genuinely been deleted.
+    # Re-read once to confirm, then fail closed — never fall back to the
+    # earlier copy, which would authorize from state captured before whatever
+    # removed the row.
+    if conv is not None:
         fresh_self = next((c for c in tree if c.id == conversation_id), None)
         if fresh_self is None:
             fresh_self = conversation_store.get_conversation(conversation_id)
         if fresh_self is None:
-            # The caller vouched for this conversation, and it is now gone
-            # (deleted mid-request). Authorizing from the preloaded copy would
-            # decide against state that no longer exists; authorizing from
-            # empty state would seed a $0 budget and ALLOW. Fail closed.
+            # The row existed moments ago and is now gone (deleted
+            # mid-request). Authorizing from the earlier copy would decide
+            # against state that no longer exists; authorizing from empty
+            # state would seed a $0 budget and ALLOW. Fail closed.
             raise OmnigentError(
                 f"Conversation {conversation_id!r} disappeared while building its "
                 f"policy engine; refusing to authorize from a stale snapshot.",
                 code=ErrorCode.CONFLICT,
             )
         conv = fresh_self
-    # Agent/spec confirmation — deliberately AFTER the fresh read above, and
-    # nowhere else. Comparing against the preloaded row (as an earlier
-    # revision did) validated the very snapshot whose staleness is the
-    # hazard, so a switch-agent in the window was accepted. Exact equality:
-    # a fresh row whose binding is ``None``, or no fresh row at all, is a
-    # mismatch too — not a reason to skip the check.
+    # Agent/spec confirmation — deliberately AFTER the refresh above, and
+    # nowhere else. Comparing against the earlier row (as a previous revision
+    # did) validated the very snapshot whose staleness is the hazard, so a
+    # switch-agent in the window was accepted. Exact equality: a fresh row
+    # whose binding is ``None``, or no fresh row at all, is a mismatch too —
+    # not a reason to skip the check.
     if expected_agent_id is not None:
         fresh_agent_id = conv.agent_id if conv is not None else None
         if fresh_agent_id != expected_agent_id:
