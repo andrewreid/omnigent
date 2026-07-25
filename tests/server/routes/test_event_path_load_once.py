@@ -13,7 +13,11 @@ counting disappeared entirely:
 
 The routing read is deliberately NOT threaded from the handler's row:
 runner resolution takes its own fresh single-column binding read so a
-concurrent rebind is picked up (see ``RunnerRouter``).
+concurrent rebind is picked up. The rebind semantics themselves are
+pinned in ``tests/runner/test_routing.py``, because the app builds its
+own ``RunnerRouter`` over a real tunnel registry with no injection seam —
+what IS testable here, and asserted below, is that every event issues its
+own binding read rather than reusing a cached resolution.
 """
 
 from __future__ import annotations
@@ -102,33 +106,6 @@ class _RecordingRunnerClient:
         del timeout
         self.posts.append((url, json))
         return httpx.Response(200, json={}, request=httpx.Request("POST", url))
-
-
-class _RoutedRunner:
-    def __init__(self, client: _RecordingRunnerClient, runner_id: str) -> None:
-        self.runner_id = runner_id
-        self.client = client
-
-
-class _BindingRouter:
-    """Router that resolves through the store, like the real one.
-
-    Reads the binding per call so a test can rebind mid-flight and observe
-    which runner the next resolution picks.
-    """
-
-    def __init__(self, store: SqlAlchemyConversationStore) -> None:
-        self._store = store
-        self.clients: dict[str, _RecordingRunnerClient] = {}
-        self.resolutions: list[str] = []
-
-    def client_for_session_resources(self, session_id: str) -> _RoutedRunner:
-        runner_id = self._store.get_runner_ids([session_id]).get(session_id)
-        if not runner_id:
-            raise LookupError(session_id)
-        self.resolutions.append(runner_id)
-        client = self.clients.setdefault(runner_id, _RecordingRunnerClient())
-        return _RoutedRunner(client, runner_id)
 
 
 @pytest.fixture()
@@ -249,3 +226,137 @@ async def test_delta_event_semantics_unchanged(
     assert resp.json() == {"queued": False}
     assert any(e.get("type") == "response.output_text.delta" for e in published), published
     assert store.list_items(conv.id).data == []
+
+
+@pytest.mark.asyncio
+async def test_each_event_issues_its_own_binding_read(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    runner_router_reset: None,
+) -> None:
+    """
+    Runner resolution must not be cached across events: each event issues
+    its own narrow binding read, which is what lets a rebind between two
+    events route to the new runner (the rebind outcome itself is pinned at
+    the router level, where the app's real router can be constructed).
+    """
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="per-event-binding")
+    store.set_runner_id(conv.id, "runner_one")
+    set_runner_client(_RecordingRunnerClient())  # type: ignore[arg-type]
+
+    payload = {"type": "external_session_status", "data": {"status": "idle"}}
+    await client.post(f"/v1/sessions/{conv.id}/events", json=payload)  # warm
+
+    engine = _engine_cache[db_uri]
+    with _count_queries_by_table(engine) as counts:
+        for _ in range(2):
+            resp = await client.post(f"/v1/sessions/{conv.id}/events", json=payload)
+            assert resp.status_code == 202, resp.text
+
+    binding_reads = [
+        st
+        for st in counts.statements
+        if "omnigent_conversation_metadata" in st
+        and st.lstrip().upper().startswith("SELECT")
+        and " IN (" in st
+    ]
+    assert len(binding_reads) == 2, binding_reads
+
+
+# Measured per-event SQL counts, by event shape. Identical on SQLite and
+# PostgreSQL 18.3 (verified on both), no-auth app fixture. These are the
+# numbers the PR describes: asserting them here stops the description and
+# the code drifting apart, which is how the earlier "10 -> 7" claim
+# survived being wrong by one.
+#
+# Pool CHECKOUT counts are deliberately not asserted: they depend on
+# whether the per-request connection-scope middleware is enabled, which
+# is a separate change and not part of this PR.
+_MEASURED_QUERIES_BY_SHAPE = {
+    # Transient publish only.
+    "delta": 3,
+    # Handler row (3) + routing's binding read + the live-status write.
+    "idle_status": 5,
+    # Re-reporting the same cumulative total: merge read, labels, tree scan.
+    "usage_unchanged": 10,
+    # An INCREASE additionally writes the owner/daily-cost rollup.
+    "usage_increasing": 11,
+    # A parent with a child costs the same as childless — the tree scan is
+    # one paged query either way.
+    "usage_with_child": 10,
+    # A DESCENDANT reporting adds the ancestor walk and the ancestor's own
+    # subtree recompute; this is the shape a single "per event" number
+    # misdescribes worst.
+    "usage_descendant": 16,
+}
+
+
+@pytest.mark.asyncio
+async def test_measured_query_counts_per_event_shape(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    runner_router_reset: None,
+) -> None:
+    """Pin the per-shape SQL counts the PR quotes.
+
+    The taxonomy matters: a childless idle status is not the same shape as
+    a descendant's increasing usage report (which adds the ancestor walk
+    and its subtree recompute), and quoting one number for "an event"
+    misdescribes the others.
+    """
+    store = SqlAlchemyConversationStore(db_uri)
+    set_runner_client(_RecordingRunnerClient())  # type: ignore[arg-type]
+    engine = _engine_cache[db_uri]
+
+    async def _count(
+        session_id: str,
+        payload: dict[str, Any],
+        warm: dict[str, Any] | None = None,
+    ) -> int:
+        # Warm with *warm* (defaults to the same payload) so the measured
+        # call starts from settled state. For usage events the warm value
+        # decides whether the measured report is an INCREASE — which adds
+        # the owner/daily-rollup writes — so the two branches are separate
+        # shapes, not one number with noise.
+        await client.post(f"/v1/sessions/{session_id}/events", json=warm or payload)
+        with _count_queries_by_table(engine) as counts:
+            resp = await client.post(f"/v1/sessions/{session_id}/events", json=payload)
+        assert resp.status_code == 202, resp.text
+        return sum(counts.values())
+
+    plain = store.create_conversation(title="shapes-plain")
+    store.set_runner_id(plain.id, "runner_one")
+    parent = store.create_conversation(title="shapes-parent")
+    child = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title="shapes:child"
+    )
+    store.set_session_usage(child.id, {"total_cost_usd": 0.25})
+    childless = store.create_conversation(title="shapes-childless")
+
+    measured = {
+        "delta": await _count(
+            plain.id, {"type": "external_output_text_delta", "data": {"delta": "x"}}
+        ),
+        "idle_status": await _count(
+            plain.id, {"type": "external_session_status", "data": {"status": "idle"}}
+        ),
+        "usage_unchanged": await _count(
+            childless.id,
+            {"type": "external_session_usage", "data": {"cumulative_cost_usd": 0.9}},
+        ),
+        "usage_increasing": await _count(
+            childless.id,
+            {"type": "external_session_usage", "data": {"cumulative_cost_usd": 1.9}},
+            warm={"type": "external_session_usage", "data": {"cumulative_cost_usd": 1.4}},
+        ),
+        "usage_with_child": await _count(
+            parent.id,
+            {"type": "external_session_usage", "data": {"cumulative_cost_usd": 0.9}},
+        ),
+        "usage_descendant": await _count(
+            child.id,
+            {"type": "external_session_usage", "data": {"cumulative_cost_usd": 0.9}},
+        ),
+    }
+    assert measured == _MEASURED_QUERIES_BY_SHAPE, measured
