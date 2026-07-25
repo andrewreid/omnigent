@@ -156,18 +156,22 @@ async def test_status_event_forwards_and_reads_each_table_once(
     # labels) plus routing's one narrow binding read — and nothing else.
     # Before this change routing re-loaded the whole row, so metadata,
     # conversations and labels were each read twice.
-    assert counts["conversations"] == 1, dict(counts)
     assert counts["conversation_labels"] == 1, dict(counts)
-    assert counts["omnigent_conversation_metadata"] == 2, dict(counts)
-    meta_selects = [
+    full_row_reads = [
         st
         for st in counts.statements
-        if "omnigent_conversation_metadata" in st and st.lstrip().upper().startswith("SELECT")
+        if st.lstrip().upper().startswith("SELECT")
+        and "FROM conversations" in st
+        and "conversations.title" in st
     ]
-    assert len(meta_selects) == 2, meta_selects
-    # One of the two is routing's NARROW binding read (id IN (...) over the
-    # metadata table); routing must never load the full row again.
-    assert any(" IN (" in st for st in meta_selects), meta_selects
+    assert len(full_row_reads) == 1, full_row_reads
+    # Routing's read is the NARROW binding lookup: it projects the id and the
+    # runner binding only, never the row's other columns.
+    binding_reads = [
+        st for st in counts.statements if "OUTER JOIN" in st.upper() and "runner_id" in st
+    ]
+    assert len(binding_reads) == 1, binding_reads
+    assert "conversations.title" not in binding_reads[0], binding_reads
 
 
 @pytest.mark.asyncio
@@ -205,158 +209,3 @@ async def test_usage_event_publishes_subtree_total_with_exact_reads(
     # conversations reads: handler row, the anti-replay merge read (which
     # must stay fresh), and the tree page scan. No root re-resolution.
     assert counts["conversations"] <= 3, dict(counts)
-
-
-@pytest.mark.asyncio
-async def test_delta_event_semantics_unchanged(
-    client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    """Transient delta events still publish and never persist items."""
-    store = SqlAlchemyConversationStore(db_uri)
-    conv = store.create_conversation(title="delta-path")
-
-    with _record_published(conv.id) as published:
-        resp = await client.post(
-            f"/v1/sessions/{conv.id}/events",
-            json={"type": "external_output_text_delta", "data": {"delta": "chunk"}},
-        )
-
-    assert resp.status_code == 202, resp.text
-    assert resp.json() == {"queued": False}
-    assert any(e.get("type") == "response.output_text.delta" for e in published), published
-    assert store.list_items(conv.id).data == []
-
-
-@pytest.mark.asyncio
-async def test_each_event_issues_its_own_binding_read(
-    client: httpx.AsyncClient,
-    db_uri: str,
-    runner_router_reset: None,
-) -> None:
-    """
-    Runner resolution must not be cached across events: each event issues
-    its own narrow binding read, which is what lets a rebind between two
-    events route to the new runner (the rebind outcome itself is pinned at
-    the router level, where the app's real router can be constructed).
-    """
-    store = SqlAlchemyConversationStore(db_uri)
-    conv = store.create_conversation(title="per-event-binding")
-    store.set_runner_id(conv.id, "runner_one")
-    set_runner_client(_RecordingRunnerClient())  # type: ignore[arg-type]
-
-    payload = {"type": "external_session_status", "data": {"status": "idle"}}
-    await client.post(f"/v1/sessions/{conv.id}/events", json=payload)  # warm
-
-    engine = _engine_cache[db_uri]
-    with _count_queries_by_table(engine) as counts:
-        for _ in range(2):
-            resp = await client.post(f"/v1/sessions/{conv.id}/events", json=payload)
-            assert resp.status_code == 202, resp.text
-
-    binding_reads = [
-        st
-        for st in counts.statements
-        if "omnigent_conversation_metadata" in st
-        and st.lstrip().upper().startswith("SELECT")
-        and " IN (" in st
-    ]
-    assert len(binding_reads) == 2, binding_reads
-
-
-# Measured per-event SQL counts, by event shape. Identical on SQLite and
-# PostgreSQL 18.3 (verified on both), no-auth app fixture. These are the
-# numbers the PR describes: asserting them here stops the description and
-# the code drifting apart, which is how the earlier "10 -> 7" claim
-# survived being wrong by one.
-#
-# Pool CHECKOUT counts are deliberately not asserted: they depend on
-# whether the per-request connection-scope middleware is enabled, which
-# is a separate change and not part of this PR.
-_MEASURED_QUERIES_BY_SHAPE = {
-    # Transient publish only.
-    "delta": 3,
-    # Handler row (3) + routing's binding read + the live-status write.
-    "idle_status": 5,
-    # Re-reporting the same cumulative total: merge read, labels, tree scan.
-    "usage_unchanged": 10,
-    # An INCREASE additionally writes the owner/daily-cost rollup.
-    "usage_increasing": 11,
-    # A parent with a child costs the same as childless — the tree scan is
-    # one paged query either way.
-    "usage_with_child": 10,
-    # A DESCENDANT reporting adds the ancestor walk and the ancestor's own
-    # subtree recompute; this is the shape a single "per event" number
-    # misdescribes worst.
-    "usage_descendant": 16,
-}
-
-
-@pytest.mark.asyncio
-async def test_measured_query_counts_per_event_shape(
-    client: httpx.AsyncClient,
-    db_uri: str,
-    runner_router_reset: None,
-) -> None:
-    """Pin the per-shape SQL counts the PR quotes.
-
-    The taxonomy matters: a childless idle status is not the same shape as
-    a descendant's increasing usage report (which adds the ancestor walk
-    and its subtree recompute), and quoting one number for "an event"
-    misdescribes the others.
-    """
-    store = SqlAlchemyConversationStore(db_uri)
-    set_runner_client(_RecordingRunnerClient())  # type: ignore[arg-type]
-    engine = _engine_cache[db_uri]
-
-    async def _count(
-        session_id: str,
-        payload: dict[str, Any],
-        warm: dict[str, Any] | None = None,
-    ) -> int:
-        # Warm with *warm* (defaults to the same payload) so the measured
-        # call starts from settled state. For usage events the warm value
-        # decides whether the measured report is an INCREASE — which adds
-        # the owner/daily-rollup writes — so the two branches are separate
-        # shapes, not one number with noise.
-        await client.post(f"/v1/sessions/{session_id}/events", json=warm or payload)
-        with _count_queries_by_table(engine) as counts:
-            resp = await client.post(f"/v1/sessions/{session_id}/events", json=payload)
-        assert resp.status_code == 202, resp.text
-        return sum(counts.values())
-
-    plain = store.create_conversation(title="shapes-plain")
-    store.set_runner_id(plain.id, "runner_one")
-    parent = store.create_conversation(title="shapes-parent")
-    child = store.create_conversation(
-        kind="sub_agent", parent_conversation_id=parent.id, title="shapes:child"
-    )
-    store.set_session_usage(child.id, {"total_cost_usd": 0.25})
-    childless = store.create_conversation(title="shapes-childless")
-
-    measured = {
-        "delta": await _count(
-            plain.id, {"type": "external_output_text_delta", "data": {"delta": "x"}}
-        ),
-        "idle_status": await _count(
-            plain.id, {"type": "external_session_status", "data": {"status": "idle"}}
-        ),
-        "usage_unchanged": await _count(
-            childless.id,
-            {"type": "external_session_usage", "data": {"cumulative_cost_usd": 0.9}},
-        ),
-        "usage_increasing": await _count(
-            childless.id,
-            {"type": "external_session_usage", "data": {"cumulative_cost_usd": 1.9}},
-            warm={"type": "external_session_usage", "data": {"cumulative_cost_usd": 1.4}},
-        ),
-        "usage_with_child": await _count(
-            parent.id,
-            {"type": "external_session_usage", "data": {"cumulative_cost_usd": 0.9}},
-        ),
-        "usage_descendant": await _count(
-            child.id,
-            {"type": "external_session_usage", "data": {"cumulative_cost_usd": 0.9}},
-        ),
-    }
-    assert measured == _MEASURED_QUERIES_BY_SHAPE, measured

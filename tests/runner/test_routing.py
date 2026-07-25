@@ -259,17 +259,43 @@ async def test_runner_router_existing_conversation_returns_none_when_unpinned() 
         await router.aclose()
 
 
+@pytest.mark.parametrize(
+    ("method", "missing", "unpinned"),
+    [
+        ("client_for_session_resources", ErrorCode.NOT_FOUND, ErrorCode.CONFLICT),
+        # The optional variant reports both as "no runner to route to".
+        ("client_for_existing_conversation", None, None),
+    ],
+)
 @pytest.mark.asyncio
-async def test_session_resources_routing_reads_binding_fresh_and_narrow() -> None:
-    """Per-event routing reads ONLY the current runner binding (single
-    column, fresh) — never the full conversation row. A mid-request
-    rebind is therefore picked up by the very next resolution."""
+async def test_narrowed_binding_routing_is_fresh_and_keeps_its_semantics(
+    method: str,
+    missing: ErrorCode | None,
+    unpinned: ErrorCode | None,
+) -> None:
+    """
+    Every per-event route that narrowed its conversation read to the binding
+    must stay fresh, stay narrow, and keep its own missing/unpinned answers.
+
+    Parametrized over the methods rather than written per method: the first
+    of the two was covered and the second was not, so reverting it to a
+    full-row read left the suite green.
+
+    Narrow: the full-row read explodes, so any regression to
+    ``get_conversation`` fails here. Fresh: a rebind landing between
+    resolutions is picked up by the next one. Semantics: a missing
+    conversation and an existing-but-unbound one stay distinguishable, which
+    is what the store's two-state binding lookup exists to preserve.
+    """
     registry = TunnelRegistry()
     registry.register("runner_new", _FakeWebSocket(), _hello(harnesses=["codex"]))
 
     class _BindingOnlyStore:
         def __init__(self) -> None:
-            self.binding = {"conv_test": "runner_old"}
+            self.binding: dict[str, str | None] = {
+                "conv_test": "runner_old",
+                "conv_unpinned": None,
+            }
 
         def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
             return {c: self.binding[c] for c in conversation_ids if c in self.binding}
@@ -279,41 +305,24 @@ async def test_session_resources_routing_reads_binding_fresh_and_narrow() -> Non
 
     store = _BindingOnlyStore()
     router = RunnerRouter(registry=registry, conversation_store=store)  # type: ignore[arg-type]
+    resolve = getattr(router, method)
     try:
-        # Old binding: runner_old is not registered -> offline error.
+        # Bound to an offline runner: both methods report it the same way.
         with pytest.raises(OmnigentError) as excinfo:
-            router.client_for_session_resources("conv_test")
+            resolve("conv_test")
         _assert_omnigent_error(excinfo, code=ErrorCode.RUNNER_UNAVAILABLE)
 
-        # Concurrent rebind lands; the next resolution must see it.
+        # A concurrent rebind must be visible to the very next resolution.
         store.binding["conv_test"] = "runner_new"
-        routed = router.client_for_session_resources("conv_test")
-        assert routed.runner_id == "runner_new"
-    finally:
-        await router.aclose()
+        routed = resolve("conv_test")
+        assert routed is not None and routed.runner_id == "runner_new"
 
-
-@pytest.mark.asyncio
-async def test_session_resources_routing_error_semantics_preserved() -> None:
-    """Missing conversation -> NOT_FOUND; unpinned -> CONFLICT — matching
-    the pre-change full-row read."""
-    registry = TunnelRegistry()
-
-    class _BindingOnlyStore:
-        def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
-            return {c: None for c in conversation_ids if c == "conv_unpinned"}
-
-    router = RunnerRouter(
-        registry=registry,
-        conversation_store=_BindingOnlyStore(),  # type: ignore[arg-type]
-    )
-    try:
-        with pytest.raises(OmnigentError) as excinfo:
-            router.client_for_session_resources("conv_missing")
-        _assert_omnigent_error(excinfo, code=ErrorCode.NOT_FOUND)
-
-        with pytest.raises(OmnigentError) as excinfo:
-            router.client_for_session_resources("conv_unpinned")
-        _assert_omnigent_error(excinfo, code=ErrorCode.CONFLICT)
+        for conv_id, expected in (("conv_missing", missing), ("conv_unpinned", unpinned)):
+            if expected is None:
+                assert resolve(conv_id) is None, conv_id
+            else:
+                with pytest.raises(OmnigentError) as excinfo:
+                    resolve(conv_id)
+                _assert_omnigent_error(excinfo, code=expected)
     finally:
         await router.aclose()

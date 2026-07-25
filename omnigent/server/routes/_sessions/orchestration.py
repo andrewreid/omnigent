@@ -8,7 +8,6 @@ imported by the router in ``sessions.py``."""
 from __future__ import annotations
 
 import asyncio
-import functools
 import json
 import secrets
 import time
@@ -1265,12 +1264,10 @@ async def _persist_external_session_usage(
     # oscillate own ⇄ subtree). For a childless session the subtree is just
     # itself, so this equals own cost — one indexed tree query per flush.
     subtree_usage = await asyncio.to_thread(
-        functools.partial(
-            load_session_usage,
-            session_id,
-            conversation_store,
-            root_conversation_id=conv.root_conversation_id,
-        )
+        load_session_usage,
+        session_id,
+        conversation_store,
+        root_conversation_id=conv.root_conversation_id,
     )
     subtree_cost = _priced_cost_for_display(subtree_usage)
     usage_by_model = _usage_by_model_for_display(subtree_usage)
