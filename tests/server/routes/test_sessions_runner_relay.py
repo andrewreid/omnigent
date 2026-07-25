@@ -863,12 +863,18 @@ async def test_relay_completion_with_usage_rolls_up_subtree_cost(db_uri: str) ->
     def _count_conv_selects(engine):
         seen: list[str] = []
 
-        def _on(conn, cursor, statement, params, context, many):  # noqa: ANN001
+        def _on(conn, cursor, statement, params, context, many):
             if (
                 statement.lstrip().upper().startswith("SELECT")
                 and "FROM conversations" in statement
                 and "conversation_item" not in statement
                 and "conversation_label" not in statement
+                # PostgreSQL takes the usage row lock as its own id-only
+                # ``SELECT … FOR UPDATE``; SQLite gets the same serialisation
+                # from BEGIN IMMEDIATE and emits nothing. It is a lock, not a
+                # row read, so counting it would make this oracle assert a
+                # different number per dialect for no behavioural reason.
+                and "FOR UPDATE" not in statement.upper()
             ):
                 seen.append(statement)
 
