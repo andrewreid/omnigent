@@ -1397,6 +1397,45 @@ class SqlAlchemyConversationStore(ConversationStore):
             returning a merged state would report a write that never
             happened.
         """
+        return self._mutate_metadata_json(
+            conversation_id, "session_state", mutate, what="session state"
+        )
+
+    def _mutate_metadata_json(
+        self,
+        conversation_id: str,
+        column: str,
+        mutate: Callable[[dict[str, Any]], None],
+        *,
+        what: str,
+    ) -> dict[str, Any]:
+        """
+        Locked read-merge-write of one JSON column on conversation metadata.
+
+        The single row-missing contract for every read-modify-write primitive
+        on this table: no row means nothing can be persisted, so raise rather
+        than return a merged dict the database does not hold. Each caller used
+        to carry its own copy of this loop, and a fix applied to one of them
+        left the other reporting phantom writes.
+
+        Locking is dialect-complementary: ``SELECT … FOR UPDATE`` where
+        supported, and ``BEGIN IMMEDIATE`` on SQLite (via the immediate
+        session maker), which takes the write lock before the first read so
+        two writers cannot each read a pre-merge snapshot.
+
+        :param conversation_id: The conversation to update,
+            e.g. ``"conv_abc123"``.
+        :param column: Metadata column holding the JSON blob, either
+            ``"session_state"`` or ``"session_usage"``.
+        :param mutate: Callable applied in place to the freshly read dict.
+            Runs inside the locked transaction, so it must not perform store
+            calls of its own.
+        :param what: Human-readable name of the thing being written, used in
+            the error message, e.g. ``"session usage"``.
+        :returns: The merged dict, as persisted.
+        :raises ConversationNotFoundError: When the conversation has no
+            metadata row.
+        """
         import json
 
         with self._session_immediate() as session:
@@ -1408,16 +1447,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 q = q.with_for_update()
             meta = session.scalars(q).first()
             if meta is None:
-                # Previously this treated a missing row as ``{}``, applied the
-                # mutation, issued an UPDATE that matched nothing, and returned
-                # the mutated dict "as persisted" — reporting a write that did
-                # not happen. Fail loudly instead.
                 raise ConversationNotFoundError(
-                    f"Cannot mutate session state for {conversation_id!r}: no metadata row exists."
+                    f"Cannot update {what} for {conversation_id!r}: no metadata row exists."
                 )
-            current: dict[str, Any] = (
-                dict(json.loads(meta.session_state)) if meta.session_state else {}
-            )
+            raw = getattr(meta, column)
+            current: dict[str, Any] = dict(json.loads(raw)) if raw else {}
             mutate(current)
             session.execute(
                 update(SqlConversationMetadata)
@@ -1425,7 +1459,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
                     SqlConversationMetadata.id == conversation_id,
                 )
-                .values(session_state=json.dumps(current))
+                .values(**{column: json.dumps(current)})
             )
             return current
 
@@ -1513,32 +1547,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param delta: Usage increments (see
             :meth:`ConversationStore.increment_session_usage`).
         :returns: The updated ``session_usage`` dict.
+        :raises ConversationNotFoundError: When the conversation has no
+            metadata row — the increment cannot be persisted, so reporting a
+            new total would be a lie. Callers on streaming paths where a
+            conversation can vanish mid-turn should treat this as "nothing to
+            accumulate", not as a failure.
         """
-        import json
-
         from omnigent.stores.conversation_store import apply_session_usage_delta
 
-        with self._session_immediate() as session:
-            q = select(SqlConversationMetadata).where(
-                SqlConversationMetadata.workspace_id == current_workspace_id(),
-                SqlConversationMetadata.id == conversation_id,
-            )
-            if self._meta_supports_for_update:
-                q = q.with_for_update()
-            meta = session.scalars(q).first()
-            current: dict[str, Any] = (
-                dict(json.loads(meta.session_usage)) if meta and meta.session_usage else {}
-            )
-            apply_session_usage_delta(current, delta)
-            session.execute(
-                update(SqlConversationMetadata)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id == conversation_id,
-                )
-                .values(session_usage=json.dumps(current))
-            )
-            return current
+        return self._mutate_metadata_json(
+            conversation_id,
+            "session_usage",
+            lambda current: apply_session_usage_delta(current, delta),
+            what="session usage",
+        )
 
     def add_daily_cost(self, user_id: str, day_utc: str, delta_usd: float) -> None:
         """

@@ -5301,18 +5301,30 @@ def test_sqlalchemy_store_implements_the_whole_abstract_contract() -> None:
         )
 
 
-def test_mutate_session_state_reports_a_missing_row(
+def test_read_modify_write_primitives_report_a_missing_row(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """A missing metadata row must raise, not report a phantom write.
+    """No metadata row means no phantom write — for EVERY such primitive.
 
-    The earlier implementation treated the absent row as ``{}``, applied
-    the mutation, ran an UPDATE that matched nothing, and returned the
-    mutated dict as if persisted.
+    Both used to treat the absent row as ``{}``, apply the change, run an
+    UPDATE that matched nothing, and return the mutated dict as if
+    persisted. Fixing one and leaving the other is how the second kept
+    reporting writes that never happened, under a comment describing the
+    bug as fixed. Driven off the shared primitive so a third caller is
+    covered by construction.
     """
     from omnigent.stores.conversation_store import ConversationNotFoundError
 
-    with pytest.raises(ConversationNotFoundError, match="no metadata row"):
-        conversation_store.mutate_session_state(
-            "0" * 32, lambda state: state.__setitem__("counter", 1)
-        )
+    missing = "0" * 32
+    writers = {
+        "session state": lambda: conversation_store.mutate_session_state(
+            missing, lambda state: state.__setitem__("counter", 1)
+        ),
+        "session usage": lambda: conversation_store.increment_session_usage(
+            missing, {"total_tokens": 10}
+        ),
+    }
+    for what, write in writers.items():
+        with pytest.raises(ConversationNotFoundError, match="no metadata row"):
+            write()
+        assert conversation_store.get_conversation(missing) is None, what
