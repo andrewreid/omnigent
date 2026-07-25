@@ -899,6 +899,17 @@ def _accumulate_session_usage(
         e.g. ``"conv_abc123"``.
     :param conversation_store: Store for reading and writing
         the ``session_usage`` column.
+    :param conversation: The relay's already-read conversation row for
+        this session, reused here for the pricing lookup instead of
+        re-reading the same row on every ``response.completed``. This is
+        point-in-time reuse, not the policy engine's immutable-fields-only
+        rule: the row supplies the mutable ``model_override``, so a
+        ``/model`` switch landing between the read and this call prices
+        the turn with the previous model — bounded to one event, and
+        ``usage.model`` (the model the harness actually used) takes
+        precedence when the harness reports it. The usage increment itself
+        is a locked read-modify-write in the store, so a stale row cannot
+        skew the persisted total. ``None`` reads the row here.
     :returns: The session's cumulative priced cost in USD after this
         update (for the caller to broadcast on a ``session.usage``
         event), or ``None`` when the session is unpriced or carries no
@@ -6328,6 +6339,16 @@ async def _get_session_snapshot(
         skipping the ``get_conversation`` read. Pass it when the caller
         just authorized the session (which fetched the same row) so the
         snapshot doesn't re-read it. ``None`` reads it here as before.
+
+        Reuse here is POINT-IN-TIME, not the policy-engine rule. The
+        engine re-derives every mutable field and keeps only the
+        immutable ``id`` / ``root_conversation_id`` from a preloaded row,
+        because it gates tool calls. A snapshot is a read projection: it
+        renders this row's labels, agent/model binding, runner and
+        archive-derived fields as they were when the caller authorized
+        the session, so a write landing during this request shows up on
+        the next read rather than mid-response. Do not reuse a snapshot
+        row to make an enforcement decision.
     :param liveness_lookup: Bulk session-liveness lookup (the server's
         ``_bulk_session_liveness``) used to populate ``runner_online``
         and ``host_online`` on the snapshot. ``None`` (e.g. focused
