@@ -283,10 +283,11 @@ def build_policy_engine(
 
     When declared labels have an ``initial`` value and no row
     exists yet in ``conversation_labels``, seeds via
-    ``ConversationStore.set_labels`` — but only for keys not
-    already persisted, so existing label state is never
-    clobbered. The hot cache is built from the freshly seeded
-    snapshot.
+    :meth:`ConversationStore.seed_labels_if_absent`, whose
+    insert-if-absent semantics leave any already-persisted value
+    untouched. The decision about which keys are missing is made by
+    the database inside the same statement, never from a snapshot read
+    beforehand. The hot cache is built from the post-seed snapshot.
 
     Policy run order: session policies (from the CRUD API)
     first, then agent spec policies, then *default_policies*
@@ -397,23 +398,6 @@ def build_policy_engine(
     # is no longer reachable since all_policy_specs is never empty).
     all_policy_specs.append(_ASK_ON_ADD_POLICY_SPEC)
 
-    if (
-        expected_agent_id is not None
-        and conv is not None
-        and conv.agent_id is not None
-        and conv.agent_id != expected_agent_id
-    ):
-        # A switch-agent landed between the caller resolving the spec and this
-        # build. The engine would enforce the OLD agent's guardrails against
-        # the NEW agent's turn, so the caller must re-resolve rather than
-        # proceed on either half.
-        raise OmnigentError(
-            f"Session {conversation_id!r} was rebound from agent "
-            f"{expected_agent_id!r} to {conv.agent_id!r} while building its "
-            f"policy engine; re-resolve the agent spec and retry.",
-            code=ErrorCode.CONFLICT,
-        )
-
     label_defs = (guardrails.labels or {}) if guardrails else {}
     # One conversation read (``conv``, resolved above for policy
     # inheritance) and ONE spawn-tree load feed everything below: labels,
@@ -430,13 +414,11 @@ def build_policy_engine(
     # (id, root_conversation_id) is trusted from it. Every mutable field —
     # labels, session_state, model_override — comes from a fresh read.
     # Normally that is this conversation's row in the tree just loaded.
-    # The tree scan excludes archived rows, so a row archived (or deleted)
-    # since the preload is absent from it: re-read directly rather than
-    # falling back to the preloaded copy. Retaining it would authorize from
-    # state captured before an atomic ``archived=True, model_override=...``
-    # update — the fail-OPEN case a newly restrictive guard would be missed
-    # by. A row that is genuinely gone yields ``None`` and the empty-state
-    # path, never stale state.
+    # The tree load includes archived rows (archived conversations still
+    # hold spend), so a row missing from the tree has genuinely been
+    # deleted. Re-read to confirm, then fail closed below — never fall back
+    # to the preloaded copy, which would authorize from state captured
+    # before whatever removed the row.
     if conversation is not None:
         fresh_self = next((c for c in tree if c.id == conversation_id), None)
         if fresh_self is None:
@@ -452,6 +434,21 @@ def build_policy_engine(
                 code=ErrorCode.CONFLICT,
             )
         conv = fresh_self
+    # Agent/spec confirmation — deliberately AFTER the fresh read above, and
+    # nowhere else. Comparing against the preloaded row (as an earlier
+    # revision did) validated the very snapshot whose staleness is the
+    # hazard, so a switch-agent in the window was accepted. Exact equality:
+    # a fresh row whose binding is ``None``, or no fresh row at all, is a
+    # mismatch too — not a reason to skip the check.
+    if expected_agent_id is not None:
+        fresh_agent_id = conv.agent_id if conv is not None else None
+        if fresh_agent_id != expected_agent_id:
+            raise OmnigentError(
+                f"Session {conversation_id!r} no longer resolves to agent "
+                f"{expected_agent_id!r} (now {fresh_agent_id!r}); the spec this "
+                f"engine would enforce is stale. Re-resolve and retry.",
+                code=ErrorCode.CONFLICT,
+            )
     root_conv = (
         conv
         if root_conversation_id == conversation_id
@@ -907,6 +904,8 @@ def _merge_by_model(
 def load_session_usage(
     conversation_id: str,
     conversation_store: ConversationStore,
+    *,
+    root_conversation_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Load cumulative session usage for a conversation **plus all of its
@@ -930,6 +929,11 @@ def load_session_usage(
     :param conversation_id: Conversation to load,
         e.g. ``"conv_abc123"``.
     :param conversation_store: Store to read from.
+    :param root_conversation_id: The conversation's tree root, when the
+        caller already holds the row. Skips the internal conversation read
+        — the root binding is immutable, so a caller-supplied value cannot
+        go stale. ``None`` resolves it here. Defined here rather than in a
+        later change so that change stays independently revertible.
     :returns: Summed usage dict with keys ``input_tokens``,
         ``output_tokens``, ``total_tokens``, ``total_cost_usd`` (the
         DISPLAY cost sum — statusLine ``S`` for claude-native), and
@@ -943,10 +947,12 @@ def load_session_usage(
         the policy seed (:func:`_policy_usage_seed`) reads
         ``policy_cost_usd`` (both unaffected by ``by_model``).
     """
-    conv = conversation_store.get_conversation(conversation_id)
-    if conv is None:
-        return {}
-    tree = _load_tree_conversations(conv.root_conversation_id, conversation_store)
+    if root_conversation_id is None:
+        conv = conversation_store.get_conversation(conversation_id)
+        if conv is None:
+            return {}
+        root_conversation_id = conv.root_conversation_id
+    tree = _load_tree_conversations(root_conversation_id, conversation_store)
     return _sum_subtree_usage(tree, conversation_id)
 
 

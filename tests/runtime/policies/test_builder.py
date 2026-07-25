@@ -1202,15 +1202,17 @@ def test_build_with_preloaded_row_sees_concurrent_mutable_writes(
     assert engine.model == "claude-sonnet-4-6"
 
 
-def test_build_rereads_when_archived_self_is_missing_from_tree(
+def test_build_uses_fresh_state_for_a_row_archived_after_preload(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """
-    The tree scan excludes archived rows, so a row archived after the
-    preload is absent from it. The builder must re-read rather than fall
-    back to the preloaded copy — otherwise an atomic
-    ``archived=True, model_override=<expensive>`` update would authorize
-    from pre-update state (fail-OPEN).
+    A row archived after the preload still authorizes from FRESH state.
+
+    The tree now includes archived rows, so the fresh row is found there
+    and the preload contributes only identity. (This test previously
+    described the tree as EXCLUDING archived rows and asserted the
+    re-read branch — a premise the ``include_archived=True`` fix
+    inverted, which made the test unable to fail for its stated reason.)
     """
     conv = conversation_store.create_conversation(title="archive-race")
     stale_row = conversation_store.get_conversation(conv.id)
@@ -1227,54 +1229,84 @@ def test_build_rereads_when_archived_self_is_missing_from_tree(
         conversation=stale_row,
     )
 
-    assert engine.model == "claude-opus-4-8", "archived self must not use the stale row"
+    # Mutable fields come from the fresh (archived) row, not the preload.
+    assert engine.model == "claude-opus-4-8"
     assert engine.labels.get("guard") == "tripped"
 
 
 def test_initial_label_seed_does_not_clobber_a_concurrent_write(
     conversation_store: SqlAlchemyConversationStore,
-    tmp_path: Path,
 ) -> None:
     """
-    Seeding declared initials is insert-if-absent, so a value written
-    between a builder's snapshot and its seed survives. Diff-then-upsert
-    reset such a write back to the initial value.
-    """
-    agent_dir = _write_spec(
-        tmp_path,
-        """
-spec_version: 1
-name: seeding
-guardrails:
-  labels:
-    integrity:
-      initial: "0"
-  policies:
-    a:
-      type: function
-      on: [request]
-      function: tests.runtime.policies.conftest._always_allow
-""",
-    )
-    spec = parse(agent_dir)
-    conv = conversation_store.create_conversation()
+    Seeding declared initials must not overwrite a value written between a
+    caller's snapshot and the seed.
 
-    # Snapshot with the label absent (what the handler would hold), then a
-    # policy write lands before the engine build seeds.
-    stale_row = conversation_store.get_conversation(conv.id)
-    assert "integrity" not in dict(stale_row.labels)
+    Calls ``_seed_and_load_labels`` with a STALE ``existing`` snapshot —
+    exactly the state a builder holds when a policy write lands in the
+    window. Insert-if-absent leaves the persisted value alone; the old
+    diff-then-``set_labels`` path recomputed "missing" from the stale
+    snapshot and reset it to the initial value.
+    """
+    from omnigent.runtime.policies.builder import _seed_and_load_labels
+    from omnigent.spec.types import LabelDef
+
+    conv = conversation_store.create_conversation()
+    stale_snapshot: dict[str, str] = {}  # taken before the write below
     conversation_store.set_labels(conv.id, {"integrity": "7"})
 
-    engine = build_policy_engine(
-        spec=spec,
+    result = _seed_and_load_labels(
         conversation_id=conv.id,
+        label_defs={"integrity": LabelDef(initial="0")},
         conversation_store=conversation_store,
-        conversation=stale_row,
+        existing=stale_snapshot,
     )
 
-    assert engine.labels["integrity"] == "7", "seed overwrote a concurrent write"
-    persisted = conversation_store.get_conversation(conv.id)
-    assert dict(persisted.labels)["integrity"] == "7"
+    assert result["integrity"] == "7", "seed overwrote a concurrent write"
+    persisted = dict(conversation_store.get_conversation(conv.id).labels)
+    assert persisted["integrity"] == "7"
+
+
+def test_initial_label_seed_uses_the_atomic_store_operation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Seeding must go through ``seed_labels_if_absent``, never ``set_labels``.
+
+    A mechanism assertion on top of the semantic one above: the race is
+    only impossible while the decision about which keys are missing is made
+    inside the insert statement, so the choice of store operation is itself
+    part of the contract.
+    """
+    from omnigent.runtime.policies.builder import _seed_and_load_labels
+    from omnigent.spec.types import LabelDef
+
+    conv = conversation_store.create_conversation()
+    calls: list[str] = []
+
+    class _RecordingStore:
+        def __init__(self, inner: SqlAlchemyConversationStore) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str):
+            attr = getattr(self._inner, name)
+            if not callable(attr):
+                return attr
+
+            def _wrapper(*args: object, **kwargs: object) -> object:
+                calls.append(name)
+                return attr(*args, **kwargs)
+
+            return _wrapper
+
+    _seed_and_load_labels(
+        conversation_id=conv.id,
+        label_defs={"integrity": LabelDef(initial="0")},
+        conversation_store=_RecordingStore(conversation_store),  # type: ignore[arg-type]
+        existing={},
+    )
+
+    assert "seed_labels_if_absent" in calls, calls
+    assert "set_labels" not in calls, calls
 
 
 def test_archive_after_preload_still_gates_on_recorded_spend(
@@ -1333,39 +1365,96 @@ def test_agent_rebind_after_spec_resolution_fails_closed(
 ) -> None:
     """
     ``agent_id`` selects the spec, so it is read before the engine exists
-    and cannot be re-derived. Passing it lets the builder confirm it
-    against the fresh row: a switch-agent in that window must fail closed
-    rather than enforce the old agent's guardrails on the new agent's turn.
+    and cannot be re-derived. The builder confirms it against the row it
+    freshly read — NOT against the caller's preload, which is the snapshot
+    whose staleness is the whole hazard.
+
+    Four cases, all of which an earlier revision accepted because the
+    comparison ran before the fresh read (and skipped on ``None``):
+
+    1. rebind with no preload
+    2. rebind WITH a stale preload naming the old agent  <- the reproduction
+    3. fresh row whose binding is ``None``
+    4. no fresh row at all (deleted)
     """
+    import asyncio
+
     from omnigent.errors import OmnigentError
 
-    conv = conversation_store.create_conversation(title="rebind", agent_id="1" * 32)
+    spec = AgentSpec(spec_version=1, name="x")
+    agent_a = "1" * 32
 
-    engine = build_policy_engine(
-        spec=AgentSpec(spec_version=1, name="x"),
-        conversation_id=conv.id,
+    def _switch(conv_id: str, new_agent_id: str) -> None:
+        # switch_conversation_agent inserts the target agent row, so each
+        # switch needs its own id.
+        conversation_store.switch_conversation_agent(
+            conv_id,
+            new_agent_id=new_agent_id,
+            new_agent_name="other",
+            new_agent_bundle_location="other/bundle",
+            new_agent_description=None,
+            copy_model_settings=False,
+            carry_history_into_native=False,
+            presentation_labels={},
+            previous_builtin_id=None,
+        )
+
+    # Matching agent proceeds (guard must not be a blanket refusal).
+    ok_conv = conversation_store.create_conversation(title="match", agent_id=agent_a)
+    assert build_policy_engine(
+        spec=spec,
+        conversation_id=ok_conv.id,
         conversation_store=conversation_store,
-        expected_agent_id="1" * 32,
+        expected_agent_id=agent_a,
     )
-    assert engine is not None  # matching agent proceeds
 
-    conversation_store.switch_conversation_agent(
-        conv.id,
-        new_agent_id="2" * 32,
-        new_agent_name="other",
-        new_agent_bundle_location="other/bundle",
-        new_agent_description=None,
-        copy_model_settings=False,
-        carry_history_into_native=False,
-        presentation_labels={},
-        previous_builtin_id=None,
-    )
-    with pytest.raises(OmnigentError, match="rebound from agent"):
+    # 1. Rebind, no preload.
+    c1 = conversation_store.create_conversation(title="rebind-nopreload", agent_id=agent_a)
+    _switch(c1.id, uuid.uuid4().hex)
+    with pytest.raises(OmnigentError, match="no longer resolves to agent"):
         build_policy_engine(
-            spec=AgentSpec(spec_version=1, name="x"),
-            conversation_id=conv.id,
+            spec=spec,
+            conversation_id=c1.id,
             conversation_store=conversation_store,
-            expected_agent_id="1" * 32,
+            expected_agent_id=agent_a,
+        )
+
+    # 2. Rebind WITH a stale preload still naming agent A. Comparing against
+    #    that preload would have found agent A == expected and accepted.
+    c2 = conversation_store.create_conversation(title="rebind-preload", agent_id=agent_a)
+    stale_row = conversation_store.get_conversation(c2.id)
+    assert stale_row.agent_id == agent_a
+    _switch(c2.id, uuid.uuid4().hex)
+    with pytest.raises(OmnigentError, match="no longer resolves to agent"):
+        build_policy_engine(
+            spec=spec,
+            conversation_id=c2.id,
+            conversation_store=conversation_store,
+            conversation=stale_row,
+            expected_agent_id=agent_a,
+        )
+
+    # 3. Fresh row with NO binding: previously skipped by an ``is not None``
+    #    guard, so an unbound session accepted any spec.
+    c3 = conversation_store.create_conversation(title="unbound")
+    assert conversation_store.get_conversation(c3.id).agent_id is None
+    with pytest.raises(OmnigentError, match="no longer resolves to agent"):
+        build_policy_engine(
+            spec=spec,
+            conversation_id=c3.id,
+            conversation_store=conversation_store,
+            expected_agent_id=agent_a,
+        )
+
+    # 4. No fresh row at all (deleted, no preload): also a mismatch.
+    c4 = conversation_store.create_conversation(title="gone", agent_id=agent_a)
+    asyncio.run(conversation_store.delete_conversation(c4.id))
+    with pytest.raises(OmnigentError, match="no longer resolves to agent"):
+        build_policy_engine(
+            spec=spec,
+            conversation_id=c4.id,
+            conversation_store=conversation_store,
+            expected_agent_id=agent_a,
         )
 
 
@@ -1421,3 +1510,70 @@ def test_concurrent_state_updates_preserve_other_keys(
     state = dict(conversation_store.get_conversation(conv.id).session_state)
     assert state["from_a"] == "a", state
     assert state["from_b"] == "b", state
+
+
+def test_load_session_usage_uses_the_supplied_root(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    The supplied root must actually drive the tree load.
+
+    Passing the correct root returns the same sum as self-resolving (the
+    optimisation is behaviour-preserving), and passing a DIFFERENT tree's
+    root returns nothing — which is what makes the argument observably
+    load-bearing. Asserting only the equal case let a version that ignored
+    the argument entirely pass.
+    """
+    from omnigent.runtime.policies.builder import load_session_usage
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
+    )
+    conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 0.05})
+    other_tree = conversation_store.create_conversation(title="unrelated")
+
+    resolved = load_session_usage(child.id, conversation_store)
+    assert resolved["total_cost_usd"] == pytest.approx(0.05)
+
+    # Correct root: identical result, one read fewer.
+    assert (
+        load_session_usage(child.id, conversation_store, root_conversation_id=parent.id)
+        == resolved
+    )
+
+    # Wrong tree's root: the child is not in that tree, so the sum is empty.
+    # A build that ignored the argument would return ``resolved`` here.
+    assert (
+        load_session_usage(child.id, conversation_store, root_conversation_id=other_tree.id) == {}
+    )
+
+
+def test_build_rereads_when_archived_self_is_missing_from_tree(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    The tree scan includes archived rows, so a row archived after the
+    preload is absent from it. The builder must re-read rather than fall
+    back to the preloaded copy — otherwise an atomic
+    ``archived=True, model_override=<expensive>`` update would authorize
+    from pre-update state (fail-OPEN).
+    """
+    conv = conversation_store.create_conversation(title="archive-race")
+    stale_row = conversation_store.get_conversation(conv.id)
+
+    conversation_store.set_labels(conv.id, {"guard": "tripped"})
+    conversation_store.update_conversation(
+        conv.id, model_override="claude-opus-4-8", archived=True
+    )
+
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="x"),
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+        conversation=stale_row,
+    )
+
+    assert engine.model == "claude-opus-4-8", "archived self must not use the stale row"
+    assert engine.labels.get("guard") == "tripped"
