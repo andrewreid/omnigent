@@ -3701,25 +3701,19 @@ async def _get_runner_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient | N
 async def _get_runner_client_impl(
     session_id: str,
     runner_router: RunnerRouter | None,
-    *,
-    conv: Conversation | None = None,
 ) -> httpx.AsyncClient | None:
     """
     Get an HTTP client for the runner bound to a session.
 
-    Uses the ``RunnerRouter`` to resolve the pinned runner. Falls
-    back to the in-process runner client for test setups.
+    Uses the ``RunnerRouter`` to resolve the pinned runner (a fresh
+    single-column binding read, so a mid-request rebind routes to the
+    new runner). Falls back to the in-process runner client for test
+    setups.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param runner_router: The ``RunnerRouter`` instance, or
         ``None`` for in-process setups.
-    :param conv: The already-loaded conversation row, when the caller
-        holds a current one. Its ``runner_id`` lets the router skip
-        re-reading the conversation per call — the event hot path
-        resolves a runner per streamed chunk. Callers must pass a row
-        read *after* any wake/relaunch that could rebind the runner;
-        an unpinned row falls back to the router's own fresh read.
     :returns: An ``httpx.AsyncClient`` pointed at the runner,
         or ``None`` if no runner is available.
     """
@@ -3727,12 +3721,9 @@ async def _get_runner_client_impl(
 
     if runner_router is not None:
         try:
-            if conv is not None and conv.runner_id:
-                routed = runner_router.client_for_bound_runner(session_id, conv.runner_id)
-            else:
-                routed = runner_router.client_for_session_resources(
-                    session_id,
-                )
+            routed = runner_router.client_for_session_resources(
+                session_id,
+            )
             return routed.client
         except (LookupError, httpx.HTTPError, OmnigentError):
             _logger.debug(
@@ -4700,8 +4691,6 @@ async def _forward_session_change_to_runner_impl(
     session_id: str,
     runner_router: Any,
     event: dict[str, Any],
-    *,
-    conv: Conversation | None = None,
 ) -> _RunnerForwardResult | None:
     """
     Best-effort POST a control event to the bound runner.
@@ -4741,9 +4730,6 @@ async def _forward_session_change_to_runner_impl(
         ``{"type": "effort_change", "effort": "high"}``,
         ``{"type": "model_change", "model": "claude-opus-4-7"}``, or
         ``{"type": "compact"}``.
-    :param conv: Optional already-loaded conversation row, forwarded to
-        :func:`_get_runner_client` so the per-chunk status forward skips
-        the router's conversation re-read.
     :returns: The runner's HTTP status/body, or ``None`` when no
         runner client could be resolved or the POST failed at the
         transport layer (in both cases the AP-side persisted value /
@@ -4751,7 +4737,7 @@ async def _forward_session_change_to_runner_impl(
     """
     from omnigent.runtime import get_runner_client
 
-    runner_client = await _get_runner_client(session_id, runner_router, conv=conv)
+    runner_client = await _get_runner_client(session_id, runner_router)
     if runner_client is None:
         runner_client = cast("httpx.AsyncClient | None", get_runner_client())
     if runner_client is None:

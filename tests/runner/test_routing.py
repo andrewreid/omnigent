@@ -44,6 +44,14 @@ class _ConversationStore:
         """
         self._conversations = conversations
 
+    def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
+        """Bulk binding read mirroring the real store's contract."""
+        return {
+            cid: self._conversations[cid].runner_id
+            for cid in conversation_ids
+            if cid in self._conversations
+        }
+
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """
         Return a conversation by id.
@@ -252,38 +260,60 @@ async def test_runner_router_existing_conversation_returns_none_when_unpinned() 
 
 
 @pytest.mark.asyncio
-async def test_client_for_bound_runner_skips_conversation_read() -> None:
-    """A caller-supplied runner binding routes without touching the store.
-
-    The event hot path resolves a runner per streamed chunk; passing the
-    already-loaded binding must not re-read the conversation row."""
+async def test_session_resources_routing_reads_binding_fresh_and_narrow() -> None:
+    """Per-event routing reads ONLY the current runner binding (single
+    column, fresh) — never the full conversation row. A mid-request
+    rebind is therefore picked up by the very next resolution."""
     registry = TunnelRegistry()
-    registry.register("runner_one", _FakeWebSocket(), _hello(harnesses=["codex"]))
+    registry.register("runner_new", _FakeWebSocket(), _hello(harnesses=["codex"]))
 
-    class _ExplodingStore:
+    class _BindingOnlyStore:
+        def __init__(self) -> None:
+            self.binding = {"conv_test": "runner_old"}
+
+        def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
+            return {c: self.binding[c] for c in conversation_ids if c in self.binding}
+
         def get_conversation(self, conversation_id: str) -> None:
-            raise AssertionError("client_for_bound_runner must not read the store")
+            raise AssertionError("routing must not load the full conversation row")
 
-    router = RunnerRouter(registry=registry, conversation_store=_ExplodingStore())  # type: ignore[arg-type]
+    store = _BindingOnlyStore()
+    router = RunnerRouter(registry=registry, conversation_store=store)  # type: ignore[arg-type]
     try:
-        routed = router.client_for_bound_runner("conv_test", "runner_one")
-        assert routed.runner_id == "runner_one"
+        # Old binding: runner_old is not registered -> offline error.
+        with pytest.raises(OmnigentError) as excinfo:
+            router.client_for_session_resources("conv_test")
+        _assert_omnigent_error(excinfo, code=ErrorCode.RUNNER_UNAVAILABLE)
+
+        # Concurrent rebind lands; the next resolution must see it.
+        store.binding["conv_test"] = "runner_new"
+        routed = router.client_for_session_resources("conv_test")
+        assert routed.runner_id == "runner_new"
     finally:
         await router.aclose()
 
 
 @pytest.mark.asyncio
-async def test_client_for_bound_runner_offline_raises_runner_unavailable() -> None:
-    """An offline pinned runner raises the same error as the re-reading path."""
+async def test_session_resources_routing_error_semantics_preserved() -> None:
+    """Missing conversation -> NOT_FOUND; unpinned -> CONFLICT — matching
+    the pre-change full-row read."""
     registry = TunnelRegistry()
+
+    class _BindingOnlyStore:
+        def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
+            return {c: None for c in conversation_ids if c == "conv_unpinned"}
+
     router = RunnerRouter(
         registry=registry,
-        conversation_store=_ConversationStore({}),  # type: ignore[arg-type]
+        conversation_store=_BindingOnlyStore(),  # type: ignore[arg-type]
     )
     try:
         with pytest.raises(OmnigentError) as excinfo:
-            router.client_for_bound_runner("conv_test", "runner_gone")
+            router.client_for_session_resources("conv_missing")
+        _assert_omnigent_error(excinfo, code=ErrorCode.NOT_FOUND)
 
-        _assert_omnigent_error(excinfo, code=ErrorCode.RUNNER_UNAVAILABLE)
+        with pytest.raises(OmnigentError) as excinfo:
+            router.client_for_session_resources("conv_unpinned")
+        _assert_omnigent_error(excinfo, code=ErrorCode.CONFLICT)
     finally:
         await router.aclose()
