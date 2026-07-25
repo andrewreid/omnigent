@@ -132,3 +132,42 @@ async def test_usage_report_reuses_listed_rows_for_subtree_totals(
     # no per-session conversation re-read. A ceiling here would pass with
     # the supplied-root argument removed.
     assert len(selects) == 2, [str(q)[:90] for q in selects]
+
+
+@pytest.mark.asyncio
+async def test_archived_descendant_spend_counts_toward_displayed_total(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Archived spend is still spend, and it shows in the displayed total.
+
+    This is a deliberate product decision, not an accident of the
+    cost-enforcement fix that motivated it. Including archived rows in the
+    spawn-tree load was required to stop an archive-after-preload seeding a
+    $0 budget and ALLOWing over-budget tool calls. The same tree feeds the
+    DISPLAY roll-up, so an archived sub-agent's spend now appears in the
+    parent's total as well.
+
+    The alternative — two tree loads with different archived semantics, one
+    for enforcement and one for display — would let the badge disagree with
+    the gate, which is worse than the change being visible. Pinned here so
+    the display behaviour cannot be altered silently in either direction.
+    """
+    from tests.server.helpers import create_test_session
+
+    snap = await create_test_session(client, title="archived-display")
+    sid = snap["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=sid, title="archived:child"
+    )
+    store.set_session_usage(sid, {"total_cost_usd": 1.0})
+    store.set_session_usage(child.id, {"total_cost_usd": 2.0})
+    store.update_conversation(child.id, archived=True)
+
+    resp = await client.get(f"/v1/sessions/{sid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["total_cost_usd"] == pytest.approx(3.0), (
+        "archived descendant spend must remain in the displayed subtree total"
+    )
