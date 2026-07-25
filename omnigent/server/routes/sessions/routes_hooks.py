@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -488,6 +489,13 @@ def register_hooks_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
         event_type = event.get("type")
+        if event_type is not None and not isinstance(event_type, str):
+            # An unhashable type (list / dict) would raise inside the phase
+            # lookup below and surface as a 500 instead of a client error.
+            raise OmnigentError(
+                f"Policy evaluate 'event.type' must be a string; got {type(event_type).__name__}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
         phase = _PROTO_EVENT_TYPE_TO_PHASE.get(event_type or "")
         if phase is None:
             raise OmnigentError(
@@ -510,8 +518,38 @@ def register_hooks_routes(
                 )
             hook_elicitation_id = raw_elicitation_id
         data = event.get("data") or {}
+        # The context builder indexes ``data`` for the tool phases and
+        # ``event.context`` unconditionally; a non-mapping there is a client
+        # mistake, so reject it here rather than raising AttributeError deep
+        # in the builder (a 500 for malformed input).
+        if phase in (Phase.TOOL_CALL, Phase.TOOL_RESULT) and not isinstance(data, dict):
+            raise OmnigentError(
+                f"Policy evaluate 'event.data' must be an object for "
+                f"{event_type!r}; got {type(data).__name__}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not isinstance(data, (dict, str)):
+            raise OmnigentError(
+                f"Policy evaluate 'event.data' must be an object or string; "
+                f"got {type(data).__name__}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        raw_event_context = event.get("context")
+        if raw_event_context is not None and not isinstance(raw_event_context, dict):
+            raise OmnigentError(
+                f"Policy evaluate 'event.context' must be an object; got "
+                f"{type(raw_event_context).__name__}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
-        conv = conversation_store.get_conversation(session_id)
+        # Reuse the row the ACL check already fetched — same point in the
+        # request, so no less fresh than reading it again here, one query
+        # fewer on the blocking PreToolUse path. Absent for admin callers
+        # (who bypass the conversation lookup) and when permissions are
+        # disabled, which fall back to their own read.
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
             raise OmnigentError(
                 f"Session {session_id!r} not found.",
@@ -605,7 +643,13 @@ def register_hooks_routes(
         # user_id for direct API callers and native-terminal sessions (whose
         # turns go via _dispatch_session_event_to_runner, which does not write
         # this label).
-        turn_actor = conv.labels.get(_TURN_ACTOR_LABEL)
+        # Read the actor from the engine's label snapshot, not from the row
+        # fetched at the top of this handler: the engine's labels come from a
+        # read taken after the agent/spec load, so a turn-actor label written
+        # in that window still gates on the right principal. (``agent_id``
+        # cannot be treated the same way — it selects the spec the engine is
+        # built from, so it is necessarily read first.)
+        turn_actor = engine.labels.get(_TURN_ACTOR_LABEL)
         ctx = _build_evaluation_context(
             phase, data, event, actor=_build_actor(turn_actor or user_id)
         )

@@ -6230,7 +6230,16 @@ def _build_policy_engine_from_spec_impl(
     spec: AgentSpec,
     session_id: str,
     conversation_store: ConversationStore,
+    conversation: Conversation | None = None,
 ) -> PolicyEngine:
+    """Build an engine for *spec*, reusing a conversation row when held.
+
+    Every caller of this wrapper already loaded the conversation to
+    resolve *spec*; passing it lets the builder skip its own read. Only
+    the row's immutable identity is reused — the builder re-derives
+    labels, session_state and model from a fresh read (see
+    :func:`build_policy_engine`).
+    """
     caps = get_caps()
     host_connection = (
         caps.policy_llm_connection_factory() if caps.policy_llm_connection_factory else None
@@ -6239,6 +6248,7 @@ def _build_policy_engine_from_spec_impl(
         spec=spec,
         conversation_id=session_id,
         conversation_store=conversation_store,
+        conversation=conversation,
         default_policies=caps.default_policies,
         policy_store=get_policy_store(),
         server_llm=caps.llm,
@@ -6302,7 +6312,7 @@ async def _apply_pending_policy_ask_writes(
     if spec is None:
         return
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
     # The label/state writes hit the DB synchronously too — keep them
     # off the loop.
@@ -6690,7 +6700,7 @@ async def _evaluate_output_policy(
         return None
 
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
     ctx = EvaluationContext(
         phase=Phase.RESPONSE,

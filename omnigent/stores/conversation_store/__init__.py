@@ -833,6 +833,32 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def seed_labels_if_absent(
+        self,
+        conversation_id: str,
+        defaults: dict[str, str],
+        updated_at: int | None = None,
+    ) -> dict[str, str]:
+        """
+        Insert declared initial labels for keys with none, then read back.
+
+        Insert-if-absent, NOT upsert: seeding must never overwrite a value
+        another writer already persisted. Deciding "is this key missing?"
+        from a snapshot taken before the write would reset a concurrent
+        policy update to its initial value, so the check belongs in the
+        same statement as the insert.
+
+        :param conversation_id: The conversation to seed,
+            e.g. ``"conv_abc123"``.
+        :param defaults: ``key -> initial value`` for declared labels.
+            Empty performs no write and just returns the snapshot.
+        :param updated_at: Timestamp for inserted rows; ``None`` uses the
+            current wall-clock.
+        :returns: The conversation's full label snapshot after seeding.
+        """
+        ...
+
+    @abstractmethod
     def set_labels(
         self,
         conversation_id: str,
