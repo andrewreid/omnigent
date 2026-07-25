@@ -573,12 +573,21 @@ _connection_scope_var: ContextVar[_ConnectionScope | None] = ContextVar(
 )
 
 
+# A held connection bypasses the pool's checkout-time ``pool_pre_ping``
+# for as long as it stays in the scope. Bound that window: an idle held
+# connection older than this many seconds is dropped and re-checked-out
+# (which pre-pings), so a database restart or failover during a long
+# request degrades back to the pool's own recovery behaviour instead of
+# guaranteeing the next store call a dead connection.
+_SCOPE_IDLE_MAX_SECONDS = 30.0
+
+
 class _ConnectionScope:
     """Holds one checked-out connection per engine, lent out serially."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._idle: dict[Engine, Connection] = {}
+        self._idle: dict[Engine, tuple[Connection, float]] = {}
         self._closed = False
 
     def lend(self, engine: Engine) -> Connection | None:
@@ -589,12 +598,19 @@ class _ConnectionScope:
         should fall back to a plain pooled session. While a connection is
         lent out it is absent from the idle map, so an overlapping call for
         the same engine checks out its own connection instead of sharing.
+        Held connections idle longer than ``_SCOPE_IDLE_MAX_SECONDS`` are
+        dropped and replaced by a fresh (pre-pinged) checkout.
         """
         with self._lock:
             if self._closed:
                 return None
-            conn = self._idle.pop(engine, None)
-        if conn is not None and (conn.closed or conn.invalidated):
+            entry = self._idle.pop(engine, None)
+        conn = entry[0] if entry is not None else None
+        if conn is not None and (
+            conn.closed
+            or conn.invalidated
+            or time.monotonic() - entry[1] > _SCOPE_IDLE_MAX_SECONDS
+        ):
             conn.close()
             conn = None
         if conn is None:
@@ -623,18 +639,48 @@ class _ConnectionScope:
             return
         with self._lock:
             if not self._closed and engine not in self._idle:
-                self._idle[engine] = conn
+                self._idle[engine] = (conn, time.monotonic())
                 return
         conn.close()
+
+    def release_idle(self) -> None:
+        """Return idle held connections to their pools; keep the scope open.
+
+        For request paths about to park on a human or network wait
+        (policy ASK gates hold up to a day): the connections go back to
+        the pool for the wait's duration, and the next managed session in
+        this scope simply checks out (and re-pins) a fresh one.
+        Connections currently lent to an in-flight session are unaffected.
+        """
+        with self._lock:
+            entries = list(self._idle.values())
+            self._idle.clear()
+        for conn, _ in entries:
+            conn.close()
 
     def close(self) -> None:
         """Release all held connections back to their pools."""
         with self._lock:
-            conns = list(self._idle.values())
+            entries = list(self._idle.values())
             self._idle.clear()
             self._closed = True
-        for conn in conns:
+        for conn, _ in entries:
             conn.close()
+
+
+def release_scoped_connections() -> None:
+    """Release the active scope's idle connections back to the pool.
+
+    Call before parking a request on an unbounded human/network wait
+    (e.g. a policy ASK gate) so the request doesn't pin a pooled
+    connection for the wait's duration — at pool exhaustion the approval
+    that would unpark it can't read the database, a self-deadlock. No-op
+    when no scope is active; the scope keeps working afterwards (the
+    next managed session checks out fresh).
+    """
+    scope = _connection_scope_var.get()
+    if scope is not None:
+        scope.release_idle()
 
 
 @contextmanager

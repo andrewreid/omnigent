@@ -22,7 +22,7 @@ from fastapi import (
 from fastapi.responses import Response
 from pydantic import ValidationError
 
-from omnigent.db.utils import generate_agent_id, generate_task_id
+from omnigent.db.utils import generate_agent_id, generate_task_id, release_scoped_connections
 from omnigent.entities import (
     Agent,
     CommentsFingerprint,
@@ -228,6 +228,11 @@ async def _publish_and_wait_for_harness_elicitation(
     """
     if elicitation_id is None:
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
+    # About to park on a human verdict (up to a day): hand the request's
+    # scoped DB connections back to the pool for the wait. At pool
+    # exhaustion the approval that unparks this wait couldn't do its own
+    # ACL read — a self-deadlock — so parked requests must never pin one.
+    release_scoped_connections()
     future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
     # ``resolved_elsewhere`` is set when a native-side signal proves the
     # prompt was answered outside the web UI: either a mirrored tool
