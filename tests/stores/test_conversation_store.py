@@ -5350,34 +5350,51 @@ def test_two_real_writers_race_on_one_metadata_row(
     )
 
 
-def test_get_runner_ids_omits_conversations_with_orphaned_metadata(
+def test_get_runner_ids_distinguishes_missing_from_unbound(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """
-    A deleted conversation must not be reachable through its binding.
+    The two half-written states are distinct, and both must report as such.
 
-    Deletion is ordered AP-row-first, metadata-second, and a failed second
-    transaction deliberately leaves orphaned metadata (documented as
-    acceptable). That is only acceptable while reachability checks consult
-    the AP row: a metadata-only binding lookup reports the OLD runner for a
-    conversation that no longer exists, so events route to it instead of
-    404-ing. This pins the AP row as the existence authority.
+    The AP row is the existence authority and the binding lives on the
+    Omnigent metadata row, written in a separate transaction — so either row
+    can outlive the other:
+
+    - AP row gone, metadata left behind (the documented deletion tradeoff):
+      the conversation no longer exists, so it must be OMITTED. Reporting
+      its old runner routes events to a session that is gone instead of
+      404-ing.
+    - AP row present, metadata absent (the same shape during creation, in
+      the opposite order): the conversation exists but is unbound, so it
+      must map to ``None`` — which the route turns into CONFLICT. Omitting
+      it produces a false NOT_FOUND.
+
+    A metadata-rooted lookup answers the first correctly and the second
+    wrongly, which is why both directions are asserted from one table.
     """
     from sqlalchemy import delete as sa_delete
 
     from omnigent.db.db_models import SqlConversation as _Conv
+    from omnigent.db.db_models import SqlConversationMetadata as _Meta
 
-    conv = conversation_store.create_conversation(title="orphan")
-    conversation_store.set_runner_id(conv.id, "runner_old")
-    assert conversation_store.get_runner_ids([conv.id]) == {conv.id: "runner_old"}
+    bound = conversation_store.create_conversation(title="bound")
+    conversation_store.set_runner_id(bound.id, "runner_live")
+    orphaned_metadata = conversation_store.create_conversation(title="ap-row-gone")
+    conversation_store.set_runner_id(orphaned_metadata.id, "runner_old")
+    missing_metadata = conversation_store.create_conversation(title="metadata-gone")
 
-    # Simulate the documented partial-failure state: AP row gone, metadata
-    # left behind.
     with conversation_store._conv_session() as session:
-        session.execute(sa_delete(_Conv).where(_Conv.id == conv.id))
+        session.execute(sa_delete(_Conv).where(_Conv.id == orphaned_metadata.id))
+    with conversation_store._session() as session:
+        session.execute(sa_delete(_Meta).where(_Meta.id == missing_metadata.id))
 
-    assert conversation_store.get_runner_ids([conv.id]) == {}, (
-        "orphaned metadata must not make a deleted conversation routable"
-    )
-    # And the full read agrees — the two must not disagree about existence.
-    assert conversation_store.get_conversation(conv.id) is None
+    ids = [bound.id, orphaned_metadata.id, missing_metadata.id]
+    assert conversation_store.get_runner_ids(ids) == {
+        bound.id: "runner_live",
+        # present but unbound -> None, never omitted
+        missing_metadata.id: None,
+        # AP row gone -> omitted entirely, never its stale runner
+    }
+    # The full read agrees about existence in both directions.
+    assert conversation_store.get_conversation(orphaned_metadata.id) is None
+    assert conversation_store.get_conversation(missing_metadata.id) is not None
