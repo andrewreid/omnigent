@@ -15,6 +15,9 @@ import pytest
 from sqlalchemy import event
 
 from omnigent.db.utils import _engine_cache
+from omnigent.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
 
 
 @contextmanager
@@ -60,3 +63,26 @@ async def test_snapshot_subtree_usage_reuses_conversation_row(
 
     assert resp.status_code == 200
     assert len(selects) <= 4, f"expected <=4 conversations SELECTs, got {len(selects)}"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_subtree_usage_aggregates_child_spend(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The reused-root recompute still sums the whole subtree: a
+    sub-agent's spend shows up in the parent snapshot's total."""
+    from tests.server.helpers import create_test_session
+
+    snap = await create_test_session(client, title="subtree-agg")
+    sid = snap["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=sid, title="agg:child"
+    )
+    store.set_session_usage(sid, {"total_cost_usd": 0.10})
+    store.set_session_usage(child.id, {"total_cost_usd": 0.05})
+
+    resp = await client.get(f"/v1/sessions/{sid}")
+    assert resp.status_code == 200
+    assert resp.json()["total_cost_usd"] == pytest.approx(0.15)
