@@ -94,8 +94,10 @@ services:
       OMNIGENT_AUTH_PROVIDER: "${OMNIGENT_AUTH_PROVIDER:-}"
 
       # Per-request DB connection reuse (default on). Set to "0" as a
-      # no-deploy kill switch if pool saturation is ever suspected —
-      # restores checkout-per-store-call behaviour on next restart.
+      # no-deploy kill switch if pool saturation is ever suspected, then
+      # recreate the container with `docker compose up -d` — a plain
+      # `docker compose restart` keeps the existing container environment
+      # and the change would not take effect.
       OMNIGENT_DB_CONNECTION_SCOPE: "${OMNIGENT_DB_CONNECTION_SCOPE:-1}"
 
       # OIDC config — consumed when OIDC mode is active (AUTH_ENABLED=1

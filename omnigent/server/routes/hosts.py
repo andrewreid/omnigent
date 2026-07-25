@@ -25,7 +25,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from omnigent.db.utils import now_epoch
+from omnigent.db.utils import db_connections_unpinned, now_epoch
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
@@ -1291,7 +1291,9 @@ def create_hosts_router(
             conn.inflight_installs[install_key] = task
             task.add_done_callback(lambda _t: conn.inflight_installs.pop(install_key, None))
             existing = task
-        result = await asyncio.shield(existing)
+        # npm install on the host can run for minutes: stay unpinned.
+        with db_connections_unpinned():
+            result = await asyncio.shield(existing)
 
         if result.get("status") == "failed":
             raise HTTPException(
