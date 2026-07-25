@@ -137,6 +137,28 @@ input states) your mandate is not "verify the fix" but "find the states that
 break": enumerate the state space, attack the cells the contract did not
 name, and deliver the FULL list in one pass rather than one edge per round.
 
+[HONESTY] — for any diff that adds or edits agent-facing prose (a prompt, a
+skill, a worker config, a comment a model will read), audit every sentence
+that describes what the SYSTEM does, and report each one that asserts
+something the runtime does not do. Four shapes to look for specifically,
+because no automated check covers them:
+- enforcement that does not exist — a policy, gate, guard or runtime step
+  described as blocking, gating, requiring or preventing something. Include
+  negated phrasings ("will not allow", "does not let") and named actors
+  ("X checks every change before ..."), which read as enforcement just as
+  strongly. Verify the mechanism EXISTS and does what the sentence says; a
+  declared policy that is never evaluated on the deploy path does not count.
+- ordering that contradicts the stated lifecycle — anything instructing or
+  implying publication before review, in any phrasing.
+- a readiness or completion marker set before the gate it is supposed to
+  follow.
+- an exception to a rule the contract states has none — for example
+  permitting same-vendor review, or permitting the orchestrator to merge.
+A false claim in agent-facing prose is a defect in its own right, whether or
+not any code changed: a worker cannot verify the claim and will act on it.
+Truthful statements about real behaviour are fine and must not be flagged —
+report only what is FALSE, with the evidence that makes it false.
+
 If the diff includes any doc, ADR or spec file, prose-only or mixed, ALSO run:
 [SELF-CONSISTENCY] — does the document contradict ITSELF? Read it whole;
 reconcile its consequences, scope and non-goals against its own decision and
@@ -153,6 +175,7 @@ pass, "run — clear" or "run — N findings", never "skipped" or absent:
   [WIDE-2] sibling-class
   [WIDE-3] input-domain
   [WIDE-4] coupled-artifact
+  [HONESTY] (agent-facing prose only, else "n/a")
   [SELF-CONSISTENCY] (docs only, else "n/a")
   [GOVERNANCE] (docs only, else "n/a")
 Then classify each finding blocking / non-blocking / suggestion, one line per
