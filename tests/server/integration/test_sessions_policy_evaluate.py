@@ -1167,68 +1167,86 @@ async def test_llm_response_allow_when_no_matching_policy(
     )
 
 
-@pytest.mark.parametrize(
-    ("event", "why"),
-    [
+def _malformed_evaluate_events() -> list[tuple[dict[str, object], str]]:
+    """Build the malformed-payload table from the two rules being enforced.
+
+    Generated rather than hand-listed so neither rule can be covered for one
+    phase and missed for another — the defect this guard was written for, and
+    then repeated by validating raw ``data`` only on the phases that keep
+    their tool name there.
+    """
+    cases: list[tuple[dict[str, object], str]] = [
         ({"type": ["not", "hashable"]}, "unhashable event.type"),
-        ({"type": "PHASE_TOOL_CALL", "data": "a string"}, "non-dict data"),
-        ({"type": "PHASE_TOOL_CALL", "data": None}, "null data"),
-        ({"type": "PHASE_TOOL_CALL", "data": False}, "false data"),
-        ({"type": "PHASE_TOOL_CALL", "data": 0}, "zero data"),
-        ({"type": "PHASE_TOOL_CALL", "data": ""}, "empty-string data"),
-        ({"type": "PHASE_TOOL_CALL", "data": []}, "empty-list data"),
-        ({"type": "PHASE_TOOL_CALL", "data": {}}, "empty object (no tool name)"),
-        ({"type": "PHASE_TOOL_CALL", "data": {"name": ""}}, "empty tool name"),
-        ({"type": "PHASE_TOOL_CALL", "data": {"name": 7}}, "non-string tool name"),
+    ]
+    # Rule 1: ``event.data`` must be an object or string on EVERY phase.
+    # A falsy non-string normalizes to ``{}`` and evaluates as if the caller
+    # had sent an empty tool call.
+    phases_with_valid_name: tuple[tuple[str, dict[str, object]], ...] = (
+        ("PHASE_TOOL_CALL", {}),
+        ("PHASE_TOOL_RESULT", {"request_data": {"name": "Bash"}}),
+        ("PHASE_LLM_REQUEST", {}),
+    )
+    for phase, extra in phases_with_valid_name:
+        for bad, why in ((False, "false"), (0, "zero"), ([], "empty-list"), (7, "int")):
+            cases.append(({"type": phase, "data": bad, **extra}, f"{why} data on {phase}"))
+    # Rule 2: a tool-scoped gate needs a non-empty tool name, wherever the
+    # phase keeps it — ``data`` for TOOL_CALL, ``request_data`` for
+    # TOOL_RESULT.
+    name_containers: tuple[tuple[str, str], ...] = (
+        ("PHASE_TOOL_CALL", "data"),
+        ("PHASE_TOOL_RESULT", "request_data"),
+    )
+    for phase, container in name_containers:
+        base: dict[str, object] = {"type": phase}
+        if container != "data":
+            base["data"] = {"result": "ok"}
+        for value, why in ((None, "missing"), ({}, "no name key"), ({"name": ""}, "empty name")):
+            event = dict(base)
+            if value is not None:
+                event[container] = value
+            cases.append((event, f"{why} in {phase}.{container}"))
+        cases.append(({**base, container: {"name": 7}}, f"non-string name in {phase}"))
+        cases.append(({**base, container: "a string"}, f"non-object {container} in {phase}"))
+    cases.append(
         (
             {"type": "PHASE_TOOL_CALL", "data": {"name": "Bash"}, "context": 7},
             "non-dict context",
-        ),
-        ({"type": "PHASE_TOOL_RESULT", "data": {"result": "ok"}}, "missing request_data.name"),
-        (
-            {
-                "type": "PHASE_TOOL_RESULT",
-                "data": {"result": "ok"},
-                "request_data": {"name": ""},
-            },
-            "EMPTY request_data.name — accepted before, skipped tool-scoped policies",
-        ),
-        (
-            {
-                "type": "PHASE_TOOL_RESULT",
-                "data": {"result": "ok"},
-                "request_data": {"name": 7},
-            },
-            "non-string request_data.name",
-        ),
-        ({"type": "PHASE_TOOL_RESULT", "data": "x"}, "non-dict data for tool result"),
-    ],
-)
+        )
+    )
+    return cases
+
+
 @pytest.mark.asyncio
 async def test_policy_evaluate_rejects_malformed_event_shapes(
     client: httpx.AsyncClient,
-    event: dict[str, object],
-    why: str,
 ) -> None:
     """
     Malformed hook payloads must be rejected with a structured 400.
 
     Every falsy ``data`` here used to normalize to ``{}`` before validation
-    and return 200/UNSPECIFIED — on a TOOL_CALL that means tool-name-scoped
+    and return 200/UNSPECIFIED — on a tool phase that means tool-name-scoped
     policies were skipped entirely on a BLOCKING hook (fail-open), which is
     worse than the 500s the earlier guards were added for. The phase strings
     are the wire values (``PHASE_*``); using the internal names silently
-    short-circuited at the unknown-type check and never reached these
-    guards, so the suite stayed green with the validation deleted.
+    short-circuited at the unknown-type check and never reached these guards,
+    so the suite stayed green with the validation deleted.
+
+    One session for the whole table: each case is an independent request, so
+    fifteen fresh sessions bought nothing but setup time. Every rejection is
+    collected before asserting, so one run reports every case that regressed.
     """
     from tests.server.helpers import create_test_session
 
-    snap = await create_test_session(client, title=f"malformed-{abs(hash(why)) % 10000}")
-    resp = await client.post(
-        f"/v1/sessions/{snap['id']}/policies/evaluate",
-        json={"event": event},
-    )
-    assert resp.status_code == 400, f"{why} returned {resp.status_code}: {resp.text}"
+    snap = await create_test_session(client, title="malformed-events")
+    accepted: list[str] = []
+    for event, why in _malformed_evaluate_events():
+        resp = await client.post(
+            f"/v1/sessions/{snap['id']}/policies/evaluate",
+            json={"event": event},
+        )
+        if resp.status_code != 400:
+            accepted.append(f"{why}: {resp.status_code} {resp.text[:120]}")
+    assert not accepted, "malformed payloads accepted:\n" + "\n".join(accepted)
 
 
 _EVALUATE_USER = "alice@example.com"
