@@ -86,3 +86,42 @@ async def test_snapshot_subtree_usage_aggregates_child_spend(
     resp = await client.get(f"/v1/sessions/{sid}")
     assert resp.status_code == 200
     assert resp.json()["total_cost_usd"] == pytest.approx(0.15)
+
+
+@pytest.mark.asyncio
+async def test_usage_report_reuses_listed_rows_for_subtree_totals(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    ``GET /v1/usage`` holds each listed conversation, so the per-session
+    subtree recompute must not re-read it: one conversations SELECT for
+    the page plus one tree scan per session, and the totals still include
+    child spend (a count-only assertion would pass with the recompute
+    deleted).
+    """
+    from tests.server.helpers import create_test_session
+
+    snap = await create_test_session(client, title="usage-report")
+    sid = snap["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=sid, title="usage:child"
+    )
+    store.set_session_usage(sid, {"total_cost_usd": 0.10})
+    store.set_session_usage(child.id, {"total_cost_usd": 0.05})
+
+    await client.get("/v1/usage")  # warm caches
+
+    engine = _engine_cache[db_uri]
+    with _count_conversation_selects(engine) as selects:
+        resp = await client.get("/v1/usage")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    rows = {s["id"]: s for s in body.get("sessions", [])}
+    assert sid in rows, body
+    # Parent 0.10 + child 0.05: proves the subtree recompute ran.
+    assert rows[sid]["cost_usd"] == pytest.approx(0.15)
+    # The listing itself + the tree scan(s); no per-session row re-read.
+    assert len(selects) <= 3, f"expected <=3 conversations SELECTs, got {len(selects)}"

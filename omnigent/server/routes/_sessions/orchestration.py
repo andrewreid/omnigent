@@ -868,6 +868,7 @@ def _accumulate_session_usage(
     resp_obj: dict[str, Any],
     session_id: str,
     conversation_store: ConversationStore,
+    conversation: Conversation | None = None,
 ) -> float | None:
     """
     Increment the session's cumulative token counters from a
@@ -917,8 +918,14 @@ def _accumulate_session_usage(
 
     # Load conversation metadata for pricing only (NOT for reading session_usage —
     # the atomic increment_session_usage call below handles that separately to
-    # avoid the read-modify-write race).
-    conv = conversation_store.get_conversation(session_id)
+    # avoid the read-modify-write race). The caller may pass the row it just
+    # read (the relay roll-up needs the same row immediately afterwards), in
+    # which case pricing reuses it rather than reading it again.
+    conv = (
+        conversation
+        if conversation is not None
+        else conversation_store.get_conversation(session_id)
+    )
 
     # Compute cost delta if pricing is available for the model. Resolve
     # the model to price with, most-specific first:
@@ -4402,10 +4409,17 @@ async def _relay_runner_stream(
                         # policy callables can read
                         # event["context"]["usage"]["total_cost_usd"] and the
                         # subtree roll-up below sees the new totals.
+                        # One conversation read serves both this pricing
+                        # lookup and the subtree roll-up below (which needs
+                        # the immutable tree root), instead of one each.
+                        _conv_row = await asyncio.to_thread(
+                            conversation_store.get_conversation, session_id
+                        )
                         _accumulate_session_usage(
                             event.get("response", {}),
                             session_id,
                             conversation_store,
+                            _conv_row,
                         )
                         # Push the server-computed cost AND token breakdown
                         # to the web client's session indicator, rolled up
@@ -4423,9 +4437,6 @@ async def _relay_runner_stream(
                         # surfaces tokens). context_tokens/window already ride
                         # on the response.completed event. Threaded: store
                         # reads + SSE fan-out.
-                        _conv_row = await asyncio.to_thread(
-                            conversation_store.get_conversation, session_id
-                        )
                         _subtree_usage = (
                             await asyncio.to_thread(
                                 functools.partial(
