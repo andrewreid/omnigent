@@ -704,3 +704,21 @@ def test_list_conversations_accessible_and_owned_intersect_split_db(
         ).data
     }
     assert ids == {owned.id}
+
+
+def test_list_projects_acl_split_db_prefetch_fallback(
+    omnigent_db: Path, store: SqlAlchemyConversationStore
+) -> None:
+    """Split binds: list_projects keeps the id-prefetch ACL and scopes
+    projects to the caller's grants."""
+    mine = store.create_conversation(title="mine")
+    other = store.create_conversation(title="other")
+    store.set_labels(mine.id, {"omni_project": "Mine"})
+    store.set_labels(other.id, {"omni_project": "Other"})
+    perms = _perms(omnigent_db)
+    perms.grant("alice@example.com", mine.id, 4)
+    perms.grant("bob@example.com", other.id, 4)
+
+    assert store.list_projects(accessible_by="alice@example.com") == ["Mine"]
+    assert store.list_projects(owned_by="bob@example.com") == ["Other"]
+    assert store.list_projects(accessible_by="nobody@example.com") == []

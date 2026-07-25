@@ -2038,11 +2038,16 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         from omnigent.server.auth import LEVEL_OWNER
 
-        # ACL (accessible_by/owned_by) resolves against session_permissions on
-        # the Omnigent DB, so it still needs a pre-fetch; archived now lives on
-        # the AP conversations table and is filtered inline below.
+        # ACL strategy mirrors list_conversations: single-DB pushes the
+        # permission check into the labels query as correlated EXISTS (no
+        # id materialization); split-DB keeps the prefetch fallback since a
+        # cross-DB EXISTS is impossible. Archived lives on the AP
+        # conversations table and is filtered inline below either way.
+        needs_acl = accessible_by is not None or owned_by is not None
+        acl_pushdown = needs_acl and self._conv_engine is self._engine
+
         permission_ids: list[str] | None = None
-        if accessible_by is not None or owned_by is not None:
+        if needs_acl and not acl_pushdown:
             with self._session() as meta_sess:
                 accessible_set: set[str] | None = None
                 owned_set: set[str] | None = None
@@ -2089,6 +2094,30 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             if permission_ids is not None:
                 stmt = stmt.where(SqlConversationLabel.conversation_id.in_(permission_ids))
+            if acl_pushdown:
+                if accessible_by is not None:
+                    stmt = stmt.where(
+                        select(SqlSessionPermission.conversation_id)
+                        .where(
+                            SqlSessionPermission.workspace_id == SqlConversationLabel.workspace_id,
+                            SqlSessionPermission.conversation_id
+                            == SqlConversationLabel.conversation_id,
+                            SqlSessionPermission.user_id == accessible_by,
+                        )
+                        .exists()
+                    )
+                if owned_by is not None:
+                    stmt = stmt.where(
+                        select(SqlSessionPermission.conversation_id)
+                        .where(
+                            SqlSessionPermission.workspace_id == SqlConversationLabel.workspace_id,
+                            SqlSessionPermission.conversation_id
+                            == SqlConversationLabel.conversation_id,
+                            SqlSessionPermission.user_id == owned_by,
+                            SqlSessionPermission.level >= LEVEL_OWNER,
+                        )
+                        .exists()
+                    )
             return [row[0] for row in ap_sess.execute(stmt).all()]
 
     def delete_label(
