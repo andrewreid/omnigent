@@ -59,6 +59,14 @@ policies:
       limit: 200
 ```
 
+> **Server config and agent bundles use different dialects.** The
+> `handler:` + `factory_params:` form above is server-config syntax, translated
+> at `omnigent/spec/omnigent.py`. A policy declared inside an **agent bundle**
+> must use `function: {path, arguments}` instead. Bundle parsing accepts
+> `handler:` but never translates `factory_params`, and it rejects no unknown
+> keys — so copying this stanza into a bundle silently drops your parameters and
+> invokes the factory on its defaults, with no error.
+
 **4. Start the server.**
 
 ```bash
