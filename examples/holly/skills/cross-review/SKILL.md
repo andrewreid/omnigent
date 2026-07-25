@@ -164,10 +164,13 @@ END REVIEWER-MANDATE-V1
 
 ## Procedure
 
-1. **Diff — local, before the remote.** `git -C .worktrees/<task_id> diff
-   main...HEAD`. For a PR that already exists and that you did not just create,
-   read its diff with the `github` MCP tool `pull_request_read` rather than
-   `gh pr diff` — it is a read, and reads prefer MCP. The implementer has committed and stopped; the
+1. **Diff.** Two cases, and they differ at the release step.
+   *Unopened branch* (the normal one): `git -C .worktrees/<task_id> diff
+   main...HEAD`. The implementer has committed and stopped; nothing is pushed.
+   *Already-open PR* (a pre-existing PR, or a fix round on one you released
+   earlier): read its diff with the `github` MCP tool `pull_request_read` —
+   it is a read, and reads prefer MCP. The work is already published, so review
+   gates the NEXT push rather than the first one. The implementer has committed and stopped; the
    commit has not been pushed.
 
 2. **Gates first — ALL of them, before any reviewer is involved.** Discover the
@@ -231,7 +234,8 @@ END REVIEWER-MANDATE-V1
    because you check HEAD before releasing.
 
 8. **Release.** Green gates AND zero blocking issues, and only then: tell the
-   SAME implementer to push its branch and open the PR. For directly-authored
+   SAME implementer to push its branch and open the PR — or, if a PR is already
+   open, to push the reviewed commits to it. For directly-authored
    work Holly pushes and opens its own reviewed PR. Record the PR URL in the
    registry, mark it ready, and leave it for the human. **Holly does NOT
    merge.**
@@ -254,8 +258,9 @@ top-level comment. A repeated class is a hard stop for point-fixing: escalate
 to whole-surface closure. When handing status to the human, report the count of
 UNRESOLVED review threads alongside your summary, because replies do not
 establish resolution — "findings serviced" is not "threads resolved", and the
-human is merging on that distinction. **Holly never declares a clean bill and
-never merges.**
+human is merging on that distinction. Holly's hand-off wording must not imply
+completeness ('findings serviced' ≠ 'threads resolved'). **Holly never declares
+a clean bill and never merges.**
 
 ## Notes
 

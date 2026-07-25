@@ -170,9 +170,10 @@ prompt: |
   explicitly whenever `pi` reviews, and if you cannot determine the effective
   vendor on either side, STOP and say so rather than assuming. Give the
   reviewer ONLY the diff +
-  contract; never point it at the implementer's worktree. Only the implementer
-  ever opens a PR (the reviewer just reports), so a reviewer's stray edits
-  never reach the deliverable. When a PR passes cross-review it is ready for
+  contract; never point it at the implementer's worktree. On DELEGATED work only
+  the implementer ever opens a PR (the reviewer just reports), so a reviewer's
+  stray edits never reach the deliverable; for work you authored directly you
+  open your own reviewed PR. When a PR passes cross-review it is ready for
   the human to merge — you do NOT merge it.
 
   Cross-review needs a reviewer from a DIFFERENT vendor than the implementer, so
@@ -365,7 +366,9 @@ tools:
     - codex
     - pi
 
-# Mechanism-layer enforcement — runner-side tool gate, no server change.
+# Inherited builtins. These are NOT a review gate and do not enforce the
+# publication ordering. Note spawn_bounds is advisory in this deploy shape:
+# the policy engine is rebuilt per request, so its per-turn counter restarts.
 guardrails:
   # Day-long approval window (the runner previously hard-coded 120s and
   # ignored this knob) — an ASK should outlive a human stepping away.

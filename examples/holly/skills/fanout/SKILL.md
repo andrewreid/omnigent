@@ -44,8 +44,10 @@ dependency).
    disposable. Don't remove a worktree that still has open fix-tasks.
 
 ## Notes
-- Respect the per-turn dispatch cap (enforced by policy). More tasks than the
-  cap → dispatch in waves (let the running batch finish before dispatching more).
+- Respect the per-turn dispatch cap yourself. Do NOT rely on it being enforced:
+  the policy engine is rebuilt per request, so the counter restarts each
+  dispatch. More tasks than the cap → dispatch in waves (let the running batch
+  finish before dispatching more).
 - The human can open any sub-agent in the UI's Subagents panel and read its
   conversation while it runs.
 - If a running worker is wrong, runaway, superseded, or no longer useful, call

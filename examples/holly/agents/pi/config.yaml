@@ -4,7 +4,7 @@ description: Pi coding sub-agent — the multi-model third worker; reviews, expl
 
 # Headless scaffold harness (no terminal wrapper): the worker runs in-process
 # behind the harness RPC contract, and its shell access flows through the
-# bridged sys_os_* tools, so every command passes the policy layer.
+# bridged sys_os_* tools.
 executor:
   type: omnigent
   config:
@@ -53,16 +53,10 @@ os_env:
   sandbox:
     type: none
 
-# No policies are declared here, deliberately. A sub-agent's own
-# guardrails.policies block is NOT evaluated for its tool calls on the
-# server deploy path: the server loads the ROOT bundle spec and ignores
-# sub_agent_name, so a block here would read as protection while enforcing
-# nothing. The root spec's policies apply to this session. Publication is
-# orchestrator-sequenced - commit and stop; nothing blocks a push, the
-# ordering is prompt discipline.
+# Publication is orchestrator-sequenced: commit and stop. Nothing here
+# blocks a push; the ordering is prompt discipline.
 
 guardrails:
-  # Pi gates on the runner ASK path (claude_code / codex gate via their
-  # native hooks, which wait a day) - match that window instead of
-  # auto-denying while the human reads the approval card.
+  # A day-long approval window, so an approval request outlives a human
+  # stepping away rather than expiring under them.
   ask_timeout: 86400
