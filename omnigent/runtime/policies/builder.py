@@ -350,6 +350,15 @@ def build_policy_engine(
     # children. Load root policies and prepend them (root policies run
     # first, then any child-specific overrides, matching the cost-budget
     # root-seeding pattern below).
+    if conversation is not None and conversation.id != conversation_id:
+        # A misrouted preload would mix one session's labels, state, usage
+        # and model into another session's authorization decision — fail
+        # closed rather than build an engine from the wrong row.
+        raise OmnigentError(
+            f"preloaded conversation {conversation.id!r} does not match "
+            f"conversation_id {conversation_id!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
     conv = (
         conversation
         if conversation is not None
@@ -385,6 +394,15 @@ def build_policy_engine(
         if conv is not None
         else []
     )
+    # Freshness contract for the preloaded row: only immutable identity
+    # (id, root_conversation_id) is trusted from it. Mutable fields —
+    # labels, session_state, model_override — re-derive from this
+    # conversation's row in the just-loaded tree, which is at worst as
+    # fresh as the builder's own read used to be. The preloaded row is
+    # the fallback only when the tree lacks the row (archived self).
+    fresh_self = next((c for c in tree if c.id == conversation_id), None)
+    if fresh_self is not None:
+        conv = fresh_self
     root_conv = (
         conv
         if root_conversation_id == conversation_id

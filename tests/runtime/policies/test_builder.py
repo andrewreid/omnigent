@@ -1152,3 +1152,52 @@ def test_build_with_preloaded_conversation_skips_own_read(
     assert calls["list_conversations"] == 1, calls
     assert dict(engine.usage) == dict(baseline.usage)
     assert engine.session_state == baseline.session_state
+
+
+def test_build_rejects_mismatched_preloaded_conversation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A preloaded row for a different session must fail closed, not mix
+    one session's labels/state/usage into another's policy decision."""
+    from omnigent.errors import OmnigentError
+
+    a = conversation_store.create_conversation(title="a")
+    b = conversation_store.create_conversation(title="b")
+    row_b = conversation_store.get_conversation(b.id)
+
+    with pytest.raises(OmnigentError, match="does not match"):
+        build_policy_engine(
+            spec=AgentSpec(spec_version=1, name="x"),
+            conversation_id=a.id,
+            conversation_store=conversation_store,
+            conversation=row_b,
+        )
+
+
+def test_build_with_preloaded_row_sees_concurrent_mutable_writes(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    The preloaded row contributes only immutable identity: labels,
+    session_state, and model written AFTER the row was captured must
+    still reach the engine (re-derived from the fresh tree row), so a
+    concurrent guard-label write can't be skipped by a stale snapshot.
+    """
+    conv = conversation_store.create_conversation(title="fresh-check")
+    stale_row = conversation_store.get_conversation(conv.id)
+
+    # Writes that land between the handler's read and the engine build.
+    conversation_store.set_labels(conv.id, {"guard": "tripped"})
+    conversation_store.set_session_state(conv.id, {"checkpoint": 1.5})
+    conversation_store.update_conversation(conv.id, model_override="claude-sonnet-4-6")
+
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="x"),
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+        conversation=stale_row,
+    )
+
+    assert engine.labels.get("guard") == "tripped"
+    assert engine.session_state.get("checkpoint") == 1.5
+    assert engine.model == "claude-sonnet-4-6"
