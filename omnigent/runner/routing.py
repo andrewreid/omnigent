@@ -130,52 +130,31 @@ class RunnerRouter:
         :raises OmnigentError: If the conversation is missing, the
             pinned runner is offline, or no online runner is available.
         """
-        conv = self._conversation_store.get_conversation(conversation_id)
-        if conv is None:
+        # Only the runner binding is needed here, and it must be current —
+        # the event hot path resolves a runner per streamed chunk and a
+        # concurrent rebind/host handoff must route to the NEW runner. One
+        # indexed single-column read instead of the full conversation +
+        # metadata + labels load.
+        runner_ids = self._conversation_store.get_runner_ids([conversation_id])
+        if conversation_id not in runner_ids:
             raise OmnigentError("conversation not found", code=ErrorCode.NOT_FOUND)
-        if conv.runner_id:
-            session = self._registry.get(conv.runner_id)
+        runner_id = runner_ids[conversation_id]
+        if runner_id:
+            session = self._registry.get(runner_id)
             if session is None:
                 raise OmnigentError(
-                    f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
+                    f"runner {runner_id!r} is offline for conversation {conversation_id!r}",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
             return RoutedRunner(
-                runner_id=conv.runner_id,
-                client=self._client_for_runner(conv.runner_id),
+                runner_id=runner_id,
+                client=self._client_for_runner(runner_id),
             )
 
         raise OmnigentError(
             f"conversation {conversation_id!r} is not bound to a runner; "
             "resume the session to bind a registered runner",
             code=ErrorCode.CONFLICT,
-        )
-
-    def client_for_bound_runner(self, conversation_id: str, runner_id: str) -> RoutedRunner:
-        """
-        Return a runner client for a session whose binding the caller holds.
-
-        Same semantics as the pinned branch of
-        :meth:`client_for_session_resources`, minus the conversation read:
-        callers that already loaded the conversation row pass its
-        ``runner_id`` so the event hot path (one call per streamed chunk)
-        doesn't re-read the row per event.
-
-        :param conversation_id: Conversation/session id (for the error
-            message only), e.g. ``"conv_0123456789abcdef"``.
-        :param runner_id: The conversation's pinned runner id.
-        :returns: Selected runner id and client.
-        :raises OmnigentError: If the pinned runner is offline.
-        """
-        session = self._registry.get(runner_id)
-        if session is None:
-            raise OmnigentError(
-                f"runner {runner_id!r} is offline for conversation {conversation_id!r}",
-                code=ErrorCode.RUNNER_UNAVAILABLE,
-            )
-        return RoutedRunner(
-            runner_id=runner_id,
-            client=self._client_for_runner(runner_id),
         )
 
     def client_for_existing_conversation(self, conversation_id: str) -> RoutedRunner | None:
@@ -194,18 +173,18 @@ class RunnerRouter:
             ``None`` when it is not pinned or not found.
         :raises OmnigentError: If the pinned runner is offline.
         """
-        conv = self._conversation_store.get_conversation(conversation_id)
-        if conv is None or not conv.runner_id:
+        runner_id = self._conversation_store.get_runner_ids([conversation_id]).get(conversation_id)
+        if not runner_id:
             return None
-        session = self._registry.get(conv.runner_id)
+        session = self._registry.get(runner_id)
         if session is None:
             raise OmnigentError(
-                f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
+                f"runner {runner_id!r} is offline for conversation {conversation_id!r}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         return RoutedRunner(
-            runner_id=conv.runner_id,
-            client=self._client_for_runner(conv.runner_id),
+            runner_id=runner_id,
+            client=self._client_for_runner(runner_id),
         )
 
     def runner_is_online(self, runner_id: str) -> bool:

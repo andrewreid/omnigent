@@ -43,15 +43,19 @@ def _count_conversation_selects(engine):
 
 
 @pytest.mark.asyncio
-async def test_status_event_resolves_runner_without_conversation_reread(
+async def test_status_event_routes_via_binding_read_and_still_forwards(
     client: httpx.AsyncClient,
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A pinned session's status event routes to the runner via the row the
-    handler already holds — one conversations SELECT per event, not one
-    per routing lookup.
+    A pinned session's status event resolves its runner via a fresh
+    single-column binding read — one conversations SELECT per event, not
+    one per routing lookup — and the forward itself demonstrably runs
+    (the count assertion alone would stay green if forwarding vanished).
     """
+    from omnigent.server.routes import sessions as sessions_pkg
+
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="event-hot-path")
     store.set_runner_id(conv.id, "runner_bench")
@@ -59,12 +63,22 @@ async def test_status_event_resolves_runner_without_conversation_reread(
     payload = {"type": "external_session_status", "data": {"status": "idle"}}
     await client.post(f"/v1/sessions/{conv.id}/events", json=payload)  # warm
 
+    forwarded: list[dict] = []
+    real_forward = sessions_pkg._forward_session_change_to_runner
+
+    async def _recording_forward(session_id, runner_router, event, **kwargs):
+        forwarded.append(event)
+        return await real_forward(session_id, runner_router, event, **kwargs)
+
+    monkeypatch.setattr(sessions_pkg, "_forward_session_change_to_runner", _recording_forward)
+
     engine = _engine_cache[db_uri]
     with _count_conversation_selects(engine) as selects:
         resp = await client.post(f"/v1/sessions/{conv.id}/events", json=payload)
 
     assert resp.status_code == 202, resp.text
     assert len(selects) <= 1, f"expected <=1 conversations SELECT, got {len(selects)}"
+    assert forwarded and forwarded[0]["type"] == "external_session_status"
 
 
 @pytest.mark.asyncio

@@ -751,7 +751,6 @@ def register_events_routes(
                 session_id,
                 runner_router,
                 forward_body,
-                conv=conv,
             )
             if (
                 conv.kind == "sub_agent"
