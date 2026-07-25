@@ -5364,6 +5364,53 @@ def _capture_conversation_selects(store: SqlAlchemyConversationStore):
         sa_event.remove(store._conv_engine, "before_execute", _on_before_execute)
 
 
+@contextlib.contextmanager
+def _capture_driver_sql(store: SqlAlchemyConversationStore):
+    """Capture (statement, parameters) as the DBAPI sees them.
+
+    Plan tests need the driver-level form: the cursor binds a 16-byte
+    identifier, which cannot be rendered as a SQL literal, and re-binding raw
+    Python values to a ``text()`` EXPLAIN skips the type decorator — the exact
+    trap that made the first row-values attempt fail only on PostgreSQL.
+    Capturing the adapted parameters lets EXPLAIN run the real statement.
+    """
+    from sqlalchemy import event as sa_event
+
+    captured: list[tuple[str, object]] = []
+
+    def _on(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT") and "FROM conversations" in statement:
+            captured.append((statement, parameters))
+
+    sa_event.listen(store._conv_engine, "before_cursor_execute", _on)
+    try:
+        yield captured
+    finally:
+        sa_event.remove(store._conv_engine, "before_cursor_execute", _on)
+
+
+def _explain_driver(store: SqlAlchemyConversationStore, statement: str, parameters: object) -> str:
+    """``EXPLAIN`` the exact statement+parameters the store executed.
+
+    Returns the plan as one string: PostgreSQL JSON, or SQLite's
+    ``EXPLAIN QUERY PLAN`` rows joined.
+    """
+    import json
+
+    dialect = store._conv_engine.dialect.name
+    with store._conv_session() as session:
+        conn = session.connection()
+        if dialect == "postgresql":
+            conn.exec_driver_sql("ANALYZE conversations")
+            conn.exec_driver_sql("ANALYZE session_permissions")
+            raw = conn.exec_driver_sql(
+                "EXPLAIN (ANALYZE, FORMAT JSON) " + statement, parameters
+            ).scalar_one()
+            return json.dumps(raw if isinstance(raw, (list, dict)) else json.loads(raw))
+        rows = conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+    return " | ".join(str(row) for row in rows)
+
+
 def _explain_json(store: SqlAlchemyConversationStore, sql: str, analyze: bool = False) -> str:
     """Return a PostgreSQL plan for *sql* as a JSON string (ANALYZE first)."""
     import json
@@ -5441,40 +5488,38 @@ def _bulk_seed_conversations_and_grants(
         session.execute(sa_insert(_Perm), perm_rows)
 
 
-def test_list_conversations_accessible_by_excludes_non_granted(
-    conversation_store: SqlAlchemyConversationStore, db_uri: str
-) -> None:
-    """A user sees exactly the sessions they hold a grant for."""
-    mine = conversation_store.create_conversation(title="mine")
-    other = conversation_store.create_conversation(title="other")
-    perms = _acl_perms(db_uri)
-    perms.grant("alice@example.com", mine.id, 1)
-    perms.grant("bob@example.com", other.id, 4)
-
-    ids = {
-        c.id for c in conversation_store.list_conversations(accessible_by="alice@example.com").data
-    }
-    assert ids == {mine.id}
-    assert not conversation_store.list_conversations(accessible_by="nobody@example.com").data
-
-
 def test_list_conversations_accessible_and_owned_intersect(
     conversation_store: SqlAlchemyConversationStore, db_uri: str
 ) -> None:
-    """accessible_by + owned_by together keep only owner-level grants."""
-    owned = conversation_store.create_conversation(title="owned")
-    shared = conversation_store.create_conversation(title="shared")
+    """
+    ``accessible_by`` + ``owned_by`` intersect, with different users.
+
+    Passing the same user for both operands makes ownership imply
+    accessibility, so the intersection equals ``owned_by`` alone and dropping
+    either operand goes unnoticed. Alice can read the row Bob owns; nothing
+    else satisfies both.
+    """
+    owned_by_alice = conversation_store.create_conversation(title="owned-by-alice")
+    owned_by_bob = conversation_store.create_conversation(title="owned-by-bob")
+    alice_reads_bob_owns = conversation_store.create_conversation(title="alice-reads-bob-owns")
+    # Both can read it and NEITHER owns it: it satisfies the intersection only
+    # if owned_by stops requiring owner level.
+    both_read_neither_owns = conversation_store.create_conversation(title="both-read")
     perms = _acl_perms(db_uri)
-    perms.grant("alice@example.com", owned.id, 4)
-    perms.grant("alice@example.com", shared.id, 1)
+    perms.grant("alice@example.com", owned_by_alice.id, 4)
+    perms.grant("bob@example.com", owned_by_bob.id, 4)
+    perms.grant("alice@example.com", alice_reads_bob_owns.id, 1)
+    perms.grant("bob@example.com", alice_reads_bob_owns.id, 4)
+    perms.grant("alice@example.com", both_read_neither_owns.id, 1)
+    perms.grant("bob@example.com", both_read_neither_owns.id, 1)
 
     ids = {
         c.id
         for c in conversation_store.list_conversations(
-            accessible_by="alice@example.com", owned_by="alice@example.com"
+            accessible_by="alice@example.com", owned_by="bob@example.com"
         ).data
     }
-    assert ids == {owned.id}
+    assert ids == {alice_reads_bob_owns.id}
 
 
 def test_single_db_acl_uses_exists_pushdown_not_prefetch(
@@ -5590,175 +5635,245 @@ def test_list_projects_single_db_uses_exists_pushdown(
         assert "EXISTS" in stmt
 
 
-def test_default_created_at_listing_uses_ordering_index(
+_PLAN_SEED_ROWS = 5_000
+"""Rows seeded for the plan tests.
+
+At a few hundred rows PostgreSQL correctly prefers a sequential scan, so a
+plan assertion there measures the planner's choice for a toy table rather than
+the production one. The index/range behaviour under test only appears once the
+table is large enough for an index plan to be the rational choice.
+"""
+
+
+def test_seeded_listing_plans_and_deep_pagination(
     conversation_store: SqlAlchemyConversationStore, db_uri: str
 ) -> None:
     """
-    Plan regression for the EXISTS-era default listing.
+    Both listing contracts, explained against a realistically sized table.
 
-    Evidence standard: the statement explained here is the one the STORE
-    EMITTED for the endpoint's real call (ACL EXISTS + has_agent_id +
-    kind + non-archived + created_at ordering + LIMIT) — captured from the
-    engine, then recompiled with literal binds. Not hand-written SQL, and
-    it cannot drift from the production query. Seeded to a size where an
-    index plan is the planner's rational choice; ANALYZE runs first on PG.
+    Two contracts share one seed because seeding is the expensive part:
+
+    1. The default listing pushes the ACL into a correlated EXISTS and reads
+       the page through the ordering index — no id round-trip through Python,
+       no sort of the whole workspace.
+    2. The cursor predicate is emitted as a row-values comparison, which
+       PostgreSQL can use as an index RANGE condition. The equivalent
+       ``ts < :ts OR (ts = :ts AND id < :id)`` form is left as a residual
+       filter, so a deep cursor reads and discards every row above it, at a
+       cost that grows with cursor depth.
+
+    Everything is asserted against the statement the STORE emitted, captured
+    from the engine: the SQL shape from the clause element, and the PLAN from
+    the driver-level statement with its adapted parameters. The plan is the
+    load-bearing half — an earlier version asserted only the SQL spelling, so
+    restoring the OR form failed on spelling and CI never checked whether the
+    comparison reached the index. EXPLAIN needs the driver form because the
+    cursor binds a 16-byte identifier that cannot be written as a SQL literal,
+    and re-binding raw values to a ``text()`` EXPLAIN skips the type decorator
+    — the exact trap that made the first row-values attempt fail only on
+    PostgreSQL.
     """
-    from sqlalchemy import text as sql_text
-
     _acl_perms(db_uri)
+    # Tied timestamps: with one row per timestamp the cursor's tiebreaker term
+    # is decorative and dropping it loses nothing, so the walk below could not
+    # tell a correct cursor from a broken one.
     _bulk_seed_conversations_and_grants(
-        conversation_store, "alice@example.com", count=600, granted_ratio=0.5
-    )
-
-    with _capture_conversation_selects(conversation_store) as captured:
-        page = conversation_store.list_conversations(
-            limit=20,
-            accessible_by="alice@example.com",
-            has_agent_id=True,
-            kind="default",
-            sort_by="created_at",
-            order="desc",
-        )
-    assert page.data, "seed must produce visible rows or the plan is not the real one"
-    assert captured, "no conversations SELECT captured"
-    listing = captured[0]
-    # Assert the pushdown on the UNCOMPILED statement, before rendering literal
-    # binds. Without the pushdown the ACL is a materialized list of 16-byte
-    # binary ids, and literal-bind rendering raises on those — so a test that
-    # compiled first would fail for a rendering reason and never reach the
-    # assertion that explains what actually regressed.
-    assert "EXISTS" in str(listing).upper(), str(listing)  # ACL really is pushed down
-    query = str(
-        listing.compile(conversation_store._conv_engine, compile_kwargs={"literal_binds": True})
+        conversation_store,
+        "alice@example.com",
+        count=_PLAN_SEED_ROWS,
+        # Half the workspace granted: a selective ACL is what production
+        # looks like, and an all-granted table lets the planner ignore the
+        # permission side entirely.
+        granted_ratio=0.5,
+        tie_size=4,
     )
     dialect = conversation_store._conv_engine.dialect.name
 
-    if dialect == "sqlite":
-        with conversation_store._conv_session() as session:
-            rows = session.execute(sql_text("EXPLAIN QUERY PLAN " + query)).all()
-        plan = " | ".join(str(row) for row in rows)
-        # The index must drive the scan and the ACL probe.
-        assert "ix_conversations_archived_created" in plan, plan
-        assert "SEARCH conversations USING INDEX" in plan, plan
-        # Measured, not assumed: SQLite uses the index for the leading terms
-        # but still builds a temp B-tree for the LAST ORDER BY term
-        # ("USE TEMP B-TREE FOR LAST TERM OF ORDER BY"). It is bounded by the
-        # LIMIT, and PostgreSQL — the production target, asserted below —
-        # needs no Sort at all. Asserting no-sort here would be asserting
-        # something untrue of this dialect.
-        assert "SCAN conversations" not in plan, plan  # never a full table scan
-        return
+    def _plan_of(driver_captured: list[tuple[str, object]]) -> str:
+        statement, parameters = next(
+            (
+                (st, pr)
+                for st, pr in driver_captured
+                if "created_at" in st and "LIMIT" in st.upper()
+            ),
+            driver_captured[-1],
+        )
+        return _explain_driver(conversation_store, statement, parameters)
 
+    def _index_conds_and_filtered(plan: str) -> tuple[list[str], list[int]]:
+        import json as _json
+
+        flat: list[dict[str, object]] = []
+
+        def _walk(node: dict[str, object]) -> None:
+            flat.append(node)
+            for child in node.get("Plans", []) or []:
+                _walk(child)
+
+        for entry in _json.loads(plan):
+            _walk(entry["Plan"])
+        return (
+            [str(n.get("Index Cond", "")) for n in flat if "Index Cond" in n],
+            [int(n.get("Rows Removed by Filter", 0) or 0) for n in flat],
+        )
+
+    # ── 1. default listing: ACL pushdown + ordering index ───────────────
+    with _capture_conversation_selects(conversation_store) as clauses:
+        with _capture_driver_sql(conversation_store) as driver_captured:
+            page = conversation_store.list_conversations(
+                limit=20,
+                accessible_by="alice@example.com",
+                has_agent_id=True,
+                kind="default",
+                sort_by="created_at",
+                order="desc",
+            )
+    assert page.data, "seed must produce visible rows or the plan is not the real one"
+    # On the uncompiled statement: without the pushdown the ACL becomes a
+    # materialized list of binary ids, and anything that renders it dies before
+    # reaching this assertion.
+    assert "EXISTS" in str(clauses[0]).upper(), str(clauses[0])
+    listing_plan = _plan_of(driver_captured)
     if dialect == "postgresql":
-        plan_json = _explain_json(conversation_store, query)
-        assert "ix_conversations_archived_created" in plan_json, plan_json
-        assert '"Node Type": "Sort"' not in plan_json, plan_json
-        return
+        assert "ix_conversations_archived_created" in listing_plan, listing_plan
+        # A Sort here would mean the whole accessible set was ordered to return
+        # twenty rows.
+        assert '"Node Type": "Sort"' not in listing_plan, listing_plan
+    else:
+        assert "ix_conversations_archived_created" in listing_plan, listing_plan
+        assert "SCAN conversations" not in listing_plan, listing_plan
 
-    pytest.skip(f"no plan assertion implemented for dialect {dialect!r}")
-
-
-def test_deep_cursor_emits_row_values_and_paginates_exactly(
-    conversation_store: SqlAlchemyConversationStore, db_uri: str
-) -> None:
-    """
-    The cursor predicate must be emitted as a row-values comparison —
-    ``(created_at, id) < (:ts, :id)`` — which PostgreSQL can use as an
-    index RANGE condition. The equivalent ``ts < :ts OR (ts = :ts AND id <
-    :id)`` form is left as a residual Filter, so a deep cursor re-reads and
-    discards every row above it (cost growing with cursor depth).
-
-    Asserted on the store's OWN emitted statement (captured from the
-    engine, not hand-written), plus the user-visible property that deep
-    pagination loses and duplicates nothing.
-
-    The plan itself is not explained here: the cursor binds a 16-byte
-    BLOB/bytea id, which cannot be rendered as a SQL literal, and passing
-    raw params to a text() EXPLAIN would bypass the type decorator (the
-    exact trap that made the first row-values attempt fail on PG). The
-    index-range evidence for this form was measured out-of-band on
-    PostgreSQL 18.3 (comparison in Index Cond, zero rows removed by
-    filter, 47 rows examined at a 70%-deep cursor versus 28,000 before).
-    """
-    _acl_perms(db_uri)
-    # Tied timestamps: with one row per timestamp the tiebreaker term is
-    # decorative and dropping it loses nothing, so the walk below could not
-    # tell a correct cursor from a broken one.
-    _bulk_seed_conversations_and_grants(
-        conversation_store, "alice@example.com", count=600, granted_ratio=1.0, tie_size=4
+    # ── 2. deep cursor: row values as an index range condition ──────────
+    # A DEEP cursor with a NORMAL page size — the shape that distinguishes an
+    # index range condition from a residual filter. Asking for half the table
+    # in one page makes a sequential scan the planner's rational choice, and
+    # the plan would then say nothing about the predicate.
+    baseline = conversation_store.list_conversations(
+        accessible_by="alice@example.com",
+        limit=_PLAN_SEED_ROWS * 2,
+        has_agent_id=True,
+        kind="default",
+        sort_by="created_at",
+        order="desc",
     )
+    assert not baseline.has_more, "baseline must be a single complete page"
+    expected_ids = [c.id for c in baseline.data]
     first = conversation_store.list_conversations(
         accessible_by="alice@example.com",
-        limit=300,
+        limit=int(len(expected_ids) * 0.7),
         has_agent_id=True,
         kind="default",
         sort_by="created_at",
         order="desc",
     )
     assert first.has_more, "seed must be deeper than one page"
+    with _capture_conversation_selects(conversation_store) as clauses:
+        with _capture_driver_sql(conversation_store) as driver_captured:
+            second = conversation_store.list_conversations(
+                accessible_by="alice@example.com",
+                limit=20,
+                after=first.data[-1].id,
+                has_agent_id=True,
+                kind="default",
+                sort_by="created_at",
+                order="desc",
+            )
+    cursor_plan = _plan_of(driver_captured)
+    if dialect == "postgresql":
+        index_conds, rows_filtered = _index_conds_and_filtered(cursor_plan)
+        assert any("created_at" in c and "id" in c for c in index_conds), cursor_plan
+        # A residual filter is the failure this form exists to avoid: it means
+        # the scan read every row above the cursor and threw it away.
+        assert all(r == 0 for r in rows_filtered), cursor_plan
+    else:
+        assert "USING INDEX" in cursor_plan, cursor_plan
+        assert "SCAN conversations" not in cursor_plan, cursor_plan
 
-    with _capture_conversation_selects(conversation_store) as captured:
-        second = conversation_store.list_conversations(
-            accessible_by="alice@example.com",
-            limit=300,
-            after=first.data[-1].id,
-            has_agent_id=True,
-            kind="default",
-            sort_by="created_at",
-            order="desc",
-        )
-    listing = next((c for c in captured if "created_at" in str(c)), captured[0])
-    normalized = " ".join(str(listing).split())
+    # Then the emitted spelling, as a description of what produced that plan.
+    listing = next((c for c in clauses if "created_at" in str(c)), clauses[0])
     # The tiebreaker column is dialect-chosen (SQLite rowid = insertion order,
     # otherwise the uuid id) — assert against the store's own choice rather
     # than hard-coding one dialect's spelling.
     tiebreaker_col = conversation_store._tiebreaker_col
-    # ``str()`` on a mapped attribute yields "SqlConversation.id"; the SQL
-    # spelling is the underlying column.
     tiebreaker = str(getattr(tiebreaker_col, "expression", tiebreaker_col))
-    assert f"(conversations.created_at, {tiebreaker}) <" in normalized, (
+    assert f"(conversations.created_at, {tiebreaker}) <" in " ".join(str(listing).split()), (
         tiebreaker,
-        normalized,
+        str(listing),
     )
 
-    # Behavioural: the deep page continues exactly where the first ended.
+    # ── 3. behaviour: deep pagination loses and duplicates nothing ──────
     first_ids = [c.id for c in first.data]
     second_ids = [c.id for c in second.data]
     assert not set(first_ids) & set(second_ids), "cursor pages overlap"
-    assert len(set(first_ids + second_ids)) == len(first_ids) + len(second_ids)
-
     # Non-overlap alone only proves no DUPLICATES. A cursor that skips rows —
     # the failure mode of a wrong tiebreaker or a strict-vs-inclusive boundary
-    # slip — also produces non-overlapping pages. Walk the whole listing in
-    # small pages and require the union to equal the single-shot result.
-    expected = conversation_store.list_conversations(
-        accessible_by="alice@example.com",
-        limit=1000,
-        has_agent_id=True,
-        kind="default",
-        sort_by="created_at",
-        order="desc",
-    )
-    assert not expected.has_more, "baseline must be a single complete page"
-    expected_ids = [c.id for c in expected.data]
-
+    # slip — also produces non-overlapping pages, so compare the paged walk to
+    # the single-shot result.
     walked: list[str] = []
     after: str | None = None
     while True:
-        page = conversation_store.list_conversations(
+        walk_page = conversation_store.list_conversations(
             accessible_by="alice@example.com",
-            limit=50,
+            limit=500,
             after=after,
             has_agent_id=True,
             kind="default",
             sort_by="created_at",
             order="desc",
         )
-        walked.extend(c.id for c in page.data)
-        if not page.has_more or page.last_id is None:
+        walked.extend(c.id for c in walk_page.data)
+        if not walk_page.has_more or walk_page.last_id is None:
             break
-        after = page.last_id
+        after = walk_page.last_id
     assert len(walked) == len(set(walked)), "paged walk returned a row twice"
     assert walked == expected_ids, (
         f"paged walk lost or reordered rows: {len(walked)} of {len(expected_ids)}"
     )
+
+
+@pytest.mark.parametrize("order", ["desc", "asc"])
+@pytest.mark.parametrize("sort_by", ["created_at", "updated_at"])
+def test_cursor_pages_forward_and_backward_in_both_orders(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str, sort_by: str, order: str
+) -> None:
+    """
+    ``before`` is the same rewritten predicate as ``after``, in reverse.
+
+    The row-values rewrite changed both directions and both sort columns, but
+    coverage only ever exercised descending ``after``. Tied timestamps are
+    seeded so the tiebreaker term decides page boundaries, which is where a
+    direction mix-up shows up: paging forward and then back must return the
+    same rows, in the same order.
+    """
+    _acl_perms(db_uri)
+    _bulk_seed_conversations_and_grants(
+        conversation_store, "alice@example.com", count=40, granted_ratio=1.0, tie_size=4
+    )
+
+    def _page(**kwargs: object) -> list[str]:
+        return [
+            c.id
+            for c in conversation_store.list_conversations(
+                accessible_by="alice@example.com",
+                has_agent_id=True,
+                kind="default",
+                sort_by=sort_by,
+                order=order,
+                **kwargs,  # type: ignore[arg-type]
+            ).data
+        ]
+
+    full = _page(limit=100)
+    assert len(full) > 12, "seed must cover several pages"
+
+    # Forward from a mid-list cursor.
+    forward = _page(limit=6, after=full[5])
+    assert forward == full[6:12], (forward, full[:14])
+
+    # ``before`` narrows to the rows preceding the cursor while keeping the
+    # same ORDER BY, so the whole prefix comes back in listing order and LIMIT
+    # takes it from the start — not the rows nearest the cursor. Both halves
+    # are asserted: the full prefix pins the boundary (exclusive, correct
+    # direction), the limited page pins which end LIMIT cuts.
+    assert _page(limit=100, before=full[12]) == full[:12], full[:14]
+    assert _page(limit=6, before=full[12]) == full[:6], full[:14]
