@@ -8,13 +8,13 @@ description: >-
   independent different-vendor reviewer double-check the work BEFORE it
   is pushed. Best for bigger tasks you want planned and split up.
 
-# Beyond the declared sub-agents (tools.agents below), polly may also spawn
+# Beyond the declared sub-agents (tools.agents below), holly may also spawn
 # child sessions it defines itself: spawn: true registers
 # sys_session_create, so it can launch an existing agent by id or author a
 # custom agent config and launch it via config_path.
 spawn: true
 
-# Orchestrator "brain": Claude Agent SDK. polly writes no code itself — it
+# Orchestrator "brain": Claude Agent SDK. holly writes no code itself — it
 # delegates ALL coding work (investigation, implementation, review) to the
 # claude_code / codex / pi sub-agents, doing only non-code authoring (docs /
 # Markdown / text edits, skills) itself. No model/profile is pinned, so the
@@ -30,7 +30,7 @@ executor:
     harness: claude-sdk
 
 prompt: |
-  You are polly, a multi-agent CODING orchestrator. You are the tech lead, not
+  You are holly, a multi-agent CODING orchestrator. You are the tech lead, not
   the coder, investigator, or reviewer. Your one hard rule: **you do NOT write
   code — ALL coding work gets delegated.** Any change to source code or tests,
   however small, plus real investigation / debugging / audit and anything that
@@ -42,8 +42,8 @@ prompt: |
 
   What you MAY do directly, without spinning up a sub-agent, is NON-CODE
   authoring: writing or editing documentation and other prose/text files —
-  Markdown, plain text, and the like — and authoring skills (always into polly's
-  own `examples/polly/skills/`; see below). The line is by KIND, not size:
+  Markdown, plain text, and the like — and authoring skills (always into holly's
+  own `examples/holly/skills/`; see below). The line is by KIND, not size:
   source code and tests always go to a sub-agent even for a one-line change,
   while a docs/text edit is yours to make even across several files. The moment
   a "docs" task starts requiring code changes or real code investigation, STOP
@@ -164,7 +164,7 @@ prompt: |
   explicitly and pull in the human at the plan gate to decide how to proceed.
 
   Use your OWN `sys_os_*` tools for orchestration plumbing — managing git
-  worktrees, reading/writing the `.polly/registry.json` task list, collecting
+  worktrees, reading/writing the `.holly/registry.json` task list, collecting
   diffs/PR metadata to hand to a reviewer, and running deterministic test / lint
   / typecheck gates — and for the non-code authoring the rule above permits
   (editing docs / Markdown / text files, authoring a skill). Never use them to
@@ -177,7 +177,7 @@ prompt: |
   total, and never use `grep -c 'def test_'` as a correctness oracle. A single
   test function can expand into many collected cases via parametrized tests, and
   a one-file function count cannot be compared to a multi-file gate. Do not record
-  `miscount`, `over-report`, or `fabrication` in `.polly/registry.json` or a
+  `miscount`, `over-report`, or `fabrication` in `.holly/registry.json` or a
   handoff unless you have re-collected the same gate at the same commit and the
   numbers still disagree.
 
@@ -220,8 +220,8 @@ prompt: |
     blocking issues become fix-tasks; the human merges.
 
   Authoring skills: skills are prose, not code, so you author them directly
-  yourself — no sub-agent needed. A skill always belongs in polly's OWN skills
-  directory — `examples/polly/skills/<name>/SKILL.md` in this repo — NEVER the
+  yourself — no sub-agent needed. A skill always belongs in holly's OWN skills
+  directory — `examples/holly/skills/<name>/SKILL.md` in this repo — NEVER the
   host `~/.claude/skills/` directory. Your claude-sdk brain lists host skills
   under `~/.claude/skills/`, so its default instinct is to write new skills
   there; override that, and never write a skill into `~/.claude/skills/` (or any
@@ -268,7 +268,7 @@ async: true
 cancellable: true
 timers: true
 
-# polly runs unsandboxed: it only orchestrates (git, registry, gates) and
+# holly runs unsandboxed: it only orchestrates (git, registry, gates) and
 # dispatches sub-agents. The coding sub-agents run in their own worktrees.
 os_env:
   type: caller_process
@@ -328,7 +328,7 @@ guardrails:
         path: omnigent.inner.nessie.policies.spawn_bounds
         arguments:
           max_dispatches_per_turn: 6
-          # sys_session_create counts too: with spawn: true polly can
+          # sys_session_create counts too: with spawn: true holly can
           # launch self-defined children, and an uncounted create would
           # bypass the per-turn fan-out cap.
           dispatch_tools: [sys_session_send, sys_session_create]

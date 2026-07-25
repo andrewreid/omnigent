@@ -22,10 +22,10 @@ anyone needs to read through.
    cases, and misses parametrized case expansion.
 3. Dispatch a DIFFERENT-vendor sub-agent as reviewer: pick any AVAILABLE worker
    whose vendor differs from the implementer's — `claude_code`, `codex`,
-   `opencode`, `cursor`, `hermes`, or `pi` (e.g. Claude built it → any of
-   `codex` / `opencode` / `cursor` / `hermes` / `pi`, and so on). Use a
+   or `pi` (e.g. `claude_code` built it → `codex` or `pi`; `codex` built it
+   → `claude_code` or `pi`; `pi` built it → either). Use a
    task-based title such as `review-auth-refactor`, never the raw vendor name:
-   `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"pi", title="review-<task_slug>",
+   `sys_session_send(agent="claude_code"|"codex"|"pi", title="review-<task_slug>",
    args={purpose: "review", input: "<the diff> + <the acceptance contract>.
    Review ONLY against the contract. Report blocking / non-blocking /
    suggestions. Do not edit code."})`. Give it the diff as text — do NOT point
@@ -47,20 +47,20 @@ anyone needs to read through.
    memory of the task. Then loop to step 1.
 6. When gates are green AND there are zero blocking issues, the PR passes
    review — mark it ready in the registry (with its PR URL) and leave it for
-   the human to merge. polly does NOT merge it.
+   the human to merge. holly does NOT merge it.
 7. If the contract can't be satisfied after a few loops, stop and escalate to
    the user with specifics.
 
 ## Notes
 - Cross-review requires a reviewer from a DIFFERENT vendor than the implementer,
-  so it needs at least two AVAILABLE workers (per polly's roster preflight). If
+  so it needs at least two AVAILABLE workers (per holly's roster preflight). If
   only one worker — or only one vendor that can review this implementer's PR —
   is available on the machine, you CANNOT run independent cross-vendor review:
   don't dispatch a reviewer that can't boot, say so explicitly, and pull in the
   human at the plan gate.
 - Give the reviewer ONLY the diff + contract — never the implementer's
   transcript or worktree. The cross-vendor independence is the whole point.
-- Review is a coding sub-agent (`claude_code`/`codex`/`opencode`/`cursor`/`hermes`/`pi`) dispatched with
+- Review is a coding sub-agent (`claude_code`/`codex`/`pi`) dispatched with
   `purpose: "review"` — a DIFFERENT vendor from the one that built the diff. It
   reports issues and never edits; only the implementer opens a PR, so a stray
   reviewer edit never reaches the deliverable.

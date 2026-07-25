@@ -1,6 +1,6 @@
 ---
 name: fanout
-description: Run independent subtasks in parallel — one git worktree and one implementation sub-agent per task, each opening its own PR — then cross-review every PR. polly never merges; the human does.
+description: Run independent subtasks in parallel — one git worktree and one implementation sub-agent per task, each opening its own PR — then cross-review every PR. holly never merges; the human does.
 ---
 
 # fanout — safe parallel execution
@@ -10,11 +10,11 @@ dependency).
 
 ## Procedure
 1. Per task, create an isolated worktree:
-   `sys_os_shell("git worktree add .worktrees/<task_id> -b polly/<task_id>")`.
+   `sys_os_shell("git worktree add .worktrees/<task_id> -b holly/<task_id>")`.
    Record the worktree path + branch in the registry
-   (`.polly/registry.json`).
+   (`.holly/registry.json`).
 2. Dispatch one implementation sub-agent per task, scoped to its worktree:
-   `sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes", title="<task_slug>",
+   `sys_session_send(agent="claude_code"|"codex"|"pi", title="<task_slug>",
    args={purpose: "implement", input: "<task + acceptance contract +
    worktree path>"})`. Use a short task-based title such as `auth-refactor` or
    `fix-sse-error`, never the raw vendor name. State the scope and that it must
@@ -33,7 +33,7 @@ dependency).
    worker conversation with `sys_session_get_history` before deciding what to do
    next.
 4. Send each finished task's PR through `cross-review`.
-5. polly does NOT merge — the PR is the deliverable. When cross-review passes,
+5. holly does NOT merge — the PR is the deliverable. When cross-review passes,
    the task is done: mark it ready in the registry with its PR URL and leave it
    for the human to review and merge. Never run `git merge` / `gh pr merge`.
 6. Remove a finished worktree (`git worktree remove`) only once its PR is open
@@ -52,6 +52,6 @@ dependency).
 - A sub-agent that returns a dark or failing result: don't re-prompt it in a
   loop — re-dispatch a fresh implementation sub-agent in a clean worktree, or
   escalate to the user.
-- Because polly never merges, cross-PR conflicts surface when the human merges,
+- Because holly never merges, cross-PR conflicts surface when the human merges,
   not here. Keeping each parallel task's file scope disjoint is what keeps that
   rare — honor it.
