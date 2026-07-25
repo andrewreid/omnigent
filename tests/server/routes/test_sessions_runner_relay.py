@@ -833,3 +833,96 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker() -> None
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_completion_with_usage_rolls_up_subtree_cost(db_uri: str) -> None:
+    """
+    A relay turn that reports usage must price it, persist it, and publish
+    the SUBTREE total — parent plus sub-agent spend.
+
+    The relay completion path was reworked to read the conversation once
+    and share it between the pricing lookup and the subtree roll-up, but
+    every existing relay test deliberately omits ``usage`` to stay off the
+    cost path, so that rework had no coverage at all. Deleting the roll-up
+    (or letting it recompute from the wrong root) leaves the badge showing
+    own-cost instead of the subtree total.
+    """
+    from omnigent.runtime import session_stream  # noqa: F401 — parity with siblings
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        title="relay:child",
+    )
+    # The sub-agent already spent: the published total must include it.
+    store.set_session_usage(child.id, {"total_cost_usd": 0.25})
+    session_id = parent.id
+
+    response_id = "resp_relay_usage_1"
+    turn_events: list[dict[str, Any]] = [
+        {
+            "type": "response.in_progress",
+            "response": {"id": response_id, "model": "databricks-claude-sonnet-4-6"},
+        },
+        {"type": "response.output_text.delta", "delta": "hi"},
+        {
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "model": "databricks-claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 500,
+                    "total_tokens": 1500,
+                },
+            },
+        },
+    ]
+    release = asyncio.Event()
+    fake_runner = _ScriptedRunnerClient(release, turn_events)
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_relay_usage",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+        release.set()
+
+        usage_events: list[dict[str, Any]] = []
+        seen: list[str] = []
+        while not seen or seen[-1] != "response.completed":
+            event = await collector.next_event()
+            seen.append(event["type"])
+            if event["type"] == "session.usage":
+                usage_events.append(event)
+
+        # The turn's own usage was accumulated onto the parent.
+        parent_usage = dict(store.get_conversation(session_id).session_usage)
+        assert parent_usage.get("total_tokens") == 1500, parent_usage
+
+        assert usage_events, f"no session.usage published; saw {seen}"
+        published = usage_events[-1].get("total_cost_usd")
+        # The parent's own turn is unpriced here (test model is not in the
+        # pricing catalog), so its own cost contributes nothing. The
+        # published figure is therefore exactly the CHILD's spend — which
+        # is the sharpest available evidence that the published total comes
+        # from the subtree scan and not from this conversation's row: an
+        # own-cost publication would have been absent or 0.
+        assert parent_usage.get("total_cost_usd") in (None, 0, 0.0), parent_usage
+        assert published == pytest.approx(0.25), (published, parent_usage)
+    finally:
+        if collector is not None:
+            await collector.stop()
+        for task_handle in list(sessions_module._runner_relay_tasks.values()):
+            task_handle.task.cancel()
+        sessions_module._runner_relay_tasks.clear()

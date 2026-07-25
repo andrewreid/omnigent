@@ -62,7 +62,11 @@ async def test_snapshot_subtree_usage_reuses_conversation_row(
         resp = await client.get(f"/v1/sessions/{sid}")
 
     assert resp.status_code == 200
-    assert len(selects) <= 4, f"expected <=4 conversations SELECTs, got {len(selects)}"
+    # EXACT, not a ceiling: a ceiling let the test pass with the supplied-root
+    # argument removed (measured 5 without it, 4 with). The four are the
+    # handler's own row, the child-indicator id scan, the liveness id scan,
+    # and the subtree tree page — no per-session root re-resolution.
+    assert len(selects) == 4, [str(q)[:90] for q in selects]
 
 
 @pytest.mark.asyncio
@@ -124,4 +128,7 @@ async def test_usage_report_reuses_listed_rows_for_subtree_totals(
     # Parent 0.10 + child 0.05: proves the subtree recompute ran.
     assert rows[sid]["cost_usd"] == pytest.approx(0.15)
     # The listing itself + the tree scan(s); no per-session row re-read.
-    assert len(selects) <= 3, f"expected <=3 conversations SELECTs, got {len(selects)}"
+    # EXACT: the page listing plus one tree scan for the listed session —
+    # no per-session conversation re-read. A ceiling here would pass with
+    # the supplied-root argument removed.
+    assert len(selects) == 2, [str(q)[:90] for q in selects]
