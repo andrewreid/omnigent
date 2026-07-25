@@ -537,6 +537,19 @@ def register_hooks_routes(
         # with no name evaluates with ``tool_name=None``, which SKIPS every
         # tool-name-scoped policy on a blocking hook — failing open.
         raw_data = event.get("data")
+        # Two independent checks, deliberately not chained. The shape of
+        # ``event.data`` is wrong for every phase; a phase in the table
+        # additionally needs a tool name, which for TOOL_RESULT lives in a
+        # different container. Chaining them behind ``elif`` meant every phase
+        # in the table skipped the shape check entirely — TOOL_RESULT accepted
+        # ``False`` / ``0`` / ``[]`` as ``data`` and normalized them to ``{}``,
+        # which is the same fail-open the guard exists to prevent.
+        if raw_data is not None and not isinstance(raw_data, (dict, str)):
+            raise OmnigentError(
+                f"Policy evaluate 'event.data' must be an object or string; "
+                f"got {type(raw_data).__name__}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
         required = _REQUIRED_NON_EMPTY_NAME_BY_PHASE.get(phase)
         if required is not None:
             container_key, field_path = required
@@ -558,12 +571,6 @@ def register_hooks_routes(
                     f"for {event_type!r}.",
                     code=ErrorCode.INVALID_INPUT,
                 )
-        elif raw_data is not None and not isinstance(raw_data, (dict, str)):
-            raise OmnigentError(
-                f"Policy evaluate 'event.data' must be an object or string; "
-                f"got {type(raw_data).__name__}.",
-                code=ErrorCode.INVALID_INPUT,
-            )
         data = raw_data or {}
         raw_event_context = event.get("context")
         if raw_event_context is not None and not isinstance(raw_event_context, dict):
