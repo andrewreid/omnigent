@@ -5384,11 +5384,17 @@ def _bulk_seed_conversations_and_grants(
     *,
     count: int,
     granted_ratio: float,
+    tie_size: int = 1,
 ) -> None:
     """Insert *count* conversations (and grants for a fraction of them).
 
     Core bulk inserts, not per-row store calls, so a plan test can reach a
     realistic row count without a slow fixture.
+
+    :param tie_size: How many rows share one ``created_at`` value. The
+        default of 1 gives every row a distinct timestamp; a larger value
+        creates ties, which is what makes the cursor's tiebreaker term
+        load-bearing (without ties, dropping it changes nothing).
     """
     import uuid as _uuid
 
@@ -5402,12 +5408,13 @@ def _bulk_seed_conversations_and_grants(
     perm_rows = []
     for i in range(count):
         cid = _uuid.uuid4().hex
+        stamp = base + i // tie_size
         conv_rows.append(
             {
                 "workspace_id": 0,
                 "id": cid,
-                "created_at": base + i,
-                "updated_at": base + i,
+                "created_at": stamp,
+                "updated_at": stamp,
                 "title": f"seed-{i}",
                 "parent_conversation_id": None,
                 "root_conversation_id": cid,
@@ -5615,10 +5622,15 @@ def test_default_created_at_listing_uses_ordering_index(
     assert page.data, "seed must produce visible rows or the plan is not the real one"
     assert captured, "no conversations SELECT captured"
     listing = captured[0]
+    # Assert the pushdown on the UNCOMPILED statement, before rendering literal
+    # binds. Without the pushdown the ACL is a materialized list of 16-byte
+    # binary ids, and literal-bind rendering raises on those — so a test that
+    # compiled first would fail for a rendering reason and never reach the
+    # assertion that explains what actually regressed.
+    assert "EXISTS" in str(listing).upper(), str(listing)  # ACL really is pushed down
     query = str(
         listing.compile(conversation_store._conv_engine, compile_kwargs={"literal_binds": True})
     )
-    assert "EXISTS" in query.upper(), query  # ACL really is pushed down
     dialect = conversation_store._conv_engine.dialect.name
 
     if dialect == "sqlite":
@@ -5669,8 +5681,11 @@ def test_deep_cursor_emits_row_values_and_paginates_exactly(
     filter, 47 rows examined at a 70%-deep cursor versus 28,000 before).
     """
     _acl_perms(db_uri)
+    # Tied timestamps: with one row per timestamp the tiebreaker term is
+    # decorative and dropping it loses nothing, so the walk below could not
+    # tell a correct cursor from a broken one.
     _bulk_seed_conversations_and_grants(
-        conversation_store, "alice@example.com", count=600, granted_ratio=1.0
+        conversation_store, "alice@example.com", count=600, granted_ratio=1.0, tie_size=4
     )
     first = conversation_store.list_conversations(
         accessible_by="alice@example.com",
@@ -5711,3 +5726,39 @@ def test_deep_cursor_emits_row_values_and_paginates_exactly(
     second_ids = [c.id for c in second.data]
     assert not set(first_ids) & set(second_ids), "cursor pages overlap"
     assert len(set(first_ids + second_ids)) == len(first_ids) + len(second_ids)
+
+    # Non-overlap alone only proves no DUPLICATES. A cursor that skips rows —
+    # the failure mode of a wrong tiebreaker or a strict-vs-inclusive boundary
+    # slip — also produces non-overlapping pages. Walk the whole listing in
+    # small pages and require the union to equal the single-shot result.
+    expected = conversation_store.list_conversations(
+        accessible_by="alice@example.com",
+        limit=1000,
+        has_agent_id=True,
+        kind="default",
+        sort_by="created_at",
+        order="desc",
+    )
+    assert not expected.has_more, "baseline must be a single complete page"
+    expected_ids = [c.id for c in expected.data]
+
+    walked: list[str] = []
+    after: str | None = None
+    while True:
+        page = conversation_store.list_conversations(
+            accessible_by="alice@example.com",
+            limit=50,
+            after=after,
+            has_agent_id=True,
+            kind="default",
+            sort_by="created_at",
+            order="desc",
+        )
+        walked.extend(c.id for c in page.data)
+        if not page.has_more or page.last_id is None:
+            break
+        after = page.last_id
+    assert len(walked) == len(set(walked)), "paged walk returned a row twice"
+    assert walked == expected_ids, (
+        f"paged walk lost or reordered rows: {len(walked)} of {len(expected_ids)}"
+    )
