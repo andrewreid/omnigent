@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
+from omnigent.db.utils import _engine_cache
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.routes.usage import (
     _build_usage_report,
@@ -14,6 +16,7 @@ from omnigent.server.routes.usage import (
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from tests.server.helpers import count_conversation_selects
 
 _DAY = 86_400
 # Agent ids are stored as 16-byte uuids, so tests use a valid 32-char hex id.
@@ -199,3 +202,45 @@ def test_sum_daily_cost_range(db_uri: str) -> None:
     assert store.sum_daily_cost("alice", "0000-00-00") == 7.0  # all-time
     assert store.sum_daily_cost("alice", "2026-08-01") == 0.0  # nothing in range
     assert store.sum_daily_cost("nobody", "0000-00-00") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_usage_report_reuses_listed_rows_for_subtree_totals(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    ``GET /v1/usage`` holds each listed conversation, so the per-session
+    subtree recompute must not re-read it: one conversations SELECT for
+    the page plus one tree scan per session, and the totals still include
+    child spend (a count-only assertion would pass with the recompute
+    deleted).
+    """
+    from tests.server.helpers import create_test_session
+
+    snap = await create_test_session(client, title="usage-report")
+    sid = snap["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=sid, title="usage:child"
+    )
+    store.set_session_usage(sid, {"total_cost_usd": 0.10})
+    store.set_session_usage(child.id, {"total_cost_usd": 0.05})
+
+    await client.get("/v1/usage")  # warm caches
+
+    engine = _engine_cache[db_uri]
+    with count_conversation_selects(engine) as selects:
+        resp = await client.get("/v1/usage")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    rows = {s["id"]: s for s in body.get("sessions", [])}
+    assert sid in rows, body
+    # Parent 0.10 + child 0.05: proves the subtree recompute ran.
+    assert rows[sid]["cost_usd"] == pytest.approx(0.15)
+    # The listing itself + the tree scan(s); no per-session row re-read.
+    # EXACT: the page listing plus one tree scan for the listed session —
+    # no per-session conversation re-read. A ceiling here would pass with
+    # the supplied-root argument removed.
+    assert len(selects) == 2, [str(q)[:90] for q in selects]
