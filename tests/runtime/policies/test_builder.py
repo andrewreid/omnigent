@@ -1201,3 +1201,78 @@ def test_build_with_preloaded_row_sees_concurrent_mutable_writes(
     assert engine.labels.get("guard") == "tripped"
     assert engine.session_state.get("checkpoint") == 1.5
     assert engine.model == "claude-sonnet-4-6"
+
+
+def test_build_rereads_when_archived_self_is_missing_from_tree(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    The tree scan excludes archived rows, so a row archived after the
+    preload is absent from it. The builder must re-read rather than fall
+    back to the preloaded copy — otherwise an atomic
+    ``archived=True, model_override=<expensive>`` update would authorize
+    from pre-update state (fail-OPEN).
+    """
+    conv = conversation_store.create_conversation(title="archive-race")
+    stale_row = conversation_store.get_conversation(conv.id)
+
+    conversation_store.set_labels(conv.id, {"guard": "tripped"})
+    conversation_store.update_conversation(
+        conv.id, model_override="claude-opus-4-8", archived=True
+    )
+
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="x"),
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+        conversation=stale_row,
+    )
+
+    assert engine.model == "claude-opus-4-8", "archived self must not use the stale row"
+    assert engine.labels.get("guard") == "tripped"
+
+
+def test_initial_label_seed_does_not_clobber_a_concurrent_write(
+    conversation_store: SqlAlchemyConversationStore,
+    tmp_path: Path,
+) -> None:
+    """
+    Seeding declared initials is insert-if-absent, so a value written
+    between a builder's snapshot and its seed survives. Diff-then-upsert
+    reset such a write back to the initial value.
+    """
+    agent_dir = _write_spec(
+        tmp_path,
+        """
+spec_version: 1
+name: seeding
+guardrails:
+  labels:
+    integrity:
+      initial: "0"
+  policies:
+    a:
+      type: function
+      on: [request]
+      function: tests.runtime.policies.conftest._always_allow
+""",
+    )
+    spec = parse(agent_dir)
+    conv = conversation_store.create_conversation()
+
+    # Snapshot with the label absent (what the handler would hold), then a
+    # policy write lands before the engine build seeds.
+    stale_row = conversation_store.get_conversation(conv.id)
+    assert "integrity" not in dict(stale_row.labels)
+    conversation_store.set_labels(conv.id, {"integrity": "7"})
+
+    engine = build_policy_engine(
+        spec=spec,
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+        conversation=stale_row,
+    )
+
+    assert engine.labels["integrity"] == "7", "seed overwrote a concurrent write"
+    persisted = conversation_store.get_conversation(conv.id)
+    assert dict(persisted.labels)["integrity"] == "7"

@@ -394,14 +394,21 @@ def build_policy_engine(
         if conv is not None
         else []
     )
-    # Freshness contract for the preloaded row: only immutable identity
-    # (id, root_conversation_id) is trusted from it. Mutable fields —
-    # labels, session_state, model_override — re-derive from this
-    # conversation's row in the just-loaded tree, which is at worst as
-    # fresh as the builder's own read used to be. The preloaded row is
-    # the fallback only when the tree lacks the row (archived self).
-    fresh_self = next((c for c in tree if c.id == conversation_id), None)
-    if fresh_self is not None:
+    # Freshness contract for the preloaded row: ONLY immutable identity
+    # (id, root_conversation_id) is trusted from it. Every mutable field —
+    # labels, session_state, model_override — comes from a fresh read.
+    # Normally that is this conversation's row in the tree just loaded.
+    # The tree scan excludes archived rows, so a row archived (or deleted)
+    # since the preload is absent from it: re-read directly rather than
+    # falling back to the preloaded copy. Retaining it would authorize from
+    # state captured before an atomic ``archived=True, model_override=...``
+    # update — the fail-OPEN case a newly restrictive guard would be missed
+    # by. A row that is genuinely gone yields ``None`` and the empty-state
+    # path, never stale state.
+    if conversation is not None:
+        fresh_self = next((c for c in tree if c.id == conversation_id), None)
+        if fresh_self is None:
+            fresh_self = conversation_store.get_conversation(conversation_id)
         conv = fresh_self
     root_conv = (
         conv
@@ -752,17 +759,15 @@ def _seed_and_load_labels(
     """
     if existing is None:
         existing = _load_existing_labels(conversation_id, conversation_store)
-    to_seed = {
-        key: ldef.initial
-        for key, ldef in label_defs.items()
-        if ldef.initial is not None and key not in existing
-    }
-    if to_seed:
-        conversation_store.set_labels(conversation_id, to_seed)
-        # Re-read to pick up the freshly seeded values plus any
-        # writes that landed concurrently from another workflow.
-        existing = _load_existing_labels(conversation_id, conversation_store)
-    return existing
+    declared = {key: ldef.initial for key, ldef in label_defs.items() if ldef.initial is not None}
+    if not declared:
+        return existing
+    # Insert-if-absent in one statement, NOT "diff against the snapshot then
+    # upsert": a policy write landing between the snapshot and the seed would
+    # be overwritten back to the initial value by an upsert. The database
+    # decides which keys are missing, and the returned snapshot is read in
+    # the same transaction as the insert.
+    return conversation_store.seed_labels_if_absent(conversation_id, declared)
 
 
 def _load_existing_labels(

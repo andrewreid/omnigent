@@ -20,6 +20,7 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import QueryableAttribute, Session, aliased
 from sqlalchemy.sql.selectable import Subquery
 
@@ -459,6 +460,66 @@ def _dialect_upsert_labels(
         },
     )
     session.execute(stmt)
+
+
+def _insert_labels_if_absent(
+    session: Session,
+    conversation_id: str,
+    defaults: dict[str, str],
+    updated_at: int,
+) -> None:
+    """
+    Insert label rows only where the key is not already present.
+
+    Distinct from :func:`_upsert_labels`, which overwrites. Used for
+    declared-initial seeding, where overwriting is precisely wrong: a
+    policy write that lands between a reader's snapshot and its seed
+    would be reset to the initial value. ``ON CONFLICT DO NOTHING``
+    makes the seed a no-op for keys that already exist, so the decision
+    is made by the database rather than by a stale snapshot.
+
+    Falls back to per-key ``INSERT`` attempts on dialects without
+    ``ON CONFLICT`` support, each in a nested transaction so a losing
+    race is absorbed rather than failing the caller.
+
+    :param session: Active SQLAlchemy session.
+    :param conversation_id: Owning conversation id.
+    :param defaults: Non-empty ``key -> initial value`` mapping.
+    :param updated_at: Timestamp written on inserted rows.
+    """
+    dialect = session.bind.dialect.name if session.bind is not None else ""
+    rows = [
+        {
+            "conversation_id": conversation_id,
+            "key": key,
+            "value": value[:LABEL_VALUE_MAX_LEN],
+            "updated_at": updated_at,
+        }
+        for key, value in defaults.items()
+    ]
+    stmt: Any
+    if dialect in ("sqlite", "postgresql"):
+        if dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+            stmt = sqlite_insert(SqlConversationLabel).values(rows)
+        else:
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+            stmt = pg_insert(SqlConversationLabel).values(rows)
+        session.execute(
+            stmt.on_conflict_do_nothing(
+                index_elements=["workspace_id", "conversation_id", "key"],
+            )
+        )
+        return
+    for row in rows:
+        try:
+            with session.begin_nested():
+                session.add(SqlConversationLabel(**row))
+        except IntegrityError:
+            # Another writer inserted this key first — that value wins.
+            continue
 
 
 def _fetch_labels(
@@ -1249,6 +1310,34 @@ class SqlAlchemyConversationStore(ConversationStore):
         stamp = updated_at if updated_at is not None else now_epoch()
         with self._conv_session() as session:
             _upsert_labels(session, conversation_id, updates, stamp)
+
+    def seed_labels_if_absent(
+        self,
+        conversation_id: str,
+        defaults: dict[str, str],
+        updated_at: int | None = None,
+    ) -> dict[str, str]:
+        """
+        Insert declared initial labels for keys that have none, then read back.
+
+        Seeding must not overwrite: a concurrent policy write landing
+        between a caller's snapshot and its seed would otherwise be reset
+        to the initial value. The insert is ``ON CONFLICT DO NOTHING``, so
+        existing keys keep their persisted value, and the post-seed
+        snapshot is read in the same transaction.
+
+        :param conversation_id: The conversation to seed,
+            e.g. ``"conv_abc123"``.
+        :param defaults: ``key -> initial value``. Empty skips the write
+            and just returns the current snapshot.
+        :param updated_at: Timestamp for inserted rows (``None`` → now).
+        :returns: The conversation's labels after seeding.
+        """
+        stamp = updated_at if updated_at is not None else now_epoch()
+        with self._conv_session() as session:
+            if defaults:
+                _insert_labels_if_absent(session, conversation_id, defaults, stamp)
+            return _fetch_labels(session, conversation_id)
 
     def set_session_state(
         self,
