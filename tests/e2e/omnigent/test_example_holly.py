@@ -15,8 +15,9 @@ workers, reviews the LOCAL branch diff with a different-vendor reviewer, and
 only then sequences publication. No policy SHIPPED BY HOLLY gates ordinary
 publication: a plain ``git push`` is ungated, so that ordering is prompt
 discipline and the tests are written accordingly. ``blast_radius`` does deny a
-set of destructive push forms, enumerated in the bundle and pinned in
-``tests/spec/test_holly_bundle.py``, but the denial is TEXT-MATCHED, so
+set of destructive push forms, enumerated in the bundle and pinned by
+``tests/spec/test_holly_bundle.py::test_review_lifecycle_branches_survive``,
+but the denial is TEXT-MATCHED, so
 ``sh -c 'git push --force'``, ``eval`` and a git alias all pass it even when the
 nested text contains an enumerated form: a guard against accident, not against
 intent. A deployment may attach session-level or server-wide policies that DO

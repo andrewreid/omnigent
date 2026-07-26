@@ -11,10 +11,11 @@ that. This file is holly's, and it is deliberately small: two cases.
    created it carried the expected ``args.purpose``.
 
 Both reuse the polly mock harness (``tests/e2e/test_polly_e2e``): a throwaway
-LOCAL server booted from this working tree (which carries the in-tree
-``omnigent.inner.nessie.policies`` module holly's guardrails resolve
-server-side), the bundle rewritten onto the ``openai-agents`` harness wired to
-the mock LLM server, and a one-shot ``omnigent run`` subprocess against it.
+LOCAL server booted from this working tree — which is what makes the in-tree
+``omnigent.inner.nessie.policies`` module importable to the RUNNER, where
+holly's function policies are resolved — the bundle rewritten onto the
+``openai-agents`` harness wired to the mock LLM server, and a one-shot
+``omnigent run`` subprocess against it.
 ``rewrite_sub_agent_harnesses`` swaps the native worker harnesses
 (``claude-native`` / ``codex-native`` / ``pi``) for ``openai-agents`` so no real
 CLI binary has to be on PATH. Neither network nor credentials are needed: the
@@ -25,7 +26,9 @@ WHAT THIS FILE DELIBERATELY DOES NOT ASSERT
 Review sequencing — that review runs before publication. Nothing in the runtime
 enforces that ordering; it is prompt discipline, which is this bundle's whole
 honesty premise. ``blast_radius`` runs with ``gate_pushes: false``, and while it
-does deny a set of destructive push forms, that denial is TEXT-MATCHED on the
+does deny a set of destructive push forms — enumerated in the bundle and pinned
+by ``tests/spec/test_holly_bundle.py::test_review_lifecycle_branches_survive``,
+which is why the list is not copied here — that denial is TEXT-MATCHED on the
 shell command: ``sh -c 'git push --force'``, ``eval`` and a git alias all pass it
 even when the nested text contains a denied form, so it is a guard against
 accident rather than against intent — and refusing a force-push was never an
@@ -260,10 +263,18 @@ def test_holly_orchestrator_boots_and_responds(
     exited 0" — a bundle that ran under some other name would leave no ``holly``
     row.
 
-    It does NOT cover the guardrail policies. Those resolve server-side when a
-    dispatch is EVALUATED, so a turn with no tool call never reaches them:
-    breaking ``blast_radius``'s factory path leaves this test green and fails
-    the dispatch test below. That one is the guard for policy resolution.
+    It DOES cover policy RESOLUTION, contrary to what this docstring claimed
+    before. The runner builds its policy gate from the spec at agent start and
+    resolves every function policy then — ``RunnerToolPolicyGate.from_spec``
+    replaces any policy whose factory path fails to resolve with a fail-closed
+    sentinel that DENIES every call, and the synthetic ``sys_agent_start``
+    evaluation that follows turns that DENY into a 403 ``agent_start_denied``.
+    So breaking ``blast_radius``'s factory path aborts startup and fails THIS
+    test, on the non-zero exit asserted below, with no tool call needed.
+
+    What it does not cover is policy BEHAVIOUR: nothing here observes a policy
+    reaching a verdict on a real call. The dispatch test below does that for
+    ``headless_subagent_purpose_guard``.
 
     :param local_holly_server: Base URL of the in-tree local server fixture.
     :param mock_llm_server_url: Base URL of the mock LLM server fixture.
@@ -294,8 +305,9 @@ def test_holly_orchestrator_boots_and_responds(
         holly_dir=holly_dir,
     )
 
-    # Exit 0 proves boot + turn completion; a harness that aborts startup or a
-    # server-side policy that fails to resolve surfaces here as a non-zero exit.
+    # Exit 0 proves boot + turn completion; a harness that aborts startup, or any
+    # function policy whose factory path fails to resolve in the runner, surfaces
+    # here as a non-zero exit — the unresolved sentinel denies the agent-start gate.
     assert result.returncode == 0, (
         f"holly run exited {result.returncode}\n--- stdout ---\n{result.stdout}\n"
         f"--- stderr ---\n{result.stderr}"
@@ -326,9 +338,12 @@ def test_holly_dispatch_reaches_a_sub_agent(
     ``args.purpose`` is missing or outside the spec's allowlist, so a child row
     existing at all is proof the guarded dispatch went through, and the
     transcript is where the purpose value itself is observable (nothing
-    persists it on the child row). Evaluating the guard is also what forces the
-    whole ``omnigent.inner.nessie.policies`` set to resolve on the server, so a
-    broken factory path fails here and nowhere else in this file.
+    persists it on the child row).
+
+    Resolution is NOT what this test adds — the runner already resolved every
+    function policy at agent start, so a broken factory path fails the boot test
+    too. What is unique here is a policy actually EVALUATING a real call and
+    returning a verdict the dispatch depends on.
 
     What it does NOT prove is any ORDERING — see the module docstring. The mock
     brain dispatches because the script says to.
