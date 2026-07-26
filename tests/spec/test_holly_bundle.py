@@ -1178,6 +1178,45 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "This carve-out is about WHO WRITES the artifact, not an exemption from "
         "review-before-push.",
     ),
+    # ── cross-file copies the widened premises sweep found unpinned ──
+    #
+    # Each of these is a rule stated in more than one bundle file where only some
+    # copies were pinned. The round-8 sweep could not see them because it looked
+    # only inside a pinned span's OWN paragraph in its OWN file, so a rule whose
+    # premise or qualifier lived in a different file read as fully covered.
+    (
+        # The SKILL headline. Its body is pinned, but "shipped by Holly" lives only
+        # in this sentence, and that qualifier IS the round-7 correction: without it
+        # the claim overreaches into deployment-attached policies the bundle cannot
+        # see. Deleting the headline leaves the pinned body intact.
+        "no-holly-policy-gates-publication-headline",
+        "the skill claims no policy at all gates publication, overreaching past "
+        "Holly's own set into policies a deployment may have attached",
+        _CROSS_REVIEW,
+        "No policy shipped by Holly gates ordinary publication.",
+    ),
+    (
+        # The root prompt's copy of the isolation claim plus the obligation it
+        # implies. fanout's copy is pinned; this one is what holly carries every
+        # turn, and it is the only place the two halves sit together.
+        "root-prompt-isolation-is-not-a-guarantee",
+        "the root prompt implies the runtime binds a worker to its worktree, so holly "
+        "skips both the absolute path and the branch verification",
+        _ROOT_CONFIG,
+        "so worktree isolation is the worker obeying its instructions, not a runtime "
+        "guarantee. Give an ABSOLUTE worktree path and VERIFY the resulting branch "
+        "before accepting the work",
+    ),
+    (
+        # The root prompt's copy of commit-and-stop. fanout's is pinned; this is the
+        # one holly reads before it ever loads a skill.
+        "root-prompt-implementer-commits-and-stops",
+        "the root prompt lets an implementer publish its own branch, so review "
+        "sequencing never happens and no skill is consulted to prevent it",
+        _ROOT_CONFIG,
+        "Each implementer commits to its own branch and STOPS — it does not push and "
+        "does not open a PR.",
+    ),
     # ── Smart Routing: the override, and what the readback does NOT establish ──
     #
     # The round that added this prose shipped with it pinned by nothing: the whole
