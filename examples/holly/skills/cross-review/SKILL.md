@@ -244,8 +244,10 @@ END REVIEWER-MANDATE-V1
    Smart Routing the server discards your `args.model` and re-picks the
    harness from `claude-sdk`/`codex`/`pi`, so neither the worker name nor the
    model you asked for establishes the vendor that actually ran. Two separate
-   checks, not one: requested-versus-recorded for a SINGLE session detects
-   substitution, and author-recorded-versus-reviewer-recorded compares vendors.
+   checks, not one: requested-versus-recorded for a SINGLE session is
+   DIAGNOSTIC of substitution — not proof, since the runner normalizes a model
+   id before it is persisted — and author-recorded-versus-reviewer-recorded
+   compares vendors.
    Identical recorded models necessarily share a vendor and are a definite
    failure; different recorded models prove nothing, since either may be a
    default or a stale record rather than what executed. `sys_session_get_info`
