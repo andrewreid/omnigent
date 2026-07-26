@@ -7,14 +7,16 @@ publication. Parse-only, so it runs in the default suite; the headline contract
 also has a thin guard under ``tests/e2e/omnigent/test_example_holly.py`` for the
 per-example coverage rule.
 
-Publication ordering is prompt discipline, not enforcement — with two edges. No
-policy SHIPPED BY HOLLY gates ordinary publication: ``blast_radius`` denies
-destructive push variants — ``--force*``, ``--delete``, ``--mirror``,
-``--prune``, bundled short forms containing ``-f`` or ``-d``, and ``+refspec`` /
-``:refspec`` — while a plain ``git push`` is ungated. It runs with
-``gate_pushes: false`` and inspects shell text only, but that flag governs the
-ASK branch, which the DENY branch precedes, so the destructive set is refused
-either way. A deployment may also attach session-level or server-wide policies
+Publication ordering is prompt discipline, not enforcement. No policy SHIPPED BY
+HOLLY gates ordinary publication: a plain ``git push`` is ungated.
+``blast_radius`` does deny a set of destructive push forms — the bundle
+enumerates them and this file pins that enumeration, which is why the list is
+not repeated here — but the denial is TEXT-MATCHED on the shell command and
+models neither nested shells nor ``eval`` nor git aliases, so
+``sh -c 'git push --force'``, ``eval`` and ``git -c alias.x='push --force' x``
+all pass even though the nested text contains an enumerated form. It is a guard
+against accident, not against intent, and nothing here should be read as saying
+otherwise. A deployment may also attach session-level or server-wide policies
 that DO gate ordinary pushes; those are not Holly's and this file asserts
 nothing either way about them.
 
@@ -1040,9 +1042,10 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         _CROSS_REVIEW,
         "It does NOT keep a worktree binding, because none exists: repeat the ABSOLUTE "
         "worktree path in every fix-round dispatch, and re-verify on return with the "
-        "SAME three baselines fanout uses, taken fresh before each round — the task "
-        "worktree's HEAD, and the runner root's branch, HEAD and `git status "
-        "--porcelain`.",
+        "SAME baselines fanout uses, taken fresh before each round — the task "
+        "worktree's HEAD and `git status --porcelain`, and the runner root's branch, "
+        "HEAD and `git status --porcelain`, with both worktrees required clean when "
+        "the baseline is taken.",
     ),
     (
         # The already-open-PR revision range. Its vocabulary anchor names the
@@ -1064,6 +1067,18 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "point-fixing: in that same round escalate the fix to whole-surface closure "
         'and the review to a whole-repo same-class audit, with "zero remaining" as '
         "the bar.",
+    ),
+    (
+        # Found by the premises-vs-conclusion sweep: "Review authorises exactly one
+        # commit" was pinned while the sentence saying NOTHING ENFORCES IT was not.
+        # Deleting that sentence leaves the rule reading as a mechanism, which is the
+        # D1a defect this bundle exists to avoid, and no test would have failed.
+        "post-review-edit-rule-has-no-mechanism",
+        "the one-commit rule reads as enforced, so holly stops checking HEAD and "
+        "relies on a gate that does not exist",
+        _CROSS_REVIEW,
+        "There is no mechanism enforcing this; it holds only because you check HEAD "
+        "before releasing.",
     ),
     (
         "post-review-edit-invalidates-verdict",
@@ -1173,6 +1188,23 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
     # turn; the cross-review skill is what it consults when dispatching a reviewer,
     # and the reviewer dispatch is the only place independence is decided.
     (
+        # Replaces territory a pin never covered: last round's prose carried a Smart
+        # Routing EXCEPTION to the roster rule ("a worker whose CLI is missing may
+        # still run"), which turned out to be unreachable — the dispatch tool probes
+        # PATH in the runner and fails there, before the server create route where
+        # forced-auto lives. Nothing pinned the exception, so nothing had to be
+        # deleted; what is pinned now is the corrected rule TOGETHER WITH the probe
+        # ordering that makes it true, so the exception cannot come back unnoticed.
+        "missing-cli-is-always-disqualifying",
+        "an unreachable routing exception returns and holly dispatches to a worker "
+        "whose CLI cannot launch, expecting routing to rescue it",
+        _ROOT_CONFIG,
+        "A missing CLI is ALWAYS disqualifying, including under Smart Routing: the "
+        "dispatch tool probes PATH for the declared harness and fails loud in the "
+        "runner, before the server create route where routing would have replaced "
+        "that harness. Routing never gets the chance to rescue it.",
+    ),
+    (
         "smart-routing-overrides-model-and-harness",
         "vendor fixity is assumed to survive routing, so a `codex` reviewer routed "
         "onto the author's own vendor is reported as an independent review",
@@ -1197,17 +1229,43 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         # dropped the asymmetry would pin an overclaim: holly would read a match as
         # confirmation and report an independence it never established. Both halves
         # therefore stay in one string.
-        "readback-mismatch-proves-substitution-match-proves-nothing",
-        "a matching readback is read as confirmed independence, which it never is; or "
-        "the readback goes altogether and routing substitution is never detected",
+        # Re-synced and SPLIT. The previous single entry pinned a conflated check
+        # and the claim that a match was "consistent with independence" — which the
+        # prose now rejects outright: a match is not evidence. Two entries, because
+        # the two halves fail differently. This one is the pair of checks and what
+        # each does and does not prove; the next is the limit that makes routed
+        # independence unconfirmable.
+        "readback-is-two-separate-checks",
+        "the two comparisons are merged again into one that establishes neither — "
+        "requested-vs-recorded cannot compare vendors, author-vs-reviewer cannot "
+        "detect substitution",
         _ROOT_CONFIG,
-        "read the child's RECORDED model back with `sys_session_get_info` and compare "
-        "it against the author's. Know what that establishes: it returns the STORED "
-        "`model_override` / `llm_model`, which is the routed value once routing has "
-        "persisted it, but it observes neither what actually executed nor the "
-        "harness, and a persistence failure can leave it stale while the routed "
-        "model still reaches the runner. So a MISMATCH proves substitution, while a "
-        "match is consistent with independence rather than proof of it.",
+        "After any dispatch you intend to rely on for independence, run TWO SEPARATE "
+        "checks and do not conflate them. FIRST, substitution: compare the model you "
+        "REQUESTED for a session against the RECORDED model `sys_session_get_info` "
+        "returns for that same session; a mismatch means the server substituted. "
+        "SECOND, vendor: compare the AUTHOR's recorded model against the REVIEWER's. "
+        "Identical recorded models necessarily share a vendor, so that is a definite "
+        "failure — but DIFFERENT recorded models are NOT proof of different vendors, "
+        "since either value may be a default or a stale record rather than what "
+        "executed.",
+    ),
+    (
+        # The decisive half, and the reason the STOP exists at all: under routing
+        # NOTHING available identifies the executing model, so independence is not
+        # weakly supported — it is unconfirmable, and the instruction is to stop
+        # rather than to compare. Pinned separately because deleting it leaves the
+        # two checks above reading as sufficient.
+        "routed-independence-is-unconfirmable",
+        "holly performs a comparison that cannot settle the question and reports the "
+        "result as an independent review",
+        _ROOT_CONFIG,
+        "Know the limit of both: `sys_session_get_info` returns only the STORED "
+        "`model_override` / `llm_model`. It observes neither what executed nor the "
+        "harness, and routing can reach the runner after persistence has failed. So "
+        "when Smart Routing is ON, nothing available to you identifies the model that "
+        "actually ran, and routed independence is UNCONFIRMABLE: STOP and say so. "
+        "Never report a cross-vendor review you cannot establish.",
     ),
     (
         # Same override, stated at the dispatch site. Shorter than the root-prompt
@@ -1226,14 +1284,26 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         # The skill's readback, with the same asymmetry kept whole for the same
         # reason. This copy also names the harness gap explicitly ("exposes no
         # harness"), which the root-prompt copy words differently.
-        "readback-asymmetry-at-the-reviewer-dispatch",
-        "a match is reported as an independent review, or the comparison is skipped "
-        "at the only dispatch where independence matters",
+        # The dispatch-site copy of the same split, re-synced for the same reason.
+        "readback-is-two-separate-checks-at-the-dispatch",
+        "the two comparisons are merged at the one place independence is decided, so "
+        "neither substitution nor vendor is actually established",
         _CROSS_REVIEW,
-        "Read both sides' RECORDED model back with `sys_session_get_info` and "
-        "compare. It reports stored metadata, not what executed, and exposes no "
-        "harness: a mismatch proves substitution, a match is consistent with "
-        "independence without proving it.",
+        "Two separate checks, not one: requested-versus-recorded for a SINGLE session "
+        "detects substitution, and author-recorded-versus-reviewer-recorded compares "
+        "vendors. Identical recorded models necessarily share a vendor and are a "
+        "definite failure; different recorded models prove nothing, since either may "
+        "be a default or a stale record rather than what executed.",
+    ),
+    (
+        "routed-independence-is-unconfirmable-at-the-dispatch",
+        "a routed review is reported as independent on the strength of a comparison "
+        "that cannot identify what executed",
+        _CROSS_REVIEW,
+        "`sys_session_get_info` reports stored metadata only, exposes no harness, and "
+        "routing can reach the runner after persistence fails — so under routing the "
+        "executing model is unidentifiable and independence is UNCONFIRMABLE. Stop "
+        "and say so rather than reporting a review you cannot establish.",
     ),
     (
         # The declared-vs-runtime distinction, pinned in the root prompt because the
@@ -1277,12 +1347,30 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "give the ABSOLUTE worktree path rather than a relative one",
     ),
     (
-        "three-baselines-recorded-before-dispatch",
+        # Re-synced: the scheme gained task-side porcelain, so it is no longer three
+        # values. Renamed off the count, which was never the point.
+        "baselines-recorded-before-dispatch",
         "there is nothing to compare a returning worker against, so contamination is "
-        "undetectable after the fact",
+        "undetectable after the fact; and gates that passed on uncommitted task-side "
+        "changes passed on work absent from the diff",
         _FANOUT,
-        "THREE baselines taken BEFORE dispatch: the task worktree's HEAD, and the "
-        "runner-root checkout's branch, HEAD and `git status --porcelain`",
+        "baselines taken BEFORE dispatch: the task worktree's HEAD and `git status "
+        "--porcelain`, and the runner root's branch, HEAD and `git status "
+        "--porcelain`.",
+    ),
+    (
+        # The PRECONDITION, pinned separately because it is what makes the baselines
+        # mean anything: against an already-dirty path every recorded value stays
+        # byte-identical while the path is altered underneath. Deleting this leaves a
+        # performable scheme that discriminates nothing — the exact defect the round
+        # that added it was fixing.
+        "baselines-require-both-worktrees-clean",
+        "the baselines are taken against an already-dirty path, so a worker can alter "
+        "it while every recorded value stays byte-identical",
+        _FANOUT,
+        "Require BOTH worktrees CLEAN at that point, or the baselines cannot "
+        "discriminate — a path already showing `M` or `??` can be altered while every "
+        "recorded value stays byte-identical.",
     ),
     (
         # Reason kept INSIDE the span here, unlike the absolute-path entry. The
