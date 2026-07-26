@@ -211,32 +211,14 @@ def _mock_polly_spec_dir(
         for the cost-advisor tests).
     :param polly_src: Source polly bundle directory; defaults to the
         shipped ``examples/polly``.
-    :param rewrite_sub_agent_harnesses: When ``True``, rewrite each
-        sub-agent's ``config.yaml`` to replace native CLI harnesses
-        (``pi``, ``pi-native``, ``claude-native``, ``codex-native``, etc.)
-        with ``openai-agents``.  Use this when a test only needs the child
-        *session row* to be created (e.g. to verify ``model_override``) and
-        doesn't need the native binary to actually run — avoids failures on
-        machines where the binary is absent from ``PATH``.
+    :param rewrite_sub_agent_harnesses: When ``True``, rewrite EVERY sub-agent
+        harness that needs a CLI binary on ``PATH`` to ``openai-agents``.  Use
+        this when a test only needs the child *session row* to be created (e.g.
+        to verify ``model_override``) and doesn't need the native binary to
+        actually run — avoids failures on machines where the binary is absent
+        from ``PATH``.
     :returns: Path to the copied polly bundle directory.
     """
-    # Native harnesses that require a CLI binary on PATH.  Replaced with
-    # ``openai-agents`` (SDK-based, no binary needed) when
-    # ``rewrite_sub_agent_harnesses`` is True.
-    _NATIVE_HARNESSES = frozenset(
-        {
-            "claude-native",
-            "native-claude",
-            "codex-native",
-            "native-codex",
-            "pi",
-            "pi-native",
-            "native-pi",
-            "cursor-native",
-            "native-cursor",
-        }
-    )
-
     # Name the copy after the source bundle so a non-polly caller (holly) does
     # not end up running a directory called "polly".
     dst = tmp_path / polly_src.name
@@ -269,10 +251,10 @@ def _mock_polly_spec_dir(
     config_path.write_text(yaml.safe_dump(spec, sort_keys=False))
 
     if rewrite_sub_agent_harnesses:
-        # Rewrite each sub-agent's config.yaml so native harnesses (which
-        # need a CLI binary on PATH) become ``openai-agents`` (SDK-based).
-        # This lets tests verify the child session row is created with the
-        # correct model_override without requiring the binary to be installed.
+        # Rewrite each sub-agent's config.yaml so any harness needing a CLI
+        # binary on PATH becomes ``openai-agents`` (SDK-based). This lets tests
+        # verify the child session row is created with the correct
+        # model_override without requiring the binary to be installed.
         agents_dir = dst / "agents"
         if agents_dir.is_dir():
             for sub_config in agents_dir.glob("*/config.yaml"):
@@ -280,13 +262,86 @@ def _mock_polly_spec_dir(
                 sub_executor = sub_spec.get("executor") or {}
                 sub_cfg = sub_executor.get("config") or {}
                 harness = sub_cfg.get("harness") or sub_executor.get("type") or ""
-                if harness in _NATIVE_HARNESSES:
+                if _harness_needs_a_cli(harness):
                     sub_cfg["harness"] = "openai-agents"
                     sub_executor["config"] = sub_cfg
                     sub_spec["executor"] = sub_executor
                     sub_config.write_text(yaml.safe_dump(sub_spec, sort_keys=False))
 
     return dst
+
+
+def _harness_needs_a_cli(harness: str) -> bool:
+    """
+    Whether *harness* launches a CLI binary that must be on ``PATH``.
+
+    Asks the installer registry instead of matching a hand-kept list of native
+    harness names. The list form was a DENYLIST and failed open exactly the way
+    the reviewer mandate says a denylist does: it named
+    ``claude-native`` / ``codex-native`` / ``pi`` / ``cursor-native`` and their
+    aliases, and silently missed the shipped ``hermes-native`` and
+    ``opencode-native`` siblings, so a bundle carrying either kept its native
+    harness and the test failed on any machine without that binary.
+
+    ``required_cli_for_harness`` returns an install spec for every harness that
+    needs a binary and ``None`` for the SDK harnesses (``openai-agents``,
+    ``claude-sdk``, ``codex``), which is also why the rewrite target itself is
+    never rewritten. Aliases are canonicalized first, so ``native-claude`` and
+    ``claude-native`` answer alike.
+
+    :param harness: Declared harness name from a sub-agent's ``executor``.
+    :returns: ``True`` when the harness needs a CLI binary on ``PATH``.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.onboarding.harness_install import required_cli_for_harness
+
+    if not harness:
+        return False
+    canonical = canonicalize_harness(harness) or harness
+    return required_cli_for_harness(canonical) is not None
+
+
+def test_native_harness_rewrite_covers_every_shipped_worker_harness() -> None:
+    """
+    Every CLI-needing harness declared by a shipped example worker is rewritten.
+
+    The regression guard for the denylist this replaced. It enumerates the
+    harnesses actually declared under ``examples/*/agents/*/config.yaml`` — the
+    real population, not a remembered list — and asserts the predicate answers
+    for each of them, so a newly shipped native harness cannot slip through
+    unrewritten the way ``hermes-native`` and ``opencode-native`` did.
+
+    Also pins the two directions that make the predicate safe: a harness needing
+    a binary is rewritten, and ``openai-agents`` (the rewrite TARGET) is not.
+    """
+    declared: dict[str, Path] = {}
+    for config_path in sorted((_REPO / "examples").glob("*/agents/*/config.yaml")):
+        spec = yaml.safe_load(config_path.read_text()) or {}
+        executor = spec.get("executor") or {}
+        harness = (executor.get("config") or {}).get("harness") or executor.get("type")
+        if harness:
+            declared.setdefault(str(harness), config_path)
+
+    assert declared, "no shipped example workers found — the glob is wrong"
+
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.onboarding.harness_install import required_cli_for_harness
+
+    for harness, config_path in declared.items():
+        canonical = canonicalize_harness(harness) or harness
+        needs_cli = required_cli_for_harness(canonical) is not None
+        assert _harness_needs_a_cli(harness) is needs_cli, (
+            f"{config_path.relative_to(_REPO)} declares {harness!r}: the rewrite "
+            f"predicate disagrees with the installer registry, so this worker is "
+            f"either left native (and fails without the binary) or rewritten when it "
+            f"did not need to be."
+        )
+
+    # The rewrite target must never itself be a rewrite candidate.
+    assert not _harness_needs_a_cli("openai-agents")
+    # And the shape the denylist got wrong: these are shipped and DO need a CLI.
+    assert _harness_needs_a_cli("hermes-native")
+    assert _harness_needs_a_cli("opencode-native")
 
 
 @pytest.fixture

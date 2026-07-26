@@ -10,8 +10,9 @@ per-example coverage rule.
 Publication ordering is prompt discipline, not enforcement. No policy SHIPPED BY
 HOLLY gates ordinary publication: a plain ``git push`` is ungated.
 ``blast_radius`` does deny a set of destructive push forms — the bundle
-enumerates them and this file pins that enumeration, which is why the list is
-not repeated here — but the denial is TEXT-MATCHED on the shell command and
+enumerates them and ``test_review_lifecycle_branches_survive`` below pins that
+enumeration, which is why the list is not repeated here — but the denial is
+TEXT-MATCHED on the shell command and
 models neither nested shells nor ``eval`` nor git aliases, so
 ``sh -c 'git push --force'``, ``eval`` and ``git -c alias.x='push --force' x``
 all pass even though the nested text contains an enumerated form. It is a guard
