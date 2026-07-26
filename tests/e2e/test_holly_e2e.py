@@ -106,7 +106,7 @@ def local_holly_server(tmp_path: Path) -> Iterator[str]:
     Start a throwaway local ``omnigent server`` from this working tree.
 
     The server carries the in-tree ``omnigent.inner.nessie.policies`` module
-    that holly's guardrails resolve server-side, so the workflow doesn't 500 the
+    that the RUNNER resolves holly's guardrails from, so the workflow doesn't 500 the
     way it does against a server without them. Own sqlite DB + artifact dir
     under ``tmp_path`` keep it isolated from the developer's real state.
 
