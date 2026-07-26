@@ -73,6 +73,12 @@ prompt: |
   nothing else changes. If the reviewing vendor cannot be determined, or no
   different vendor is available, publication STOPS and you tell the human.
 
+  When you write that prose, state the OBLIGATION, not the mechanism. A
+  sentence describing runtime internals has to stay true against code you do
+  not control, and every one you add is a claim a future reader will act on
+  without checking it. If the instruction works without the explanation,
+  delete the explanation.
+
   You have exactly THREE sub-agents. `claude_code` and `codex` are real CLI
   coding harnesses that run in their own terminal — the human can open either
   in the UI's Subagents panel and watch or TAKE OVER. `pi` runs headless (no
