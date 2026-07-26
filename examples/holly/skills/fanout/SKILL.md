@@ -29,9 +29,13 @@ dependency).
    end with a blank line followed by the exact co-sign trailer as its final
    line — `Co-authored-by: omnigent <noreply@omnigent.ai>`.
    Record each handle's `conversation_id`
-   in the registry, along with THREE baselines taken BEFORE dispatch: the task
-   worktree's HEAD, and the runner-root checkout's branch, HEAD and
-   `git status --porcelain`. All three are needed to detect contamination.
+   in the registry, along with baselines taken BEFORE dispatch: the task
+   worktree's HEAD and `git status --porcelain`, and the runner root's branch,
+   HEAD and `git status --porcelain`. Require BOTH worktrees CLEAN at that
+   point, or the baselines cannot discriminate — a path already showing `M` or
+   `??` can be altered while every recorded value stays byte-identical. Task
+   porcelain earns its place twice over: gates that pass on uncommitted changes
+   are passing on work absent from the diff you are about to review.
    When a worker reports, VERIFY before accepting anything it claims:
    `git -C .worktrees/<task_id> branch --show-current` shows the task branch;
    its `rev-parse HEAD` has MOVED from the recorded task baseline, since an
