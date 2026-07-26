@@ -301,15 +301,71 @@ def _harness_needs_a_cli(harness: str) -> bool:
     return required_cli_for_harness(canonical) is not None
 
 
+# INDEPENDENT classification for the test below, hand-maintained on purpose.
+#
+# The obvious oracle — ``required_cli_for_harness(h) is not None`` — is the exact
+# expression ``_harness_needs_a_cli`` evaluates, so comparing them compares a
+# thing to itself and passes by construction. It is also fail-open in the same
+# direction as the denylist it replaced: the registry returns ``None`` for an
+# UNKNOWN harness just as it does for an SDK one, so a newly declared native
+# harness nobody registered yields ``False == False`` and is never rewritten.
+#
+# These two sets are therefore maintained by hand and deliberately not derived
+# from the registry. A harness in NEITHER set fails the test, which is the point:
+# shipping a new worker harness is exactly when a human should decide which kind
+# it is. That failure is the maintenance cost, and it is cheaper than the silent
+# pass it replaces.
+_KNOWN_CLI_HARNESSES = frozenset(
+    {
+        "antigravity-native",
+        "claude-native",
+        "codex-native",
+        "cursor-native",
+        "goose",
+        "goose-native",
+        "hermes",
+        "hermes-native",
+        "kimi",
+        "kimi-native",
+        "kiro-native",
+        "opencode-native",
+        "pi",
+        "pi-native",
+        "qwen",
+        "qwen-code",
+        "qwen-native",
+    }
+)
+_KNOWN_SDK_HARNESSES = frozenset(
+    {
+        "antigravity",
+        "claude",
+        "claude-sdk",
+        "codex",
+        "copilot",
+        "cursor",
+        "openai-agents",
+    }
+)
+
+
 def test_native_harness_rewrite_covers_every_shipped_worker_harness() -> None:
     """
-    Every CLI-needing harness declared by a shipped example worker is rewritten.
+    Every harness a shipped example worker declares is classified, and the
+    rewrite predicate agrees with that classification.
 
-    The regression guard for the denylist this replaced. It enumerates the
-    harnesses actually declared under ``examples/*/agents/*/config.yaml`` — the
-    real population, not a remembered list — and asserts the predicate answers
-    for each of them, so a newly shipped native harness cannot slip through
-    unrewritten the way ``hermes-native`` and ``opencode-native`` did.
+    The regression guard for the denylist this replaced — rewritten, because the
+    first version of this test was the same fail-open shape one level up. It
+    asked the registry the predicate itself asks, so it could only ever agree
+    with it, and an unregistered native harness read as SDK to both.
+
+    The oracle is now ``_KNOWN_CLI_HARNESSES`` / ``_KNOWN_SDK_HARNESSES`` above:
+    independent of the registry, and exhaustive over the shipped population by
+    construction, because a harness in neither set FAILS instead of passing
+    quietly. What this test does NOT do is predict the future — it cannot know
+    that some harness invented tomorrow needs a binary. It guarantees only that
+    such a harness cannot arrive UNNOTICED, which is what commit 08dc63f0
+    claimed and did not deliver.
 
     Also pins the two directions that make the predicate safe: a harness needing
     a binary is rewritten, and ``openai-agents`` (the rewrite TARGET) is not.
@@ -329,19 +385,32 @@ def test_native_harness_rewrite_covers_every_shipped_worker_harness() -> None:
 
     for harness, config_path in declared.items():
         canonical = canonicalize_harness(harness) or harness
-        needs_cli = required_cli_for_harness(canonical) is not None
-        assert _harness_needs_a_cli(harness) is needs_cli, (
+        is_cli = canonical in _KNOWN_CLI_HARNESSES
+        is_sdk = canonical in _KNOWN_SDK_HARNESSES
+        assert is_cli != is_sdk, (
+            f"{config_path.relative_to(_REPO)} declares {harness!r} "
+            f"(canonical {canonical!r}), which is in neither _KNOWN_CLI_HARNESSES "
+            f"nor _KNOWN_SDK_HARNESSES. Classify it: if it launches a CLI binary it "
+            f"must be rewritten for mock runs, and the registry cannot tell you — it "
+            f"returns None for an unregistered harness exactly as it does for an SDK "
+            f"one."
+        )
+        assert _harness_needs_a_cli(harness) is is_cli, (
             f"{config_path.relative_to(_REPO)} declares {harness!r}: the rewrite "
-            f"predicate disagrees with the installer registry, so this worker is "
-            f"either left native (and fails without the binary) or rewritten when it "
-            f"did not need to be."
+            f"predicate says needs_cli={_harness_needs_a_cli(harness)} but this test's "
+            f"own classification says {is_cli}. Either the harness is left native "
+            f"(and fails without the binary) or it is rewritten when it did not need "
+            f"to be."
         )
 
     # The rewrite target must never itself be a rewrite candidate.
     assert not _harness_needs_a_cli("openai-agents")
-    # And the shape the denylist got wrong: these are shipped and DO need a CLI.
+    # The shape the denylist got wrong: these are shipped and DO need a CLI.
     assert _harness_needs_a_cli("hermes-native")
     assert _harness_needs_a_cli("opencode-native")
+    # And the fail-open that makes the hand-maintained sets necessary: the
+    # registry cannot distinguish "needs no CLI" from "never heard of it".
+    assert required_cli_for_harness("totally-unregistered-native") is None
 
 
 @pytest.fixture
