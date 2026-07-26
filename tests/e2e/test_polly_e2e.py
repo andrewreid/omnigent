@@ -45,7 +45,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -97,7 +97,11 @@ def _wait_for_health(base_url: str, deadline: float) -> None:
     raise TimeoutError(f"local server at {base_url} never became healthy: {last_err}")
 
 
-def _mock_env(mock_llm_server_url: str) -> dict[str, str]:
+def _mock_env(
+    mock_llm_server_url: str,
+    *,
+    env_passthrough: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     """
     Build a subprocess env with mock LLM credentials injected.
 
@@ -110,6 +114,13 @@ def _mock_env(mock_llm_server_url: str) -> dict[str, str]:
     :param mock_llm_server_url: The mock LLM server base URL, e.g.
         ``"http://127.0.0.1:12345"``.  The function appends ``/v1`` so the
         harness hits ``/v1/responses``.
+    :param env_passthrough: Env vars applied AFTER the credential strip, so a
+        spec that INTERPOLATES one of the stripped names still parses. holly's
+        github MCP header reads ``${GITHUB_TOKEN}`` and an unresolved variable
+        is a hard parse error by design, so the strip would fail the run at
+        spec load. The caller supplies the value (a dummy is enough — nothing
+        here contacts github), which keeps the test independent of whatever
+        real token the developer happens to have exported.
     :returns: A copy of ``os.environ`` with credentials stripped and mock
         overrides set.
     """
@@ -118,7 +129,7 @@ def _mock_env(mock_llm_server_url: str) -> dict[str, str]:
     env["OMNIGENT_NO_UPDATE_CHECK"] = "1"
     # Write an isolated config home so the spawned process doesn't inherit the
     # developer's real auth config.
-    config_home = Path(tempfile.mkdtemp(prefix="omnigent-polly-mock-config-"))
+    config_home = Path(tempfile.mkdtemp(prefix="omnigent-mock-config-"))
     (config_home / "config.yaml").write_text("", encoding="utf-8")
     env["OMNIGENT_CONFIG_HOME"] = str(config_home)
     # Strip credentials that would shadow or conflict with mock access.
@@ -167,6 +178,8 @@ def _mock_env(mock_llm_server_url: str) -> dict[str, str]:
     # Point the openai-agents harness at the mock server.
     env["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
     env["OPENAI_API_KEY"] = "mock-key"
+    # Re-apply after the strip: these are the vars the spec under test needs.
+    env.update(env_passthrough or {})
     return env
 
 
@@ -224,7 +237,9 @@ def _mock_polly_spec_dir(
         }
     )
 
-    dst = tmp_path / "polly"
+    # Name the copy after the source bundle so a non-polly caller (holly) does
+    # not end up running a directory called "polly".
+    dst = tmp_path / polly_src.name
     shutil.copytree(polly_src, dst, symlinks=False)
     config_path = dst / "config.yaml"
     spec = yaml.safe_load(config_path.read_text())
