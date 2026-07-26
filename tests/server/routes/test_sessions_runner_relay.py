@@ -956,9 +956,23 @@ async def test_relay_completion_with_usage_rolls_up_subtree_cost(db_uri: str) ->
         # matches no rows, so nothing would be published at all.
         assert published == pytest.approx(0.25), (published, reporter_usage)
 
-        # One conversation read shared by pricing and the roll-up. Splitting
-        # it back into two reads shows up here.
-        assert len(conv_selects) == 5, [q.split("\n")[0][:70] for q in conv_selects]
+        # The invariant this PR owns, stated as "how many times is THIS
+        # session's row read", not as a total across every conversations
+        # SELECT the turn makes. A total also counts the tree scan and the
+        # ancestor walk, which belong to the PR below this one — so reverting
+        # that PR failed this oracle for a reason unrelated to the change
+        # under test. This count is identical with or without it.
+        #
+        # Two, and both are named: the relay's shared row (pricing + roll-up)
+        # and the relay-status path's own read, which stays separate on
+        # purpose because it must observe the newest labels. Splitting the
+        # shared row back into two reads makes this three.
+        own_row_reads = [
+            q
+            for q in conv_selects
+            if "conversations.title" in q and "root_conversation_id = " not in q
+        ]
+        assert len(own_row_reads) == 2, [q.split("\n")[0][:70] for q in own_row_reads]
     finally:
         if collector is not None:
             await collector.stop()
