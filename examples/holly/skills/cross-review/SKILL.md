@@ -196,8 +196,9 @@ END REVIEWER-MANDATE-V1
    the unreviewed part. `pull_request_read` returns the published diff only, so
    reviewing it would approve what is already on the remote and miss the commit
    you are about to add. Use MCP here for review THREADS and their resolution
-   state, not for the diff. Review gates the next push rather than the first. The implementer has committed and stopped; the
-   commit has not been pushed.
+   state, not for the diff. Here you sequence review before the NEXT push
+   rather than before the first; nothing blocks either. The implementer has
+   committed and stopped; the commit has not been pushed.
 
 2. **Gates first — ALL of them, before any reviewer is involved.** Discover the
    full deterministic set rather than assuming test/lint/typecheck: read
