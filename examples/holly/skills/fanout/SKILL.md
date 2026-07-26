@@ -31,11 +31,15 @@ dependency).
    Record each handle's `conversation_id`
    in the registry, along with baselines taken BEFORE dispatch: the task
    worktree's HEAD and `git status --porcelain`, and the runner root's branch,
-   HEAD and `git status --porcelain`. Require BOTH worktrees CLEAN at that
-   point, or the baselines cannot discriminate — a path already showing `M` or
-   `??` can be altered while every recorded value stays byte-identical. Task
-   porcelain earns its place twice over: gates that pass on uncommitted changes
-   are passing on work absent from the diff you are about to review.
+   HEAD and `git status --porcelain`. A porcelain baseline discriminates only
+   over a CLEAN tree: a path already showing `M` or `??` can be altered while
+   every recorded value stays byte-identical. Prefer both worktrees clean. When
+   the runner root is legitimately dirty — which is common and is not grounds
+   to refuse the task — additionally record a content hash of each already-dirty
+   path and compare those too, or run the orchestration from a dedicated clean
+   checkout rather than disturbing the human's. Task porcelain earns its place
+   twice over: gates that pass on uncommitted changes are passing on work
+   absent from the diff you are about to review.
    When a worker reports, VERIFY before accepting anything it claims:
    `git -C .worktrees/<task_id> branch --show-current` shows the task branch;
    its `rev-parse HEAD` has MOVED from the recorded task baseline, since an

@@ -284,8 +284,8 @@ END REVIEWER-MANDATE-V1
    exists: repeat the ABSOLUTE worktree path in every fix-round dispatch, and
    re-verify on return with the SAME baselines fanout uses, taken fresh before
    each round — the task worktree's HEAD and `git status --porcelain`, and the
-   runner root's branch, HEAD and `git status --porcelain`, with both worktrees
-   required clean when the baseline is taken. A fix round is a dispatch like any other:
+   runner root's branch, HEAD and `git status --porcelain`, with the same
+   already-dirty handling fanout describes when the root cannot be clean. A fix round is a dispatch like any other:
    without a fresh task-HEAD baseline you cannot tell a new commit from none at
    all, and without the porcelain baseline you cannot see a fixer that edited
    the runner root instead. A new title spawns a fresh worker with no

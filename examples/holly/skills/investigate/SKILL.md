@@ -20,10 +20,11 @@ repository-specific technical question.
    `explore-ci-flake`, never the raw vendor name. Use `purpose: "search"` only
    when the task is primarily external/document search. Prefer `pi` when a
    third lens or a non-Claude/GPT model is wanted. Any worker takes an optional
-   `args.model` (`sys_list_models` shows what each worker can run; an invalid
-   model/worker combination fails loud at dispatch, and `model` only applies on
-   the dispatch that CREATES the session — a send that continues an existing
-   title rejects it).
+   `args.model` (`sys_list_models` lists candidates, but check each row's
+   `verified` flag — static rows prove nothing; a rejected model fails on
+   FAMILY rather than existence, so a valid-looking id can still fail at
+   launch; and `model` only applies on the dispatch that CREATES the session —
+   a send that continues an existing title rejects it).
    Tell the worker to edit nothing and return file,
    command, URL, or line evidence. Emit these `sys_session_send` calls in the
    SAME turn — do not end a turn having only said you will dispatch.

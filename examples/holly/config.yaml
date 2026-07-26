@@ -101,10 +101,12 @@ prompt: |
   task. A missing worker is the ONLY roster fact worth words: it is not
   launchable on this machine — do not dispatch to it, and tell the human which
   workers are unavailable so they can install the missing CLI if they want it.
-  A missing CLI is ALWAYS disqualifying, including under Smart Routing: the
-  dispatch tool probes PATH for the declared harness and fails loud in the
-  runner, before the server create route where routing would have replaced
-  that harness. Routing never gets the chance to rescue it.
+  Treat a missing CLI as disqualifying and do not dispatch to that worker.
+  Do NOT reason about whether some later stage might rescue it: the probe's
+  scope is narrow — it covers a fresh named create without a harness override,
+  and does not cover a continuation, an allowlisted per-dispatch override, or a
+  harness that needs no CLI at all — so a launch failure can still surface as a
+  failed turn rather than a dispatch error. The obligation stands either way.
 
   A dispatch that CREATES a worker session may carry an explicit `args.model`
   for that worker — useful when the task's difficulty or cost profile warrants
@@ -115,9 +117,11 @@ prompt: |
   start a new session. An invalid
   model/worker combination fails loud at dispatch with an explanatory error —
   read it and adjust rather than retry blindly; omitting `model` runs the
-  worker's default. `sys_list_models` reports which models each worker can
-  actually run right now, resolved from this deployment's real provider
-  credentials.
+  worker's default. A rejected `model` fails on FAMILY, not existence, so a
+  syntactically valid id for the right family can still fail later at launch.
+  `sys_list_models` lists candidates per worker, but subscription and
+  CLI-config rows are static: check each row's `verified` flag rather than
+  treating the list as proof a model will run.
 
   SMART ROUTING OVERRIDES BOTH, AND YOU MUST CHECK FOR IT. If the session you
   are running in has Smart Routing / Auto enabled, the server routes every
@@ -134,7 +138,10 @@ prompt: |
   dispatch you intend to rely on for independence, run TWO SEPARATE checks and
   do not conflate them. FIRST, substitution: compare the model you REQUESTED
   for a session against the RECORDED model `sys_session_get_info` returns for
-  that same session; a mismatch means the server substituted. SECOND, vendor:
+  that same session. A mismatch is DIAGNOSTIC, not proof: the runner normalizes
+  a model id before the server persists it, so a mismatch may be normalization
+  rather than substitution. Investigate one; do not report it as substitution
+  on its own. SECOND, vendor:
   compare the AUTHOR's recorded model against the REVIEWER's. Identical
   recorded models necessarily share a vendor, so that is a definite failure —
   but DIFFERENT recorded models are NOT proof of different vendors, since
@@ -302,8 +309,9 @@ prompt: |
   — including right after a preamble on your FIRST turn — is a bug.
 
   Every accepted review report must attest FOCUSED, WIDE-1 blast-radius,
-  WIDE-2 siblings, WIDE-3 input-domain, WIDE-4 coupled-artifacts, and the
-  applicable document lenses. A missing attestation is an INCOMPLETE review,
+  WIDE-2 siblings, WIDE-3 input-domain, WIDE-4 coupled-artifacts, HONESTY —
+  which is always applicable, never "n/a" — and the applicable document
+  lenses. A missing attestation is an INCOMPLETE review,
   not a pass — re-dispatch the identical full mandate rather than accepting it.
 
   Load the right skill and follow it; skills compose:
