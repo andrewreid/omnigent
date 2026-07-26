@@ -108,12 +108,14 @@ def test_declared_executor_shape(holly_spec: AgentSpec) -> None:
     cannot establish.
 
     Nothing here establishes independence, and no readback establishes it either
-    once routing is on. The bundle's rule is that requested-versus-recorded
-    detects substitution for one session, author-recorded-versus-reviewer-recorded
-    compares vendors, identical recorded models are a definite failure, DIFFERENT
-    ones prove nothing — and that under Smart Routing the executing model is
-    unidentifiable, so independence is UNCONFIRMABLE and holly stops rather than
-    comparing. Those rules live in ``examples/holly/config.yaml`` and the
+    once routing is on. The bundle's rule is that requested-versus-recorded is
+    DIAGNOSTIC of substitution for one session rather than proof of it — the
+    runner normalizes a model id before it is persisted, so a mismatch may be
+    normalization and is worth investigating rather than reporting —
+    author-recorded-versus-reviewer-recorded compares vendors, identical recorded
+    models are a definite failure, DIFFERENT ones prove nothing — and that under
+    Smart Routing the executing model is unidentifiable, so independence is
+    UNCONFIRMABLE and holly stops rather than comparing. Those rules live in ``examples/holly/config.yaml`` and the
     cross-review skill, pinned in ``tests/spec/test_holly_bundle.py``.
 
     Models stay unpinned where the contract requires it: the orchestrator brain

@@ -1253,16 +1253,24 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         # covers everything. It does not: a fresh named create without a harness
         # override only. Pinned separately because deleting the scope leaves the
         # obligation looking mechanically guaranteed, which is the D1a shape.
-        "cli-probe-scope-is-narrow",
-        "the preflight probe is treated as complete coverage, so a launch failure "
-        "arriving later as a failed turn reads as impossible",
+        # REPLACED, not re-synced. The old entry pinned a DESCRIPTION of the probe's
+        # scope, and that description was false in a fresh way in each of four
+        # rounds. The prose stopped describing the probe at all, so this pins what
+        # is left and is durable: the rule is Holly's own, it is deliberately
+        # conservative rather than a runtime verdict, and the reporting wording is
+        # constrained to match. The wording constraint is the load-bearing half —
+        # "not launchable on this machine" is a claim about the runtime that the
+        # preflight cannot support, and it is what holly said for four rounds.
+        "roster-rule-is-conservative-not-a-runtime-verdict",
+        "holly reports a PATH miss as proof the worker could not launch, which the "
+        "preflight cannot establish, and then reasons about later stages rescuing it",
         _ROOT_CONFIG,
-        "Do NOT reason about whether some later stage might rescue it: the probe's "
-        "scope is narrow — it covers a fresh named create without a harness override, "
-        "and does not cover a continuation, an allowlisted per-dispatch override, or "
-        "a harness that needs no CLI at all — so a launch failure can still surface "
-        "as a failed turn rather than a dispatch error. The obligation stands either "
-        "way.",
+        "This is HOLLY'S ROSTER RULE and it is deliberately conservative — it is not "
+        "a runtime verdict and not proof the worker could not launch. `command -v` "
+        "reads only PATH, while the runtime's own resolution is broader, so a worker "
+        'the preflight rejects might in fact have started. Say "unavailable per the '
+        'preflight", never "not launchable on this machine", and do not reason '
+        "about whether some later stage would have rescued it.",
     ),
     (
         # The root prompt's acceptance criteria for a returned report, which had no
@@ -1277,11 +1285,14 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "it — while the dispatched mandate says that pass always applies, so the two "
         "halves of the bundle disagree about what a complete review is",
         _ROOT_CONFIG,
-        "Every accepted review report must attest FOCUSED, WIDE-1 blast-radius, "
-        "WIDE-2 siblings, WIDE-3 input-domain, WIDE-4 coupled-artifacts, HONESTY — "
-        'which is always applicable, never "n/a" — and the applicable document '
-        "lenses. A missing attestation is an INCOMPLETE review, not a pass — "
-        "re-dispatch the identical full mandate rather than accepting it.",
+        "Every accepted review report must attest EVERY row of the battery checklist: "
+        "FOCUSED, WIDE-1 blast-radius, WIDE-2 siblings, WIDE-3 input-domain, WIDE-4 "
+        'coupled-artifacts, HONESTY — which is always applicable, never "n/a" — and '
+        'BOTH document lenses, SELF-CONSISTENCY and GOVERNANCE, which carry "n/a" on '
+        "a code-only review rather than being omitted. A missing ROW is as "
+        "disqualifying as a missing finding: an omitted row is indistinguishable from "
+        "a pass that was never run. A missing attestation is an INCOMPLETE review, "
+        "not a pass — re-dispatch the identical full mandate rather than accepting it.",
     ),
     (
         # `sys_list_models` is the tool holly would naturally trust to prove a model
@@ -1317,9 +1328,11 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
     (
         # The ASYMMETRY is the pinned content, not decoration. `sys_session_get_info`
         # returns STORED metadata, observes neither execution nor harness, and can be
-        # stale — so a mismatch is proof of substitution while a match is only
-        # CONSISTENT with independence. A span that kept the readback instruction and
-        # dropped the asymmetry would pin an overclaim: holly would read a match as
+        # stale. Neither direction is proof: a mismatch is DIAGNOSTIC of substitution
+        # and worth investigating, because the runner normalizes a model id before it
+        # is persisted, so the mismatch may be normalization; and a match establishes
+        # nothing at all. A span that kept the readback instruction and dropped the
+        # asymmetry would pin an overclaim: holly would read a match as
         # confirmation and report an independence it never established. Both halves
         # therefore stay in one string.
         # Re-synced and SPLIT. The previous single entry pinned a conflated check
@@ -1386,8 +1399,10 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "neither substitution nor vendor is actually established",
         _CROSS_REVIEW,
         "Two separate checks, not one: requested-versus-recorded for a SINGLE session "
-        "detects substitution, and author-recorded-versus-reviewer-recorded compares "
-        "vendors. Identical recorded models necessarily share a vendor and are a "
+        "is DIAGNOSTIC of substitution — not proof, since the runner normalizes a "
+        "model id before it is persisted — and author-recorded-versus-reviewer-recorded "
+        "compares vendors. Identical recorded models necessarily share a vendor and "
+        "are a "
         "definite failure; different recorded models prove nothing, since either may "
         "be a default or a stale record rather than what executed.",
     ),
