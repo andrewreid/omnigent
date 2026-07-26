@@ -783,6 +783,22 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "dispatch that CREATES the review session",
     ),
     (
+        # The mechanic that makes the rule above ACTIONABLE, pinned separately
+        # because it is a different claim: that one says WHICH model a pi
+        # reviewer needs, this one says the create-time send is the only place
+        # to set it. Deleting it leaves the independence rule word-for-word
+        # intact while removing the only statement of how a continuation
+        # behaves — and a resent `model` is rejected silently from holly's
+        # point of view, so the reviewer keeps whatever model it was created
+        # with while holly believes it re-pinned one.
+        "continuation-keeps-the-creation-model",
+        "a re-sent model is assumed to have taken effect, so a review continues on "
+        "the model the session was created with while holly believes it changed",
+        _CROSS_REVIEW,
+        "a continuation keeps the model set at creation and rejects a resent one, "
+        "so verify it rather than resending it.",
+    ),
+    (
         "undeterminable-or-same-vendor-is-a-hard-stop",
         "the review is dispatched to the author's own vendor and called independent",
         _CROSS_REVIEW,
