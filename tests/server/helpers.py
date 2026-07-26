@@ -8,7 +8,8 @@ import json
 import re
 import tarfile
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -937,3 +938,30 @@ class CapturingRunnerClient:
         if body.get("type") == "cost_approval_popup":
             self.popup_seen.set()
         return httpx.Response(202, request=httpx.Request("POST", f"http://runner{url}"))
+
+
+@contextmanager
+def count_conversation_selects(engine: Any) -> Iterator[list[str]]:
+    """Collect the conversations-table SELECTs a request emits.
+
+    Shared by the snapshot and usage-report read-count regressions, which
+    live in the files owning those endpoints.
+    """
+    from sqlalchemy import event
+
+    seen: list[str] = []
+
+    def _on_exec(conn, cursor, statement, parameters, context, executemany):
+        if (
+            statement.lstrip().startswith("SELECT")
+            and "FROM conversations" in statement
+            and "conversation_items" not in statement
+            and "conversation_labels" not in statement
+        ):
+            seen.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _on_exec)
+    try:
+        yield seen
+    finally:
+        event.remove(engine, "before_cursor_execute", _on_exec)
