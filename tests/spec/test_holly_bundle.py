@@ -915,9 +915,11 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         # reviewer needs, this one says the create-time send is the only place
         # to set it. Deleting it leaves the independence rule word-for-word
         # intact while removing the only statement of how a continuation
-        # behaves — and a resent `model` is rejected silently from holly's
-        # point of view, so the reviewer keeps whatever model it was created
-        # with while holly believes it re-pinned one.
+        # behaves. The rejection is NOT silent — the runtime returns an explicit,
+        # actionable error naming the existing session and saying to re-send
+        # without `model` or close the session first — but holly only benefits
+        # from that error if the prose tells it the resend is refused rather
+        # than applied, which is what this pins.
         "continuation-keeps-the-creation-model",
         "a re-sent model is assumed to have taken effect, so a review continues on "
         "the model the session was created with while holly believes it changed",
@@ -1044,8 +1046,8 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "worktree path in every fix-round dispatch, and re-verify on return with the "
         "SAME baselines fanout uses, taken fresh before each round — the task "
         "worktree's HEAD and `git status --porcelain`, and the runner root's branch, "
-        "HEAD and `git status --porcelain`, with both worktrees required clean when "
-        "the baseline is taken.",
+        "HEAD and `git status --porcelain`, with the same already-dirty handling "
+        "fanout describes when the root cannot be clean.",
     ),
     (
         # The already-open-PR revision range. Its vocabulary anchor names the
@@ -1195,14 +1197,65 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         # forced-auto lives. Nothing pinned the exception, so nothing had to be
         # deleted; what is pinned now is the corrected rule TOGETHER WITH the probe
         # ordering that makes it true, so the exception cannot come back unnoticed.
+        # Re-synced. The claim was an assertion about probe ORDERING ("fails loud in
+        # the runner, before the server create route"); it is now an OBLIGATION plus
+        # an honest statement of what the probe does not cover. Pinning the ordering
+        # was itself the defect this round is about — the prose no longer needs the
+        # mechanism to carry the instruction, and neither does the pin.
         "missing-cli-is-always-disqualifying",
-        "an unreachable routing exception returns and holly dispatches to a worker "
-        "whose CLI cannot launch, expecting routing to rescue it",
+        "holly reasons its way to dispatching a worker whose CLI cannot launch, on the "
+        "theory that some later stage will rescue it",
         _ROOT_CONFIG,
-        "A missing CLI is ALWAYS disqualifying, including under Smart Routing: the "
-        "dispatch tool probes PATH for the declared harness and fails loud in the "
-        "runner, before the server create route where routing would have replaced "
-        "that harness. Routing never gets the chance to rescue it.",
+        "Treat a missing CLI as disqualifying and do not dispatch to that worker.",
+    ),
+    (
+        # The obligation above without this note reads as backed by a probe that
+        # covers everything. It does not: a fresh named create without a harness
+        # override only. Pinned separately because deleting the scope leaves the
+        # obligation looking mechanically guaranteed, which is the D1a shape.
+        "cli-probe-scope-is-narrow",
+        "the preflight probe is treated as complete coverage, so a launch failure "
+        "arriving later as a failed turn reads as impossible",
+        _ROOT_CONFIG,
+        "Do NOT reason about whether some later stage might rescue it: the probe's "
+        "scope is narrow — it covers a fresh named create without a harness override, "
+        "and does not cover a continuation, an allowlisted per-dispatch override, or "
+        "a harness that needs no CLI at all — so a launch failure can still surface "
+        "as a failed turn rather than a dispatch error. The obligation stands either "
+        "way.",
+    ),
+    (
+        # The root prompt's acceptance criteria for a returned report, which had no
+        # entry. It is the one place the ORCHESTRATOR decides whether a report counts,
+        # so it has to agree with the mandate the reviewer was handed: [HONESTY] is
+        # always applicable and never "n/a" there, and if this list omits it or lets
+        # it be n/a, holly accepts a report the skill's own checklist rejects. Pinned
+        # with the incomplete-review consequence, because an attestation list with no
+        # consequence attached is a list holly can note and move past.
+        "accepted-report-must-attest-every-pass-including-honesty",
+        "holly accepts a report missing the HONESTY attestation — or accepts `n/a` for "
+        "it — while the dispatched mandate says that pass always applies, so the two "
+        "halves of the bundle disagree about what a complete review is",
+        _ROOT_CONFIG,
+        "Every accepted review report must attest FOCUSED, WIDE-1 blast-radius, "
+        "WIDE-2 siblings, WIDE-3 input-domain, WIDE-4 coupled-artifacts, HONESTY — "
+        'which is always applicable, never "n/a" — and the applicable document '
+        "lenses. A missing attestation is an INCOMPLETE review, not a pass — "
+        "re-dispatch the identical full mandate rather than accepting it.",
+    ),
+    (
+        # `sys_list_models` is the tool holly would naturally trust to prove a model
+        # will run. It does not: subscription and CLI-config rows are static. Pinned
+        # because the false version of this claim ("the list proves the model runs")
+        # is the same shape as the readback overclaim — a lookup treated as a
+        # guarantee.
+        "list-models-rows-need-their-verified-flag",
+        "a static row is read as proof the model will run, so a dispatch is planned on "
+        "a model that fails at launch",
+        _ROOT_CONFIG,
+        "`sys_list_models` lists candidates per worker, but subscription and "
+        "CLI-config rows are static: check each row's `verified` flag rather than "
+        "treating the list as proof a model will run.",
     ),
     (
         "smart-routing-overrides-model-and-harness",
@@ -1243,8 +1296,11 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "After any dispatch you intend to rely on for independence, run TWO SEPARATE "
         "checks and do not conflate them. FIRST, substitution: compare the model you "
         "REQUESTED for a session against the RECORDED model `sys_session_get_info` "
-        "returns for that same session; a mismatch means the server substituted. "
-        "SECOND, vendor: compare the AUTHOR's recorded model against the REVIEWER's. "
+        "returns for that same session. A mismatch is DIAGNOSTIC, not proof: the "
+        "runner normalizes a model id before the server persists it, so a mismatch "
+        "may be normalization rather than substitution. Investigate one; do not "
+        "report it as substitution on its own. SECOND, vendor: compare the AUTHOR's "
+        "recorded model against the REVIEWER's. "
         "Identical recorded models necessarily share a vendor, so that is a definite "
         "failure — but DIFFERENT recorded models are NOT proof of different vendors, "
         "since either value may be a default or a stale record rather than what "
@@ -1364,13 +1420,21 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         # byte-identical while the path is altered underneath. Deleting this leaves a
         # performable scheme that discriminates nothing — the exact defect the round
         # that added it was fixing.
-        "baselines-require-both-worktrees-clean",
-        "the baselines are taken against an already-dirty path, so a worker can alter "
-        "it while every recorded value stays byte-identical",
+        # Re-synced: a hard requirement became a preference with two workable
+        # alternatives, because a legitimately dirty runner root is common and
+        # refusing the task over it is worse than handling it. The span covers the
+        # preference AND both alternatives — dropping the alternatives leaves a
+        # preference holly cannot satisfy and will therefore ignore.
+        "baselines-prefer-clean-and-handle-a-dirty-root",
+        "the baselines are taken against an already-dirty path with no compensation, "
+        "so a worker can alter it while every recorded value stays byte-identical — or "
+        "holly refuses a task over a dirty root",
         _FANOUT,
-        "Require BOTH worktrees CLEAN at that point, or the baselines cannot "
-        "discriminate — a path already showing `M` or `??` can be altered while every "
-        "recorded value stays byte-identical.",
+        "Prefer both worktrees clean. When the runner root is legitimately dirty — "
+        "which is common and is not grounds to refuse the task — additionally record a "
+        "content hash of each already-dirty path and compare those too, or run the "
+        "orchestration from a dedicated clean checkout rather than disturbing the "
+        "human's.",
     ),
     (
         # Reason kept INSIDE the span here, unlike the absolute-path entry. The
