@@ -243,12 +243,16 @@ END REVIEWER-MANDATE-V1
    author's, and VERIFY it after dispatch rather than assuming it.** Under
    Smart Routing the server discards your `args.model` and re-picks the
    harness from `claude-sdk`/`codex`/`pi`, so neither the worker name nor the
-   model you asked for establishes the vendor that actually ran. Read both
-   sides' RECORDED model back with `sys_session_get_info` and compare. It
-   reports stored metadata, not what executed, and exposes no harness: a
-   mismatch proves substitution, a match is consistent with independence
-   without proving it. Equal or undeterminable vendors means you have NOT got
-   an independent review, and you say so instead of reporting one. Vendor is a property of the model, not
+   model you asked for establishes the vendor that actually ran. Two separate
+   checks, not one: requested-versus-recorded for a SINGLE session detects
+   substitution, and author-recorded-versus-reviewer-recorded compares vendors.
+   Identical recorded models necessarily share a vendor and are a definite
+   failure; different recorded models prove nothing, since either may be a
+   default or a stale record rather than what executed. `sys_session_get_info`
+   reports stored metadata only, exposes no harness, and routing can reach the
+   runner after persistence fails — so under routing the executing model is
+   unidentifiable and independence is UNCONFIRMABLE. Stop and say so rather
+   than reporting a review you cannot establish. Vendor is a property of the model, not
    of the worker name:
    absent Smart Routing `claude_code` and `codex` run their declared native
    harness while `pi` runs any gateway model; under routing none is fixed. A
@@ -278,9 +282,10 @@ END REVIEWER-MANDATE-V1
    `title`, or address it by `session_id`, with `purpose: "implement"`) so it
    keeps its task context. It does NOT keep a worktree binding, because none
    exists: repeat the ABSOLUTE worktree path in every fix-round dispatch, and
-   re-verify on return with the SAME three baselines fanout uses, taken fresh
-   before each round — the task worktree's HEAD, and the runner root's branch,
-   HEAD and `git status --porcelain`. A fix round is a dispatch like any other:
+   re-verify on return with the SAME baselines fanout uses, taken fresh before
+   each round — the task worktree's HEAD and `git status --porcelain`, and the
+   runner root's branch, HEAD and `git status --porcelain`, with both worktrees
+   required clean when the baseline is taken. A fix round is a dispatch like any other:
    without a fresh task-HEAD baseline you cannot tell a new commit from none at
    all, and without the porcelain baseline you cannot see a fixer that edited
    the runner root instead. A new title spawns a fresh worker with no
