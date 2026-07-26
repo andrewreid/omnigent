@@ -1,8 +1,8 @@
 """Small mock-LLM e2e smoke for the polly coding orchestrator (examples/polly).
 
 Mock mode: boots a throwaway LOCAL server from this working tree (which carries
-the in-tree ``omnigent.inner.nessie.policies`` module that polly's guardrails
-resolve server-side), rewrites the polly bundle's executor to use
+the in-tree ``omnigent.inner.nessie.policies`` module the RUNNER resolves polly's
+guardrails from), rewrites the polly bundle's executor to use
 ``openai-agents`` harness wired to the mock LLM server, and runs a one-shot
 ``omnigent run`` subprocess against it. This exercises the parts a structural
 spec-load test can't — bundle load, server-side guardrail policy resolution,
@@ -349,9 +349,10 @@ def local_polly_server(tmp_path: Path) -> Iterator[str]:
     """
     Start a throwaway local ``omnigent server`` from this working tree.
 
-    The server carries the in-tree ``omnigent.inner.nessie.policies`` module
-    that polly's guardrails resolve server-side, so the workflow doesn't 500
-    the way it does against the shared prod app. Own sqlite DB + artifact dir
+    The server carries the in-tree ``omnigent.inner.nessie.policies`` module the
+    RUNNER resolves polly's guardrails from — it builds its policy gate from the
+    spec at agent start, and an unresolvable factory path denies startup — so the
+    workflow doesn't 500 the way it does against the shared prod app. Own sqlite DB + artifact dir
     under ``tmp_path`` keep it isolated from the developer's real state.
 
     :param tmp_path: pytest-provided per-test temp dir for the DB + artifacts.
