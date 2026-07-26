@@ -72,9 +72,11 @@ policies:
 > ways, because `_has_no_required_params` counts only POSITIONAL parameters
 > (`omnigent/policies/function.py:377`). A required POSITIONAL parameter
 > makes it false, so the factory function itself is kept as the evaluator; it
-> is callable, the build succeeds, and the failure surfaces later still, when
-> the policy is evaluated and the factory is called with an event it has no
-> signature for. A required KEYWORD-ONLY parameter is invisible to that check,
+> is callable, so the build succeeds. The failure surfaces later still, and not
+> for the reason you might expect: the runtime treats it as a one-argument
+> callable and passes it the event, whose arity it DOES accept, so the factory
+> runs and returns its evaluator function. That returned callable is not a
+> policy-result shape, and the failure is raised when the result is coerced. A required KEYWORD-ONLY parameter is invisible to that check,
 > so the callable is taken for a zero-argument factory, invoked immediately
 > with nothing, and the failure surfaces at BUILD time instead —
 > `deny_trivial_to_expensive_model(*, expensive_models=...)` in
