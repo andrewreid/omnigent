@@ -22,10 +22,13 @@ coupled-artifact axes require grepping a clean checkout, so always permit repo
 read, and hand over the changed surface plus its adjacency — callers, sibling
 surfaces, the target type — not just the raw hunk.
 
-**No policy gates ordinary publication.** `blast_radius` denies only
-catastrophic push variants (`--force*`, `--delete`, `--mirror`, `--prune`); a
-plain `git push` is ungated, so the ordering below holds only because you
-sequence it. That is the honest description, and you must not tell a worker
+**No policy shipped by Holly gates ordinary publication.** `blast_radius`
+denies destructive push variants — `--force*`, `--delete`, `--mirror`,
+`--prune`, bundled short forms containing `-f` or `-d`, and `+refspec` /
+`:refspec` — while a plain `git push` is ungated. A deployment may attach
+session-level or server-wide policies that gate ordinary pushes too; those are
+not Holly's and you cannot assume either way. The ordering below holds only
+because you sequence it. That is the honest description, and you must not tell a worker
 otherwise in EITHER direction — neither that a gate exists, nor that nothing
 is denied at all.
 
@@ -211,7 +214,7 @@ END REVIEWER-MANDATE-V1
    reviewing it would approve what is already on the remote and miss the commit
    you are about to add. Use MCP here for review THREADS and their resolution
    state, not for the diff. Here you sequence review before the NEXT push
-   rather than before the first; nothing blocks either. The implementer has
+   rather than before the first; no Holly-shipped policy blocks either. The implementer has
    committed and stopped; the commit has not been pushed.
    *Direct authoring* (a doc or skill Holly wrote itself): there is no task
    worktree and no implementer, so neither command above applies. Commit
@@ -259,7 +262,9 @@ END REVIEWER-MANDATE-V1
 5. **Route blocking issues back to the SAME fixer, on the SAME branch.**
    Delegated: re-send to the same implementer conversation (reuse its `agent` +
    `title`, or address it by `session_id`, with `purpose: "implement"`) so it
-   keeps its worktree and branch. A new title spawns a fresh worker with no
+   keeps its task context. It does NOT keep a worktree binding, because none
+   exists: repeat the ABSOLUTE worktree path in every fix-round dispatch, and
+   re-verify the branch on return. A new title spawns a fresh worker with no
    memory of the task. Direct-authoring: Holly revises the prose itself, re-runs
    the gates and every applicable pass, and re-dispatches the review. Same loop;
    only the fixer differs. Log each blocking issue as a registry fix-task scoped
