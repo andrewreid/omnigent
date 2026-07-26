@@ -52,11 +52,20 @@ def test_identity_roster_and_skills(holly_spec: AgentSpec) -> None:
     """
     The bundle parses and ships exactly three workers and three skills.
 
-    Three vendors is the minimum that keeps different-vendor review always
-    satisfiable and still leaves a tiebreak vendor. Dropping one collapses
-    cross-vendor review; adding an undeclared one escapes the routing rules the
-    prompt and skills are written against. Set equality on both, not membership,
-    so an addition fails as loudly as a removal.
+    What this pins is the ROSTER, not a vendor count. Cross-vendor review needs
+    TWO distinct effective vendors, and three workers do not supply three
+    vendors: ``pi``'s effective vendor is whatever model it is dispatched with,
+    so a third-vendor tiebreak is conditional rather than standing. Dropping a
+    worker does not by itself make different-vendor review unsatisfiable, and
+    nothing here asserts that it would.
+
+    The names are what the bundle is written against. The root prompt and all
+    three skills dispatch by these exact strings — ``claude_code`` and ``codex``
+    as the implementers, ``pi`` as the read-mostly multi-model worker — and the
+    roster preflight probes exactly these three binaries. A removed worker
+    leaves prose dispatching to something absent; an added one is reachable
+    while no routing rule, preflight or skill mentions it. Set equality on both
+    lists, not membership, so an addition fails as loudly as a removal.
     """
     assert holly_spec.name == "holly"
     assert sorted(a.name for a in holly_spec.sub_agents) == ["claude_code", "codex", "pi"]

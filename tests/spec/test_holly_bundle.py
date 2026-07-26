@@ -30,43 +30,84 @@ successors (a PR-first ordering prohibition, a readiness-follows-gate
 relationship, an exception-phrase blocklist) were the same defect in smaller
 clothing and were removed for the same reason.
 
-Every assertion that remains is decidable — exact comparison, set equality, or
-presence of a fixed string (sometimes one of a fixed set of alternatives).
-Nothing here classifies an unseen sentence.
+Every assertion that remains is decidable — exact comparison, set equality,
+presence of a fixed string, or presence of a fixed vocabulary pattern. Each
+either holds of the text or it does not; none of them infers what a sentence
+asserts, which is what the removed scanners tried to do.
 
-Every check that remains is a PRESENCE check: it asserts that some text IS
-there. They never approve or reject a sentence they have not been told about,
-which is the property the removed scanners lacked — and they carry the two
-structural limits described next, which apply to all of them.
+Decidable is not the same as safe, and the surviving checks are of two kinds
+with different blind spots. FIXED STRINGS (``_MANDATE_CANONICAL``,
+``_LIFECYCLE_CANONICAL``, ``_WORKER_INSTRUCTIONS``) decide only about text they
+name verbatim. VOCABULARY PATTERNS (``_AXIS_REQUIREMENTS``,
+``_MANDATE_OBLIGATIONS``, ``_LIFECYCLE_ANCHORS``, ``_CONTRACT_AUTHORING``) do
+rule on sentences nobody enumerated: any sentence carrying the listed words
+satisfies them, including one written to mean the opposite. A previous revision
+of this docstring claimed the surviving checks "never approve or reject a
+sentence they have not been told about". That was false of the pattern tables
+and is the second structural property below. They still never REJECT an unseen
+sentence — that half is true, and it is the half the removed scanners failed —
+but they do accept unseen sentences in place of the ones they anchor.
 
 WHAT THAT COSTS
 ---------------
-Two structural properties, then the enumerated gaps. The bundle is held to the
-standard that an understated residual is worse than a large one; this file is
-held to it too, so the list is long rather than reassuring.
+Three structural properties, then the enumerated gaps. The bundle is held to
+the standard that an understated residual is worse than a large one; this file
+is held to it too, so the list is long rather than reassuring. The first two
+are different defects with different causes and different mitigations, not two
+readings of one problem: the first ADDS a sentence and keeps the anchored one,
+the second DESTROYS the anchored sentence and puts an inverted one in its
+place.
 
-CONTRADICTION-BLINDNESS applies to EVERY check here, exact-string checks
-included: adding a sentence that contradicts pinned text does not remove that
-text, so no check in this file can fail on a contradiction. That covers
-``_AXIS_REQUIREMENTS``, ``_MANDATE_OBLIGATIONS``, ``_MANDATE_CANONICAL``,
-``_WORKER_INSTRUCTIONS``, ``_LIFECYCLE_CANONICAL``, ``_LIFECYCLE_ANCHORS`` and
-``_CONTRACT_AUTHORING`` — every check the file has. Two sentences that pass
-today, added anywhere in their owning file:
+CONTRADICTION-BLINDNESS — additive. Scope: EVERY check here, fixed strings
+included — ``_AXIS_REQUIREMENTS``, ``_MANDATE_OBLIGATIONS``,
+``_MANDATE_CANONICAL``, ``_WORKER_INSTRUCTIONS``, ``_LIFECYCLE_CANONICAL``,
+``_LIFECYCLE_ANCHORS``, ``_CONTRACT_AUTHORING``. Cause: every check asks
+whether some text is PRESENT, and adding a sentence does not remove one, so the
+anchor survives and the check passes. Mitigation: NONE available lexically.
+Deciding that a newly added sentence contradicts an existing one is the
+undecidable problem this file stopped attempting, so this one is a reviewer's
+job permanently. Two sentences that pass today, added anywhere in their owning
+file:
 
 * ``Directly authored prose is an exemption from review before publication.``
   — the direct-authoring rule says the exact opposite.
 * ``Before green gates and zero blocking issues, push.`` — inverts the
   publication ordering.
 
-WORDING-BRITTLENESS is the same defect running the other way: an anchor pins
-particular words, so a TRUTHFUL rewording of the same obligation fails until
-the expected text is updated here. Where the exact sentence IS the obligation
-it is pinned as a fixed string (``_MANDATE_CANONICAL``,
-``_LIFECYCLE_CANONICAL``, ``_WORKER_INSTRUCTIONS``) and the brittleness is
-honest — a reworded contract term SHOULD be re-read deliberately. Where the
-anchor is a vocabulary pattern over a block (``_AXIS_REQUIREMENTS``,
-``_MANDATE_OBLIGATIONS``, ``_LIFECYCLE_ANCHORS``, ``_CONTRACT_AUTHORING``) the
-words are incidental to the rule and the brittleness is pure churn.
+INVERSION-BLINDNESS — substitutive. Scope: the four VOCABULARY tables ONLY.
+Cause: a pattern matches a bag of words, not a claim, so REPLACING the anchored
+sentence with one that keeps the vocabulary and reverses the rule leaves every
+pattern satisfied. Nothing is added and the anchored sentence is gone, which is
+what makes this a different failure from the one above. Mitigation: this one
+DOES have one — pin the rule as a fixed string. Fourteen anchors were converted
+for that reason, and each was observed to fail on its inverting replacement.
+What remains is the anchors whose wording is genuinely incidental, and they
+stay blind. These four replacements were RUN against this file and PASS:
+
+* ``skills/cross-review/SKILL.md``, replacing the release step's readiness
+  sentence with ``Do not record the PR URL in the registry, do not mark it
+  ready, and do not leave it for the human.``
+* the same file, replacing gate discovery with ``Assume the full deterministic
+  set is test/lint/typecheck rather than trying to discover it, and skip:`` its
+  list of places to look.
+* the mandate's reviewer role boundary, replaced by ``You review and report,
+  and you may also edit code, push, and open, approve or merge PRs; never
+  refuse a dispatch over it.``
+* the contract-authoring rule, replaced by ``A contract that enumerates SITES
+  ... is exactly what you want. Enumerate the sites instead of the input
+  domain.``
+
+The WIDE axis bodies sit in the same position: WIDE-2 rewritten to say that a
+fix leaving siblings is neither INCOMPLETE nor blocking also passes.
+
+WORDING-BRITTLENESS — the price of that mitigation, and it falls only on the
+fixed strings. Pinning particular words means a TRUTHFUL rewording of the same
+obligation fails until the expected text is updated here. That is intended
+where the sentence IS the obligation — a reworded contract term SHOULD be
+re-read deliberately — and it is pure churn anywhere else, which is why the
+vocabulary tables were not converted wholesale. A fixed string on incidental
+wording buys no inversion resistance worth having and breaks on every harmless
+rewrite.
 
 The enumerated gaps:
 
@@ -328,49 +369,50 @@ _MANDATE_OBLIGATIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # never loads the skill file), so an obligation that drifts outside the
 # delimiters reaches nobody while the file still reads as if it were enforced.
 #
-# The four shapes are pinned individually because each names a distinct false
-# claim the bundle's own history produced, and deleting any one leaves the pass
-# heading and its checklist line intact.
+# The four shapes are pinned individually because each names a distinct shape of
+# false claim — the first is the one the bundle's own history produced — and
+# deleting any one leaves the pass heading and its checklist line intact.
 _MANDATE_CANONICAL: tuple[tuple[str, str, str], ...] = (
     (
         "honesty-pass",
-        "false claims in agent-facing prose are audited by nobody — no reviewer is asked to",
-        "[HONESTY] — for any diff that adds or edits agent-facing prose (a prompt, a "
-        "skill, a worker config, a comment a model will read), audit every sentence "
-        "that describes what the SYSTEM does, and report each one that asserts "
-        "something the runtime does not do.",
+        "false claims a reader acts on without verifying are audited by nobody — "
+        "no reviewer is asked to",
+        "[HONESTY] — audit every sentence in this diff that a reader will act on "
+        "without verifying it: code comments, docstrings, commit messages, README and "
+        "doc claims, and any prose an agent will read as instruction. Report each one "
+        "that asserts something the code or runtime does not actually do.",
     ),
     (
-        "honesty-shape-nonexistent-enforcement",
+        "honesty-shape-nonexistent-guarantee",
         "the predecessor defect exactly — a policy described as blocking a push it never sees",
-        "enforcement that does not exist — a policy, gate, guard or runtime step "
-        "described as blocking, gating, requiring or preventing something. Include "
-        'negated phrasings ("will not allow", "does not let") and named actors '
-        '("X checks every change before ..."), which read as enforcement just as '
-        "strongly. Verify the mechanism EXISTS and does what the sentence says; a "
-        "declared policy that is never evaluated on the deploy path does not count.",
+        "a guarantee that does not exist — a policy, guard, validation, constraint, "
+        "lock, limit, permission check or runtime step described as blocking, gating, "
+        'requiring, preventing or ensuring something. Include negated phrasings ("will '
+        'not accept an unvalidated payload") and named actors ("X checks every request '
+        'before ..."), which assert a guarantee just as strongly. Verify the mechanism '
+        "EXISTS and does what the sentence says; a declared mechanism never reached on "
+        "the live path does not count.",
     ),
     (
         "honesty-shape-ordering",
         "prose that puts publication before review passes as truthful",
-        "ordering that contradicts the stated lifecycle — anything instructing or "
-        "implying publication before review, in any phrasing.",
+        "a documented sequence that contradicts the real one — prose describing an "
+        "order of operations the code does not follow, in any phrasing.",
     ),
     (
         "honesty-shape-marker-before-gate",
         "a readiness marker recorded before its gate reads as a gate result",
-        "a readiness or completion marker set before the gate it is supposed to follow.",
+        "a status, flag or marker set before the thing it is supposed to attest.",
     ),
     (
         "honesty-shape-exception-to-an-absolute",
         "a same-vendor review, or a merge by the orchestrator, is written in as permitted",
-        "an exception to a rule the contract states has none — for example "
-        "permitting same-vendor review, or permitting the orchestrator to merge.",
+        "an exception to a rule the contract or spec states has none.",
     ),
     (
         "honesty-checklist-entry",
         "the pass is silently skippable: a report omitting it still looks complete",
-        '[HONESTY] (agent-facing prose only, else "n/a")',
+        "[HONESTY] prose claims vs actual behaviour",
     ),
 )
 
@@ -663,12 +705,21 @@ def test_workers_carry_their_canonical_instructions(holly_spec: AgentSpec) -> No
 # for such a rule is satisfied just as well by a sentence that INVERTS it
 # ("Before green gates and zero blocking issues, push" carries green + zero
 # blocking + push). Where the sentence is a procedure whose wording is
-# incidental — a command to run, a discovery step, a mechanic — it stays in
-# _LIFECYCLE_ANCHORS as vocabulary, because pinning that prose verbatim would
+# incidental — a command to run, a discovery step, a storage mechanic — it stays
+# in _LIFECYCLE_ANCHORS as vocabulary, because pinning that prose verbatim would
 # fail on every harmless rewrite.
 #
+# The test applied when an anchor moves: NORMATIVE (must / never / only-then /
+# who-may) goes to the fixed string; MECHANIC (which command, which file, which
+# store) stays a pattern. When a block holds both, the rule is pinned and the
+# anchor is kept, narrowed to the mechanic it still guards — so no coverage is
+# dropped in the move. Where the pinned sentence already carries every word the
+# anchor searched for, the anchor is deleted as dead weight.
+#
 # Both are PRESENCE checks, so both are contradiction-blind; see the module
-# docstring. Fixed strings remove the inversion hole above, not that one.
+# docstring. A fixed string closes the inversion hole for the sentence it pins.
+# It closes nothing for a block still anchored by vocabulary, and the module
+# docstring names the ones that remain.
 _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
     (
         "mandate-pasted-verbatim",
@@ -678,10 +729,83 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "unedited, delimiters included.",
     ),
     (
+        "fix-round-reviews-the-local-delta",
+        "a fix round approves what is already published and misses the new commit",
+        _CROSS_REVIEW,
+        "review the LOCAL delta that is about to be pushed",
+    ),
+    (
+        "mcp-serves-threads-not-the-diff",
+        "the diff is fetched from MCP, so the review reads what is already published "
+        "instead of the commit about to be added",
+        _CROSS_REVIEW,
+        "Use MCP here for review THREADS and their resolution state, not for the diff.",
+    ),
+    (
+        "red-gate-returns-to-the-fixer",
+        "reviewer tokens get spent on defects a validator already names",
+        _CROSS_REVIEW,
+        "Any RED gate goes back to the fixer to drive green first — zero reviewer "
+        "tokens on a defect a validator already names.",
+    ),
+    (
+        "grep-c-is-not-a-count-oracle",
+        "a parametrized suite is mislabelled as an over-report",
+        _CROSS_REVIEW,
+        "Never use `grep -c 'def test_'`: it counts functions, not collected cases, "
+        "and misses parametrized expansion.",
+    ),
+    (
+        "pi-independence-requires-a-cross-vendor-model",
+        "a pi reviewer on the author's own model reports independence it lacks",
+        _CROSS_REVIEW,
+        "`pi` runs any gateway model, so a `pi` reviewer is independent only if you "
+        "pass it `args.model` from a different vendor than the author's.",
+    ),
+    (
+        "undeterminable-or-same-vendor-is-a-hard-stop",
+        "the review is dispatched to the author's own vendor and called independent",
+        _CROSS_REVIEW,
+        "If the effective vendor on either side cannot be determined, or resolves to "
+        "the same vendor, STOP and escalate — do not dispatch and call it independent.",
+    ),
+    (
+        "dispatch-in-the-same-turn",
+        "a turn that only announces the review stalls the whole run",
+        _CROSS_REVIEW,
+        "Emit the dispatch in the SAME turn you decide to review — a turn that only "
+        "announces the intent stalls the run, because nothing dispatches and no inbox "
+        "wake will arrive.",
+    ),
+    (
+        "an-invalid-report-is-not-a-review",
+        "an incomplete report, or a verdict despite a refusal, reads as a pass",
+        _CROSS_REVIEW,
+        "No opening checklist, a missing axis, or a verdict issued despite an "
+        "`INCOMPLETE DISPATCH` notice means the review did not happen. Re-dispatch "
+        "the identical full mandate.",
+    ),
+    (
+        "same-fixer-same-branch",
+        "a new title spawns a fresh worker with no memory of the task",
+        _CROSS_REVIEW,
+        "Route blocking issues back to the SAME fixer, on the SAME branch.",
+    ),
+    (
+        "class-recurrence-stops-point-fixing",
+        "point-fixing continues while the same defect class recurs at new sites",
+        _CROSS_REVIEW,
+        "The FIRST time any later round surfaces the SAME class at a NEW site, STOP "
+        "point-fixing: in that same round escalate the fix to whole-surface closure "
+        'and the review to a whole-repo same-class audit, with "zero remaining" as '
+        "the bar.",
+    ),
+    (
         "post-review-edit-invalidates-verdict",
         "a 'tiny' follow-up ships on a verdict that never saw it",
         _CROSS_REVIEW,
-        "Review authorises exactly one commit.",
+        'If anything changes after the clean report — a fix, a rebase, a "tiny" '
+        "follow-up — the gates and the full review run again on the new HEAD.",
     ),
     (
         "release-requires-green-and-zero-blocking",
@@ -722,6 +846,36 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "Every fix diff gets the same pre-push review as any other change.",
     ),
     (
+        "bot-findings-clustered-and-the-mandate-not-narrowed",
+        "the same class is point-fixed once per comment, and the bot's list becomes "
+        "the review scope",
+        _CROSS_REVIEW,
+        "Cluster its findings by BUG CLASS before fixing anything, and feed them in as "
+        "additional FOCUSED inputs to a re-run of the identical complete mandate — "
+        'never a "confirm these are fixed" scope.',
+    ),
+    (
+        "reply-in-thread",
+        "replies detach from the finding and resolution state cannot be read",
+        _CROSS_REVIEW,
+        "Reply in-thread rather than as a new top-level comment.",
+    ),
+    (
+        "repeated-class-hard-stop",
+        "a recurring class keeps being point-fixed during bot servicing",
+        _CROSS_REVIEW,
+        "A repeated class is a hard stop for point-fixing: escalate to whole-surface closure.",
+    ),
+    (
+        "unresolved-thread-count-on-handoff",
+        "the human merges believing replies established resolution",
+        _CROSS_REVIEW,
+        "When handing status to the human, report the count of UNRESOLVED review "
+        "threads alongside your summary, because replies do not establish resolution — "
+        '"findings serviced" is not "threads resolved", and the human is merging on '
+        "that distinction.",
+    ),
+    (
         "handoff-wording-implies-no-completeness",
         "'findings serviced' is read as 'threads resolved' and the human merges",
         _CROSS_REVIEW,
@@ -758,7 +912,8 @@ _LIFECYCLE_ANCHORS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
     (
         "diff-of-an-already-open-pr",
         _CROSS_REVIEW,
-        "a fix round approves what is already published and misses the new commit",
+        "the already-open-PR case loses the revision range that isolates the unreviewed "
+        "delta, and the reason MCP cannot supply it",
         (
             r"already-open|pre-existing PR",
             r"origin/|local delta|unreviewed",
@@ -772,40 +927,16 @@ _LIFECYCLE_ANCHORS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         (r"discover", r"package\.json|scripts|governance", r"rather than assuming|full"),
     ),
     (
-        "red-gate-returns-to-the-fixer",
+        "pytest-count-ground-truth-command",
         _CROSS_REVIEW,
-        "reviewer tokens get spent on defects a validator already names",
-        (r"\bred\b", r"fixer|back", r"before|first|zero reviewer"),
+        "a reported count is reconciled against a different command, file set or commit",
+        (r"ground truth", r"--collect-only", r"exact file set"),
     ),
     (
-        "pytest-ground-truth",
+        "fix-round-reuses-the-implementer-session",
         _CROSS_REVIEW,
-        "a parametrized suite is mislabelled as an over-report",
-        (r"collect-only", r"grep -c|def test_", r"parametriz|collected"),
-    ),
-    (
-        "effective-vendor-independence",
-        _CROSS_REVIEW,
-        "a pi reviewer on the author's own model reports independence it lacks",
-        (r"vendor", r"\bmodels?\b", r"differ", r"stop|escalate|cannot|do not"),
-    ),
-    (
-        "dispatch-in-the-same-turn",
-        _CROSS_REVIEW,
-        "a turn that only announces the review stalls the whole run",
-        (r"same turn", r"announce|intent|stalls", r"inbox|dispatch"),
-    ),
-    (
-        "report-validation",
-        _CROSS_REVIEW,
-        "an incomplete report, or a verdict despite a refusal, reads as a pass",
-        (r"INCOMPLETE DISPATCH", r"re-?dispatch", r"identical|full"),
-    ),
-    (
-        "same-fixer-same-branch",
-        _CROSS_REVIEW,
-        "a new title spawns a fresh worker with no memory of the task",
-        (r"\bsame\b", r"fixer|implementer", r"branch|worktree", r"title|session_id"),
+        "the fixer is re-addressed in a way that loses its worktree and branch",
+        (r"same implementer conversation", r"session_id", r"worktree"),
     ),
     (
         "blocking-issues-logged-as-registry-fix-tasks",
@@ -814,10 +945,10 @@ _LIFECYCLE_ANCHORS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         (r"registry", r"fix-task|log", r"worktree|scoped"),
     ),
     (
-        "class-closure-recurrence-stop",
+        "class-vs-one-off-and-the-enumeration-table",
         _CROSS_REVIEW,
-        "point-fixing continues while the same defect class recurs at new sites",
-        (r"\bclass\b", r"\bstop\b", r"one-off|enumerat", r"zero remaining|every instance"),
+        "a class-shaped fix is scoped like a typo, and closure is sampled not proven",
+        (r"one-off", r"every instance", r"enumeration table"),
     ),
     (
         "release-records-registry-readiness",
@@ -826,46 +957,10 @@ _LIFECYCLE_ANCHORS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         (r"registry", r"PR URL|record", r"ready|human"),
     ),
     (
-        "unsatisfiable-contract-escalation",
-        _CROSS_REVIEW,
-        "the fix loop spins forever instead of returning to the human",
-        (r"contract", r"cannot be satisfied|a few loops", r"escalate|stop"),
-    ),
-    (
         "bot-sweep-uses-a-timer",
         _CROSS_REVIEW,
         "holly busy-polls a bot that posts on its own lag",
         (r"timer", r"sweep|lag", r"polling|genuine|delay"),
-    ),
-    (
-        "bot-findings-clustered-by-class",
-        _CROSS_REVIEW,
-        "the same class is point-fixed once per comment instead of closed",
-        (r"cluster", r"\bclass\b", r"before fixing|before"),
-    ),
-    (
-        "bot-findings-never-narrow-the-mandate",
-        _CROSS_REVIEW,
-        "a bot's comment list becomes the review scope and the battery shrinks",
-        (r"bot|findings", r"narrow|confirm these", r"mandate"),
-    ),
-    (
-        "reply-in-thread",
-        _CROSS_REVIEW,
-        "replies detach from the finding and resolution state cannot be read",
-        (r"repl", r"in-?thread", r"top-level|new"),
-    ),
-    (
-        "repeated-class-hard-stop",
-        _CROSS_REVIEW,
-        "a recurring class keeps being point-fixed during bot servicing",
-        (r"repeated class", r"stop", r"whole-surface|escalate"),
-    ),
-    (
-        "unresolved-thread-count-on-handoff",
-        _CROSS_REVIEW,
-        "the human merges believing replies established resolution",
-        (r"unresolved", r"thread", r"count|report"),
     ),
 )
 
@@ -899,8 +994,12 @@ def test_review_lifecycle_branches_survive() -> None:
 
     Rules whose exact sentence IS the obligation are pinned verbatim; procedure
     steps whose wording is incidental stay as per-block vocabulary. Presence
-    either way — neither form fails on a sentence added next to it that says the
-    opposite, which is the module docstring's first structural gap.
+    either way, so neither form fails on a sentence ADDED beside it that says
+    the opposite — the module docstring's contradiction-blindness. The two forms
+    differ on REPLACEMENT: a pinned rule fails when its sentence is swapped for
+    an inverted one, a vocabulary anchor does not. The anchors still here are
+    the ones whose wording is incidental, and two of them are named in the
+    module docstring as verified-blind.
     """
     texts = _orchestration_files()
     for branch, consequence, owner, canonical in _LIFECYCLE_CANONICAL:
