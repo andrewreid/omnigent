@@ -778,9 +778,31 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         _CROSS_REVIEW,
         "`blast_radius` denies destructive push variants — `--force*`, `--delete`, "
         "`--mirror`, `--prune`, bundled short forms containing `-f` or `-d`, and "
-        "`+refspec` / `:refspec` — while a plain `git push` is ungated. A deployment "
-        "may attach session-level or server-wide policies that gate ordinary pushes "
-        "too; those are not Holly's and you cannot assume either way.",
+        "`+refspec` / `:refspec` — while a plain `git push` is ungated.",
+    ),
+    (
+        # Split out of the span above, which a new sentence now sits inside. This
+        # one is a claim about how STRONG the denial is, and its deletion leaves the
+        # list of denied variants reading as a guarantee against a determined
+        # worker. `sh -c` and a git alias defeat a text match; nothing in the list
+        # says so on its own.
+        "push-denial-is-text-matched-not-semantic",
+        "the variant list reads as a real barrier, so a worker infers that a "
+        "force-push is impossible rather than merely spelled differently",
+        _CROSS_REVIEW,
+        "That denial is TEXT-MATCHED and models neither nested shells nor `eval` nor "
+        "git aliases, so `sh -c '...'`, `eval '...'` and `git -c alias.x='push "
+        "--force' x` all pass it: a guard against accident, not against intent.",
+    ),
+    (
+        # Also split out: it was inside the old span and is now separated from it.
+        # Without it the file reads as if Holly's policy set were the whole story.
+        "push-gating-may-come-from-the-deployment",
+        "a deployment's own session or server-wide gate is assumed absent, and an ASK "
+        "on an ordinary push is read as a malfunction",
+        _CROSS_REVIEW,
+        "A deployment may attach session-level or server-wide policies that gate "
+        "ordinary pushes too; those are not Holly's and you cannot assume either way.",
     ),
     (
         # Split out of the span above rather than pinned with it. The sentence
@@ -816,9 +838,27 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "No policy SHIPPED BY HOLLY gates ordinary publication: `blast_radius` "
         "denies destructive push variants — `--force*`, `--delete`, `--mirror`, "
         "`--prune`, bundled short forms containing `-f` or `-d`, and `+refspec` / "
-        "`:refspec` — while a plain `git push` is ungated. A deployment may attach "
-        "session-level or server-wide policies that DO gate ordinary pushes; those "
-        "are not Holly's and you cannot assume either way.",
+        "`:refspec` — while a plain `git push` is ungated.",
+    ),
+    (
+        # The root-prompt twin of the text-matching caveat. Its wording differs from
+        # the skill's — this copy also carries the explicit instruction not to
+        # DESCRIBE the guard as preventing anything, which is the D1a rule applied
+        # to Holly's own future prose, so the two are not interchangeable.
+        "push-denial-is-text-matched-in-the-root-prompt",
+        "holly repeats the variant list to a worker as if it prevented a force-push",
+        _ROOT_CONFIG,
+        "That denial is TEXT-MATCHED on the shell command and models neither nested "
+        "shells nor `eval` nor git aliases: `sh -c '...'`, `eval '...'` and `git -c "
+        "alias.x='push --force' x` all pass. It guards against accident, not against "
+        "intent, and you must not describe it as preventing anything.",
+    ),
+    (
+        "push-gating-may-come-from-the-deployment-root-prompt",
+        "the prompt holly carries every turn assumes no deployment gate exists",
+        _ROOT_CONFIG,
+        "A deployment may attach session-level or server-wide policies that DO gate "
+        "ordinary pushes; those are not Holly's and you cannot assume either way.",
     ),
     (
         "mandate-pasted-verbatim",
@@ -855,11 +895,16 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "and misses parametrized expansion.",
     ),
     (
-        "pi-independence-requires-a-cross-vendor-model",
-        "a pi reviewer on the author's own model reports independence it lacks",
+        # Re-synced: independence is now a model you CONFIRM rather than one you
+        # pass, which is the whole point of the routing caveat — passing a model is
+        # a request the server may discard. The span stops before the
+        # continuation-rejects-a-resent-model mechanic, which has its own entry.
+        "pi-independence-requires-a-confirmed-cross-vendor-model",
+        "a pi reviewer on the author's own model reports independence it lacks, or a "
+        "requested model is treated as a confirmed one",
         _CROSS_REVIEW,
-        "`pi` runs any gateway model, so a `pi` reviewer is independent only if you "
-        "pass it `args.model` from a different vendor than the author's, on the "
+        "A reviewer is independent only if the effective model you CONFIRM differs in "
+        "vendor from the author's, which for `pi` means passing `args.model`, on the "
         "dispatch that CREATES the review session",
     ),
     (
@@ -976,12 +1021,28 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         # rule contains whether it says a reused session KEEPS a worktree binding
         # or says it does NOT. The claim that just changed was therefore pinned by
         # a word that survives its own reversal.
+        # Re-synced from the INSUFFICIENT form. "re-verify the branch on return" was
+        # the whole check; a branch name matches whether the fixer committed or not,
+        # and says nothing about the runner root. The rule now requires the same
+        # three baselines fanout uses, taken FRESH each round, and the pin covers
+        # all three plus the freshness — a stale baseline reused across rounds makes
+        # a no-commit round look like a commit.
+        #
+        # Left OUT of the span: the two "without X you cannot Y" clauses that follow.
+        # They explain why each baseline is needed, and the requirement above already
+        # names all three explicitly, so excluding them costs nothing a reader acts
+        # on. Deleting a reason alone therefore passes here — unlike fanout's
+        # porcelain entry, where the reason IS the discriminator and stays pinned.
         "fix-round-carries-the-absolute-worktree-path",
-        "a fix-round dispatch assumes a worktree binding that does not exist, and the "
-        "fixer edits whatever directory it happens to start in",
+        "a fix-round dispatch assumes a worktree binding that does not exist; a fixer "
+        "that committed nothing is indistinguishable from one that did; and a fixer "
+        "that edited the runner root instead is invisible",
         _CROSS_REVIEW,
         "It does NOT keep a worktree binding, because none exists: repeat the ABSOLUTE "
-        "worktree path in every fix-round dispatch, and re-verify the branch on return.",
+        "worktree path in every fix-round dispatch, and re-verify on return with the "
+        "SAME three baselines fanout uses, taken fresh before each round — the task "
+        "worktree's HEAD, and the runner root's branch, HEAD and `git status "
+        "--porcelain`.",
     ),
     (
         # The already-open-PR revision range. Its vocabulary anchor names the
@@ -1098,6 +1159,93 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         _ROOT_CONFIG,
         "This carve-out is about WHO WRITES the artifact, not an exemption from "
         "review-before-push.",
+    ),
+    # ── Smart Routing: the override, and what the readback does NOT establish ──
+    #
+    # The round that added this prose shipped with it pinned by nothing: the whole
+    # override paragraph and the readback instruction could be deleted with every
+    # test still green, because the only effective-vendor anchor pinned the generic
+    # same-or-undeterminable STOP, which survives their deletion. The stop is the
+    # conclusion; these are the premises that make it necessary, and a conclusion
+    # whose premises are gone is prose nobody can act on.
+    #
+    # Pinned in BOTH carrying files. The root prompt is what holly holds every
+    # turn; the cross-review skill is what it consults when dispatching a reviewer,
+    # and the reviewer dispatch is the only place independence is decided.
+    (
+        "smart-routing-overrides-model-and-harness",
+        "vendor fixity is assumed to survive routing, so a `codex` reviewer routed "
+        "onto the author's own vendor is reported as an independent review",
+        _ROOT_CONFIG,
+        "SMART ROUTING OVERRIDES BOTH, AND YOU MUST CHECK FOR IT. If the session you "
+        "are running in has Smart Routing / Auto enabled, the server routes every "
+        "worker session you create: it discards your `args.model` at creation and "
+        "replaces the worker's declared harness with one it picks from `claude-sdk`, "
+        "`codex`, `pi`. Native harnesses are excluded from that set, so a "
+        "`claude_code` worker does NOT run claude-native and a `codex` worker does "
+        "NOT run codex-native under routing, and `pi` may be moved to either. Your "
+        "requested model is not recovered even if routing later fails. The "
+        "consequence is that the roster's vendor fixity is NOT a property you can "
+        "assume: a `codex` reviewer can be routed onto the same vendor as a "
+        "`claude_code` author, which silently defeats cross-vendor independence.",
+    ),
+    (
+        # The ASYMMETRY is the pinned content, not decoration. `sys_session_get_info`
+        # returns STORED metadata, observes neither execution nor harness, and can be
+        # stale — so a mismatch is proof of substitution while a match is only
+        # CONSISTENT with independence. A span that kept the readback instruction and
+        # dropped the asymmetry would pin an overclaim: holly would read a match as
+        # confirmation and report an independence it never established. Both halves
+        # therefore stay in one string.
+        "readback-mismatch-proves-substitution-match-proves-nothing",
+        "a matching readback is read as confirmed independence, which it never is; or "
+        "the readback goes altogether and routing substitution is never detected",
+        _ROOT_CONFIG,
+        "read the child's RECORDED model back with `sys_session_get_info` and compare "
+        "it against the author's. Know what that establishes: it returns the STORED "
+        "`model_override` / `llm_model`, which is the routed value once routing has "
+        "persisted it, but it observes neither what actually executed nor the "
+        "harness, and a persistence failure can leave it stale while the routed "
+        "model still reaches the runner. So a MISMATCH proves substitution, while a "
+        "match is consistent with independence rather than proof of it.",
+    ),
+    (
+        # Same override, stated at the dispatch site. Shorter than the root-prompt
+        # copy and carrying the operative half of vendor fixity — that neither the
+        # NAME nor the requested MODEL establishes what ran — so no separate fixity
+        # entry is needed for this file.
+        "smart-routing-defeats-name-and-requested-model",
+        "the reviewer dispatch treats the worker name or the model it asked for as "
+        "evidence of vendor, at the one point where independence is decided",
+        _CROSS_REVIEW,
+        "Under Smart Routing the server discards your `args.model` and re-picks the "
+        "harness from `claude-sdk`/`codex`/`pi`, so neither the worker name nor the "
+        "model you asked for establishes the vendor that actually ran.",
+    ),
+    (
+        # The skill's readback, with the same asymmetry kept whole for the same
+        # reason. This copy also names the harness gap explicitly ("exposes no
+        # harness"), which the root-prompt copy words differently.
+        "readback-asymmetry-at-the-reviewer-dispatch",
+        "a match is reported as an independent review, or the comparison is skipped "
+        "at the only dispatch where independence matters",
+        _CROSS_REVIEW,
+        "Read both sides' RECORDED model back with `sys_session_get_info` and "
+        "compare. It reports stored metadata, not what executed, and exposes no "
+        "harness: a mismatch proves substitution, a match is consistent with "
+        "independence without proving it.",
+    ),
+    (
+        # The declared-vs-runtime distinction, pinned in the root prompt because the
+        # e2e harness test docstring now cites exactly this sentence for what its
+        # assertion does and does not establish.
+        "harness-fixity-holds-only-absent-routing",
+        "declared configuration is read as runtime fact, which is the error the "
+        "routing investigation found in three places",
+        _ROOT_CONFIG,
+        "ABSENT Smart Routing, `claude_code` and `codex` run their declared native "
+        "harness and `pi` runs ANY gateway model; UNDER routing none of the three is "
+        "fixed, per the caveat above.",
     ),
     # ── fanout: dispatch isolation and the verification that stands in for it ──
     #
