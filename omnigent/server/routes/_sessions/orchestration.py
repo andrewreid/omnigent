@@ -6341,12 +6341,23 @@ async def _get_session_snapshot(
         Reuse here is POINT-IN-TIME, not the policy-engine rule. The
         engine re-derives every mutable field and keeps only the
         immutable ``id`` / ``root_conversation_id`` from a preloaded row,
-        because it gates tool calls. A snapshot is a read projection: it
-        renders this row's labels, agent/model binding, runner and
-        archive-derived fields as they were when the caller authorized
-        the session, so a write landing during this request shows up on
-        the next read rather than mid-response. Do not reuse a snapshot
-        row to make an enforcement decision.
+        because it gates tool calls. A snapshot is a read projection, and
+        a MIXED-epoch one — which fields come from when is worth stating
+        exactly, because a response can combine both:
+
+        - **Request-start**, from this row: labels, agent/model binding,
+          ``runner_id`` / ``host_id``, title, archived state and everything
+          derived from them.
+        - **Later**, read while the response is being built: routing and
+          liveness, subtree usage, host state, and the agent/spec/harness
+          lookups (some served from process caches).
+
+        So a rebind landing mid-request can be queried on the NEW runner
+        while the response still reports the OLD ``runner_id``. Nothing
+        here is an enforcement decision, and each half is internally
+        consistent; making the whole projection single-epoch is a change to
+        this endpoint's contract, not to a redundant read. Do not reuse a
+        snapshot row to make an enforcement decision.
     :param liveness_lookup: Bulk session-liveness lookup (the server's
         ``_bulk_session_liveness``) used to populate ``runner_online``
         and ``host_online`` on the snapshot. ``None`` (e.g. focused
