@@ -1402,13 +1402,18 @@ def test_agent_rebind_after_spec_resolution_fails_closed(
         )
 
 
-def test_concurrent_state_increments_do_not_lose_updates(
+def test_increments_from_independent_snapshots_merge(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """
-    Reproduction of the reported lost update: two engines built from
-    independent snapshots each INCREMENT the same key. A blind
-    whole-blob write persisted 1; the atomic merge persists 2.
+    Two engines holding independent snapshots each INCREMENT one key, and
+    both increments survive. A blind whole-blob write persisted 1.
+
+    Sequential by construction, and named for what it proves: the MERGE, not
+    the race. Serialisation of overlapping transactions is a store-level
+    property and is pinned there, against each dialect's own mechanism
+    (``test_two_real_writers_race_on_one_metadata_row``) — this test stays
+    green with the row lock removed and should not be read as covering it.
     """
     from omnigent.spec.types import StateUpdate, StateUpdateAction
 
@@ -1429,10 +1434,13 @@ def test_concurrent_state_increments_do_not_lose_updates(
     assert dict(persisted.session_state)["risk"] == 2
 
 
-def test_concurrent_state_updates_preserve_other_keys(
+def test_sets_from_independent_snapshots_preserve_other_keys(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """A second engine's SET must not drop a key the first one wrote."""
+    """A second engine's SET must not drop a key the first one wrote.
+
+    Sequential, like its sibling above: the merge is the contract here.
+    """
     from omnigent.spec.types import StateUpdate, StateUpdateAction
 
     conv = conversation_store.create_conversation(title="state-keys")
@@ -1456,17 +1464,26 @@ def test_concurrent_state_updates_preserve_other_keys(
     assert state["from_b"] == "b", state
 
 
-def test_load_session_usage_uses_the_supplied_root(
+def test_supplied_root_is_a_hint_that_gets_verified(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """
-    The supplied root must actually drive the tree load.
+    A caller's tree root saves a read when right and is corrected when wrong.
 
-    Passing the correct root returns the same sum as self-resolving (the
-    optimisation is behaviour-preserving), and passing a DIFFERENT tree's
-    root returns nothing — which is what makes the argument observably
-    load-bearing. Asserting only the equal case let a version that ignored
-    the argument entirely pass.
+    ``root_conversation_id`` is immutable per ROW, not per conversation id.
+    Delete a conversation and recreate it under the same id and the new row
+    can sit in a different tree, so a row read earlier in the request names a
+    root this conversation no longer belongs to. Trusting it silently summed
+    the wrong tree — the recreated child reported nothing at all.
+
+    Three properties, because the argument has to be observably load-bearing
+    AND observably safe:
+
+    1. right root → same answer as self-resolving, one conversation read
+       fewer (a build that ignored the argument fails on the read count);
+    2. wrong tree's root → still the right answer (a build that trusts it
+       fails here);
+    3. the delete/recreate case that produced the regression.
     """
     from omnigent.runtime.policies.builder import load_session_usage
 
@@ -1478,19 +1495,69 @@ def test_load_session_usage_uses_the_supplied_root(
     conversation_store.set_session_usage(child.id, {"total_cost_usd": 0.05})
     other_tree = conversation_store.create_conversation(title="unrelated")
 
-    resolved = load_session_usage(child.id, conversation_store)
+    with _count_sql(conversation_store) as self_resolved_sql:
+        resolved = load_session_usage(child.id, conversation_store)
     assert resolved["total_cost_usd"] == pytest.approx(0.05)
 
-    # Correct root: identical result, one read fewer.
+    with _count_sql(conversation_store) as supplied_sql:
+        supplied = load_session_usage(child.id, conversation_store, root_conversation_id=parent.id)
+    assert supplied == resolved
+    # The saved read is the point of the argument: a triplet fewer.
+    executed = lambda caught: [q for q in caught if not q.startswith("PRAGMA")]  # noqa: E731
+    assert len(executed(supplied_sql)) == len(executed(self_resolved_sql)) - 3, (
+        executed(supplied_sql),
+        executed(self_resolved_sql),
+    )
+
+    # Wrong tree's root: verified against the tree it produced, so the sum is
+    # still right. Trusting it returned {} — the shape of the regression.
     assert (
-        load_session_usage(child.id, conversation_store, root_conversation_id=parent.id)
+        load_session_usage(child.id, conversation_store, root_conversation_id=other_tree.id)
         == resolved
     )
 
-    # Wrong tree's root: the child is not in that tree, so the sum is empty.
-    # A build that ignored the argument would return ``resolved`` here.
-    assert (
-        load_session_usage(child.id, conversation_store, root_conversation_id=other_tree.id) == {}
+
+def test_recreated_conversation_is_summed_in_its_new_tree(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A row read before a delete/recreate must not decide which tree to sum.
+
+    The reported regression: a child is deleted and recreated under the same
+    id in a different tree while a caller holds the old row. Summing from the
+    stale row's root found no such conversation and emitted nothing, so the
+    session's cost silently stopped updating.
+    """
+    import asyncio
+
+    from omnigent.runtime.policies.builder import load_session_usage
+
+    old_parent = conversation_store.create_conversation(title="old-root")
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=old_parent.id, title=_sub_agent_title()
+    )
+    stale_row = conversation_store.get_conversation(child.id)
+    assert stale_row.root_conversation_id == old_parent.root_conversation_id
+
+    # Recreate the same id under a different tree, as the delete/recreate
+    # boundary does.
+    asyncio.run(conversation_store.delete_conversation(child.id))
+    new_parent = conversation_store.create_conversation(title="new-root")
+    conversation_store.create_conversation(
+        conversation_id=child.id,
+        kind="sub_agent",
+        parent_conversation_id=new_parent.id,
+        title=_sub_agent_title(),
+    )
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 2.0})
+
+    summed = load_session_usage(
+        child.id,
+        conversation_store,
+        root_conversation_id=stale_row.root_conversation_id,
+    )
+    assert summed["total_cost_usd"] == pytest.approx(2.0), (
+        "a stale root must not silence a recreated conversation's spend"
     )
 
 
