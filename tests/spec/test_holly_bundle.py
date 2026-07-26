@@ -798,11 +798,31 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
     ),
     (
         "an-invalid-report-is-not-a-review",
-        "an incomplete report, or a verdict despite a refusal, reads as a pass",
+        "an incomplete report, a short-delivered one, or a verdict despite a refusal, "
+        "reads as a pass",
         _CROSS_REVIEW,
-        "No opening checklist, a missing axis, or a verdict issued despite an "
-        "`INCOMPLETE DISPATCH` notice means the review did not happen. Re-dispatch "
-        "the identical full mandate.",
+        "No opening checklist, a missing axis, a declared finding count the report "
+        "does not deliver, or a verdict issued despite an `INCOMPLETE DISPATCH` "
+        "notice means the review did not happen. Re-dispatch the identical full "
+        "mandate.",
+    ),
+    (
+        # Separate from the step above, which pins the same count clause as one of
+        # four invalidating conditions. This pins the RULE the clause is shorthand
+        # for: what a count mismatch means and why the return path needs it at all.
+        # Deleting this paragraph leaves step 4 word-for-word intact, so nothing
+        # else here fails — holly is left told to notice a mismatch and never told
+        # that a mismatch is a truncated transport rather than a completed review.
+        "return-path-truncation-detected-by-count",
+        "a report truncated in transport reads as a normal successful completion, and "
+        "the missing findings are never dispatched for",
+        _CROSS_REVIEW,
+        "The checklist declares a finding count per pass: reconcile it against the "
+        "findings actually delivered. The DISPATCH is guarded against truncation by "
+        "the mandate's END marker; the RETURN is not, and a worker can return a "
+        "partial result that reads as a normal successful completion. A report "
+        "declaring more findings than arrived was truncated in transport, not "
+        "completed.",
     ),
     (
         "same-fixer-same-branch",
