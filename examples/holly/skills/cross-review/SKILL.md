@@ -22,9 +22,12 @@ coupled-artifact axes require grepping a clean checkout, so always permit repo
 read, and hand over the changed surface plus its adjacency — callers, sibling
 surfaces, the target type — not just the raw hunk.
 
-**Nothing mechanically blocks a push.** There is no policy gate; the ordering
-below holds only because you sequence it. That is the honest description, and
-you must not tell a worker otherwise.
+**No policy gates ordinary publication.** `blast_radius` denies only
+catastrophic push variants (`--force*`, `--delete`, `--mirror`, `--prune`); a
+plain `git push` is ungated, so the ordering below holds only because you
+sequence it. That is the honest description, and you must not tell a worker
+otherwise in EITHER direction — neither that a gate exists, nor that nothing
+is denied at all.
 
 ## Author the contract WIDE — this is upstream of everything else
 
@@ -195,8 +198,12 @@ END REVIEWER-MANDATE-V1
 ## Procedure
 
 1. **Diff.** Two cases, and they differ at the release step.
-   *Unopened branch* (the normal one): `git -C .worktrees/<task_id> diff
-   main...HEAD`. The implementer has committed and stopped; nothing is pushed.
+   *Unopened branch* (the normal one): diff against the exact ref the task
+   branched FROM, recorded when you created the worktree — `git -C
+   .worktrees/<task_id> diff <base_ref>...HEAD`. Do not hard-code `main`: a
+   repo may not have one, and a task branched from a feature branch would
+   otherwise show unrelated pre-existing work as part of its diff. The
+   implementer has committed and stopped; nothing is pushed.
    *Already-open PR* (a pre-existing PR, or a fix round on one you released
    earlier): review the LOCAL delta that is about to be pushed —
    `git -C .worktrees/<task_id> diff origin/<branch>...HEAD` — because that is
@@ -208,9 +215,9 @@ END REVIEWER-MANDATE-V1
    committed and stopped; the commit has not been pushed.
    *Direct authoring* (a doc or skill Holly wrote itself): there is no task
    worktree and no implementer, so neither command above applies. Commit
-   locally on the branch you are working on, then diff that branch against its
-   merge-base — `git diff main...HEAD` — before EVERY round, fix rounds
-   included. An uncommitted working tree is not what will be published, so
+   locally on the branch you are working on, then diff it against the ref it
+   branched FROM — `git diff <base_ref>...HEAD`, not a hard-coded `main` —
+   before EVERY round, fix rounds included. An uncommitted working tree is not what will be published, so
    reviewing one reviews the wrong thing.
 
 2. **Gates first — ALL of them, before any reviewer is involved.** Discover the
