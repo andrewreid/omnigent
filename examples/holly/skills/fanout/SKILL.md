@@ -18,13 +18,25 @@ dependency).
    `sys_session_send(agent="claude_code"|"codex"|"pi", title="<task_slug>",
    args={purpose: "implement", input: "<task + acceptance contract +
    worktree path>"})`. Use a short task-based title such as `auth-refactor` or
-   `fix-sse-error`, never the raw vendor name. State the scope and that it must
-   work only inside `.worktrees/<task_id>`. The worker drives the task to green,
+   `fix-sse-error`, never the raw vendor name. State the scope, and give the
+   ABSOLUTE worktree path rather than a relative one: `sys_session_send` has no
+   workspace parameter, the child session is persisted with `workspace=None`,
+   and its runtime cwd is the RUNNER ROOT. A worker that does not move into the
+   worktree will read, edit, test and COMMIT against the runner-root checkout
+   instead, where a later push publishes the wrong branch. Isolation here is
+   instruction-following, not a binding. The worker drives the task to green,
    commits, and STOPS — it does not push and does not open a PR. Every commit it authors must
    end with a blank line followed by the exact co-sign trailer as its final
    line — `Co-authored-by: omnigent <noreply@omnigent.ai>`.
    Record each handle's `conversation_id`
-   in the registry. Emit the worktree + `sys_session_send` tool calls in THIS
+   in the registry, along with the runner-root branch and HEAD as they stand
+   BEFORE dispatch — you need that baseline to detect contamination later.
+   When a worker reports, VERIFY before accepting anything it claims:
+   `git -C .worktrees/<task_id> branch --show-current` and `rev-parse HEAD`
+   show the task branch carrying the new commit, and the runner-root checkout's
+   branch and HEAD are unchanged from the recorded baseline. `sys_session_get_info`
+   cannot substitute for this: it reports the child's persisted `workspace` and
+   `git_branch`, and on this dispatch path both are always `null`. Emit the worktree + `sys_session_send` tool calls in THIS
    turn — never end a turn having only said you will dispatch; the dispatch
    calls and their announcement go in the same turn. Dispatch the whole
    parallel-safe set, THEN (and only then) END YOUR TURN. Do not poll.

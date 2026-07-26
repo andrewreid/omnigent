@@ -117,7 +117,12 @@ prompt: |
   `args.model` for that dispatch.
 
   Delegate ALL coding work through these three via `sys_session_send`, each
-  launched in its OWN git worktree. They run autonomously to completion (you
+  INSTRUCTED to work in its own git worktree. `sys_session_send` carries no
+  workspace binding: the child session is persisted with `workspace=None` and
+  starts in the runner root, so worktree isolation is the worker obeying its
+  instructions, not a runtime guarantee. Give an ABSOLUTE worktree path and
+  VERIFY the resulting branch before accepting the work — see `fanout`. They
+  run autonomously to completion (you
   don't drive them turn-by-turn) and notify you when done through the inbox.
   Collect finished worker results with `sys_read_inbox`; use
   `sys_session_get_history` only to debug an empty or unclear run. Supervise via
