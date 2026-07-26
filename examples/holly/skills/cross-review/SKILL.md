@@ -25,9 +25,12 @@ surfaces, the target type — not just the raw hunk.
 **No policy shipped by Holly gates ordinary publication.** `blast_radius`
 denies destructive push variants — `--force*`, `--delete`, `--mirror`,
 `--prune`, bundled short forms containing `-f` or `-d`, and `+refspec` /
-`:refspec` — while a plain `git push` is ungated. A deployment may attach
-session-level or server-wide policies that gate ordinary pushes too; those are
-not Holly's and you cannot assume either way. The ordering below holds only
+`:refspec` — while a plain `git push` is ungated. That denial is TEXT-MATCHED
+and models neither nested shells nor `eval` nor git aliases, so `sh -c '...'`,
+`eval '...'` and `git -c alias.x='push --force' x` all pass it: a guard against
+accident, not against intent. A deployment may attach session-level or
+server-wide policies that gate ordinary pushes too; those are not Holly's and
+you cannot assume either way. The ordering below holds only
 because you sequence it. That is the honest description, and you must not tell a worker
 otherwise in EITHER direction — neither that a gate exists, nor that nothing
 is denied at all.
@@ -241,13 +244,16 @@ END REVIEWER-MANDATE-V1
    Smart Routing the server discards your `args.model` and re-picks the
    harness from `claude-sdk`/`codex`/`pi`, so neither the worker name nor the
    model you asked for establishes the vendor that actually ran. Read both
-   sides' effective model back with `sys_session_get_info` and compare; equal
-   or undeterminable vendors means you have NOT got an independent review, and
-   you say so instead of reporting one. Vendor is a property of the model, not
+   sides' RECORDED model back with `sys_session_get_info` and compare. It
+   reports stored metadata, not what executed, and exposes no harness: a
+   mismatch proves substitution, a match is consistent with independence
+   without proving it. Equal or undeterminable vendors means you have NOT got
+   an independent review, and you say so instead of reporting one. Vendor is a property of the model, not
    of the worker name:
-   `claude_code` and `codex` are fixed, but `pi` runs any gateway model, so a
-   `pi` reviewer is independent only if you pass it `args.model` from a
-   different vendor than the author's, on the dispatch that CREATES the review
+   absent Smart Routing `claude_code` and `codex` run their declared native
+   harness while `pi` runs any gateway model; under routing none is fixed. A
+   reviewer is independent only if the effective model you CONFIRM differs in
+   vendor from the author's, which for `pi` means passing `args.model`, on the dispatch that CREATES the review
    session — but see the routing caveat below, which can discard it — where a
    continuation keeps the model set at creation and rejects a
    resent one, so verify it rather than resending it. For a doc or skill Holly authored
@@ -272,7 +278,12 @@ END REVIEWER-MANDATE-V1
    `title`, or address it by `session_id`, with `purpose: "implement"`) so it
    keeps its task context. It does NOT keep a worktree binding, because none
    exists: repeat the ABSOLUTE worktree path in every fix-round dispatch, and
-   re-verify the branch on return. A new title spawns a fresh worker with no
+   re-verify on return with the SAME three baselines fanout uses, taken fresh
+   before each round — the task worktree's HEAD, and the runner root's branch,
+   HEAD and `git status --porcelain`. A fix round is a dispatch like any other:
+   without a fresh task-HEAD baseline you cannot tell a new commit from none at
+   all, and without the porcelain baseline you cannot see a fixer that edited
+   the runner root instead. A new title spawns a fresh worker with no
    memory of the task. Direct-authoring: Holly revises the prose itself, re-runs
    the gates and every applicable pass, and re-dispatches the review. Same loop;
    only the fixer differs. Log each blocking issue as a registry fix-task scoped
