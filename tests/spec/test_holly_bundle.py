@@ -153,8 +153,19 @@ The enumerated gaps:
 8. Anything NOT enumerated. ``_LIFECYCLE_CANONICAL`` and ``_LIFECYCLE_ANCHORS``
    are a list of named branches, not a completeness claim; a branch absent from
    both is protected by nothing, and adding a branch to the prose adds no test.
+9. DIRTY RUNNER-ROOT CONTAMINATION is not tested, and the fanout pins do not
+   test it. They prove the INSTRUCTION survives — that the three baselines, the
+   porcelain clause and the moved-HEAD check are still in the file a reader
+   receives. They prove NOTHING about whether contamination is actually caught,
+   because catching it is holly's runtime judgement rather than a mechanism:
+   nothing compares a baseline for it, and nothing fails if it never looks. The
+   behavioural test was considered and deliberately not built — it needs a git
+   fixture with a runner root plus worktree and a scripted brain, and against a
+   scripted brain the assertion is about the script, not about holly. This is
+   the same wall as review sequencing (see the e2e module's own disclaimer), and
+   it is a reviewer's job for the same reason.
 
-All eight now depend on review rather than on CI.
+All nine now depend on review rather than on CI.
 """
 
 from __future__ import annotations
@@ -179,6 +190,7 @@ _MANDATE_BEGIN = "BEGIN REVIEWER-MANDATE-V1"
 _MANDATE_END = "END REVIEWER-MANDATE-V1"
 
 _CROSS_REVIEW = "skills/cross-review/SKILL.md"
+_FANOUT = "skills/fanout/SKILL.md"
 _ROOT_CONFIG = "config.yaml"
 
 
@@ -1086,6 +1098,86 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         _ROOT_CONFIG,
         "This carve-out is about WHO WRITES the artifact, not an exemption from "
         "review-before-push.",
+    ),
+    # ── fanout: dispatch isolation and the verification that stands in for it ──
+    #
+    # This file had NO entry in either table until now — the only bundle file with
+    # no coverage at all — and it carries the rules that exist BECAUSE
+    # ``sys_session_send`` provides no worktree binding. Every one of them is a
+    # claim about what the runtime does or does not do, which is the class this
+    # bundle keeps getting wrong, so all of them are fixed strings rather than
+    # vocabulary.
+    (
+        # The honesty claim for this file, and pinned first because everything
+        # below exists only if it is true. Its reversal — "the worktree is a
+        # binding" — is the false-mechanism claim in its purest form.
+        "worktree-isolation-is-instruction-following",
+        "a binding is assumed where none exists, so nothing downstream is verified",
+        _FANOUT,
+        "Isolation here is instruction-following, not a binding.",
+    ),
+    (
+        # Operative instruction only. The three runtime facts that follow it
+        # (no workspace parameter, ``workspace=None``, cwd is the runner root)
+        # explain WHY and are left out: they can be re-explained without changing
+        # the obligation, and the obligation is what a dispatch either carries or
+        # does not.
+        "dispatch-carries-the-absolute-worktree-path",
+        "the child starts in the runner root and edits, tests and commits against "
+        "the wrong checkout",
+        _FANOUT,
+        "give the ABSOLUTE worktree path rather than a relative one",
+    ),
+    (
+        "three-baselines-recorded-before-dispatch",
+        "there is nothing to compare a returning worker against, so contamination is "
+        "undetectable after the fact",
+        _FANOUT,
+        "THREE baselines taken BEFORE dispatch: the task worktree's HEAD, and the "
+        "runner-root checkout's branch, HEAD and `git status --porcelain`",
+    ),
+    (
+        # Reason kept INSIDE the span here, unlike the absolute-path entry. The
+        # reason is the discriminator: without "leaves its branch and HEAD
+        # untouched" there is nothing to say why the other two baselines are
+        # insufficient, and porcelain reads as belt-and-braces that a later edit
+        # can drop.
+        "porcelain-catches-uncommitted-runner-root-edits",
+        "a worker that edited the runner root without committing passes verification, "
+        "because branch and HEAD both still match",
+        _FANOUT,
+        "Porcelain is not optional here — a worker that edited the runner root "
+        "without committing leaves its branch and HEAD untouched.",
+    ),
+    (
+        "task-head-must-have-moved",
+        "a worker that committed nothing is accepted on its own report",
+        _FANOUT,
+        "its `rev-parse HEAD` has MOVED from the recorded task baseline, since an "
+        "unchanged HEAD means no commit was made whatever the worker reported",
+    ),
+    (
+        # A negative capability claim: this tool CANNOT do the job. Pinned because
+        # its reversal invites holly to swap the real verification for a call that
+        # returns ``null`` on this path and reads as a pass.
+        "session-get-info-cannot-verify-the-worktree",
+        "verification is swapped for a call that always returns null here, which "
+        "looks like confirmation",
+        _FANOUT,
+        "`sys_session_get_info` cannot substitute for this: it reports the child's "
+        "persisted `workspace` and `git_branch`, and on this dispatch path both are "
+        "always `null`.",
+    ),
+    (
+        # The worker configs carry "Do NOT push and do NOT open a PR." as a
+        # canonical instruction, but that is the worker's copy in a different file.
+        # This is holly's own copy in the dispatch procedure, and deleting it here
+        # leaves the orchestrator with no rule about what it dispatches for.
+        "fanout-worker-commits-and-stops",
+        "an implementer publishes its own branch and holly's review sequencing never happens",
+        _FANOUT,
+        "The worker drives the task to green, commits, and STOPS — it does not push "
+        "and does not open a PR.",
     ),
 )
 
