@@ -13,12 +13,14 @@ branches, the worker obligations, the policy argument values — live in
 holly delegates every coding task to its ``claude_code`` / ``codex`` / ``pi``
 workers, reviews the LOCAL branch diff with a different-vendor reviewer, and
 only then sequences publication. No policy SHIPPED BY HOLLY gates ordinary
-publication: ``blast_radius`` denies destructive push variants — ``--force*``,
-``--delete``, ``--mirror``, ``--prune``, bundled short forms containing ``-f`` or
-``-d``, and ``+refspec`` / ``:refspec`` — while a plain ``git push`` is ungated,
-so that ordering is prompt discipline and the tests are written accordingly. A
-deployment may attach session-level or server-wide policies that DO gate ordinary
-pushes; those are not Holly's and nothing here asserts either way.
+publication: a plain ``git push`` is ungated, so that ordering is prompt
+discipline and the tests are written accordingly. ``blast_radius`` does deny a
+set of destructive push forms, enumerated in the bundle and pinned in
+``tests/spec/test_holly_bundle.py``, but the denial is TEXT-MATCHED, so
+``sh -c 'git push --force'``, ``eval`` and a git alias all pass it even when the
+nested text contains an enumerated form: a guard against accident, not against
+intent. A deployment may attach session-level or server-wide policies that DO
+gate ordinary pushes; those are not Holly's and nothing here asserts either way.
 """
 
 from __future__ import annotations
@@ -83,7 +85,7 @@ def test_identity_roster_and_skills(holly_spec: AgentSpec) -> None:
     ]
 
 
-def test_executor_shape_keeps_vendors_distinct(holly_spec: AgentSpec) -> None:
+def test_declared_executor_shape(holly_spec: AgentSpec) -> None:
     """
     The bundle DECLARES the orchestrator's harness and one per worker.
 
@@ -100,10 +102,18 @@ def test_executor_shape_keeps_vendors_distinct(holly_spec: AgentSpec) -> None:
     at the ``pi`` harness leaves every name, prompt and routing rule intact while
     silently removing the declared vendor distinction the whole cross-vendor
     design rests on — a defect in the bundle regardless of what routing later
-    does to it. Vendor independence itself is established per dispatch by reading
-    the recorded model back, not here; see the routing caveat in
-    ``examples/holly/config.yaml``, which is pinned in
-    ``tests/spec/test_holly_bundle.py``.
+    does to it. That is what this test is for, and it is the limit of it: the
+    test was previously named for keeping vendors DISTINCT, which executor shape
+    cannot establish.
+
+    Nothing here establishes independence, and no readback establishes it either
+    once routing is on. The bundle's rule is that requested-versus-recorded
+    detects substitution for one session, author-recorded-versus-reviewer-recorded
+    compares vendors, identical recorded models are a definite failure, DIFFERENT
+    ones prove nothing — and that under Smart Routing the executing model is
+    unidentifiable, so independence is UNCONFIRMABLE and holly stops rather than
+    comparing. Those rules live in ``examples/holly/config.yaml`` and the
+    cross-review skill, pinned in ``tests/spec/test_holly_bundle.py``.
 
     Models stay unpinned where the contract requires it: the orchestrator brain
     must resolve whatever Claude provider the deployment configured, and ``pi``
