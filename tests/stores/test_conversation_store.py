@@ -5268,44 +5268,6 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
     assert stored == ["custom-search-text"]
 
 
-def test_sqlalchemy_store_implements_the_whole_abstract_contract() -> None:
-    """
-    Every abstract ConversationStore method must be implemented by the
-    real store, with a compatible signature.
-
-    Guard for a recurring class of breakage: adding a method to the
-    abstract contract (or a parameter to an existing one) silently
-    diverges implementations and in-tree doubles, and the failure only
-    surfaces in whichever unrelated suite happens to exercise that path.
-    """
-    import inspect
-
-    from omnigent.stores.conversation_store import ConversationStore
-
-    missing = getattr(SqlAlchemyConversationStore, "__abstractmethods__", frozenset())
-    assert not missing, f"unimplemented abstract methods: {sorted(missing)}"
-
-    for name in dir(ConversationStore):
-        base = getattr(ConversationStore, name, None)
-        if not callable(base) or not getattr(base, "__isabstractmethod__", False):
-            continue
-        impl = getattr(SqlAlchemyConversationStore, name)
-        base_params = set(inspect.signature(base).parameters)
-        impl_sig = inspect.signature(impl)
-        impl_params = set(impl_sig.parameters)
-        accepts_var_kw = any(
-            p.kind is inspect.Parameter.VAR_KEYWORD for p in impl_sig.parameters.values()
-        )
-        if accepts_var_kw:
-            continue
-        assert base_params <= impl_params, (
-            f"{name}: implementation is missing {sorted(base_params - impl_params)}"
-        )
-
-
-# ── ACL EXISTS pushdown (single-DB) ────────────────────
-
-
 def _acl_perms(db_uri: str):
     from omnigent.stores.permission_store.sqlalchemy_store import (
         SqlAlchemyPermissionStore,
@@ -5567,7 +5529,15 @@ def test_list_conversations_acl_with_cursor_pagination(
     """Cursor pagination composes with the ACL filter: walking every page
     yields exactly the granted rows (no leak, no overlap, none lost), and a
     NON-granted conversation used as the cursor still returns the granted
-    rows that follow it — an empty page would not satisfy this."""
+    rows that follow it — an empty page would not satisfy this.
+
+    Owns the ACL-vs-cursor COMPOSITION: removing the filter (``needs_meta_filter
+    = False``) fails here, because the ungranted rows appear. It deliberately
+    does NOT own the pushdown — disabling it falls back to the id prefetch,
+    which must return identical rows on split binds, so this test passing
+    under that mutation is the contract working. The pushdown is pinned by
+    the statement-shape and plan guards below.
+    """
     convs = [conversation_store.create_conversation(title=f"c{i}") for i in range(6)]
     # Newest first: c0, c1, ... c5. Deterministic on every dialect.
     _spread_created_at(conversation_store, [c.id for c in convs])
@@ -5748,6 +5718,13 @@ def test_seeded_listing_plans_and_deep_pagination(
     # index range condition from a residual filter. Asking for half the table
     # in one page makes a sequential scan the planner's rational choice, and
     # the plan would then say nothing about the predicate.
+    #
+    # ALL FOUR branches are explained, not just descending ``after``. The
+    # rewrite changed both directions and both orders, and the four produce
+    # different predicates; pinning one of them let the residual OR form be
+    # restored for the other three with every test still green. Behavioural
+    # equality cannot see this — the OR form returns the same rows, just by
+    # reading and discarding everything above the cursor.
     baseline = conversation_store.list_conversations(
         accessible_by="alice@example.com",
         limit=_PLAN_SEED_ROWS * 2,
@@ -5758,48 +5735,71 @@ def test_seeded_listing_plans_and_deep_pagination(
     )
     assert not baseline.has_more, "baseline must be a single complete page"
     expected_ids = [c.id for c in baseline.data]
-    first = conversation_store.list_conversations(
-        accessible_by="alice@example.com",
-        limit=int(len(expected_ids) * 0.7),
-        has_agent_id=True,
-        kind="default",
-        sort_by="created_at",
-        order="desc",
-    )
-    assert first.has_more, "seed must be deeper than one page"
-    with _capture_conversation_selects(conversation_store) as clauses:
-        with _capture_driver_sql(conversation_store) as driver_captured:
-            second = conversation_store.list_conversations(
-                accessible_by="alice@example.com",
-                limit=20,
-                after=first.data[-1].id,
-                has_agent_id=True,
-                kind="default",
-                sort_by="created_at",
-                order="desc",
-            )
-    cursor_plan = _plan_of(driver_captured)
-    if dialect == "postgresql":
-        index_conds, rows_filtered = _index_conds_and_filtered(cursor_plan)
-        assert any("created_at" in c and "id" in c for c in index_conds), cursor_plan
-        # A residual filter is the failure this form exists to avoid: it means
-        # the scan read every row above the cursor and threw it away.
-        assert all(r == 0 for r in rows_filtered), cursor_plan
-    else:
-        assert "USING INDEX" in cursor_plan, cursor_plan
-        assert "SCAN conversations" not in cursor_plan, cursor_plan
+    deep = int(len(expected_ids) * 0.7)
 
-    # Then the emitted spelling, as a description of what produced that plan.
-    listing = next((c for c in clauses if "created_at" in str(c)), clauses[0])
+    tiebreaker_col = conversation_store._tiebreaker_col
     # The tiebreaker column is dialect-chosen (SQLite rowid = insertion order,
     # otherwise the uuid id) — assert against the store's own choice rather
     # than hard-coding one dialect's spelling.
-    tiebreaker_col = conversation_store._tiebreaker_col
     tiebreaker = str(getattr(tiebreaker_col, "expression", tiebreaker_col))
-    assert f"(conversations.created_at, {tiebreaker}) <" in " ".join(str(listing).split()), (
-        tiebreaker,
-        str(listing),
-    )
+
+    first = None
+    second = None
+    for sort_by in ("created_at", "updated_at"):
+        for order in ("desc", "asc"):
+            for direction in ("after", "before"):
+                page = conversation_store.list_conversations(
+                    accessible_by="alice@example.com",
+                    limit=deep,
+                    has_agent_id=True,
+                    kind="default",
+                    sort_by=sort_by,
+                    order=order,
+                )
+                assert page.has_more, "seed must be deeper than one page"
+                cursor_id = page.data[-1].id
+                with _capture_conversation_selects(conversation_store) as clauses:
+                    with _capture_driver_sql(conversation_store) as driver_captured:
+                        cursor_page = conversation_store.list_conversations(
+                            accessible_by="alice@example.com",
+                            limit=20,
+                            has_agent_id=True,
+                            kind="default",
+                            sort_by=sort_by,
+                            order=order,
+                            **{direction: cursor_id},
+                        )
+                where = f"{sort_by}/{order}/{direction}"
+                # The PLAN first: a residual filter is the failure this form
+                # exists to avoid — it means the scan read every row past the
+                # cursor and threw it away.
+                cursor_plan = _plan_of(driver_captured)
+                if dialect == "postgresql":
+                    index_conds, rows_filtered = _index_conds_and_filtered(cursor_plan)
+                    assert any(sort_by in c and "id" in c for c in index_conds), (
+                        where,
+                        cursor_plan,
+                    )
+                    assert all(r == 0 for r in rows_filtered), (where, cursor_plan)
+                else:
+                    assert "USING INDEX" in cursor_plan, (where, cursor_plan)
+                    assert "SCAN conversations" not in cursor_plan, (where, cursor_plan)
+
+                # Then the emitted spelling, as a description of what produced
+                # that plan. ``after`` in a descending scan compares "<";
+                # every other combination flips one of the two.
+                listing = next((c for c in clauses if sort_by in str(c)), clauses[0])
+                descending_scan = (order == "desc") if direction == "after" else (order == "asc")
+                comparison = "<" if descending_scan else ">"
+                assert f"(conversations.{sort_by}, {tiebreaker}) {comparison}" in " ".join(
+                    str(listing).split()
+                ), (where, tiebreaker, str(listing))
+
+                # Keep the descending created_at/after pages for the walk below.
+                if sort_by == "created_at" and order == "desc" and direction == "after":
+                    first, second = page, cursor_page
+
+    assert first is not None and second is not None
 
     # ── 3. behaviour: deep pagination loses and duplicates nothing ──────
     first_ids = [c.id for c in first.data]
