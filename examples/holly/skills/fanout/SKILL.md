@@ -29,12 +29,16 @@ dependency).
    end with a blank line followed by the exact co-sign trailer as its final
    line — `Co-authored-by: omnigent <noreply@omnigent.ai>`.
    Record each handle's `conversation_id`
-   in the registry, along with the runner-root branch and HEAD as they stand
-   BEFORE dispatch — you need that baseline to detect contamination later.
+   in the registry, along with THREE baselines taken BEFORE dispatch: the task
+   worktree's HEAD, and the runner-root checkout's branch, HEAD and
+   `git status --porcelain`. All three are needed to detect contamination.
    When a worker reports, VERIFY before accepting anything it claims:
-   `git -C .worktrees/<task_id> branch --show-current` and `rev-parse HEAD`
-   show the task branch carrying the new commit, and the runner-root checkout's
-   branch and HEAD are unchanged from the recorded baseline. `sys_session_get_info`
+   `git -C .worktrees/<task_id> branch --show-current` shows the task branch;
+   its `rev-parse HEAD` has MOVED from the recorded task baseline, since an
+   unchanged HEAD means no commit was made whatever the worker reported; and
+   the runner root's branch, HEAD and porcelain status all match their
+   baselines. Porcelain is not optional here — a worker that edited the runner
+   root without committing leaves its branch and HEAD untouched. `sys_session_get_info`
    cannot substitute for this: it reports the child's persisted `workspace` and
    `git_branch`, and on this dispatch path both are always `null`. Emit the worktree + `sys_session_send` tool calls in THIS
    turn — never end a turn having only said you will dispatch; the dispatch

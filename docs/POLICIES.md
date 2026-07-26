@@ -70,7 +70,7 @@ policies:
 > optional is then invoked with none and runs on its defaults, silently and
 > with no log line. A factory with a required parameter behaves one of two
 > ways, because `_has_no_required_params` counts only POSITIONAL parameters
-> (`omnigent/policies/function.py:370-377`). A required POSITIONAL parameter
+> (`omnigent/policies/function.py:377`). A required POSITIONAL parameter
 > makes it false, so the factory function itself is kept as the evaluator; it
 > is callable, the build succeeds, and the failure surfaces later still, when
 > the policy is evaluated and the factory is called with an event it has no
