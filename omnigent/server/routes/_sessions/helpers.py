@@ -1241,6 +1241,12 @@ def _ancestor_session_ids(
     """
     Return ancestor session ids for a session, nearest parent first.
 
+    Reads each link fresh. The cost-usage fan-out walks a loaded tree
+    instead (:func:`ancestor_ids_from_tree`); this remains for callers that
+    hold no tree, and a caller-supplied starting row is deliberately not
+    accepted — a row read earlier in the request can name a parent chain the
+    session has since left, and these ids decide where events are published.
+
     :param conv_store: Store used to read conversation parent links.
     :param session_id: Session to walk upward from, e.g.
         ``"conv_child123"``.
@@ -3701,8 +3707,13 @@ async def _get_runner_client_impl(
     """
     Get an HTTP client for the runner bound to a session.
 
-    Uses the ``RunnerRouter`` to resolve the pinned runner. Falls
-    back to the in-process runner client for test setups.
+    Uses the ``RunnerRouter`` to resolve the pinned runner via a fresh
+    single-column binding read, so the RESOLUTION reflects a rebind that
+    landed before this call. The returned client is bound to that runner:
+    a rebind between this resolution and the caller's POST is not fenced
+    (the resolve→forward window is unchanged by the read narrowing, and
+    fencing it needs a binding generation on the wire). Falls back to the
+    in-process runner client for test setups.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.

@@ -634,6 +634,11 @@ def _publish_subtree_cost_to_ancestors(
         behind that its remaining callers already depend on.
     :returns: None.
     """
+    # Loaded HERE, not taken from the caller. What each ancestor's badge
+    # should read is a fact about now, at publication time — a tree captured
+    # when the request arrived can already describe a smaller total, and two
+    # siblings publishing from their own request-start snapshots delivered a
+    # newer figure followed by an older one, leaving the parent's badge stale.
     tree = load_session_tree(
         session_id,
         conv_store,
@@ -1187,6 +1192,7 @@ def _persist_native_cumulative_usage(
 
 async def _persist_external_session_usage(
     session_id: str,
+    conv: Conversation,
     body: SessionEventInput,
     conversation_store: ConversationStore,
 ) -> int | None:
@@ -1198,6 +1204,9 @@ async def _persist_external_session_usage(
     (:func:`_persist_native_cumulative_usage`) must be present.
 
     :param session_id: Session/conversation identifier.
+    :param conv: The already-loaded conversation row; only its immutable
+        ``root_conversation_id`` is read (so a request-start row is safe),
+        letting the subtree recompute skip one conversation read.
     :param body: External session-usage event body.
     :param conversation_store: Store used to upsert the labels.
     :returns: The persisted ``context_tokens`` when present, else ``None``.
@@ -1260,7 +1269,16 @@ async def _persist_external_session_usage(
     # hide in-flight sub-agent spend until the next child flush (the badge would
     # oscillate own ⇄ subtree). For a childless session the subtree is just
     # itself, so this equals own cost — one indexed tree query per flush.
-    subtree_usage = await asyncio.to_thread(load_session_usage, session_id, conversation_store)
+    # This tree serves only this session's own subtree total. The ancestor
+    # re-publish below loads its OWN tree instead of reusing this one — see
+    # the comment down there for why sharing it would be wrong.
+    tree = await asyncio.to_thread(
+        load_session_tree,
+        session_id,
+        conversation_store,
+        conv.root_conversation_id,
+    )
+    subtree_usage = _sum_subtree_usage(tree, session_id)
     subtree_cost = _priced_cost_for_display(subtree_usage)
     usage_by_model = _usage_by_model_for_display(subtree_usage)
     # Only include fields that were sent; the client treats absent
@@ -1285,12 +1303,16 @@ async def _persist_external_session_usage(
     # This session's usage also moves its ANCESTORS' subtree cost (its spend
     # rolls up into every ancestor), so re-publish each ancestor's subtree cost
     # too — otherwise a grandparent's badge wouldn't reflect a deep descendant.
-    # No-op for a top-level session (no ancestors). Threaded: it pages the
-    # conversation tree per ancestor.
+    # Publishes nothing for a top-level session (no ancestors to walk), but
+    # still pays its own tree load to find that out — it reads its own tree
+    # rather than reusing the one summed above: what an ancestor's badge
+    # should show is a fact about publication time, and a sibling's event may
+    # have landed since this request started.
     await asyncio.to_thread(
         _publish_subtree_cost_to_ancestors,
         conversation_store,
         session_id,
+        conv,
     )
     return raw_tokens
 
