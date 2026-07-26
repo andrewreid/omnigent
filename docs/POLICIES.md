@@ -66,13 +66,17 @@ policies:
 > (`omnigent/spec/parser.py`), which uses the same grammar as an agent bundle's
 > `guardrails.policies:` and does **not** understand `factory_params`. Neither
 > parser rejects unknown keys, so a `factory_params:` block is silently
-> discarded. A factory whose parameters are all optional then runs on its
-> defaults, silently and with no log line; a factory with a required parameter
-> fails later instead, at build time. `factory_params` is real only on the
-> REST/DB row path and in the legacy single-file omnigent YAML
-> (`omnigent/spec/omnigent.py`). The per-policy examples in the catalog below
-> are written in that single-file dialect; translate `factory_params:` to
-> `function: {path, arguments}` before copying one into a server config or an
+> discarded, leaving `arguments=None`. A factory whose parameters are all
+> optional is then invoked with none and runs on its defaults, silently and
+> with no log line. A factory with a REQUIRED parameter is not invoked at all:
+> `_has_no_required_params` is false, so the factory function itself is kept
+> as the evaluator (`omnigent/policies/function.py:291-302`). It is callable,
+> so the build succeeds — the failure surfaces later still, when the policy is
+> evaluated and the factory is called with an event it has no signature for.
+> `factory_params` is real only on the REST/DB row path and in the legacy
+> single-file omnigent YAML (`omnigent/spec/omnigent.py`). Any catalog example
+> below that uses `factory_params:` is written in that dialect; translate it to
+> `function: {path, arguments}` before copying it into a server config or an
 > agent bundle's `guardrails.policies:`.
 
 **4. Start the server.**

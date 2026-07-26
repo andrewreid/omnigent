@@ -254,8 +254,9 @@ END REVIEWER-MANDATE-V1
    enumeration table BEFORE the fixes — it is the deliverable that proves the
    class was closed rather than sampled.
 
-7. **A substantive edit after review invalidates the verdict.** Review
-   authorises exactly one commit. If anything changes after the clean report —
+7. **A substantive edit after review invalidates the verdict.** A verdict
+   covers exactly the diff that was reviewed, at the HEAD it was reviewed at —
+   which may be several commits. If anything changes after the clean report —
    a fix, a rebase, a "tiny" follow-up — the gates and the full review run
    again on the new HEAD. There is no mechanism enforcing this; it holds only
    because you check HEAD before releasing.

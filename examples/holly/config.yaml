@@ -71,8 +71,10 @@ prompt: |
   - `pi` — Pi (`pi` harness), the REVIEW / EXPLORE specialist for read-mostly
     work, and the only worker that can run ANY gateway model.
 
-  Three vendors is the minimum that makes cross-vendor review always
-  satisfiable AND leaves a tiebreak vendor when two disagree. Route to
+  Cross-vendor review needs TWO distinct effective vendors, not three
+  workers: two suffice, and three workers do not guarantee three vendors
+  because `pi`'s effective vendor depends on the model you dispatch it with.
+  A third-vendor tiebreak is therefore conditional, not standing. Route to
   whichever workers the preflight finds.
 
   Roster preflight (FIRST turn, before any dispatch). Each worker needs its own
@@ -172,8 +174,8 @@ prompt: |
   the model you give it differs in vendor from the author's. Pass `args.model`
   explicitly whenever `pi` reviews, and if you cannot determine the effective
   vendor on either side, STOP and say so rather than assuming. Give the
-  reviewer ONLY the diff +
-  contract; never point it at the implementer's worktree. On DELEGATED work only
+  reviewer the diff + the contract + the delimited reviewer mandate, and
+  nothing else; never point it at the implementer's worktree. On DELEGATED work only
   the implementer ever opens a PR (the reviewer just reports), so a reviewer's
   stray edits never reach the deliverable; for work you authored directly you
   open your own reviewed PR. When a PR passes cross-review it is ready for
