@@ -967,11 +967,15 @@ class ConversationStore(ABC):
         """
         Persist the full session-state snapshot for a conversation.
 
-        Overwrites the existing ``session_state`` JSON column with
-        the serialized *state* dict. Called by
-        :meth:`PolicyEngine.apply_state_updates` after applying
-        structured :class:`StateUpdate` operations to the hot
-        cache.
+        Overwrites the existing ``session_state`` JSON column with the
+        serialized *state* dict — last writer wins, including over keys the
+        caller never read. Use it to install a state wholesale (seeding,
+        import, tests).
+
+        A caller applying updates to state it read earlier wants
+        :meth:`mutate_session_state` instead: two writers each holding their
+        own snapshot lose each other's changes here, which is why policy
+        evaluation no longer uses this method.
 
         :param conversation_id: The conversation to update,
             e.g. ``"conv_abc123"``.

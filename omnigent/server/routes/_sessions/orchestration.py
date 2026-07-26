@@ -629,8 +629,9 @@ def _publish_subtree_cost_to_ancestors(
         holds one. Only its ``root_conversation_id`` is used, and only as a
         hint: :func:`load_session_tree` verifies the tree it names actually
         contains this session and resolves the root itself when it does not.
-        Declared here rather than alongside its first caller so that caller
-        stays independently revertible.
+        The parameter belongs to this function, not to whichever caller first
+        needed it, so that no caller can be removed and leave a signature
+        behind that its remaining callers already depend on.
     :returns: None.
     """
     tree = load_session_tree(
