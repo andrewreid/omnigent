@@ -833,3 +833,251 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker() -> None
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_completion_with_usage_rolls_up_subtree_cost(db_uri: str) -> None:
+    """
+    A relay turn reporting usage must price it, persist it, and publish the
+    SUBTREE total resolved from the TREE ROOT — not from the reporting
+    conversation.
+
+    Deliberately runs the relay on a SUB-AGENT with the spend on a DESCENDANT,
+    so the published figure can only be right if the roll-up sums the tree
+    rather than the reporting conversation.
+
+    What actually fails here, and why: rooting the tree at the reporter is
+    REPAIRED downstream — the tree loader verifies a supplied root and
+    resolves it again when the conversation is not in the tree it names — so
+    the cost stays correct and that mutation is caught by the PR owning that
+    contract, not here. This test owns the shared read: collapsing one
+    conversation read back into two is caught by the read count, which a
+    behavioural assertion cannot see.
+    """
+    from contextlib import contextmanager
+
+    from sqlalchemy import event as sa_event
+
+    from omnigent.db.utils import _engine_cache
+    from omnigent.server.routes import sessions as sessions_module
+
+    @contextmanager
+    def _count_conv_selects(engine):
+        seen: list[str] = []
+
+        def _on(conn, cursor, statement, params, context, many):
+            if (
+                statement.lstrip().upper().startswith("SELECT")
+                and "FROM conversations" in statement
+                and "conversation_item" not in statement
+                and "conversation_label" not in statement
+                # PostgreSQL takes the usage row lock as its own id-only
+                # ``SELECT … FOR UPDATE``; SQLite gets the same serialisation
+                # from BEGIN IMMEDIATE and emits nothing. It is a lock, not a
+                # row read, so counting it would make this oracle assert a
+                # different number per dialect for no behavioural reason.
+                and "FOR UPDATE" not in statement.upper()
+            ):
+                seen.append(statement)
+
+        sa_event.listen(engine, "before_cursor_execute", _on)
+        try:
+            yield seen
+        finally:
+            sa_event.remove(engine, "before_cursor_execute", _on)
+
+    sessions_module._runner_relay_tasks.clear()
+    store = SqlAlchemyConversationStore(db_uri)
+    root = store.create_conversation()
+    reporter = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=root.id, title="relay:reporter"
+    )
+    descendant = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=reporter.id, title="relay:grandchild"
+    )
+    # Spend on a DESCENDANT of the reporter: inside the reporter's subtree,
+    # but only visible if the tree is loaded from the real root — its
+    # ``root_conversation_id`` is the root's, so a tree rooted at the
+    # reporter matches no rows at all.
+    store.set_session_usage(descendant.id, {"total_cost_usd": 0.25})
+    session_id = reporter.id
+
+    response_id = "resp_relay_usage_1"
+    turn_events: list[dict[str, Any]] = [
+        {
+            "type": "response.in_progress",
+            "response": {"id": response_id, "model": "databricks-claude-sonnet-4-6"},
+        },
+        {"type": "response.output_text.delta", "delta": "hi"},
+        {
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "model": "databricks-claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 500,
+                    "total_tokens": 1500,
+                },
+            },
+        },
+    ]
+    release = asyncio.Event()
+    fake_runner = _ScriptedRunnerClient(release, turn_events)
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_relay_usage",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+
+        with _count_conv_selects(_engine_cache[db_uri]) as conv_selects:
+            release.set()
+            usage_events: list[dict[str, Any]] = []
+            seen: list[str] = []
+            while not seen or seen[-1] != "response.completed":
+                event = await collector.next_event()
+                seen.append(event["type"])
+                if event["type"] == "session.usage":
+                    usage_events.append(event)
+
+        # The turn's own tokens landed on the reporting conversation.
+        reporter_usage = dict(store.get_conversation(session_id).session_usage)
+        assert reporter_usage.get("total_tokens") == 1500, reporter_usage
+
+        assert usage_events, f"no session.usage published; saw {seen}"
+        published = usage_events[-1].get("total_cost_usd")
+        # The reporter's own turn is unpriced (test model is not in the
+        # pricing catalog), so the ONLY way a total appears is the tree-root
+        # scan reaching the descendant. Rooting the tree at the reporter
+        # matches no rows, so nothing would be published at all.
+        assert published == pytest.approx(0.25), (published, reporter_usage)
+
+        # The invariant this PR owns, stated as "how many times is THIS
+        # session's row read", not as a total across every conversations
+        # SELECT the turn makes. A total also counts the tree scan and the
+        # ancestor walk, which belong to the PR below this one — so reverting
+        # that PR failed this oracle for a reason unrelated to the change
+        # under test. This count is identical with or without it.
+        #
+        # Two, and both are named: the relay's shared row (pricing + roll-up)
+        # and the relay-status path's own read, which stays separate on
+        # purpose because it must observe the newest labels. A full revert of
+        # the shared-row fix makes this four, not three: pricing, the
+        # subtree roll-up and the ancestor walk each go back to resolving
+        # their own row independently once the sharing is gone, plus the one
+        # unrelated relay-status read that was always separate.
+        own_row_reads = [
+            q
+            for q in conv_selects
+            if "conversations.title" in q and "root_conversation_id = " not in q
+        ]
+        assert len(own_row_reads) == 2, [q.split("\n")[0][:70] for q in own_row_reads]
+    finally:
+        if collector is not None:
+            await collector.stop()
+        for task_handle in list(sessions_module._runner_relay_tasks.values()):
+            task_handle.task.cancel()
+        sessions_module._runner_relay_tasks.clear()
+
+
+@pytest.mark.asyncio
+async def test_relay_completion_stops_when_the_session_is_gone(db_uri: str) -> None:
+    """
+    A completion whose session vanished must not bill a recreated row.
+
+    The handler reads the conversation once and uses it for both the pricing
+    lookup and the subtree roll-up. Passing an absent row onward meant
+    ``None`` read as "re-read the row" to the accumulator and as "skip" to the
+    roll-up, so a session deleted and recreated under the same id had the
+    turn's usage persisted to the new row while the event reporting it was
+    suppressed — billed silently.
+
+    The window is inside the handler, so it is constructed there: the shared
+    read observes the deletion, and the row exists again by the time a
+    re-reading accumulator would look. One read now decides for the whole
+    completion.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    store = SqlAlchemyConversationStore(db_uri)
+    doomed = store.create_conversation(title="relay:doomed")
+    session_id = doomed.id
+
+    class _RecreateBetweenReads:
+        """Reports the deletion, then recreates the id behind the reader."""
+
+        def __init__(self, inner: SqlAlchemyConversationStore) -> None:
+            self._inner = inner
+            self.recreated = False
+
+        def get_conversation(self, conversation_id: str):
+            row = self._inner.get_conversation(conversation_id)
+            if row is None and conversation_id == session_id and not self.recreated:
+                self.recreated = True
+                self._inner.create_conversation(
+                    conversation_id=conversation_id, title="relay:recreated"
+                )
+            return row
+
+        def __getattr__(self, name: str):
+            return getattr(self._inner, name)
+
+    proxy = _RecreateBetweenReads(store)
+
+    response_id = "resp_relay_gone_1"
+    turn_events: list[dict[str, Any]] = [
+        {
+            "type": "response.in_progress",
+            "response": {"id": response_id, "model": "databricks-claude-sonnet-4-6"},
+        },
+        {
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "model": "databricks-claude-sonnet-4-6",
+                "usage": {"input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500},
+            },
+        },
+    ]
+    release = asyncio.Event()
+    fake_runner = _ScriptedRunnerClient(release, turn_events)
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_relay_gone",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=proxy,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+
+        await store.delete_conversation(session_id)
+
+        release.set()
+        seen: list[str] = []
+        while not seen or seen[-1] != "response.completed":
+            event = await collector.next_event()
+            seen.append(event["type"])
+
+        assert proxy.recreated, "the interleave never happened; the test proves nothing"
+        recreated = store.get_conversation(session_id)
+        assert recreated is not None
+        assert not dict(recreated.session_usage), (
+            f"the vanished session's turn was billed to the recreated row: "
+            f"{dict(recreated.session_usage)}"
+        )
+    finally:
+        if collector is not None:
+            await collector.stop()
+        for task_handle in list(sessions_module._runner_relay_tasks.values()):
+            task_handle.task.cancel()
+        sessions_module._runner_relay_tasks.clear()
