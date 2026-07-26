@@ -6230,7 +6230,16 @@ def _build_policy_engine_from_spec_impl(
     spec: AgentSpec,
     session_id: str,
     conversation_store: ConversationStore,
+    conversation: Conversation | None = None,
 ) -> PolicyEngine:
+    """Build an engine for *spec*, reusing a conversation row when held.
+
+    Every caller of this wrapper already loaded the conversation to
+    resolve *spec*; passing it lets the builder skip its own read. Only
+    the row's immutable identity is reused — the builder re-derives
+    labels, session_state and model from a fresh read (see
+    :func:`build_policy_engine`).
+    """
     caps = get_caps()
     host_connection = (
         caps.policy_llm_connection_factory() if caps.policy_llm_connection_factory else None
@@ -6239,6 +6248,11 @@ def _build_policy_engine_from_spec_impl(
         spec=spec,
         conversation_id=session_id,
         conversation_store=conversation_store,
+        conversation=conversation,
+        # The spec was resolved from this row's agent binding; the builder
+        # confirms it against its own fresh read and fails closed if a
+        # switch-agent landed in between.
+        expected_agent_id=conversation.agent_id if conversation is not None else None,
         default_policies=caps.default_policies,
         policy_store=get_policy_store(),
         server_llm=caps.llm,
@@ -6302,7 +6316,7 @@ async def _apply_pending_policy_ask_writes(
     if spec is None:
         return
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
     # The label/state writes hit the DB synchronously too — keep them
     # off the loop.
@@ -6410,11 +6424,13 @@ def _build_evaluation_context(
             harness=hook_harness,
         )
     # REQUEST / RESPONSE — content is the user/assistant text. The wire ``data``
-    # is a dict for the native command hooks (``{"text"|"content": ...}``), but
-    # may be a bare string — opencode's policy plugin sends the prompt text
-    # directly for ``PHASE_REQUEST``. Accept both, and NEVER raise here: a crash
-    # 500s the evaluate endpoint, which silently fails the request/result gate
-    # OPEN (the exact symptom that let cost-over-budget terminal prompts through).
+    # is a dict for every current first-party producer (``{"text"|"content":
+    # ...}``, including OpenCode's plugin, which sends ``{"text": ...}``), but
+    # a bare string is still accepted for ``PHASE_REQUEST`` for compatibility
+    # with older or third-party callers that send the prompt text directly.
+    # Accept both, and NEVER raise here: a crash 500s the evaluate endpoint,
+    # which silently fails the request/result gate OPEN (the exact symptom
+    # that let cost-over-budget terminal prompts through).
     if isinstance(data, str):
         text = data
     elif isinstance(data, dict):
@@ -6690,7 +6706,7 @@ async def _evaluate_output_policy(
         return None
 
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
     ctx = EvaluationContext(
         phase=Phase.RESPONSE,
