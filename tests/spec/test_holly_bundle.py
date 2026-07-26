@@ -7,12 +7,16 @@ publication. Parse-only, so it runs in the default suite; the headline contract
 also has a thin guard under ``tests/e2e/omnigent/test_example_holly.py`` for the
 per-example coverage rule.
 
-Publication ordering is prompt discipline, not enforcement: ``blast_radius``
-denies only catastrophic push variants (``--force*``, ``--delete``,
-``--mirror``, ``--prune``); a plain ``git push`` is ungated. It runs with
-``gate_pushes: false`` and inspects shell text only — but that flag governs the
-ASK branch, which the DENY branch precedes, so the catastrophic set is refused
-either way.
+Publication ordering is prompt discipline, not enforcement — with two edges. No
+policy SHIPPED BY HOLLY gates ordinary publication: ``blast_radius`` denies
+destructive push variants — ``--force*``, ``--delete``, ``--mirror``,
+``--prune``, bundled short forms containing ``-f`` or ``-d``, and ``+refspec`` /
+``:refspec`` — while a plain ``git push`` is ungated. It runs with
+``gate_pushes: false`` and inspects shell text only, but that flag governs the
+ASK branch, which the DENY branch precedes, so the destructive set is refused
+either way. A deployment may also attach session-level or server-wide policies
+that DO gate ordinary pushes; those are not Holly's and this file asserts
+nothing either way about them.
 
 WHAT THIS FILE DELIBERATELY DOES NOT DO
 ---------------------------------------
@@ -757,13 +761,29 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         # deliberately rather than drift.
         "push-enforcement-stated-in-both-directions",
         "a worker is told either that a gate exists, or that nothing is denied and a "
-        "force-push is available to it",
+        "force-push is available to it; or the denial set is named short of what "
+        "`_push_severity` actually refuses",
         _CROSS_REVIEW,
-        "`blast_radius` denies only catastrophic push variants (`--force*`, "
-        "`--delete`, `--mirror`, `--prune`); a plain `git push` is ungated, so the "
-        "ordering below holds only because you sequence it. That is the honest "
-        "description, and you must not tell a worker otherwise in EITHER direction "
-        "— neither that a gate exists, nor that nothing is denied at all.",
+        "`blast_radius` denies destructive push variants — `--force*`, `--delete`, "
+        "`--mirror`, `--prune`, bundled short forms containing `-f` or `-d`, and "
+        "`+refspec` / `:refspec` — while a plain `git push` is ungated. A deployment "
+        "may attach session-level or server-wide policies that gate ordinary pushes "
+        "too; those are not Holly's and you cannot assume either way.",
+    ),
+    (
+        # Split out of the span above rather than pinned with it. The sentence
+        # between them — "The ordering below holds only because you sequence it" —
+        # is a consequence of the fact, and keeping it inside one long span meant a
+        # rewrite of the consequence failed the test while every fact stood. This
+        # instruction is separately deletable and is the D1a rule itself, so it
+        # gets its own entry instead.
+        "push-claim-must-not-mislead-in-either-direction",
+        "the honesty rule for worker-facing prose is gone, leaving the facts above "
+        "with no instruction attached to them",
+        _CROSS_REVIEW,
+        "That is the honest description, and you must not tell a worker otherwise in "
+        "EITHER direction — neither that a gate exists, nor that nothing is denied "
+        "at all.",
     ),
     (
         # The same D1a claim in the ROOT PROMPT — the copy holly itself carries
@@ -778,11 +798,15 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         # untouched. The facts are what a reader acts on and cannot verify.
         "push-enforcement-in-the-root-prompt",
         "the prompt holly carries every turn says either that a gate exists, or that "
-        "nothing is denied and a force-push is available",
+        "nothing is denied and a force-push is available; or it names the denial set "
+        "short of what `_push_severity` refuses",
         _ROOT_CONFIG,
-        "No policy gates ordinary publication: `blast_radius` denies only "
-        "catastrophic push variants (`--force*`, `--delete`, `--mirror`, "
-        "`--prune`), so a plain `git push` is ungated",
+        "No policy SHIPPED BY HOLLY gates ordinary publication: `blast_radius` "
+        "denies destructive push variants — `--force*`, `--delete`, `--mirror`, "
+        "`--prune`, bundled short forms containing `-f` or `-d`, and `+refspec` / "
+        "`:refspec` — while a plain `git push` is ungated. A deployment may attach "
+        "session-level or server-wide policies that DO gate ordinary pushes; those "
+        "are not Holly's and you cannot assume either way.",
     ),
     (
         "mandate-pasted-verbatim",
@@ -908,6 +932,58 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "Route blocking issues back to the SAME fixer, on the SAME branch.",
     ),
     (
+        # Task-branch diff base. The old anchor for this was a vocabulary tuple
+        # whose middle pattern was ``worktree|main\.\.\.HEAD`` — it ACCEPTED the
+        # hard-coded base it was supposed to forbid, and passed anyway on the
+        # incidental word "worktree" that the corrected prose also contains. A
+        # fixed string is the only decidable form for a rule of the shape "use X,
+        # not Y": restoring Y removes X's text and fails.
+        "task-diff-base-is-the-recorded-branch-point",
+        "a task branched from a feature branch shows unrelated pre-existing work as "
+        "part of its diff, and a repo with no `main` cannot be reviewed at all",
+        _CROSS_REVIEW,
+        "diff against the exact ref the task branched FROM, recorded when you created "
+        "the worktree — `git -C .worktrees/<task_id> diff <base_ref>...HEAD`. Do not "
+        "hard-code `main`",
+    ),
+    (
+        # The same rule at its second site. Direct authoring has no task worktree,
+        # so it carries its own command, and a revert there is invisible to the
+        # pin above. This branch's recurring defect is a sweep that stops at the
+        # first site, so the twin is pinned rather than assumed.
+        "direct-authoring-diff-base-is-not-hard-coded-main",
+        "prose holly authored itself is reviewed against the wrong range, or not "
+        "reviewable in a repo without `main`",
+        _CROSS_REVIEW,
+        "then diff it against the ref it branched FROM — `git diff <base_ref>...HEAD`, "
+        "not a hard-coded `main`",
+    ),
+    (
+        # Same weakness as the diff base, found by the sweep the finding prompted:
+        # the vocabulary anchor for this branch matched ``worktree``, a word the
+        # rule contains whether it says a reused session KEEPS a worktree binding
+        # or says it does NOT. The claim that just changed was therefore pinned by
+        # a word that survives its own reversal.
+        "fix-round-carries-the-absolute-worktree-path",
+        "a fix-round dispatch assumes a worktree binding that does not exist, and the "
+        "fixer edits whatever directory it happens to start in",
+        _CROSS_REVIEW,
+        "It does NOT keep a worktree binding, because none exists: repeat the ABSOLUTE "
+        "worktree path in every fix-round dispatch, and re-verify the branch on return.",
+    ),
+    (
+        # The already-open-PR revision range. Its vocabulary anchor names the
+        # rationale words (``unreviewed``, ``published diff``) but never the
+        # command, so restoring a review of the PUBLISHED diff — the defect the
+        # rule exists to prevent — leaves every pattern satisfied.
+        "open-pr-round-diffs-the-local-delta",
+        "a fix round approves what is already on the remote and never sees the commit "
+        "about to be added",
+        _CROSS_REVIEW,
+        "review the LOCAL delta that is about to be pushed — `git -C "
+        ".worktrees/<task_id> diff origin/<branch>...HEAD`",
+    ),
+    (
         "class-recurrence-stops-point-fixing",
         "point-fixing continues while the same defect class recurs at new sites",
         _CROSS_REVIEW,
@@ -1020,10 +1096,10 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
 # the procedural step must fail even while the restatement lives.
 _LIFECYCLE_ANCHORS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
     (
-        "diff-of-the-unopened-branch",
+        "unopened-branch-diff-is-committed-and-unpushed",
         _CROSS_REVIEW,
-        "review runs against the wrong revision range",
-        (r"diff", r"worktree|main\.\.\.HEAD", r"committed|nothing is pushed"),
+        "the reviewer is handed an uncommitted or already-published state",
+        (r"implementer has committed and stopped", r"nothing is pushed"),
     ),
     (
         "diff-of-an-already-open-pr",

@@ -25,9 +25,12 @@ WHAT THIS FILE DELIBERATELY DOES NOT ASSERT
 Review sequencing — that review runs before publication. Nothing in the runtime
 enforces that ordering; it is prompt discipline, which is this bundle's whole
 honesty premise. ``blast_radius`` runs with ``gate_pushes: false`` and inspects
-shell text only, and it still denies catastrophic push variants (``--force*``,
-``--delete``, ``--mirror``, ``--prune``) — but refusing a force-push is not an
-ordering gate on a plain ``git push``, which is ungated. Against a scripted mock
+shell text only, and it still denies destructive push variants (``--force*``,
+``--delete``, ``--mirror``, ``--prune``, bundled short forms containing ``-f`` or
+``-d``, and ``+refspec`` / ``:refspec``) — but refusing a force-push is not an
+ordering gate on a plain ``git push``, which is ungated. A deployment may attach
+session-level or server-wide policies that DO gate ordinary pushes; this file
+runs with none of them. Against a scripted mock
 brain the brain does exactly what the script says, so an ordering assertion
 would be asserting the script rather than holly. Proving holly actually
 sequences review before publication takes real CLIs and real judgement — a live
