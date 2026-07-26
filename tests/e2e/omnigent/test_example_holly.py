@@ -12,10 +12,13 @@ branches, the worker obligations, the policy argument values — live in
 
 holly delegates every coding task to its ``claude_code`` / ``codex`` / ``pi``
 workers, reviews the LOCAL branch diff with a different-vendor reviewer, and
-only then sequences publication. ``blast_radius`` denies only catastrophic push
-variants (``--force*``, ``--delete``, ``--mirror``, ``--prune``); a plain
-``git push`` is ungated, so that ordering is prompt discipline and the tests are
-written accordingly.
+only then sequences publication. No policy SHIPPED BY HOLLY gates ordinary
+publication: ``blast_radius`` denies destructive push variants — ``--force*``,
+``--delete``, ``--mirror``, ``--prune``, bundled short forms containing ``-f`` or
+``-d``, and ``+refspec`` / ``:refspec`` — while a plain ``git push`` is ungated,
+so that ordering is prompt discipline and the tests are written accordingly. A
+deployment may attach session-level or server-wide policies that DO gate ordinary
+pushes; those are not Holly's and nothing here asserts either way.
 """
 
 from __future__ import annotations
