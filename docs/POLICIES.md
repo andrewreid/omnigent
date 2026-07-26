@@ -68,11 +68,17 @@ policies:
 > parser rejects unknown keys, so a `factory_params:` block is silently
 > discarded, leaving `arguments=None`. A factory whose parameters are all
 > optional is then invoked with none and runs on its defaults, silently and
-> with no log line. A factory with a REQUIRED parameter is not invoked at all:
-> `_has_no_required_params` is false, so the factory function itself is kept
-> as the evaluator (`omnigent/policies/function.py:291-302`). It is callable,
-> so the build succeeds — the failure surfaces later still, when the policy is
-> evaluated and the factory is called with an event it has no signature for.
+> with no log line. A factory with a required parameter behaves one of two
+> ways, because `_has_no_required_params` counts only POSITIONAL parameters
+> (`omnigent/policies/function.py:370-377`). A required POSITIONAL parameter
+> makes it false, so the factory function itself is kept as the evaluator; it
+> is callable, the build succeeds, and the failure surfaces later still, when
+> the policy is evaluated and the factory is called with an event it has no
+> signature for. A required KEYWORD-ONLY parameter is invisible to that check,
+> so the callable is taken for a zero-argument factory, invoked immediately
+> with nothing, and the failure surfaces at BUILD time instead —
+> `deny_trivial_to_expensive_model(*, expensive_models=...)` in
+> `omnigent/policies/builtins/routing.py` is a live example.
 > `factory_params` is real only on the REST/DB row path and in the legacy
 > single-file omnigent YAML (`omnigent/spec/omnigent.py`). Any catalog example
 > below that uses `factory_params:` is written in that dialect; translate it to
