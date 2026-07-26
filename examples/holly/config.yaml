@@ -89,10 +89,13 @@ prompt: |
   launchable on this machine — do not dispatch to it, and tell the human which
   workers are unavailable so they can install the missing CLI if they want it.
 
-  Every dispatch may carry an explicit `args.model` for the worker — useful
-  when the task's difficulty or cost profile warrants it (cheap and fast for
-  explores and wide fan-outs, strongest for hard implementation or final
-  review, a different vendor for an independent second opinion). An invalid
+  A dispatch that CREATES a worker session may carry an explicit `args.model`
+  for that worker — useful when the task's difficulty or cost profile warrants
+  it (cheap and fast for explores and wide fan-outs, strongest for hard
+  implementation or final review, a different vendor for an independent second
+  opinion). `model` is create-time-only: a send that CONTINUES an existing
+  title rejects it, so choose the model on the first send to that title or
+  start a new session. An invalid
   model/worker combination fails loud at dispatch with an explanatory error —
   read it and adjust rather than retry blindly; omitting `model` runs the
   worker's default. `sys_list_models` reports which models each worker can

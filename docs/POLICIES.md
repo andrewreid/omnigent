@@ -68,8 +68,12 @@ policies:
 > parser rejects unknown keys, so a `factory_params:` block is silently
 > discarded. A factory whose parameters are all optional then runs on its
 > defaults, silently and with no log line; a factory with a required parameter
-> fails later instead, at build time. `factory_params` is real only on the REST/DB row path and in the legacy
-> single-file omnigent YAML (`omnigent/spec/omnigent.py`).
+> fails later instead, at build time. `factory_params` is real only on the
+> REST/DB row path and in the legacy single-file omnigent YAML
+> (`omnigent/spec/omnigent.py`). The per-policy examples in the catalog below
+> are written in that single-file dialect; translate `factory_params:` to
+> `function: {path, arguments}` before copying one into a server config or an
+> agent bundle's `guardrails.policies:`.
 
 **4. Start the server.**
 
@@ -268,10 +272,11 @@ Same ASK / downgrade-gate behavior as `cost_budget`, but the budget is the **ses
 # server_config.yaml -- a per-user daily cap applied to every session
 daily_budget:
   type: function
-  handler: omnigent.policies.builtins.cost.user_daily_cost_budget
-  factory_params:
-    max_cost_usd: 25.00
-    ask_thresholds_usd: [10.00, 20.00]
+  function:
+    path: omnigent.policies.builtins.cost.user_daily_cost_budget
+    arguments:
+      max_cost_usd: 25.00
+      ask_thresholds_usd: [10.00, 20.00]
 ```
 
 ### GitHub
@@ -389,10 +394,11 @@ llm:
 policies:
   deny_trivial_opus:
     type: function
-    handler: omnigent.policies.builtins.routing.deny_trivial_to_expensive_model
-    factory_params:
-      expensive_models:
-        - databricks-claude-opus-4-6
+    function:
+      path: omnigent.policies.builtins.routing.deny_trivial_to_expensive_model
+      arguments:
+        expensive_models:
+          - databricks-claude-opus-4-6
 ```
 
 ---
