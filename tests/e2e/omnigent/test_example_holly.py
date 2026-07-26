@@ -85,17 +85,25 @@ def test_identity_roster_and_skills(holly_spec: AgentSpec) -> None:
 
 def test_executor_shape_keeps_vendors_distinct(holly_spec: AgentSpec) -> None:
     """
-    The orchestrator and each worker keep their harness.
+    The bundle DECLARES the orchestrator's harness and one per worker.
 
-    Vendor independence is a property of the executor, not of the worker's name.
-    Two of the three harnesses have a FIXED vendor — ``claude_code`` and
-    ``codex``; ``pi`` runs whatever model its dispatch names, so it is not a
-    standing third vendor. Repointing ``codex`` at the ``pi`` harness leaves
-    every name, prompt and routing rule intact while removing one of the two
-    fixed vendors, and what remains is one fixed vendor plus a worker whose
-    independence has to be established per dispatch. A review routed on the old
-    assumption then reaches the same engine that wrote the diff and reports an
-    independence nobody checked.
+    Declared configuration, not runtime fact. ABSENT Smart Routing, ``claude_code``
+    and ``codex`` run their declared native harness and ``pi`` runs ANY gateway
+    model; UNDER routing none of the three is fixed — the server discards
+    ``args.model`` at creation and replaces the declared harness with one it picks
+    from ``claude-sdk`` / ``codex`` / ``pi``, native harnesses excluded. So this
+    assertion establishes what the bundle ASKS FOR, and nothing about what
+    executes in a routed deployment.
+
+    Worth asserting anyway, because the declaration is what the prose is written
+    against and what a non-routed deployment actually runs. Repointing ``codex``
+    at the ``pi`` harness leaves every name, prompt and routing rule intact while
+    silently removing the declared vendor distinction the whole cross-vendor
+    design rests on — a defect in the bundle regardless of what routing later
+    does to it. Vendor independence itself is established per dispatch by reading
+    the recorded model back, not here; see the routing caveat in
+    ``examples/holly/config.yaml``, which is pinned in
+    ``tests/spec/test_holly_bundle.py``.
 
     Models stay unpinned where the contract requires it: the orchestrator brain
     must resolve whatever Claude provider the deployment configured, and ``pi``
