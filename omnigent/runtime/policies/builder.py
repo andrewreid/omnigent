@@ -938,10 +938,13 @@ def load_session_usage(
         e.g. ``"conv_abc123"``.
     :param conversation_store: Store to read from.
     :param root_conversation_id: The conversation's tree root, when the
-        caller already holds the row. Skips the internal conversation read
-        — the root binding is immutable, so a caller-supplied value cannot
-        go stale. ``None`` resolves it here. Defined here rather than in a
-        later change so that change stays independently revertible.
+        caller already holds the row. Skips the internal conversation read.
+        The root binding is immutable **per row**, not per conversation id:
+        a conversation deleted and recreated under the same id gets a new
+        row, whose root may differ. A supplied root is therefore validated
+        against the tree it produces — if this conversation is not in that
+        tree, the caller's row is stale and the root is resolved here
+        instead. ``None`` resolves it here from the start.
     :returns: Summed usage dict with keys ``input_tokens``,
         ``output_tokens``, ``total_tokens``, ``total_cost_usd`` (the
         DISPLAY cost sum — statusLine ``S`` for claude-native), and
@@ -955,13 +958,56 @@ def load_session_usage(
         the policy seed (:func:`_policy_usage_seed`) reads
         ``policy_cost_usd`` (both unaffected by ``by_model``).
     """
+    tree = load_session_tree(conversation_id, conversation_store, root_conversation_id)
+    return _sum_subtree_usage(tree, conversation_id)
+
+
+def load_session_tree(
+    conversation_id: str,
+    conversation_store: ConversationStore,
+    root_conversation_id: str | None = None,
+) -> list[Conversation]:
+    """
+    Load the spawn tree *conversation_id* belongs to, verifying the root.
+
+    One place owns the reuse rule for a caller-supplied tree root, so every
+    consumer gets the same guarantee: the tree comes back containing this
+    conversation, or the supplied root was stale and is resolved again.
+
+    A caller's ``root_conversation_id`` is immutable **per row**. Deleting a
+    conversation and recreating it under the same id produces a new row that
+    may sit in a different tree, so a row read earlier in the request can
+    name a root this conversation no longer belongs to. Rather than trust it
+    or re-read unconditionally, the supplied root is checked against the
+    tree it produced — a membership test on rows already in memory, so the
+    happy path costs nothing and the stale path costs one read.
+
+    :param conversation_id: The conversation whose tree is wanted,
+        e.g. ``"conv_abc123"``.
+    :param conversation_store: Store to read from.
+    :param root_conversation_id: Caller-supplied tree root, validated as
+        above. ``None`` resolves the root here.
+    :returns: Every conversation in the tree (root plus all descendants,
+        archived included). Empty when the conversation does not exist.
+    """
     if root_conversation_id is None:
         conv = conversation_store.get_conversation(conversation_id)
         if conv is None:
-            return {}
+            return []
         root_conversation_id = conv.root_conversation_id
+        return _load_tree_conversations(root_conversation_id, conversation_store)
+
     tree = _load_tree_conversations(root_conversation_id, conversation_store)
-    return _sum_subtree_usage(tree, conversation_id)
+    if any(c.id == conversation_id for c in tree):
+        return tree
+    # Not in the tree the supplied root produced: either this conversation
+    # is gone, or it now lives in a different tree. Resolve it once.
+    conv = conversation_store.get_conversation(conversation_id)
+    if conv is None:
+        return []
+    if conv.root_conversation_id == root_conversation_id:
+        return tree
+    return _load_tree_conversations(conv.root_conversation_id, conversation_store)
 
 
 def _sum_subtree_usage(
@@ -1143,6 +1189,45 @@ def _subtree_conversation_ids(
         subtree.add(node)
         stack.extend(children_by_parent.get(node, []))
     return subtree
+
+
+def ancestor_ids_from_tree(
+    tree: list[Conversation],
+    conversation_id: str,
+) -> list[str]:
+    """
+    Walk a conversation's ancestor chain inside an already-loaded tree.
+
+    The mirror of :func:`_subtree_conversation_ids`, and public for the
+    same reason the tree loader is: the ancestor chain must come from the
+    same freshly-read rows as the sums, not from a conversation row the
+    caller read earlier. ``parent_conversation_id`` is immutable per row,
+    but a conversation deleted and recreated under the same id gets a new
+    row with a new parent, so a caller's copy can name a chain that no
+    longer exists — and walking it publishes to the wrong sessions.
+
+    Pure: no store reads, and no reads are needed, because a tree already
+    contains every row on the chain by construction.
+
+    :param tree: All conversations in the spawn tree (from
+        :func:`load_session_tree`); order-independent.
+    :param conversation_id: The node to walk upward from,
+        e.g. ``"conv_child123"``.
+    :returns: Ancestor ids nearest-parent-first. Empty when the node is
+        top-level, absent from the tree, or its chain is cyclic.
+    """
+    by_id = {c.id: c for c in tree}
+    ancestors: list[str] = []
+    seen = {conversation_id}
+    current = by_id.get(conversation_id)
+    while current is not None and current.parent_conversation_id is not None:
+        parent_id = current.parent_conversation_id
+        if parent_id in seen:
+            break
+        ancestors.append(parent_id)
+        seen.add(parent_id)
+        current = by_id.get(parent_id)
+    return ancestors
 
 
 def _load_default_policy_specs(

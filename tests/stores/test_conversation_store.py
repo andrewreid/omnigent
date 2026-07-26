@@ -5293,3 +5293,58 @@ def test_read_modify_write_primitives_report_a_missing_row(
         with pytest.raises(ConversationNotFoundError, match="no metadata row"):
             write()
         assert conversation_store.get_conversation(missing) is None, what
+
+
+def test_two_real_writers_race_on_one_metadata_row(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Two threads, two connections, overlapping read windows — a real race.
+
+    Tests that merge two snapshots sequentially prove the merge but never
+    construct the race, so they stay green with the row lock removed. This
+    one holds each writer inside its own locked transaction (the mutate
+    callback runs there) and only releases when both have arrived, so the
+    writers' read windows overlap unless the store serialises them.
+
+    Without the lock both writers read the same pre-state and the second
+    overwrites the first: ``risk`` ends at 1. With it, the second blocks at
+    the lock — never reaching the barrier, which is why the barrier has a
+    timeout rather than deadlocking — reads 1 and persists 2.
+
+    Locking is dialect-complementary, so this is meaningful on both:
+    ``SELECT … FOR UPDATE`` on PostgreSQL, ``BEGIN IMMEDIATE`` on SQLite.
+    """
+    import contextlib as _contextlib
+    import threading
+
+    conv = conversation_store.create_conversation(title="real-race")
+    # Both threads try to meet here from inside their transactions. When the
+    # store serialises correctly only one can arrive, so the wait must expire
+    # rather than block forever.
+    barrier = threading.Barrier(2, timeout=0.5)
+    errors: list[BaseException] = []
+
+    def _increment() -> None:
+        def _mutate(state: dict) -> None:
+            with _contextlib.suppress(threading.BrokenBarrierError):
+                barrier.wait()
+            state["risk"] = state.get("risk", 0) + 1
+
+        try:
+            conversation_store.mutate_session_state(conv.id, _mutate)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_increment) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not errors, errors
+    persisted = dict(conversation_store.get_conversation(conv.id).session_state)
+    assert persisted["risk"] == 2, (
+        f"one writer's increment was lost: {persisted} — the two transactions "
+        f"were not serialised on the metadata row"
+    )
