@@ -108,6 +108,19 @@ class _RecordingRunnerClient:
         return httpx.Response(200, json={}, request=httpx.Request("POST", url))
 
 
+class _ExplodingRunnerClient:
+    """Process-wide fallback client that must never be used.
+
+    Delivery falling back to this client is what let the routed-binding
+    assertion pass for four review rounds.
+    """
+
+    async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        raise AssertionError(
+            f"event was delivered through the fallback client, not the bound runner: POST {url}"
+        )
+
+
 @pytest.fixture()
 def runner_router_reset():
     """Install/remove runner globals around a test."""
@@ -118,26 +131,47 @@ def runner_router_reset():
 
 @pytest.mark.asyncio
 async def test_status_event_forwards_and_reads_each_table_once(
+    app: Any,
     client: httpx.AsyncClient,
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
     runner_router_reset: None,
 ) -> None:
     """
-    A status event must actually reach the runner, and read each
+    A status event reaches the runner it is BOUND to, and reads each
     conversation table once — not once per routing lookup on top of the
     handler's own read.
 
-    Rebind-freshness of the routing read itself is pinned at the router
-    level (``tests/runner/test_routing.py``), where the binding read
-    lives; this app fixture has no runner router, so forwarding here goes
-    through the in-process runner client.
+    The event is delivered through a real :class:`RunnerRouter` over a real
+    registry, so the binding read under test actually selects the client
+    that receives the POST. Earlier versions of this test bound
+    ``runner_one`` without registering it: routing reported it offline,
+    delivery silently fell back to the process-wide client, and the
+    assertion passed while observing nothing about routing. The fallback
+    client is installed here as a trap that fails if it is ever used.
     """
+    from tests.server.helpers import register_test_runner
+
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="event-hot-path")
     store.set_runner_id(conv.id, "runner_one")
 
+    # Bind AND register: the app's own router resolves the binding through
+    # the read under test and then looks the runner up in the app's
+    # registry. Binding without registering is what made routing report the
+    # runner offline and delivery fall through to the global client.
+    register_test_runner(app, "runner_one")
     runner = _RecordingRunnerClient()
-    set_runner_client(runner)  # type: ignore[arg-type]
+    routed_ids: list[str] = []
+
+    def _client_for_runner(runner_id: str) -> Any:
+        routed_ids.append(runner_id)
+        return runner
+
+    # Real routing, stubbed transport: everything up to and including the
+    # binding lookup is production code; only the tunnel socket is replaced.
+    monkeypatch.setattr(app.state.runner_router, "_client_for_runner", _client_for_runner)
+    set_runner_client(_ExplodingRunnerClient())  # type: ignore[arg-type]
 
     payload = {"type": "external_session_status", "data": {"status": "idle"}}
     await client.post(f"/v1/sessions/{conv.id}/events", json=payload)  # warm
@@ -148,7 +182,9 @@ async def test_status_event_forwards_and_reads_each_table_once(
         resp = await client.post(f"/v1/sessions/{conv.id}/events", json=payload)
 
     assert resp.status_code == 202, resp.text
-    # Delivered, not merely attempted: deleting the forward fails here.
+    # Delivered to the BOUND runner, not merely delivered: the routed client
+    # is the one that received it, and the global fallback would have raised.
+    assert routed_ids and set(routed_ids) == {"runner_one"}, routed_ids
     delivered = runner.posts[baseline:]
     assert [body["type"] for _url, body in delivered] == ["external_session_status"], delivered
 

@@ -600,6 +600,7 @@ def _publish_subtree_cost_to_ancestors(
     conv_store: ConversationStore,
     session_id: str,
     conv: Conversation | None = None,
+    tree: list[Conversation] | None = None,
 ) -> None:
     """
     Re-publish each ancestor's subtree-summed cost after a child usage update.
@@ -632,13 +633,19 @@ def _publish_subtree_cost_to_ancestors(
         The parameter belongs to this function, not to whichever caller first
         needed it, so that no caller can be removed and leave a signature
         behind that its remaining callers already depend on.
+    :param tree: The already-loaded tree, when the caller has one. A caller
+        that just summed this session's subtree holds exactly the rows this
+        walk needs, so passing them makes the whole ancestor publish
+        read-free. Must come from :func:`load_session_tree` so it carries
+        that function's verification.
     :returns: None.
     """
-    tree = load_session_tree(
-        session_id,
-        conv_store,
-        conv.root_conversation_id if conv is not None else None,
-    )
+    if tree is None:
+        tree = load_session_tree(
+            session_id,
+            conv_store,
+            conv.root_conversation_id if conv is not None else None,
+        )
     for ancestor_id in ancestor_ids_from_tree(tree, session_id):
         ancestor_usage = _sum_subtree_usage(tree, ancestor_id)
         subtree_cost = _priced_cost_for_display(ancestor_usage)
@@ -1263,12 +1270,16 @@ async def _persist_external_session_usage(
     # hide in-flight sub-agent spend until the next child flush (the badge would
     # oscillate own ⇄ subtree). For a childless session the subtree is just
     # itself, so this equals own cost — one indexed tree query per flush.
-    subtree_usage = await asyncio.to_thread(
-        load_session_usage,
+    # One verified tree load serves this session's own subtree total AND the
+    # ancestor re-publish below — they need the same rows, and the ancestor
+    # walk must not re-derive the chain from a row read before this event.
+    tree = await asyncio.to_thread(
+        load_session_tree,
         session_id,
         conversation_store,
-        root_conversation_id=conv.root_conversation_id,
+        conv.root_conversation_id,
     )
+    subtree_usage = _sum_subtree_usage(tree, session_id)
     subtree_cost = _priced_cost_for_display(subtree_usage)
     usage_by_model = _usage_by_model_for_display(subtree_usage)
     # Only include fields that were sent; the client treats absent
@@ -1293,13 +1304,14 @@ async def _persist_external_session_usage(
     # This session's usage also moves its ANCESTORS' subtree cost (its spend
     # rolls up into every ancestor), so re-publish each ancestor's subtree cost
     # too — otherwise a grandparent's badge wouldn't reflect a deep descendant.
-    # No-op for a top-level session (no ancestors). Threaded: it pages the
-    # conversation tree per ancestor.
+    # No-op for a top-level session (no ancestors), and read-free either way:
+    # the tree loaded above holds every row the walk and the sums need.
     await asyncio.to_thread(
         _publish_subtree_cost_to_ancestors,
         conversation_store,
         session_id,
         conv,
+        tree,
     )
     return raw_tokens
 
