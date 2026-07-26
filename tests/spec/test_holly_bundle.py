@@ -34,14 +34,42 @@ Every assertion that remains is decidable — exact comparison, set equality, or
 presence of a fixed string (sometimes one of a fixed set of alternatives).
 Nothing here classifies an unseen sentence.
 
-The presence checks have one honest caveat, which is churn rather than
-misjudgement: they require particular text to BE there, so rewording a mandate
-axis or a procedure step fails this file until the expected text is updated.
-They never approve or reject a sentence they have not been told about, which is
-the property the removed scanners lacked.
+Every check that remains is a PRESENCE check: it asserts that some text IS
+there. They never approve or reject a sentence they have not been told about,
+which is the property the removed scanners lacked — and they carry the two
+structural limits described next, which apply to all of them.
 
-WHAT THAT COSTS — the full list, not a summary
-----------------------------------------------
+WHAT THAT COSTS
+---------------
+Two structural properties, then the enumerated gaps. The bundle is held to the
+standard that an understated residual is worse than a large one; this file is
+held to it too, so the list is long rather than reassuring.
+
+CONTRADICTION-BLINDNESS applies to EVERY check here, exact-string checks
+included: adding a sentence that contradicts pinned text does not remove that
+text, so no check in this file can fail on a contradiction. That covers
+``_AXIS_REQUIREMENTS``, ``_MANDATE_OBLIGATIONS``, ``_MANDATE_CANONICAL``,
+``_WORKER_INSTRUCTIONS``, ``_LIFECYCLE_CANONICAL``, ``_LIFECYCLE_ANCHORS`` and
+``_CONTRACT_AUTHORING`` — every check the file has. Two sentences that pass
+today, added anywhere in their owning file:
+
+* ``Directly authored prose is an exemption from review before publication.``
+  — the direct-authoring rule says the exact opposite.
+* ``Before green gates and zero blocking issues, push.`` — inverts the
+  publication ordering.
+
+WORDING-BRITTLENESS is the same defect running the other way: an anchor pins
+particular words, so a TRUTHFUL rewording of the same obligation fails until
+the expected text is updated here. Where the exact sentence IS the obligation
+it is pinned as a fixed string (``_MANDATE_CANONICAL``,
+``_LIFECYCLE_CANONICAL``, ``_WORKER_INSTRUCTIONS``) and the brittleness is
+honest — a reworded contract term SHOULD be re-read deliberately. Where the
+anchor is a vocabulary pattern over a block (``_AXIS_REQUIREMENTS``,
+``_MANDATE_OBLIGATIONS``, ``_LIFECYCLE_ANCHORS``, ``_CONTRACT_AUTHORING``) the
+words are incidental to the rule and the brittleness is pure churn.
+
+The enumerated gaps:
+
 1. A newly introduced FALSE ENFORCEMENT CLAIM is caught by no test, in any
    phrasing: ``The blast_radius policy blocks every push until review lands.``
    ``The policy will not allow a push before review.``  ``Every push is gated by
@@ -56,15 +84,20 @@ WHAT THAT COSTS — the full list, not a summary
 5. SAME-VENDOR / SKIPPED-REVIEW EXCEPTIONS are no longer detected. ``A
    same-vendor review may suffice.`` added to the root prompt passes, and so
    does a permission to merge.
-6. The worker-obligation check proves only that the canonical instruction is
-   PRESENT. It does not prove that a CONTRADICTING instruction is absent: a
-   prompt keeping ``Do NOT push and do NOT open a PR.`` while adding ``Push the
-   branch before reporting.`` passes.
+6. A CONTRADICTING instruction placed beside a pinned one passes, everywhere —
+   this is contradiction-blindness in its concrete forms. A worker prompt
+   keeping ``Do NOT push and do NOT open a PR.`` while adding ``Push the branch
+   before reporting.`` passes. A mandate keeping the whole ``[HONESTY]`` pass
+   while adding an exemption from it passes. A lifecycle block keeping its
+   canonical sentence while adding either probe above passes.
 7. The banned-token check is an unconditional ban on three spellings, so it
    also rejects a truthful sentence that names one of them. That is a
    deliberate reserved-word rule, not a claim about meaning.
+8. Anything NOT enumerated. ``_LIFECYCLE_CANONICAL`` and ``_LIFECYCLE_ANCHORS``
+   are a list of named branches, not a completeness claim; a branch absent from
+   both is protected by nothing, and adding a branch to the prose adds no test.
 
-All seven now depend on review rather than on CI.
+All eight now depend on review rather than on CI.
 """
 
 from __future__ import annotations
@@ -286,11 +319,66 @@ _MANDATE_OBLIGATIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("repo-read-permitted", (r"read", r"repo", r"grep|sibling|not enough")),
 )
 
+# The [HONESTY] pass, pinned as EXACT strings — same shape as the canonical
+# worker instructions below, for the same reason: these sentences ARE the
+# obligation, so presence of the sentence is the assertion.
+#
+# The pass is asserted against the text BETWEEN the mandate delimiters, which
+# is the whole point: the mandate is all a reviewer worker ever receives (it
+# never loads the skill file), so an obligation that drifts outside the
+# delimiters reaches nobody while the file still reads as if it were enforced.
+#
+# The four shapes are pinned individually because each names a distinct false
+# claim the bundle's own history produced, and deleting any one leaves the pass
+# heading and its checklist line intact.
+_MANDATE_CANONICAL: tuple[tuple[str, str, str], ...] = (
+    (
+        "honesty-pass",
+        "false claims in agent-facing prose are audited by nobody — no reviewer is asked to",
+        "[HONESTY] — for any diff that adds or edits agent-facing prose (a prompt, a "
+        "skill, a worker config, a comment a model will read), audit every sentence "
+        "that describes what the SYSTEM does, and report each one that asserts "
+        "something the runtime does not do.",
+    ),
+    (
+        "honesty-shape-nonexistent-enforcement",
+        "the predecessor defect exactly — a policy described as blocking a push it never sees",
+        "enforcement that does not exist — a policy, gate, guard or runtime step "
+        "described as blocking, gating, requiring or preventing something. Include "
+        'negated phrasings ("will not allow", "does not let") and named actors '
+        '("X checks every change before ..."), which read as enforcement just as '
+        "strongly. Verify the mechanism EXISTS and does what the sentence says; a "
+        "declared policy that is never evaluated on the deploy path does not count.",
+    ),
+    (
+        "honesty-shape-ordering",
+        "prose that puts publication before review passes as truthful",
+        "ordering that contradicts the stated lifecycle — anything instructing or "
+        "implying publication before review, in any phrasing.",
+    ),
+    (
+        "honesty-shape-marker-before-gate",
+        "a readiness marker recorded before its gate reads as a gate result",
+        "a readiness or completion marker set before the gate it is supposed to follow.",
+    ),
+    (
+        "honesty-shape-exception-to-an-absolute",
+        "a same-vendor review, or a merge by the orchestrator, is written in as permitted",
+        "an exception to a rule the contract states has none — for example "
+        "permitting same-vendor review, or permitting the orchestrator to merge.",
+    ),
+    (
+        "honesty-checklist-entry",
+        "the pass is silently skippable: a report omitting it still looks complete",
+        '[HONESTY] (agent-facing prose only, else "n/a")',
+    ),
+)
+
 
 def test_reviewer_mandate_axes_state_their_requirements(holly_spec: AgentSpec) -> None:
     """
     Each WIDE axis is bound to its number in both places AND still states what
-    it requires.
+    it requires; the non-axis passes state theirs too.
 
     Renaming an axis heading is one defect; gutting its body is the same defect
     one level down. Keep the heading and the checklist label, replace the body
@@ -298,6 +386,10 @@ def test_reviewer_mandate_axes_state_their_requirements(holly_spec: AgentSpec) -
     a pass name with no obligation attached — every finding it would have
     produced disappears while the battery checklist still reports
     "[WIDE-3] run — clear".
+
+    ``_MANDATE_CANONICAL`` pins the [HONESTY] pass verbatim rather than by
+    vocabulary. Presence only, as everywhere in this file: it proves the pass is
+    inside the delimiters, not that nothing beside it contradicts the pass.
     """
     mandate = _mandate(holly_spec)
 
@@ -331,6 +423,16 @@ def test_reviewer_mandate_axes_state_their_requirements(holly_spec: AgentSpec) -
             f"the mandate no longer obliges {obligation!r}; a dispatched reviewer "
             f"would not look for that defect class at all."
         )
+
+    flat_mandate = _flatten(mandate)
+    for obligation, consequence, canonical in _MANDATE_CANONICAL:
+        assert canonical in flat_mandate, (
+            f"the mandate no longer carries {obligation!r} between its delimiters, "
+            f"or it has been reworded.\n"
+            f"  expected verbatim: {canonical!r}\n"
+            f"  Without it: {consequence}."
+        )
+
     assert "[FOCUSED]" in mandate
 
 
@@ -551,18 +653,101 @@ def test_workers_carry_their_canonical_instructions(holly_spec: AgentSpec) -> No
 
 # ───────────────── review-lifecycle branches (D3 / D5 / D6) ─────────────────
 #
-# This list is an ENUMERATION, not a claim of completeness: it pins the branches
-# named below, each checked by deleting the block that carries it. A branch not
-# listed here is not protected.
+# Both tables below are an ENUMERATION, not a claim of completeness: they pin
+# the branches named, each checked by deleting the text that carries it. A
+# branch listed in neither table is unprotected.
 #
-# Anchoring is per block and per owning file. Per block, because scattering the
-# vocabulary across a document would satisfy a whole-file search. Per owning
+# The split is by what the words are doing. Where the sentence IS the rule — an
+# ordering, a prohibition, an authority boundary, a denied exemption — it goes
+# in _LIFECYCLE_CANONICAL and is pinned verbatim, because a vocabulary pattern
+# for such a rule is satisfied just as well by a sentence that INVERTS it
+# ("Before green gates and zero blocking issues, push" carries green + zero
+# blocking + push). Where the sentence is a procedure whose wording is
+# incidental — a command to run, a discovery step, a mechanic — it stays in
+# _LIFECYCLE_ANCHORS as vocabulary, because pinning that prose verbatim would
+# fail on every harmless rewrite.
+#
+# Both are PRESENCE checks, so both are contradiction-blind; see the module
+# docstring. Fixed strings remove the inversion hole above, not that one.
+_LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "mandate-pasted-verbatim",
+        "the dispatched mandate is paraphrased and its obligations quietly shrink",
+        _CROSS_REVIEW,
+        "The dispatch `input` = the diff + the acceptance contract + this block, "
+        "unedited, delimiters included.",
+    ),
+    (
+        "post-review-edit-invalidates-verdict",
+        "a 'tiny' follow-up ships on a verdict that never saw it",
+        _CROSS_REVIEW,
+        "Review authorises exactly one commit.",
+    ),
+    (
+        "release-requires-green-and-zero-blocking",
+        "the PR opens on red gates or on unresolved blocking findings",
+        _CROSS_REVIEW,
+        "Green gates AND zero blocking issues, and only then: tell the SAME "
+        "implementer to push its branch and open the PR",
+    ),
+    (
+        "direct-authoring-pr-ownership",
+        "prose holly wrote has no one responsible for publishing it",
+        _CROSS_REVIEW,
+        "For directly-authored work Holly pushes and opens its own reviewed PR.",
+    ),
+    (
+        "holly-never-merges",
+        "the orchestrator takes the merge decision that belongs to the human",
+        _CROSS_REVIEW,
+        "Holly does NOT merge.",
+    ),
+    (
+        "reviewer-unavailable-hard-stop",
+        "with no different-vendor reviewer the run silently proceeds unreviewed",
+        _CROSS_REVIEW,
+        "If no different-vendor reviewer is available, you CANNOT run independent "
+        "review: STOP, do not open the PR on unreviewed code, and pull in the human.",
+    ),
+    (
+        "never-degrade-to-same-vendor",
+        "review quietly downgrades to same-vendor or skipped instead of stopping",
+        _CROSS_REVIEW,
+        "Never silently degrade to a same-vendor or skipped review.",
+    ),
+    (
+        "every-fix-diff-is-reviewed",
+        "fix rounds ship unreviewed because the first round was reviewed",
+        _CROSS_REVIEW,
+        "Every fix diff gets the same pre-push review as any other change.",
+    ),
+    (
+        "handoff-wording-implies-no-completeness",
+        "'findings serviced' is read as 'threads resolved' and the human merges",
+        _CROSS_REVIEW,
+        "Holly's hand-off wording must not imply completeness ('findings serviced' "
+        "≠ 'threads resolved').",
+    ),
+    (
+        "never-declares-a-clean-bill",
+        "the orchestrator issues the sign-off that is the human's to give",
+        _CROSS_REVIEW,
+        "Holly never declares a clean bill and never merges.",
+    ),
+    (
+        "direct-authoring-not-exempt",
+        "prose holly wrote itself reaches the remote without an independent review",
+        _ROOT_CONFIG,
+        "This carve-out is about WHO WRITES the artifact, not an exemption from "
+        "review-before-push.",
+    ),
+)
+
+# Anchoring here is per block and per owning file. Per block, because scattering
+# the vocabulary across a document would satisfy a whole-file search. Per owning
 # file, because the prose deliberately restates several rules in more than one
 # place — good redundancy, but the restatement is not the procedure, so deleting
 # the procedural step must fail even while the restatement lives.
-#
-# Like the axis requirements, these are PRESENCE checks over a fixed vocabulary:
-# decidable, and they say nothing about whether a block means the right thing.
 _LIFECYCLE_ANCHORS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
     (
         "diff-of-the-unopened-branch",
@@ -605,12 +790,6 @@ _LIFECYCLE_ANCHORS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         (r"vendor", r"\bmodels?\b", r"differ", r"stop|escalate|cannot|do not"),
     ),
     (
-        "mandate-pasted-verbatim",
-        _CROSS_REVIEW,
-        "the dispatched mandate is paraphrased and its obligations quietly shrink",
-        (r"verbatim", r"delimiter", r"input|unedited|included"),
-    ),
-    (
         "dispatch-in-the-same-turn",
         _CROSS_REVIEW,
         "a turn that only announces the review stalls the whole run",
@@ -641,57 +820,16 @@ _LIFECYCLE_ANCHORS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         (r"\bclass\b", r"\bstop\b", r"one-off|enumerat", r"zero remaining|every instance"),
     ),
     (
-        "post-review-edit-invalidates-verdict",
-        _CROSS_REVIEW,
-        "a 'tiny' follow-up ships on a verdict that never saw it",
-        (r"invalidat|authoris|authoriz|verdict", r"\bafter\b", r"HEAD|again|re-?run"),
-    ),
-    (
-        "release-requires-green-and-zero-blocking",
-        _CROSS_REVIEW,
-        "the PR opens on red gates or on unresolved blocking findings",
-        (r"green", r"zero blocking|no blocking", r"push|PR"),
-    ),
-    (
         "release-records-registry-readiness",
         _CROSS_REVIEW,
         "the human is never handed a PR URL or told it is ready",
         (r"registry", r"PR URL|record", r"ready|human"),
     ),
     (
-        "direct-authoring-pr-ownership",
-        _CROSS_REVIEW,
-        "prose holly wrote has no one responsible for publishing it",
-        (r"director|directly", r"holly", r"push|open"),
-    ),
-    (
-        "holly-never-merges",
-        _CROSS_REVIEW,
-        "the orchestrator takes the merge decision that belongs to the human",
-        (r"merge", r"\b(not|never)\b", r"human"),
-    ),
-    (
-        "reviewer-unavailable-hard-stop",
-        _CROSS_REVIEW,
-        "with no different-vendor reviewer the run silently proceeds unreviewed",
-        (
-            r"no different-vendor|cannot run independent|reviewer is available",
-            r"\bstop\b",
-            r"human|escalate",
-            r"unreviewed|do not open|not open the PR",
-        ),
-    ),
-    (
         "unsatisfiable-contract-escalation",
         _CROSS_REVIEW,
         "the fix loop spins forever instead of returning to the human",
         (r"contract", r"cannot be satisfied|a few loops", r"escalate|stop"),
-    ),
-    (
-        "never-degrade-to-same-vendor",
-        _CROSS_REVIEW,
-        "review quietly downgrades to same-vendor or skipped instead of stopping",
-        (r"never", r"same-vendor|same vendor", r"skip|degrade"),
     ),
     (
         "bot-sweep-uses-a-timer",
@@ -712,12 +850,6 @@ _LIFECYCLE_ANCHORS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         (r"bot|findings", r"narrow|confirm these", r"mandate"),
     ),
     (
-        "every-fix-diff-is-reviewed",
-        _CROSS_REVIEW,
-        "fix rounds ship unreviewed because the first round was reviewed",
-        (r"every fix|fix diff", r"same", r"review"),
-    ),
-    (
         "reply-in-thread",
         _CROSS_REVIEW,
         "replies detach from the finding and resolution state cannot be read",
@@ -734,28 +866,6 @@ _LIFECYCLE_ANCHORS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         _CROSS_REVIEW,
         "the human merges believing replies established resolution",
         (r"unresolved", r"thread", r"count|report"),
-    ),
-    (
-        "handoff-wording-implies-no-completeness",
-        _CROSS_REVIEW,
-        "'findings serviced' is read as 'threads resolved' and the human merges",
-        (r"serviced", r"resolved", r"complet|not|≠"),
-    ),
-    (
-        "never-declares-a-clean-bill",
-        _CROSS_REVIEW,
-        "the orchestrator issues the sign-off that is the human's to give",
-        (r"clean bill", r"never"),
-    ),
-    (
-        "direct-authoring-not-exempt",
-        _ROOT_CONFIG,
-        "prose holly wrote itself reaches the remote without an independent review",
-        (
-            r"authored directly|directly[- ]author|you author",
-            r"review",
-            r"exemption|exactly like|still owes|before",
-        ),
     ),
 )
 
@@ -786,8 +896,20 @@ def test_review_lifecycle_branches_survive() -> None:
 
     The list is an enumeration, not a completeness claim: a branch not listed
     is not protected by this test.
+
+    Rules whose exact sentence IS the obligation are pinned verbatim; procedure
+    steps whose wording is incidental stay as per-block vocabulary. Presence
+    either way — neither form fails on a sentence added next to it that says the
+    opposite, which is the module docstring's first structural gap.
     """
     texts = _orchestration_files()
+    for branch, consequence, owner, canonical in _LIFECYCLE_CANONICAL:
+        assert canonical in _flatten(texts[owner]), (
+            f"review-lifecycle rule {branch!r} is gone from {owner}, or reworded.\n"
+            f"  expected verbatim: {canonical!r}\n"
+            f"  Without it: {consequence}."
+        )
+
     for branch, owner, consequence, patterns in _LIFECYCLE_ANCHORS:
         blocks = _segments(texts[owner])
         compiled = [re.compile(p, re.IGNORECASE) for p in patterns]
