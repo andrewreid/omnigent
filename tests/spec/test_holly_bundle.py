@@ -766,6 +766,25 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "— neither that a gate exists, nor that nothing is denied at all.",
     ),
     (
+        # The same D1a claim in the ROOT PROMPT — the copy holly itself carries
+        # every turn, where the skill above is loaded only when the review
+        # lifecycle runs. Same both-directions history, same invisible reversion,
+        # different file, so neither pin can catch the other's edit.
+        #
+        # Span ends at "is ungated". The tail that follows — "and this ordering
+        # holds only because you sequence it" — explains why the ordering holds
+        # rather than stating what the runtime does, and pinning it would fail
+        # this test on a rewrite of the explanation while both facts stood
+        # untouched. The facts are what a reader acts on and cannot verify.
+        "push-enforcement-in-the-root-prompt",
+        "the prompt holly carries every turn says either that a gate exists, or that "
+        "nothing is denied and a force-push is available",
+        _ROOT_CONFIG,
+        "No policy gates ordinary publication: `blast_radius` denies only "
+        "catastrophic push variants (`--force*`, `--delete`, `--mirror`, "
+        "`--prune`), so a plain `git push` is ungated",
+    ),
+    (
         "mandate-pasted-verbatim",
         "the dispatched mandate is paraphrased and its obligations quietly shrink",
         _CROSS_REVIEW,
