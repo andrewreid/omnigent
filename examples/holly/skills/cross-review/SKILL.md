@@ -237,11 +237,19 @@ END REVIEWER-MANDATE-V1
    parametrized expansion.
 
 3. **Dispatch a reviewer whose EFFECTIVE MODEL vendor differs from the
-   author's.** Vendor is a property of the model, not of the worker name:
+   author's, and VERIFY it after dispatch rather than assuming it.** Under
+   Smart Routing the server discards your `args.model` and re-picks the
+   harness from `claude-sdk`/`codex`/`pi`, so neither the worker name nor the
+   model you asked for establishes the vendor that actually ran. Read both
+   sides' effective model back with `sys_session_get_info` and compare; equal
+   or undeterminable vendors means you have NOT got an independent review, and
+   you say so instead of reporting one. Vendor is a property of the model, not
+   of the worker name:
    `claude_code` and `codex` are fixed, but `pi` runs any gateway model, so a
    `pi` reviewer is independent only if you pass it `args.model` from a
    different vendor than the author's, on the dispatch that CREATES the review
-   session: a continuation keeps the model set at creation and rejects a
+   session — but see the routing caveat below, which can discard it — where a
+   continuation keeps the model set at creation and rejects a
    resent one, so verify it rather than resending it. For a doc or skill Holly authored
    directly, the author's vendor is Holly's own model family. If the effective
    vendor on either side cannot be determined, or resolves to the same vendor,
