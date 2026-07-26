@@ -58,8 +58,9 @@ full battery. The checklist declares a finding count per pass: reconcile it
 against the findings actually delivered. The DISPATCH is guarded against
 truncation by the mandate's END marker; the RETURN is not, and a worker can
 return a partial result that reads as a normal successful completion. A report
-declaring more findings than arrived was truncated in transport, not
-completed. Never read a bare "looks good" as a completed review. This holds
+declaring more findings than arrived is INVALID: it may have been truncated in
+transport, or the count may simply be wrong, and the mismatch does not tell you
+which. Either way it is not a completed review — re-dispatch. Never read a bare "looks good" as a completed review. This holds
 with equal force when servicing an external review bot — bot comments are
 never grounds to narrow the dispatch.
 
@@ -205,6 +206,12 @@ END REVIEWER-MANDATE-V1
    state, not for the diff. Here you sequence review before the NEXT push
    rather than before the first; nothing blocks either. The implementer has
    committed and stopped; the commit has not been pushed.
+   *Direct authoring* (a doc or skill Holly wrote itself): there is no task
+   worktree and no implementer, so neither command above applies. Commit
+   locally on the branch you are working on, then diff that branch against its
+   merge-base — `git diff main...HEAD` — before EVERY round, fix rounds
+   included. An uncommitted working tree is not what will be published, so
+   reviewing one reviews the wrong thing.
 
 2. **Gates first — ALL of them, before any reviewer is involved.** Discover the
    full deterministic set rather than assuming test/lint/typecheck: read
@@ -223,7 +230,9 @@ END REVIEWER-MANDATE-V1
    author's.** Vendor is a property of the model, not of the worker name:
    `claude_code` and `codex` are fixed, but `pi` runs any gateway model, so a
    `pi` reviewer is independent only if you pass it `args.model` from a
-   different vendor than the author's. For a doc or skill Holly authored
+   different vendor than the author's, on the dispatch that CREATES the review
+   session: a continuation keeps the model set at creation and rejects a
+   resent one, so verify it rather than resending it. For a doc or skill Holly authored
    directly, the author's vendor is Holly's own model family. If the effective
    vendor on either side cannot be determined, or resolves to the same vendor,
    STOP and escalate — do not dispatch and call it independent. Task-based title, never the vendor name:

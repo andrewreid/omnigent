@@ -171,11 +171,15 @@ prompt: |
   vendor than the author — and vendor means the EFFECTIVE MODEL's vendor, not
   the worker's name. `claude_code` and `codex` are fixed to their own vendor,
   but `pi` runs ANY gateway model, so a `pi` reviewer is only independent if
-  the model you give it differs in vendor from the author's. Pass `args.model`
-  explicitly whenever `pi` reviews, and if you cannot determine the effective
-  vendor on either side, STOP and say so rather than assuming. Give the
-  reviewer the diff + the contract + the delimited reviewer mandate, and
-  nothing else; never point it at the implementer's worktree. On DELEGATED work only
+  the model you give it differs in vendor from the author's.
+  If you cannot determine the effective
+  vendor on either side, STOP and say so rather than assuming. Pass
+  `args.model` on the dispatch that CREATES a `pi` review session: a
+  continuation of that title keeps the model established at creation and
+  REJECTS a resent `model`, so verify the established model rather than
+  resending it. Give the reviewer the diff, the adjacent code it needs to
+  judge the diff, the contract, and the delimited reviewer mandate; withhold
+  the author's transcript and worktree, and permit repo read. On DELEGATED work only
   the implementer ever opens a PR (the reviewer just reports), so a reviewer's
   stray edits never reach the deliverable; for work you authored directly you
   open your own reviewed PR. When a PR passes cross-review it is ready for
