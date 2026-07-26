@@ -779,7 +779,8 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "a pi reviewer on the author's own model reports independence it lacks",
         _CROSS_REVIEW,
         "`pi` runs any gateway model, so a `pi` reviewer is independent only if you "
-        "pass it `args.model` from a different vendor than the author's.",
+        "pass it `args.model` from a different vendor than the author's, on the "
+        "dispatch that CREATES the review session",
     ),
     (
         "undeterminable-or-same-vendor-is-a-hard-stop",
@@ -807,22 +808,38 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "mandate.",
     ),
     (
-        # Separate from the step above, which pins the same count clause as one of
-        # four invalidating conditions. This pins the RULE the clause is shorthand
-        # for: what a count mismatch means and why the return path needs it at all.
-        # Deleting this paragraph leaves step 4 word-for-word intact, so nothing
-        # else here fails — holly is left told to notice a mismatch and never told
-        # that a mismatch is a truncated transport rather than a completed review.
-        "return-path-truncation-detected-by-count",
-        "a report truncated in transport reads as a normal successful completion, and "
-        "the missing findings are never dispatched for",
+        # The return-path rule, pinned as its two OPERATIVE clauses rather than as
+        # one span across the paragraph. They are separated by the paragraph's
+        # rationale (the DISPATCH/RETURN asymmetry), which is the most rewordable
+        # sentence in it and which pinning bought nothing: a rewrite of the reason
+        # failed the test while the rule was untouched. Deleting either clause now
+        # fails, and the reason can be re-explained freely.
+        #
+        # Both are separate from procedure step 4, which pins the count mismatch as
+        # one of four invalidating conditions. Step 4 says a mismatch invalidates;
+        # only these say what to reconcile against and what a mismatch does and does
+        # NOT establish. Deleting this paragraph leaves step 4 word-for-word intact.
+        "report-count-reconciliation",
+        "nothing tells holly to compare the declared count against what arrived, so a "
+        "short-delivered report reads as a complete one",
         _CROSS_REVIEW,
         "The checklist declares a finding count per pass: reconcile it against the "
-        "findings actually delivered. The DISPATCH is guarded against truncation by "
-        "the mandate's END marker; the RETURN is not, and a worker can return a "
-        "partial result that reads as a normal successful completion. A report "
-        "declaring more findings than arrived was truncated in transport, not "
-        "completed.",
+        "findings actually delivered.",
+    ),
+    (
+        # The cause clause is load-bearing, not commentary: a mismatch has two
+        # explanations (truncated transport, or a wrong count) and the symptom is
+        # identical, so a rule naming only one of them asserts a cause it cannot
+        # establish. The verdict does not depend on which — the clause and its
+        # consequence stand or fall together, which is why they are one string.
+        "count-mismatch-invalidates-the-report",
+        "a short-delivered report is treated as a completed review, or its cause is "
+        "asserted from a symptom that does not establish one",
+        _CROSS_REVIEW,
+        "A report declaring more findings than arrived is INVALID: it may have been "
+        "truncated in transport, or the count may simply be wrong, and the mismatch "
+        "does not tell you which. Either way it is not a completed review — "
+        "re-dispatch.",
     ),
     (
         "same-fixer-same-branch",
