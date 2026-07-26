@@ -7,9 +7,12 @@ publication. Parse-only, so it runs in the default suite; the headline contract
 also has a thin guard under ``tests/e2e/omnigent/test_example_holly.py`` for the
 per-example coverage rule.
 
-Publication ordering is prompt discipline, not enforcement: nothing in the
-runtime blocks a ``git push``. ``blast_radius`` runs with ``gate_pushes: false``
-and inspects shell text only.
+Publication ordering is prompt discipline, not enforcement: ``blast_radius``
+denies only catastrophic push variants (``--force*``, ``--delete``,
+``--mirror``, ``--prune``); a plain ``git push`` is ungated. It runs with
+``gate_pushes: false`` and inspects shell text only — but that flag governs the
+ASK branch, which the DENY branch precedes, so the catastrophic set is refused
+either way.
 
 WHAT THIS FILE DELIBERATELY DOES NOT DO
 ---------------------------------------
@@ -503,8 +506,10 @@ def test_root_policy_arguments_are_pinned(holly_spec: AgentSpec) -> None:
 
     A policy set can satisfy name equality and still enforce. Flipping
     ``gate_pushes`` to ``true`` is a one-word edit that leaves every name in
-    place, turns ``blast_radius`` into an ASK gate on push, and falsifies every
-    "nothing blocks a push" disclaimer in the bundle at once.
+    place, turns ``blast_radius`` into an ASK gate on ORDINARY pushes, and
+    falsifies the bundle's disclaimer that a plain ``git push`` is ungated
+    everywhere it appears. It does not affect the catastrophic variants, which
+    the DENY branch refuses before ``gate_pushes`` is consulted.
 
     ``blast_radius`` and the purpose guard are stateless: they decide from the
     event in front of them, so their arguments determine what happens on every
@@ -517,8 +522,9 @@ def test_root_policy_arguments_are_pinned(holly_spec: AgentSpec) -> None:
     policies = {p.name: p for p in holly_spec.guardrails.policies}
 
     assert policies["blast_radius"].function.arguments.get("gate_pushes") is False, (
-        "blast_radius must not gate pushes: the bundle tells every reader that "
-        "nothing mechanically blocks a push, and enabling the gate makes that "
+        "blast_radius must not gate ordinary pushes: the bundle tells every "
+        "reader that a plain `git push` is ungated and that only catastrophic "
+        "variants are denied, and enabling the gate makes the first half of that "
         "claim false everywhere it appears."
     )
 
@@ -740,6 +746,25 @@ def test_workers_carry_their_canonical_instructions(holly_spec: AgentSpec) -> No
 # It closes nothing for a block still anchored by vocabulary, and the module
 # docstring names the ones that remain.
 _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
+    (
+        # The D1a honesty claim itself, and the one sentence in the bundle with a
+        # record of being wrong in BOTH directions: it once claimed a gate that
+        # was never evaluated, and then claimed nothing was denied at all while
+        # blast_radius refuses the catastrophic set before gate_pushes is read.
+        # Nothing else pins it, so either reversion is invisible. Pinned whole,
+        # including the bidirectional instruction, because a reworded claim about
+        # what the runtime does is exactly the sentence that should be re-read
+        # deliberately rather than drift.
+        "push-enforcement-stated-in-both-directions",
+        "a worker is told either that a gate exists, or that nothing is denied and a "
+        "force-push is available to it",
+        _CROSS_REVIEW,
+        "`blast_radius` denies only catastrophic push variants (`--force*`, "
+        "`--delete`, `--mirror`, `--prune`); a plain `git push` is ungated, so the "
+        "ordering below holds only because you sequence it. That is the honest "
+        "description, and you must not tell a worker otherwise in EITHER direction "
+        "— neither that a gate exists, nor that nothing is denied at all.",
+    ),
     (
         "mandate-pasted-verbatim",
         "the dispatched mandate is paraphrased and its obligations quietly shrink",

@@ -12,8 +12,10 @@ branches, the worker obligations, the policy argument values — live in
 
 holly delegates every coding task to its ``claude_code`` / ``codex`` / ``pi``
 workers, reviews the LOCAL branch diff with a different-vendor reviewer, and
-only then sequences publication. Nothing in the runtime blocks a ``git push``:
-that ordering is prompt discipline, and the tests are written accordingly.
+only then sequences publication. ``blast_radius`` denies only catastrophic push
+variants (``--force*``, ``--delete``, ``--mirror``, ``--prune``); a plain
+``git push`` is ungated, so that ordering is prompt discipline and the tests are
+written accordingly.
 """
 
 from __future__ import annotations
@@ -117,10 +119,11 @@ def test_root_guardrail_policies_are_exactly_the_three(holly_spec: AgentSpec) ->
     The orchestrator carries exactly ``blast_radius``, ``spawn_bounds`` and
     ``headless_subagent_purpose_guard`` — no more, no fewer.
 
-    Set equality, not membership. The bundle's honesty contract is that
-    publication is unenforced; a fourth policy would change what the runtime
-    does while every prose disclaimer stays behind, silently false. Equality
-    also catches the ordinary regression of a policy being dropped.
+    Set equality, not membership. The bundle's honesty contract is that ORDINARY
+    publication is unenforced — only catastrophic push variants are denied; a
+    fourth policy would change what the runtime does while every prose disclaimer
+    stays behind, silently false. Equality also catches the ordinary regression
+    of a policy being dropped.
 
     Argument values are pinned in ``tests/spec/test_holly_bundle.py``.
     """
