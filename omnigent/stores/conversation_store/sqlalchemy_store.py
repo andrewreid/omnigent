@@ -1102,22 +1102,82 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     def get_runner_ids(self, conversation_ids: list[str]) -> dict[str, str | None]:
         """
-        Single ``SELECT id, runner_id WHERE id IN (...)`` — bulk
-        variant of :meth:`get_conversation` for the runner-dot path.
-        Missing ids are omitted; ids without a bound runner map to
-        ``None``.
+        Bulk ``runner_id`` lookup, gated on the conversation still existing.
+
+        The binding lives on the Omnigent metadata row, but the AP
+        ``conversations`` row is the EXISTENCE authority: deletion is
+        deliberately ordered AP-row-first, metadata-second, and a failed
+        second transaction leaves orphaned metadata for a conversation that
+        no longer exists (documented as an acceptable best-effort tradeoff
+        in :meth:`delete_conversation`). That tradeoff is only acceptable
+        while every reachability check consults the AP row — a
+        metadata-only read would route a deleted conversation to its old
+        runner instead of reporting it missing.
+
+        The lookup is therefore rooted in the AP row and reaches sideways for
+        the binding, never the other way round: one outer-joined query when
+        both live on the same bind, two when they are split (still narrower
+        than the three a full :meth:`get_conversation` costs). Rooting it in
+        metadata instead answered only one of the two failure directions —
+        a deleted conversation with orphaned metadata was correctly dropped,
+        while an existing conversation whose metadata row is absent was
+        *also* dropped, turning "exists but unbound" into a false
+        ``NOT_FOUND``. Both states are constructible: creation commits the AP
+        row and the metadata row in separate transactions, the same
+        two-transaction shape as deletion in the opposite order.
+
+        :param conversation_ids: Conversation ids to look up.
+        :returns: ``{id: runner_id or None}`` for ids whose AP row exists.
+            Ids with no AP row are omitted, exactly as a missing
+            :meth:`get_conversation` would report them; ids that exist
+            without a binding map to ``None``.
         """
         if not conversation_ids:
             return {}
         unique_ids = list(set(conversation_ids))
+        same_bind = self._conv_engine is self._engine
+        if same_bind:
+            with self._session() as session:
+                rows = session.execute(
+                    select(SqlConversation.id, SqlConversationMetadata.runner_id)
+                    .outerjoin(
+                        SqlConversationMetadata,
+                        and_(
+                            SqlConversationMetadata.workspace_id == SqlConversation.workspace_id,
+                            SqlConversationMetadata.id == SqlConversation.id,
+                        ),
+                    )
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id.in_(unique_ids),
+                    )
+                ).all()
+            return {row.id: row.runner_id for row in rows}
+        # Split-DB: no cross-bind join, so read existence from the AP bind and
+        # overlay the bindings. Seeding every existing id with ``None`` keeps
+        # the two states distinct without a second existence check.
+        with self._conv_session() as ap_session:
+            existing = set(
+                ap_session.execute(
+                    select(SqlConversation.id).where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id.in_(unique_ids),
+                    )
+                ).scalars()
+            )
+        if not existing:
+            return {}
+        bindings: dict[str, str | None] = dict.fromkeys(existing)
         with self._session() as session:
             rows = session.execute(
                 select(SqlConversationMetadata.id, SqlConversationMetadata.runner_id).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id.in_(unique_ids),
+                    SqlConversationMetadata.id.in_(list(existing)),
                 )
             ).all()
-        return {row.id: row.runner_id for row in rows}
+        for row in rows:
+            bindings[row.id] = row.runner_id
+        return bindings
 
     def get_session_connectivity(
         self, conversation_ids: list[str]

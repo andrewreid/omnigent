@@ -1237,6 +1237,7 @@ def _targeted_elicitation_event(
 def _ancestor_session_ids(
     conv_store: ConversationStore,
     session_id: str,
+    conv: Conversation | None = None,
 ) -> list[str]:
     """
     Return ancestor session ids for a session, nearest parent first.
@@ -1244,12 +1245,15 @@ def _ancestor_session_ids(
     :param conv_store: Store used to read conversation parent links.
     :param session_id: Session to walk upward from, e.g.
         ``"conv_child123"``.
+    :param conv: The session's already-loaded conversation row, when the
+        caller holds one — skips the first read, which makes the
+        top-level case (no parent) read-free.
     :returns: Ancestor ids in parent-to-root order. Empty when the
         session is top-level or missing.
     """
     ancestors: list[str] = []
     seen = {session_id}
-    current = conv_store.get_conversation(session_id)
+    current = conv if conv is not None else conv_store.get_conversation(session_id)
     while current is not None and current.parent_conversation_id is not None:
         parent_id = current.parent_conversation_id
         if parent_id in seen:
@@ -3701,8 +3705,13 @@ async def _get_runner_client_impl(
     """
     Get an HTTP client for the runner bound to a session.
 
-    Uses the ``RunnerRouter`` to resolve the pinned runner. Falls
-    back to the in-process runner client for test setups.
+    Uses the ``RunnerRouter`` to resolve the pinned runner via a fresh
+    single-column binding read, so the RESOLUTION reflects a rebind that
+    landed before this call. The returned client is bound to that runner:
+    a rebind between this resolution and the caller's POST is not fenced
+    (the resolve→forward window is unchanged by the read narrowing, and
+    fencing it needs a binding generation on the wire). Falls back to the
+    in-process runner client for test setups.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
