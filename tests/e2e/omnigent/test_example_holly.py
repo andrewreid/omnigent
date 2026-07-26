@@ -83,10 +83,14 @@ def test_executor_shape_keeps_vendors_distinct(holly_spec: AgentSpec) -> None:
     The orchestrator and each worker keep their harness.
 
     Vendor independence is a property of the executor, not of the worker's name.
-    Repointing ``codex`` at the ``pi`` harness leaves every name, prompt and
-    routing rule intact while silently collapsing two of the three vendors —
-    cross-vendor review then dispatches to the same engine that wrote the diff
-    and reports independence it does not have.
+    Two of the three harnesses have a FIXED vendor — ``claude_code`` and
+    ``codex``; ``pi`` runs whatever model its dispatch names, so it is not a
+    standing third vendor. Repointing ``codex`` at the ``pi`` harness leaves
+    every name, prompt and routing rule intact while removing one of the two
+    fixed vendors, and what remains is one fixed vendor plus a worker whose
+    independence has to be established per dispatch. A review routed on the old
+    assumption then reaches the same engine that wrote the diff and reports an
+    independence nobody checked.
 
     Models stay unpinned where the contract requires it: the orchestrator brain
     must resolve whatever Claude provider the deployment configured, and ``pi``

@@ -111,13 +111,22 @@ rewrite.
 
 The enumerated gaps:
 
-1. A newly introduced FALSE ENFORCEMENT CLAIM is caught by no test, in any
-   phrasing: ``The blast_radius policy blocks every push until review lands.``
-   ``The policy will not allow a push before review.``  ``Every push is gated by
-   the policy layer.``  ``The review step is mandatory and automatic.``
-   ``There is a gate. It stops every push.``
-2. The same, INSIDE THE WORKER CONFIGS specifically — the files workers read,
-   and where the predecessor defect actually did its damage.
+1. A newly introduced FALSE CLAIM is caught by no test, in any phrasing, in any
+   prose a reader will act on without verifying it. The enforcement shape is
+   only the most familiar one: ``The blast_radius policy blocks every push until
+   review lands.``  ``The policy will not allow a push before review.``  ``Every
+   push is gated by the policy layer.``  ``There is a gate. It stops every
+   push.``  It is not the only one — a docstring describing an order the code
+   does not follow, or a comment naming a validation that never runs, is the
+   same defect and is equally uncaught. The mandate's [HONESTY] pass is scoped
+   that widely deliberately; the checks in this file are not, and never were.
+2. Worse than that: SCOPE. Every check here reads the seven files of this bundle,
+   so a false claim anywhere else is outside this file's reach altogether — a
+   code comment or docstring in a target repo, a README, a doc claim, and COMMIT
+   MESSAGES, which no test in this repo reads at all and which the mandate
+   singles out as the case a future reader has least reason to doubt. Inside the
+   bundle the worker configs remain the highest-value target: they are the files
+   workers read, and where the predecessor defect did its damage.
 3. PR-FIRST ORDERING is no longer detected. ``Push the branch and open its PR
    first; run cross-review afterward.`` added to any file passes.
 4. MARKER-BEFORE-GATE is no longer detected. ``Set READY on the registry before
@@ -372,6 +381,15 @@ _MANDATE_OBLIGATIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # The four shapes are pinned individually because each names a distinct shape of
 # false claim — the first is the one the bundle's own history produced — and
 # deleting any one leaves the pass heading and its checklist line intact.
+#
+# The pass is scoped to any prose a reader acts on without verifying it — code
+# comments, docstrings, commit messages, README and doc claims — not only to
+# agent-facing prose. holly runs against arbitrary target repos, most carrying no
+# agent prose at all, and under the narrow scope the pass returned "n/a" on
+# nearly every diff. That scope clause sits INSIDE the honesty-pass string below
+# rather than beside it, so re-narrowing the pass fails this test instead of
+# silently reverting the widening. Same for the checklist row: it no longer
+# carries an "n/a" opt-out, and the pinned row is the one without it.
 _MANDATE_CANONICAL: tuple[tuple[str, str, str], ...] = (
     (
         "honesty-pass",
@@ -384,7 +402,8 @@ _MANDATE_CANONICAL: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "honesty-shape-nonexistent-guarantee",
-        "the predecessor defect exactly — a policy described as blocking a push it never sees",
+        "a mechanism never reached on the live path is described as blocking, gating or "
+        "ensuring — the predecessor defect here, and the same defect in any repo",
         "a guarantee that does not exist — a policy, guard, validation, constraint, "
         "lock, limit, permission check or runtime step described as blocking, gating, "
         'requiring, preventing or ensuring something. Include negated phrasings ("will '
@@ -395,18 +414,18 @@ _MANDATE_CANONICAL: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "honesty-shape-ordering",
-        "prose that puts publication before review passes as truthful",
+        "prose documenting an order of operations the code does not follow reads as true",
         "a documented sequence that contradicts the real one — prose describing an "
         "order of operations the code does not follow, in any phrasing.",
     ),
     (
-        "honesty-shape-marker-before-gate",
-        "a readiness marker recorded before its gate reads as a gate result",
+        "honesty-shape-marker-before-attestation",
+        "a status set before the thing it attests is read as evidence that thing happened",
         "a status, flag or marker set before the thing it is supposed to attest.",
     ),
     (
         "honesty-shape-exception-to-an-absolute",
-        "a same-vendor review, or a merge by the orchestrator, is written in as permitted",
+        "an exception is written into a rule the contract or spec states has none",
         "an exception to a rule the contract or spec states has none.",
     ),
     (
