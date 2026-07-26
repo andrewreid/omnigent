@@ -54,7 +54,12 @@ time.
 
 A returned report must OPEN with the battery-completeness checklist. Missing
 or partial checklist = INCOMPLETE review, not a clean bill: re-dispatch the
-full battery. Never read a bare "looks good" as a completed review. This holds
+full battery. The checklist declares a finding count per pass: reconcile it
+against the findings actually delivered. The DISPATCH is guarded against
+truncation by the mandate's END marker; the RETURN is not, and a worker can
+return a partial result that reads as a normal successful completion. A report
+declaring more findings than arrived was truncated in transport, not
+completed. Never read a bare "looks good" as a completed review. This holds
 with equal force when servicing an external review bot — bot comments are
 never grounds to narrow the dispatch.
 
@@ -231,8 +236,9 @@ END REVIEWER-MANDATE-V1
    Then end your turn and collect the report with `sys_read_inbox`.
 
 4. **Validate the report before acting on it.** No opening checklist, a missing
-   axis, or a verdict issued despite an `INCOMPLETE DISPATCH` notice means the
-   review did not happen. Re-dispatch the identical full mandate.
+   axis, a declared finding count the report does not deliver, or a verdict
+   issued despite an `INCOMPLETE DISPATCH` notice means the review did not
+   happen. Re-dispatch the identical full mandate.
 
 5. **Route blocking issues back to the SAME fixer, on the SAME branch.**
    Delegated: re-send to the same implementer conversation (reuse its `agent` +
