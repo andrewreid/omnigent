@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import logging
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -175,14 +176,15 @@ def create_host_tunnel_router(
                 return
             tunnel_owner = managed.user_id
         elif auth_provider is not None:
-            tunnel_owner = auth_provider.get_user_id(ws)
-            if tunnel_owner is None:
+            authenticated_user_id = auth_provider.get_user_id(ws)
+            if authenticated_user_id is None:
                 # Auth is enabled but this peer didn't authenticate. Fail
                 # closed — never fall back to RESERVED_USER_LOCAL, which is
                 # admin-equivalent under the multi-user header scheme
                 # Closing before accept() refuses the handshake.
                 await ws.close(code=4004, reason="unauthenticated")
                 return
+            tunnel_owner = authenticated_user_id
         else:
             # No auth provider configured = explicit single-user / local
             # deployment; RESERVED_USER_LOCAL is the accepted local owner
@@ -227,6 +229,24 @@ def create_host_tunnel_router(
 
         await ws.accept()
         conn: HostConnection | None = None
+
+        async def _cleanup_current_connection() -> None:
+            if conn is None or not host_registry.deregister(host_id, conn):
+                return
+            await asyncio.to_thread(
+                host_store.set_offline,
+                host_id,
+                conn.session_id,
+            )
+            if on_host_disconnect is not None:
+                try:
+                    await on_host_disconnect(host_id, tunnel_owner)
+                except Exception:
+                    _logger.exception(
+                        "on_host_disconnect callback failed for %s",
+                        host_id,
+                    )
+
         try:
             raw = await ws.receive_text()
             frame = decode_host_frame(raw)
@@ -246,6 +266,7 @@ def create_host_tunnel_router(
                 )
                 return
 
+            conn_session_id = uuid.uuid4().hex
             await asyncio.to_thread(
                 host_store.upsert_on_connect,
                 host_id=host_id,
@@ -253,6 +274,7 @@ def create_host_tunnel_router(
                 user_id=tunnel_owner,
                 allow_host_id_reown=allow_host_id_reown,
                 configured_harnesses=frame.configured_harnesses,
+                conn_session_id=conn_session_id,
             )
 
             conn = host_registry.register(
@@ -260,6 +282,7 @@ def create_host_tunnel_router(
                 ws,
                 frame,
                 owner=tunnel_owner,
+                session_id=conn_session_id,
             )
             _logger.info(
                 "Host %s connected (version=%s, name=%s, runners=%s)",
@@ -325,16 +348,7 @@ def create_host_tunnel_router(
                     receive_task,
                     return_exceptions=True,
                 )
-                host_registry.deregister(host_id)
-                await asyncio.to_thread(host_store.set_offline, host_id)
-                if on_host_disconnect is not None:
-                    try:
-                        await on_host_disconnect(host_id, tunnel_owner)
-                    except Exception:
-                        _logger.exception(
-                            "on_host_disconnect callback failed for %s",
-                            host_id,
-                        )
+                await _cleanup_current_connection()
 
         except WebSocketDisconnect:
             _logger.warning("Host %s disconnected", host_id)
@@ -343,23 +357,11 @@ def create_host_tunnel_router(
             # register — e.g. the upsert IntegrityError when a peer
             # connects with another owner's host_id — must not deregister
             # or flip that owner's host offline (cross-user DoS).
-            if conn is not None:
-                host_registry.deregister(host_id)
-                await asyncio.to_thread(host_store.set_offline, host_id)
-                if on_host_disconnect is not None:
-                    try:
-                        await on_host_disconnect(host_id, tunnel_owner)
-                    except Exception:
-                        _logger.exception(
-                            "on_host_disconnect callback failed for %s",
-                            host_id,
-                        )
+            await _cleanup_current_connection()
         except Exception:
             _logger.exception("Host tunnel error for %s", host_id)
             # Same guard as above: don't touch a host we never registered.
-            if conn is not None:
-                host_registry.deregister(host_id)
-                await asyncio.to_thread(host_store.set_offline, host_id)
+            await _cleanup_current_connection()
 
     return router
 
@@ -710,7 +712,14 @@ async def _ping_loop(
             return
         # The host is still within the liveness window — refresh its
         # last-seen so the freshness gate keeps it in the online set.
-        await asyncio.to_thread(host_store.heartbeat, host_id)
+        updated = await asyncio.to_thread(
+            host_store.heartbeat,
+            host_id,
+            session_id=conn.session_id,
+        )
+        if updated == 0:
+            _logger.debug("Stopping ping loop for superseded host connection: %s", host_id)
+            return
         try:
             ping_text = encode_frame(PingFrame(ts=int(time.time() * 1000)))
             conn.outbound_queue.put_nowait(ping_text)

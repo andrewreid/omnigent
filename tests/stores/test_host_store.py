@@ -7,6 +7,7 @@ from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlHost
+from omnigent.db.enum_codecs import encode_host_status
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.stores.host_store import (
     HOST_LIVENESS_TTL_S,
@@ -281,10 +282,12 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
         host_id="b1b5efd7dfc33b5a6241f1866ffb00e6",
         name="dev-laptop",
         user_id="dana@example.com",
+        conn_session_id="session-rotated",
     )
 
     assert updated.host_id == "b1b5efd7dfc33b5a6241f1866ffb00e6"
     assert updated.status == "online"
+    assert updated.conn_session_id == "session-rotated"
     # The binding followed the rotation — the conversation now points at
     # the new host_id, not the old (dangling) one or NULL.
     rebound = conversations.get_conversation(conv.id)
@@ -389,7 +392,7 @@ def test_set_offline(host_store: HostStore) -> None:
         name="laptop",
         user_id="carol@example.com",
     )
-    host_store.set_offline("7b463227e479b3a677307588a5d9e44f")
+    assert host_store.set_offline("7b463227e479b3a677307588a5d9e44f") == 1
 
     fetched = host_store.get_host("7b463227e479b3a677307588a5d9e44f")
     assert fetched is not None
@@ -405,34 +408,208 @@ def test_set_offline_noop_for_unknown_host(
     The disconnect callback may fire after a failed registration;
     it must not raise.
     """
-    host_store.set_offline("aababcc3941edb738172734a9ab7bb8c")
+    assert host_store.set_offline("aababcc3941edb738172734a9ab7bb8c") == 0
 
 
-def test_heartbeat_advances_updated_at_without_changing_status(
+def test_upsert_on_connect_stamps_conn_session_id(host_store: HostStore) -> None:
+    """Connect upsert records the live tunnel ownership token atomically."""
+    host = host_store.upsert_on_connect(
+        host_id="d3dbe0220074ea02966cb46f3e83acc3",
+        name="laptop-session",
+        user_id="alice@example.com",
+        conn_session_id="session-current",
+    )
+
+    assert host.conn_session_id == "session-current"
+    fetched = host_store.get_host("d3dbe0220074ea02966cb46f3e83acc3")
+    assert fetched is not None
+    assert fetched.conn_session_id == "session-current"
+
+
+def test_set_offline_expected_session_fences_stale_cleanup(host_store: HostStore) -> None:
+    """A stale session token cannot offline a row owned by a newer tunnel."""
+    host_store.upsert_on_connect(
+        host_id="a641543096b837a13d3b4a030c30d196",
+        name="laptop-fenced",
+        user_id="alice@example.com",
+        conn_session_id="session-current",
+    )
+
+    assert (
+        host_store.set_offline(
+            "a641543096b837a13d3b4a030c30d196",
+            expected_session="session-stale",
+        )
+        == 0
+    )
+    fetched = host_store.get_host("a641543096b837a13d3b4a030c30d196")
+    assert fetched is not None
+    assert fetched.status == "online"
+
+    assert (
+        host_store.set_offline(
+            "a641543096b837a13d3b4a030c30d196",
+            expected_session="session-current",
+        )
+        == 1
+    )
+    fetched = host_store.get_host("a641543096b837a13d3b4a030c30d196")
+    assert fetched is not None
+    assert fetched.status == "offline"
+
+
+def test_set_offline_legacy_null_session_remains_offlinable(host_store: HostStore) -> None:
+    """Legacy rows with no session token remain offlinable during rollout."""
+    host_store.upsert_on_connect(
+        host_id="c9348277837ecf948bb5e7e51ac6c368",
+        name="laptop-legacy",
+        user_id="alice@example.com",
+    )
+
+    assert (
+        host_store.set_offline(
+            "c9348277837ecf948bb5e7e51ac6c368",
+            expected_session="session-new",
+        )
+        == 1
+    )
+
+
+def test_heartbeat_advances_updated_at_and_stamps_matching_session(
     host_store: HostStore,
     db_uri: str,
 ) -> None:
     """
-    Verify heartbeat refreshes last-seen but leaves status alone.
+    Verify heartbeat refreshes last-seen and keeps ownership.
 
     The ping loop calls this every interval to keep a live host fresh.
     If it doesn't advance ``updated_at``, a long-lived host would age
-    past the TTL and wrongly drop offline; if it flipped ``status``,
-    it would fight the connect/disconnect writers.
+    past the TTL and wrongly drop offline.
     """
-    host_store.upsert_on_connect("12b05166b1e4ccd4dce299285b12442f", "laptop", "alice@example.com")
+    host_store.upsert_on_connect(
+        "12b05166b1e4ccd4dce299285b12442f",
+        "laptop",
+        "alice@example.com",
+        conn_session_id="session-hb",
+    )
     # Stand last-seen well in the past, as if the last touch was long ago.
     _set_updated_at(db_uri, "12b05166b1e4ccd4dce299285b12442f", now_epoch() - 10_000)
 
-    host_store.heartbeat("12b05166b1e4ccd4dce299285b12442f")
+    assert (
+        host_store.heartbeat(
+            "12b05166b1e4ccd4dce299285b12442f",
+            session_id="session-hb",
+        )
+        == 1
+    )
 
     fetched = host_store.get_host("12b05166b1e4ccd4dce299285b12442f")
     assert fetched is not None
     # Last-seen jumped back to ~now (within a generous window for clock
     # granularity), proving the heartbeat wrote a fresh timestamp.
     assert fetched.updated_at >= now_epoch() - 5
-    # Status is untouched — heartbeat only refreshes liveness.
     assert fetched.status == "online"
+    assert fetched.conn_session_id == "session-hb"
+
+
+def test_heartbeat_stale_session_does_not_reclaim_token_or_refresh(
+    host_store: HostStore,
+    db_uri: str,
+) -> None:
+    """A stale heartbeat cannot take ownership back from a newer session."""
+    host_id = "7c883c6375878770486b932571c70eef"
+    host_store.upsert_on_connect(
+        host_id,
+        "laptop-stale-session",
+        "alice@example.com",
+        conn_session_id="session-b",
+    )
+    old_updated_at = now_epoch() - 10_000
+    _set_updated_at(db_uri, host_id, old_updated_at)
+
+    assert host_store.heartbeat(host_id, session_id="session-a") == 0
+
+    fetched = host_store.get_host(host_id)
+    assert fetched is not None
+    assert fetched.conn_session_id == "session-b"
+    assert fetched.updated_at == old_updated_at
+    assert fetched.status == "online"
+
+
+def test_heartbeat_claims_legacy_null_session(host_store: HostStore, db_uri: str) -> None:
+    """Legacy NULL-token rows remain claimable during rolling deploys."""
+    host_id = "9f3f72d82eb081ed8986ff1b53fd0b06"
+    host_store.upsert_on_connect(host_id, "laptop-legacy-hb", "alice@example.com")
+    _set_updated_at(db_uri, host_id, now_epoch() - 10_000)
+
+    assert host_store.heartbeat(host_id, session_id="session-new") == 1
+
+    fetched = host_store.get_host(host_id)
+    assert fetched is not None
+    assert fetched.conn_session_id == "session-new"
+    assert fetched.updated_at >= now_epoch() - 5
+    assert fetched.status == "online"
+
+
+def test_heartbeat_restores_online_when_session_matches(
+    host_store: HostStore,
+    db_uri: str,
+) -> None:
+    """A matching live heartbeat self-heals residual sticky-offline rows."""
+    host_id = "317a32296015d9bbe80581203c4d6e94"
+    host_store.upsert_on_connect(
+        host_id,
+        "laptop-self-heal",
+        "alice@example.com",
+        conn_session_id="session-live",
+    )
+    engine = get_or_create_engine(db_uri)
+    with Session(engine) as session:
+        session.execute(
+            update(SqlHost)
+            .where(SqlHost.host_id == host_id)
+            .values(status=encode_host_status("offline"), updated_at=now_epoch() - 10_000)
+        )
+        session.commit()
+
+    assert host_store.heartbeat(host_id, session_id="session-live") == 1
+
+    fetched = host_store.get_host(host_id)
+    assert fetched is not None
+    assert fetched.status == "online"
+    assert fetched.conn_session_id == "session-live"
+    assert fetched.updated_at >= now_epoch() - 5
+
+
+def test_heartbeat_does_not_restore_online_when_session_mismatches(
+    host_store: HostStore,
+    db_uri: str,
+) -> None:
+    """A stale heartbeat cannot self-heal a row owned by another session."""
+    host_id = "b78118f3e09ab45d64c21f5b4214d160"
+    host_store.upsert_on_connect(
+        host_id,
+        "laptop-no-self-heal",
+        "alice@example.com",
+        conn_session_id="session-current",
+    )
+    old_updated_at = now_epoch() - 10_000
+    engine = get_or_create_engine(db_uri)
+    with Session(engine) as session:
+        session.execute(
+            update(SqlHost)
+            .where(SqlHost.host_id == host_id)
+            .values(status=encode_host_status("offline"), updated_at=old_updated_at)
+        )
+        session.commit()
+
+    assert host_store.heartbeat(host_id, session_id="session-stale") == 0
+
+    fetched = host_store.get_host(host_id)
+    assert fetched is not None
+    assert fetched.status == "offline"
+    assert fetched.conn_session_id == "session-current"
+    assert fetched.updated_at == old_updated_at
 
 
 def test_heartbeat_noop_for_unknown_host(host_store: HostStore) -> None:
@@ -441,7 +618,13 @@ def test_heartbeat_noop_for_unknown_host(host_store: HostStore) -> None:
 
     A heartbeat can race a just-deregistered host; it must not raise.
     """
-    host_store.heartbeat("aababcc3941edb738172734a9ab7bb8c")
+    assert (
+        host_store.heartbeat(
+            "aababcc3941edb738172734a9ab7bb8c",
+            session_id="session-missing",
+        )
+        == 0
+    )
 
 
 def test_is_online_true_for_fresh_online_host(host_store: HostStore) -> None:
