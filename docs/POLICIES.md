@@ -48,16 +48,35 @@ policy_modules:
 policies:
   session_budget:
     type: function
-    handler: omnigent.policies.builtins.cost.cost_budget
-    factory_params:
-      max_cost_usd: 10.00
-      ask_thresholds_usd: [5.00]
+    function:
+      path: omnigent.policies.builtins.cost.cost_budget
+      arguments:
+        max_cost_usd: 10.00
+        ask_thresholds_usd: [5.00]
   global_rate_limit:
     type: function
-    handler: omnigent.policies.builtins.safety.max_tool_calls_per_session
-    factory_params:
-      limit: 200
+    function:
+      path: omnigent.policies.builtins.safety.max_tool_calls_per_session
+      arguments:
+        limit: 200
 ```
+
+> **Use `function: {path, arguments}`, not `factory_params:`.** The server
+> config's `policies:` mapping is parsed by `parse_default_policies`
+> (`omnigent/spec/parser.py`), which uses the same grammar as an agent bundle's
+> `guardrails.policies:` and does **not** understand `factory_params`. Neither
+> parser rejects unknown keys, so a `factory_params:` block is silently
+> discarded, leaving `arguments=None`. A factory whose parameters are all
+> optional is then invoked with none and runs on its defaults, silently and
+> with no log line — the dangerous case, because nothing reports it. A factory
+> with any required parameter fails instead, either when the engine is built or
+> at its first evaluation depending on how that parameter is declared; the
+> error will not name the discarded block, so it is easy to misattribute.
+> `factory_params` is real only on the REST/DB row path and in the legacy
+> single-file omnigent YAML (`omnigent/spec/omnigent.py`). Any catalog example
+> below that uses `factory_params:` is written in that dialect; translate it to
+> `function: {path, arguments}` before copying it into a server config or an
+> agent bundle's `guardrails.policies:`.
 
 **4. Start the server.**
 
@@ -256,10 +275,11 @@ Same ASK / downgrade-gate behavior as `cost_budget`, but the budget is the **ses
 # server_config.yaml -- a per-user daily cap applied to every session
 daily_budget:
   type: function
-  handler: omnigent.policies.builtins.cost.user_daily_cost_budget
-  factory_params:
-    max_cost_usd: 25.00
-    ask_thresholds_usd: [10.00, 20.00]
+  function:
+    path: omnigent.policies.builtins.cost.user_daily_cost_budget
+    arguments:
+      max_cost_usd: 25.00
+      ask_thresholds_usd: [10.00, 20.00]
 ```
 
 ### GitHub
@@ -377,10 +397,11 @@ llm:
 policies:
   deny_trivial_opus:
     type: function
-    handler: omnigent.policies.builtins.routing.deny_trivial_to_expensive_model
-    factory_params:
-      expensive_models:
-        - databricks-claude-opus-4-6
+    function:
+      path: omnigent.policies.builtins.routing.deny_trivial_to_expensive_model
+      arguments:
+        expensive_models:
+          - databricks-claude-opus-4-6
 ```
 
 ---
