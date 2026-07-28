@@ -22,8 +22,9 @@ Every debate is grounded on real, merged code. The caller must provide:
 **Launch contract — run from the grounded worktree root.** Patricia must be
 launched with its current working directory set to the merged repository being
 debated (cwd = the checked-out worktree). The heads read the code by relative
-path against that root, and the Claude head's sandbox binds that cwd READ-ONLY
-— including `.git`, which is visible for SHA grounding but never writable.
+path against that root — including `.git`, visible for SHA grounding. The heads
+treat the grounded repo as read-only: they read it to ground their arguments
+but must not modify it.
 Patricia does NOT mount arbitrary external repo paths, so whoever spawns her (a
 human, or Polly) must `cd` into the merged worktree first. If you find you are
 not running inside the repo the caller named, halt and ask to be relaunched
