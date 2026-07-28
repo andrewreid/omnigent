@@ -1258,6 +1258,9 @@ class SqlHost(OmnigentBase):
         host has never reported it (older host build) — unknown, not
         "nothing configured". Surfaced via ``GET /v1/hosts`` so the web
         agent picker can warn about unconfigured harnesses.
+    :param conn_session_id: Nullable ownership token stamped by the live
+        host tunnel connection. Disconnect cleanup passes its expected
+        value so a stale tunnel cannot offline a newer connection's row.
     """
 
     __tablename__ = "hosts"
@@ -1287,6 +1290,7 @@ class SqlHost(OmnigentBase):
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    conn_session_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     __table_args__ = (
         CheckConstraint(
