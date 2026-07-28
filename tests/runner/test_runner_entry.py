@@ -1622,6 +1622,80 @@ async def test_resolve_agent_spec_from_server_caches_success_by_agent_version(
 
 
 @pytest.mark.asyncio
+async def test_resolve_agent_spec_from_server_memoizes_parse_across_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shared spec_parse_cache parses one bundle once but returns isolated copies.
+
+    Two sessions sharing the same (agent_id, version) bundle parse it once (the
+    memo), yet each gets an independent spec so per-session in-place edits, like a
+    builtin tool appending a sub-agent, don't leak across sessions.
+
+    :param tmp_path: Temporary spec cache root.
+    :param monkeypatch: Pytest patch fixture.
+    :returns: None.
+    """
+    config_bytes = (
+        b"spec_version: 1\nname: cached-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
+        b"params:\n  shared_key: original\n"
+    )
+    bundle_buf = io.BytesIO()
+    with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config_bytes)
+        tf.addfile(info, io.BytesIO(config_bytes))
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Return the same bundle for every request.
+
+        :param request: Incoming mocked HTTP request.
+        :returns: A mocked successful bundle response.
+        """
+        return httpx.Response(200, content=bundle_buf.getvalue(), headers={"X-Agent-Version": "7"})
+
+    import omnigent.spec
+
+    real_load = omnigent.spec.load
+    parse_dirs: list[Path] = []
+
+    def _counting_load(source: Any, **kwargs: Any) -> Any:
+        """Record parse-mode calls (a directory source) and delegate.
+
+        :param source: Bundle bytes on extract, or the extracted dir on parse.
+        :returns: The real load() result.
+        """
+        if isinstance(source, Path):
+            parse_dirs.append(source)
+        return real_load(source, **kwargs)
+
+    monkeypatch.setattr(omnigent.spec, "load", _counting_load)
+
+    cache: dict[tuple[str, str, bool], Any] = {}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server.test",
+    ) as client:
+        first = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_cached", session_id="conv_a", spec_parse_cache=cache
+        )
+        second = await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_cached", session_id="conv_b", spec_parse_cache=cache
+        )
+
+    assert first is not None
+    assert second is not None
+    assert len(parse_dirs) == 1  # parsed once, then served from the memo
+    assert list(cache) == [("ag_cached", "7", False)]
+    # Each resolve gets an independent deepcopy, so a per-session in-place edit
+    # does not leak into the cached master or the other session's spec.
+    assert first.spec is not second.spec
+    assert first.spec.params is not second.spec.params
+    first.spec.params["injected"] = "session-a"
+    assert "injected" not in second.spec.params
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [401, 403, 500, 502])
 async def test_resolve_agent_spec_from_server_raises_for_non_404_errors(
     tmp_path: Path,
