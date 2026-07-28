@@ -13,9 +13,10 @@ What breaks if this fails:
   dropped,
 - a head silently switches harness (e.g. the GPT head ends up on claude-sdk),
 - the ``debate`` skill is dropped or renamed (the debate protocol regresses),
-- the Claude head loses its web tools (``web_fetch`` / ``web_search``) or its
-  network-enabled ``linux_bwrap`` sandbox — it can no longer pull contemporary
-  docs mid-debate,
+- the Claude head loses its web tools (``web_fetch`` / ``web_search``) — it can
+  no longer pull contemporary docs mid-debate,
+- the Claude head regains a sandbox (it must stay ``type: none``, matching
+  Debby's heads — the read-mostly debate head is intentionally unsandboxed),
 - the ``os_env`` blocks disappear (the heads lose the file/shell tools the
   grounding-on-merged-code protocol relies on).
 """
@@ -60,16 +61,30 @@ def test_patricia_is_two_headed_cross_vendor(patricia_spec: AgentSpec) -> None:
     assert len(set(fam.values())) == 2
 
 
-def test_patricia_heads_are_unpinned(patricia_spec: AgentSpec) -> None:
+def test_patricia_heads_pin_frontier_models(patricia_spec: AgentSpec) -> None:
     """
-    Neither head pins a model: each inherits whatever Claude / OpenAI provider
-    the user configured. A Databricks-specific model id would 404 on a plain
-    Anthropic / OpenAI key, so re-introducing a pin re-couples a head to one
-    provider — fail here if a model reappears.
+    Each head pins its intended frontier model via top-level ``executor.model``
+    so debates run on the chosen models by default, not whatever provider default
+    ``omnigent setup`` left configured (a per-session ``/model`` override still
+    outranks the spec pin):
+
+    - claude head -> ``claude-fable-5``
+    - gpt head    -> ``gpt-5.6-sol``
+
+    The model id is a passthrough string (the spec parser stores it verbatim;
+    there is no static-catalog membership check), so a non-catalog id like
+    ``gpt-5.6-sol`` validates clean even though it is not in the repo catalog;
+    where and how it actually resolves is up to the operator's configured
+    provider for that harness. Reasoning effort is deliberately NOT pinned here:
+    for a
+    ``type: omnigent`` harness head there is no static effort slot (the harness
+    adapter reads effort per-turn only), so ``profile`` stays ``None`` and effort
+    is a session-level concern. Fail here if a pin drifts or a profile appears.
     """
     by_name = _by_name(patricia_spec)
+    assert by_name["claude"].executor.model == "claude-fable-5"
+    assert by_name["gpt"].executor.model == "gpt-5.6-sol"
     for name in ("claude", "gpt"):
-        assert by_name[name].executor.model is None, name
         assert by_name[name].executor.profile is None, name
 
 
@@ -103,46 +118,42 @@ def test_patricia_claude_head_has_web_tools(patricia_spec: AgentSpec) -> None:
     assert builtins["web_search"].config.get("search_provider") == "duckduckgo"
 
 
-def test_patricia_claude_head_read_only_repo_sandbox(patricia_spec: AgentSpec) -> None:
+def test_patricia_claude_head_is_unsandboxed(patricia_spec: AgentSpec) -> None:
     """
-    The Claude head's sandbox enforces the grounding security model:
+    The Claude head is unsandboxed, matching Debby's heads exactly. A
+    read-mostly design-debate head needs no containment, so its ``os_env``
+    block is the same unsandboxed shape as Debby's:
 
-    - ``type: linux_bwrap`` — network-enabled (for the web tools), and the
-      backend that binds cwd read-only by default.
-    - ``allow_network`` is true so web_fetch / web_search have egress.
-    - NO ``write_paths`` grant — the grounded repo (cwd), INCLUDING ``.git``,
-      stays READ-ONLY. If a ``write_paths`` covering ``.`` or ``.git`` ever
-      reappears, the head could rewrite refs/config/hooks/objects — the exact
-      defect this guards.
-    - ``cwd_allow_hidden == [".git"]`` — ``.git`` is VISIBLE (for SHA grounding)
-      but, per the point above, not writable. ``.venv`` is intentionally NOT in
-      the list: setting ``cwd_allow_hidden`` replaces the backend default
-      ``[".venv"]``, and SHA grounding only needs ``.git``.
+    - ``type: caller_process`` with ``sandbox.type == "none"`` — no
+      ``linux_bwrap`` backend, so the bundle also loads on macOS.
+    - none of the bwrap-only knobs remain: no ``write_paths`` / ``write_files``
+      grants, and no ``cwd_allow_hidden`` / ``cwd_prune_dirs`` (those only mean
+      anything under a bwrap-style read-only cwd). If any of them reappears, the
+      head has drifted back toward a sandbox Debby's heads never carried.
+
+    The grounded repo being read-only is now a BEHAVIORAL instruction in the
+    head's prompt ("read but do not modify"), not a physically enforced mount.
     """
     claude = _by_name(patricia_spec)["claude"]
     assert claude.os_env is not None
+    assert claude.os_env.type == "caller_process"
     sandbox = claude.os_env.sandbox
     assert sandbox is not None
-    assert sandbox.type == "linux_bwrap"
-    assert sandbox.allow_network is True
-
-    # Read-only repo: no write grant of any kind over the grounded worktree.
-    assert sandbox.write_paths is None, (
-        f"Claude head must not grant write_paths (repo incl .git is read-only); "
-        f"got {sandbox.write_paths!r}."
-    )
-    assert not sandbox.write_files, (
-        f"Claude head must not grant write_files over the grounded repo; "
-        f"got {sandbox.write_files!r}."
+    assert sandbox.type == "none", (
+        f"Claude head must be unsandboxed (sandbox.type == 'none') to match "
+        f"Debby; got {sandbox.type!r}."
     )
 
-    # .git visible for SHA grounding, .venv dropped.
-    assert sandbox.cwd_allow_hidden == [".git"], (
-        f"Claude head must admit exactly .git through the dotfile mask (visible, "
-        f"read-only); got {sandbox.cwd_allow_hidden!r}."
+    # No bwrap-only keys should linger after dropping the sandbox.
+    assert sandbox.write_paths is None, sandbox.write_paths
+    assert not sandbox.write_files, sandbox.write_files
+    assert sandbox.cwd_allow_hidden is None, (
+        f"cwd_allow_hidden is a bwrap-only knob; must be gone under sandbox "
+        f"type none, got {sandbox.cwd_allow_hidden!r}."
     )
-    assert ".venv" not in (sandbox.cwd_allow_hidden or []), (
-        "SHA grounding needs only .git; .venv should not be re-admitted."
+    assert sandbox.cwd_prune_dirs is None, (
+        f"cwd_prune_dirs is a bwrap-only knob; must be gone under sandbox type "
+        f"none, got {sandbox.cwd_prune_dirs!r}."
     )
 
 
