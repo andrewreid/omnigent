@@ -852,6 +852,7 @@ def register_events_routes(
             # post-hoc here — a logged output cannot be un-logged.)
             await _persist_external_session_usage(
                 session_id,
+                conv,
                 body,
                 conversation_store,
             )

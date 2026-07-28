@@ -67,6 +67,9 @@ from omnigent.runtime.policies.approval import (
     resolve_ask_timeout,
 )
 from omnigent.runtime.policies.builder import (
+    _sum_subtree_usage,
+    ancestor_ids_from_tree,
+    load_session_tree,
     load_session_usage,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
@@ -596,6 +599,7 @@ def _build_session_list_item(
 def _publish_subtree_cost_to_ancestors(
     conv_store: ConversationStore,
     session_id: str,
+    conv: Conversation | None = None,
 ) -> None:
     """
     Re-publish each ancestor's subtree-summed cost after a child usage update.
@@ -608,18 +612,40 @@ def _publish_subtree_cost_to_ancestors(
     display side.) For each ancestor of *session_id*, recompute its subtree
     priced cost and publish a ``session.usage`` event carrying it.
 
+    One tree load serves the whole walk. Every ancestor of this session is in
+    the same tree, so both the chain and each ancestor's sum are derived from
+    one set of freshly-read rows — previously each ancestor paged the tree
+    again, and the chain came from a conversation row that may have been read
+    before a concurrent delete/recreate moved this session elsewhere.
+
     Sync (does store reads + SSE fan-out); call via
     :func:`asyncio.to_thread`, mirroring the elicitation ancestor-publish
     helpers. ``session_stream.publish`` is safe to call from a worker thread.
 
-    :param conv_store: Store used to discover ancestors and sum each
-        ancestor's subtree usage.
+    :param conv_store: Store used to load the tree.
     :param session_id: The child session whose usage just changed, e.g.
         ``"conv_child123"``.
+    :param conv: The child's already-loaded conversation row, when the caller
+        holds one. Only its ``root_conversation_id`` is used, and only as a
+        hint: :func:`load_session_tree` verifies the tree it names actually
+        contains this session and resolves the root itself when it does not.
+        The parameter belongs to this function, not to whichever caller first
+        needed it, so that no caller can be removed and leave a signature
+        behind that its remaining callers already depend on.
     :returns: None.
     """
-    for ancestor_id in _ancestor_session_ids(conv_store, session_id):
-        ancestor_usage = load_session_usage(ancestor_id, conv_store)
+    # Loaded HERE, not taken from the caller. What each ancestor's badge
+    # should read is a fact about now, at publication time — a tree captured
+    # when the request arrived can already describe a smaller total, and two
+    # siblings publishing from their own request-start snapshots delivered a
+    # newer figure followed by an older one, leaving the parent's badge stale.
+    tree = load_session_tree(
+        session_id,
+        conv_store,
+        conv.root_conversation_id if conv is not None else None,
+    )
+    for ancestor_id in ancestor_ids_from_tree(tree, session_id):
+        ancestor_usage = _sum_subtree_usage(tree, ancestor_id)
         subtree_cost = _priced_cost_for_display(ancestor_usage)
         usage_by_model = _usage_by_model_for_display(ancestor_usage)
         if subtree_cost is None and usage_by_model is None:
@@ -840,6 +866,7 @@ def _accumulate_session_usage(
     resp_obj: dict[str, Any],
     session_id: str,
     conversation_store: ConversationStore,
+    conversation: Conversation | None = None,
 ) -> float | None:
     """
     Increment the session's cumulative token counters from a
@@ -870,6 +897,17 @@ def _accumulate_session_usage(
         e.g. ``"conv_abc123"``.
     :param conversation_store: Store for reading and writing
         the ``session_usage`` column.
+    :param conversation: The relay's already-read conversation row for
+        this session, reused here for the pricing lookup instead of
+        re-reading the same row on every ``response.completed``. This is
+        point-in-time reuse, not the policy engine's immutable-fields-only
+        rule: the row supplies the mutable ``model_override``, so a
+        ``/model`` switch landing between the read and this call prices
+        the turn with the previous model — bounded to one event, and
+        ``usage.model`` (the model the harness actually used) takes
+        precedence when the harness reports it. The usage increment itself
+        is a locked read-modify-write in the store, so a stale row cannot
+        skew the persisted total. ``None`` reads the row here.
     :returns: The session's cumulative priced cost in USD after this
         update (for the caller to broadcast on a ``session.usage``
         event), or ``None`` when the session is unpriced or carries no
@@ -889,8 +927,14 @@ def _accumulate_session_usage(
 
     # Load conversation metadata for pricing only (NOT for reading session_usage —
     # the atomic increment_session_usage call below handles that separately to
-    # avoid the read-modify-write race).
-    conv = conversation_store.get_conversation(session_id)
+    # avoid the read-modify-write race). The caller may pass the row it just
+    # read (the relay roll-up needs the same row immediately afterwards), in
+    # which case pricing reuses it rather than reading it again.
+    conv = (
+        conversation
+        if conversation is not None
+        else conversation_store.get_conversation(session_id)
+    )
 
     # Compute cost delta if pricing is available for the model. Resolve
     # the model to price with, most-specific first:
@@ -961,7 +1005,15 @@ def _accumulate_session_usage(
             model_delta["total_cost_usd"] = cost_delta
         delta["by_model"] = {llm_model: model_delta}
 
-    new_current = conversation_store.increment_session_usage(session_id, delta)
+    try:
+        new_current = conversation_store.increment_session_usage(session_id, delta)
+    except ConversationNotFoundError:
+        # The session was deleted while its turn was still streaming. There is
+        # no row to bill and nothing to publish; the store now refuses to report
+        # a total it did not persist, and failing the relay loop over a deleted
+        # session would be worse than dropping the increment. The primitive that
+        # raises ships this handler, so it can land without regressing callers.
+        return None
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)
     return _priced_cost_for_display(new_current)
@@ -1160,6 +1212,7 @@ def _persist_native_cumulative_usage(
 
 async def _persist_external_session_usage(
     session_id: str,
+    conv: Conversation,
     body: SessionEventInput,
     conversation_store: ConversationStore,
 ) -> int | None:
@@ -1171,6 +1224,9 @@ async def _persist_external_session_usage(
     (:func:`_persist_native_cumulative_usage`) must be present.
 
     :param session_id: Session/conversation identifier.
+    :param conv: The already-loaded conversation row; only its immutable
+        ``root_conversation_id`` is read (so a request-start row is safe),
+        letting the subtree recompute skip one conversation read.
     :param body: External session-usage event body.
     :param conversation_store: Store used to upsert the labels.
     :returns: The persisted ``context_tokens`` when present, else ``None``.
@@ -1233,7 +1289,16 @@ async def _persist_external_session_usage(
     # hide in-flight sub-agent spend until the next child flush (the badge would
     # oscillate own ⇄ subtree). For a childless session the subtree is just
     # itself, so this equals own cost — one indexed tree query per flush.
-    subtree_usage = await asyncio.to_thread(load_session_usage, session_id, conversation_store)
+    # This tree serves only this session's own subtree total. The ancestor
+    # re-publish below loads its OWN tree instead of reusing this one — see
+    # the comment down there for why sharing it would be wrong.
+    tree = await asyncio.to_thread(
+        load_session_tree,
+        session_id,
+        conversation_store,
+        conv.root_conversation_id,
+    )
+    subtree_usage = _sum_subtree_usage(tree, session_id)
     subtree_cost = _priced_cost_for_display(subtree_usage)
     usage_by_model = _usage_by_model_for_display(subtree_usage)
     # Only include fields that were sent; the client treats absent
@@ -1258,12 +1323,16 @@ async def _persist_external_session_usage(
     # This session's usage also moves its ANCESTORS' subtree cost (its spend
     # rolls up into every ancestor), so re-publish each ancestor's subtree cost
     # too — otherwise a grandparent's badge wouldn't reflect a deep descendant.
-    # No-op for a top-level session (no ancestors). Threaded: it pages the
-    # conversation tree per ancestor.
+    # Publishes nothing for a top-level session (no ancestors to walk), but
+    # still pays its own tree load to find that out — it reads its own tree
+    # rather than reusing the one summed above: what an ancestor's badge
+    # should show is a fact about publication time, and a sibling's event may
+    # have landed since this request started.
     await asyncio.to_thread(
         _publish_subtree_cost_to_ancestors,
         conversation_store,
         session_id,
+        conv,
     )
     return raw_tokens
 
@@ -4426,11 +4495,27 @@ async def _relay_runner_stream(
                         # policy callables can read
                         # event["context"]["usage"]["total_cost_usd"] and the
                         # subtree roll-up below sees the new totals.
-                        _accumulate_session_usage(
-                            event.get("response", {}),
-                            session_id,
-                            conversation_store,
+                        # One conversation read serves both this pricing
+                        # lookup and the subtree roll-up below (which needs
+                        # the immutable tree root), instead of one each.
+                        _conv_row = await asyncio.to_thread(
+                            conversation_store.get_conversation, session_id
                         )
+                        # That one read decides for the whole completion. An
+                        # absent row means this session is gone: nothing to
+                        # bill, nothing to publish. Passing ``None`` onward
+                        # instead meant it read as "re-read the row" to the
+                        # accumulator and as "skip" to the roll-up below — so a
+                        # session deleted and recreated under the same id had
+                        # the turn's usage persisted to the new row while the
+                        # event reporting it was suppressed.
+                        if _conv_row is not None:
+                            _accumulate_session_usage(
+                                event.get("response", {}),
+                                session_id,
+                                conversation_store,
+                                _conv_row,
+                            )
                         # Push the server-computed cost AND token breakdown
                         # to the web client's session indicator, rolled up
                         # over the spawn subtree. The session's own event
@@ -4447,10 +4532,15 @@ async def _relay_runner_stream(
                         # surfaces tokens). context_tokens/window already ride
                         # on the response.completed event. Threaded: store
                         # reads + SSE fan-out.
-                        _subtree_usage = await asyncio.to_thread(
-                            load_session_usage,
-                            session_id,
-                            conversation_store,
+                        _subtree_usage = (
+                            await asyncio.to_thread(
+                                load_session_usage,
+                                session_id,
+                                conversation_store,
+                                root_conversation_id=_conv_row.root_conversation_id,
+                            )
+                            if _conv_row is not None
+                            else {}
                         )
                         _subtree_cost = _priced_cost_for_display(_subtree_usage)
                         _usage_by_model = _usage_by_model_for_display(_subtree_usage)
@@ -4471,6 +4561,7 @@ async def _relay_runner_stream(
                                 _publish_subtree_cost_to_ancestors,
                                 conversation_store,
                                 session_id,
+                                _conv_row,
                             )
 
                     # Reset the turn-scoped response_id on any
@@ -4816,7 +4907,7 @@ async def _evaluate_tool_call_policy(
     if spec is None:
         return None
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
 
     try:
@@ -4968,7 +5059,7 @@ async def _evaluate_input_policy(
     request_content = {"user_content": user_text, "attachments": attachments}
 
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
     ctx = EvaluationContext(
         phase=Phase.REQUEST,
@@ -5880,7 +5971,7 @@ async def _handle_mcp_tools_call(
     # only) and TOOL_RESULT (both paths). Engine construction reads
     # session-policy specs and labels from the DB, so keep it off-loop too.
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
 
     if is_retry:
@@ -6361,6 +6452,56 @@ async def _get_session_snapshot(
         skipping the ``get_conversation`` read. Pass it when the caller
         just authorized the session (which fetched the same row) so the
         snapshot doesn't re-read it. ``None`` reads it here as before.
+
+        Reuse here is POINT-IN-TIME, not the policy-engine rule. The
+        engine re-derives every mutable field and keeps only the
+        immutable ``id`` / ``root_conversation_id`` from a preloaded row,
+        because it gates tool calls. A snapshot is a read projection, and
+        a MIXED-epoch one. A field-by-field table here previously drifted
+        from the response schema (an invented field name, a field claimed
+        agent-keyed that isn't, a source claimed single that isn't), and a
+        prior group-based rewrite still assigned several fields to a
+        single group when their actual value can come from either —
+        a symptom of the same "table copies the code, then the code moves
+        on" problem this reuse itself was written to avoid. What follows
+        is deliberately loose rather than exhaustively exact per field,
+        since that precision is exactly what keeps drifting:
+
+        - Most of :class:`~omnigent.server.schemas.SessionResponse` —
+          identity, timestamps, the runner/host binding, archive state,
+          the model/cost overrides, external-session and workspace fields
+          — comes straight off THIS row. ``labels`` is also sourced from
+          this row alone, but is not passed through raw: it's
+          viewer-scoped and gets a closed-status marker derived from the
+          row's title, so "off this row" does not mean "unexamined".
+        - A handful of fields are read fresh after this row: runner/host
+          liveness, elicitations, items, the subtree cost rollup, and
+          process-local caches (todos, sandbox status, MCP startup, the
+          active response id). ``skills`` is fetched live from the
+          runner, keyed by session id, with no dependency on
+          ``agent_id`` at all.
+        - Several fields are genuine hybrids, not cleanly one epoch or
+          the other, and each blends its two sources differently:
+          ``agent_name``, ``llm_model`` and (absent a persisted
+          per-session override, which wins outright) ``harness`` are
+          read fresh but resolved THROUGH this row's ``agent_id`` — they
+          describe the agent this row named, not necessarily the one
+          bound now. Lifecycle ``status`` is read fresh (from the
+          relay-fed cache, or a live runner query on a cache miss) but
+          can be overridden to ``"failed"`` by a runner-crash report
+          looked up by THIS row's ``runner_id``. ``context_window`` is
+          resolved fresh through the agent's spec, but a raw override
+          value stored in THIS row's labels wins when present.
+        - ``permission_level`` is neither: it is the caller's ACL grant,
+          resolved before this function — and before the row itself, when
+          the caller preloads it — ever runs.
+
+        None of this is an enforcement decision. A rebind landing
+        mid-request can be queried on the NEW runner while the response
+        reports the OLD ``runner_id`` and the OLD agent's resolved fields.
+        Making the whole projection single-epoch is a change to this
+        endpoint's contract, not to a redundant read. Do not reuse a
+        snapshot row to make an enforcement decision.
     :param liveness_lookup: Bulk session-liveness lookup (the server's
         ``_bulk_session_liveness``) used to populate ``runner_online``
         and ``host_online`` on the snapshot. ``None`` (e.g. focused
@@ -6565,7 +6706,14 @@ async def _get_session_snapshot(
     # is persisted on its own child conversation, not the parent's, so the
     # parent's own session_usage would under-report. Off the event loop
     # because it pages the conversation tree from the store.
-    subtree_usage = await asyncio.to_thread(load_session_usage, conv.id, conv_store)
+    # The row in hand supplies the (immutable) tree root, so the helper
+    # skips its own conversation re-read; the tree scan itself stays fresh.
+    subtree_usage = await asyncio.to_thread(
+        load_session_usage,
+        conv.id,
+        conv_store,
+        root_conversation_id=conv.root_conversation_id,
+    )
     # Static signal telling the open view a host-bound, host-down session is a
     # resumable managed host it can wake by sending a message, vs a terminal
     # host_offline dead-end. Computed independently of liveness_lookup (the web
