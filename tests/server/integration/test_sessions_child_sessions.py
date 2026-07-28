@@ -1946,3 +1946,117 @@ async def test_non_subagent_session_not_healed_via_parent(
 
     assert resp.status_code == 503, resp.text
     assert not heal_called, "heal must not run for a top-level session"
+
+
+async def test_subagent_terminal_status_route_heals_diverged_runner_end_to_end(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+) -> None:
+    """
+    Route composition test: the real HTTP route heals a diverged child runner.
+
+    The other recovery tests in this module and in
+    ``test_subagent_status_forward_recovery.py`` monkeypatch
+    ``_recover_subagent_status_forward_via_parent`` /
+    ``_subagent_parent_runner_id_if_diverged`` themselves, so deleting the
+    route's call to them would leave those tests green. This test patches
+    only the runner-client resolution boundary (``_get_runner_client`` +
+    ``_wait_for_runner_client`` — the app always carries a real, non-None
+    ``TunnelRegistry`` on ``app.state``, so recovery takes the
+    wait-for-tunnel-connect branch, not the ``_get_runner_client``-only one)
+    and drives the REAL route + orchestration wiring: a child whose
+    ``runner_id`` has diverged from its parent's current one POSTs its
+    terminal status through the actual endpoint, and the assertions confirm
+    the full contract — the stale runner is never contacted, the parent's
+    session-init handshake runs on the resolved live client, the terminal
+    event is re-forwarded through that SAME client, and the child's
+    ``runner_id`` heals.
+    """
+    parent = await _create_parent_with_subagents(
+        client,
+        name="orch-route-e2e",
+        sub_agents=[{"name": "impl", "harness": "claude-native"}],
+    )
+    child_resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": parent["agent_id"],
+            "parent_session_id": parent["session_id"],
+            "title": "impl:task-1",
+            "sub_agent_name": "impl",
+        },
+    )
+    assert child_resp.status_code == 201, child_resp.text
+    child = child_resp.json()
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.replace_runner_id(parent["session_id"], "runner_live")
+    conv_store.replace_runner_id(child["id"], "runner_stale")
+
+    stale_requests: list[str] = []
+    live_requests: list[str] = []
+
+    def _stale_handler(request: httpx.Request) -> httpx.Response:
+        stale_requests.append(request.url.path)
+        return httpx.Response(503)
+
+    def _live_handler(request: httpx.Request) -> httpx.Response:
+        live_requests.append(request.url.path)
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(
+                200, json={"session_init_protocol_version": 2, "terminal_ready": True}
+            )
+        return httpx.Response(202)
+
+    stale_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_stale_handler), base_url="http://stale-runner"
+    )
+    live_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_live_handler), base_url="http://live-runner"
+    )
+
+    def _client_for_runner_id(runner_id: str | None) -> httpx.AsyncClient | None:
+        if runner_id is None:
+            return None
+        return live_client if runner_id == "runner_live" else stale_client
+
+    async def _fake_get_runner_client(
+        session_id: str, runner_router: object
+    ) -> httpx.AsyncClient | None:
+        """Route by the session's CURRENT persisted runner_id, like the real router."""
+        del runner_router
+        conv = conv_store.get_conversation(session_id)
+        return _client_for_runner_id(conv.runner_id if conv is not None else None)
+
+    async def _fake_wait_for_runner_client(
+        session_id: str, runner_router: object, tunnel_registry: object, **_kwargs: Any
+    ) -> httpx.AsyncClient | None:
+        """Skip the real tunnel-connect wait — resolve by persisted runner_id instead."""
+        del runner_router, tunnel_registry
+        conv = conv_store.get_conversation(session_id)
+        return _client_for_runner_id(conv.runner_id if conv is not None else None)
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _fake_wait_for_runner_client)
+
+    try:
+        status_resp = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+    finally:
+        await stale_client.aclose()
+        await live_client.aclose()
+
+    assert status_resp.status_code == 202, status_resp.text
+    # (a) Proactive divergence routing means the stale runner is NEVER hit —
+    # deleting the proactive check would route the first attempt here.
+    assert stale_requests == []
+    # (b) + (d) exact-parent init ran, then the terminal event was
+    # re-forwarded through the SAME resolved live client (fix for the
+    # re-resolve-by-child-id bug) — both land on the live runner in order.
+    assert live_requests == ["/v1/sessions", f"/v1/sessions/{child['id']}/events"]
+    # (c) the child's runner_id healed to the parent's live one.
+    healed_child = conv_store.get_conversation(child["id"])
+    assert healed_child is not None and healed_child.runner_id == "runner_live"

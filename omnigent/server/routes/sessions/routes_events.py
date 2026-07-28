@@ -216,6 +216,13 @@ def register_events_routes(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
+        # Resolved once, unconditionally, so every downstream use (the
+        # host-relaunch connect-grace wait, the terminal-status recovery
+        # path, and the item-dispatch native-boot-failure recovery) sees it
+        # regardless of which branch below actually runs — a runner_client
+        # that resolves immediately skips the host-relaunch block entirely,
+        # so a conditional assignment there left this unbound on that path.
+        _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
         # Validate event type at the route boundary. Anything not in
         # ``_ALLOWED_EVENT_TYPES`` is a client mistake — failing here
         # is far better than silently persisting an item the agent
@@ -751,38 +758,36 @@ def register_events_routes(
             forward_body["data"] = await _enrich_idle_status_with_subagent_output(
                 forward_body["data"], status, session_id, conversation_store
             )
-            runner_result = await _forward_session_change_to_runner(
-                session_id,
-                runner_router,
-                forward_body,
-            )
-            if (
+            # Codex-internal children are tracked inside the same app-server
+            # thread tree; they have no runner inbox entry to forward
+            # terminal status to.
+            is_subagent_terminal_delivery = (
                 conv.kind == "sub_agent"
                 and status in {"idle", "failed"}
                 and not _is_codex_native_subagent(conv)
-            ):
-                # Codex-internal children are tracked inside the same
-                # app-server thread tree; they have no runner inbox entry
-                # to forward terminal status to.
-                if runner_result is None:
-                    # The child's pinned runner_id is stale — its runner was
-                    # relaunched under a new id and only the parent was
-                    # rebound, so the child points at a dead runner forever and
-                    # this terminal status would 503 indefinitely while the
-                    # parent hangs waiting for the child's inbox result. Heal
-                    # the binding and re-deliver through the parent's live
-                    # runner before failing.
-                    from omnigent.server.routes import sessions as _sf
+            )
+            runner_result: _RunnerForwardResult | None = None
+            if is_subagent_terminal_delivery:
+                from omnigent.server.routes import sessions as _sf
 
-                    recovered = await _sf._recover_subagent_status_forward_via_parent(
-                        conv,
-                        runner_router,
-                        getattr(request.app.state, "tunnel_registry", None),
-                        conversation_store,
-                        forward_body,
-                    )
-                    if recovered is not None:
-                        runner_result = recovered
+                # Shared with _forward_native_subagent_terminal_failure: the
+                # proactive divergence check, direct forward, and
+                # missing_parent_inbox recovery are one policy, not
+                # duplicated per call site.
+                runner_result = await _sf._deliver_subagent_terminal_status_with_recovery(
+                    conv,
+                    runner_router,
+                    getattr(request.app.state, "tunnel_registry", None),
+                    conversation_store,
+                    forward_body,
+                )
+            else:
+                runner_result = await _forward_session_change_to_runner(
+                    session_id,
+                    runner_router,
+                    forward_body,
+                )
+            if is_subagent_terminal_delivery:
                 _require_external_status_forward(
                     session_id,
                     status,
@@ -1013,7 +1018,6 @@ def register_events_routes(
                 if conv is None:
                     raise _session_not_found()
         if runner_client is None and conv.host_id is not None:
-            _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
             _grace_host_reg = getattr(request.app.state, "host_registry", None)
             _grace_host_conn = (
                 _grace_host_reg.get(conv.host_id) if _grace_host_reg is not None else None
@@ -1100,6 +1104,7 @@ def register_events_routes(
                             launch_attempt.error,
                             runner_router,
                             created_by=_attribution_user(user_id),
+                            tunnel_registry=_tunnel_registry,
                         )
                         return {"queued": True, "item_id": item_id}
                     relaunched_runner_id = launch_attempt.runner_id
@@ -1184,6 +1189,7 @@ def register_events_routes(
                     offline_error,
                     runner_router,
                     created_by=_attribution_user(user_id),
+                    tunnel_registry=_tunnel_registry,
                 )
                 return {"queued": True, "item_id": item_id}
             # Raise so the Omnigent server doesn't persist an item the
@@ -1279,6 +1285,7 @@ def register_events_routes(
             created_by=_attribution_user(user_id),
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
+            tunnel_registry=_tunnel_registry,
         )
         if pending_background_title is not None:
             pending_background_title.schedule()

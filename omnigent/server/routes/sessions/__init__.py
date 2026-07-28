@@ -258,6 +258,9 @@ from omnigent.server.routes._sessions.orchestration import (
 from omnigent.server.routes._sessions.orchestration import (
     _publish_runner_recovered_status_impl as _publish_runner_recovered_status,
 )
+from omnigent.server.routes._sessions.orchestration import (
+    _recover_subagent_status_forward_via_parent_impl as _recover_subagent_status_forward_via_parent,
+)
 from omnigent.server.schemas import (
     AgentObject,
     AutomaticSessionRenameRequest,
