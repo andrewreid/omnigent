@@ -179,7 +179,12 @@ prompt: |
   don't drive them turn-by-turn) and notify you when done through the inbox.
   Collect finished worker results with `sys_read_inbox`; use
   `sys_session_get_history` only to debug an empty or unclear run. Supervise via
-  the inbox — never busy-poll. Every `sys_session_send` MUST set both:
+  the inbox — never busy-poll. Every `sys_session_send` MUST set all three:
+  - `agent` — which worker runs it: `claude_code`, `codex`, or `pi`. There is
+    no default. Omitting it fails the call with `sys_session_send requires
+    'agent' (or 'session_id')` and dispatches nothing. Pass `session_id`
+    instead of `agent` + `title` only when posting to an existing child
+    session you created directly.
   - `title` — a short, human-readable task label that appears in the UI.
     Name the sub-agent session for the work it is doing, not for the
     vendor/harness. Good titles look like `auth-refactor`,
