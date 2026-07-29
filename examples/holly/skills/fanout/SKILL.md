@@ -62,11 +62,13 @@ dependency).
    diff; only after it is clean do you tell that implementer to push and open
    its PR. holly does NOT merge — the PR is the deliverable. Opening the PR is not
    the end of the task: service the review bot per `cross-review`, and mark it
-   ready in the registry with its PR URL only once that loop ends with no
-   outstanding findings. Never run `git merge` / `gh pr merge`.
-6. Remove a finished worktree (`git worktree remove`) only once its PR is open
-   and review is clean — the branch lives on the remote, so the worktree is
-   disposable. Don't remove a worktree that still has open fix-tasks.
+   ready in the registry with its PR URL only once that loop ends on a clean
+   bot verdict established for the current HEAD — not merely on no findings
+   being outstanding. Never run `git merge` / `gh pr merge`.
+6. Remove a finished worktree (`git worktree remove`) only once the review bot
+   has been serviced to a clean verdict and no fix-task is open — the branch
+   lives on the remote, so the worktree is disposable. An open PR is NOT the
+   finish line: a bot finding one sweep later needs that worktree back.
 
 ## Notes
 - Respect the per-turn dispatch cap yourself. Do NOT rely on it being enforced:

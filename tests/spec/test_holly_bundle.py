@@ -1267,9 +1267,10 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "findings on a surface nobody read are invisible, and the table stops being "
         "a classifier because more than one row may be applied",
         _CROSS_REVIEW,
-        "Each sweep read the bot's reactions, root comments, reviews and inline "
-        "review comments, and the check runs, then take the FIRST row below that "
-        "matches.",
+        "Each sweep, read the PR's current head sha, the bot's reactions, root "
+        "comments, reviews and inline review comments, and the check runs, then "
+        "take the FIRST row below that matches. Every row classifies only on what "
+        "that read collects.",
     ),
     (
         # The premise of the first-match rule, pinned separately from it. Deleting
@@ -1335,19 +1336,6 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "7 before resuming.",
     ),
     (
-        # The budget rule, and it is a claim about the CAP rather than about the
-        # row — which is why it is its own span and not part of either neighbour. A
-        # restart that reset the count made the cap unbounded: every push bought a
-        # fresh allowance, so the terminus below could be deferred forever by an
-        # external actor. The reversal keeps restart, reset, sweep and cap and loses
-        # the bound.
-        "restart-does-not-reset-the-sweep-count",
-        "each push buys a fresh sweep allowance, so the cap never binds and the loop "
-        "runs as long as anyone keeps pushing",
-        _CROSS_REVIEW,
-        "Restarting does NOT reset the sweep count; the cap is over the whole loop.",
-    ),
-    (
         # The reason, pinned because it is the discriminator and because its second
         # half names a failure mode stated nowhere else: not merely that a verdict
         # judges other code, but that a BOT verdict stands in for the different-vendor
@@ -1362,15 +1350,20 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "code no different vendor ever reviewed.",
     ),
     (
-        # Row 2, and the "even while other checks are still pending" clause is the
-        # whole point: it is what makes a failure outrank the pending row below.
-        # Without the clause the fail-plus-pending case falls to row 5 and re-arms,
-        # which is the defect the reviewer found in the previous form.
+        # Row 2: the recorded-HEAD premise, fail-closed allowlist, and "even while
+        # other checks are still pending" precedence are one rule. Without the
+        # premise an old check judges new code; without the allowlist an unfamiliar
+        # bad conclusion can pass; without the last clause fail-plus-pending re-arms.
         "failed-check-outranks-pending",
-        "a failed check plus a still-pending one is read as engaged and re-armed, so "
-        "a red build is never serviced as a finding",
+        "a bad or unknown check conclusion on the recorded HEAD is accepted, or a "
+        "bad check plus a still-pending one is read as engaged and re-armed",
         _CROSS_REVIEW,
-        "2. any check FAILED -> a finding, even while other checks are still pending.",
+        "2. a check run on your recorded HEAD concluded anything other than "
+        "`success`, `skipped` or `neutral` -> a finding, even while other checks "
+        "are still pending. Those three are an ALLOWLIST of clean conclusions, so "
+        "`failure`, `timed_out`, `cancelled`, `action_required`, `stale` and any "
+        "conclusion you do not recognise are all findings rather than passes. A "
+        "check that concluded on an earlier sha is not a verdict on this one.",
     ),
     (
         # Row 3. Short, and pinned anyway: it is the row a broad clean-verdict row
@@ -1384,7 +1377,7 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "3. bot findings newer than your push -> service them below.",
     ),
     (
-        # Row 4, pinned whole. The per-round split IS the rule — the previous form
+        # Row 5, pinned whole. The per-round split IS the rule — the previous form
         # accepted any post-push `+1` as clean, which the idempotency paragraph
         # above already said was impossible, and the table won. Both halves stay in
         # one span: the first-round half without the fix-push half is the old bug,
@@ -1394,28 +1387,25 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "a fix round is handed off on the `+1` the first round earned, or a clean "
         "first round waits forever for a comment that was never going to come",
         _CROSS_REVIEW,
-        "4. a clean verdict, and what counts as one differs by round: on the FIRST, "
-        "a bot `+1` newer than your push, because a clean first round may post NO "
-        "comment at all and you must not wait for one. After a FIX PUSH, only a bot "
+        "5. a clean verdict, and what counts as one differs by round: on the FIRST, "
+        "a bot `+1` newer than your push OR a bot comment or review stating it "
+        "found nothing, because a clean first round may post either one alone and "
+        "you must not wait for a particular shape. After a FIX PUSH, only a bot "
         "comment, review or inline comment saying so — its `+1` is already sitting "
         "there and cannot say anything about this round.",
     ),
     (
-        # RENAMED from sweep-cap-applies-to-every-branch, and re-derived rather than
-        # reworded. There is no longer one sentence claiming the cap for every
-        # branch — the prose was corrected because that claim disagreed with a table
-        # that re-armed unconditionally. The obligation now lives in the two rows
-        # that loop back, each carrying its own "under the cap", so the span is both
-        # rows together: pinning one leaves the other free to loop forever, which is
-        # the defect in its original form. Row 6 is the catch-all and is the more
-        # important half — an unmatched signal is exactly the case that used to fall
-        # off the end of the table.
-        "sweep-cap-binds-both-looping-rows",
-        "an engaged-but-stalled bot, permanently pending CI, or a signal matching no "
-        "row at all, loops until something external stops it",
+        # COLLAPSED with restart-does-not-reset-the-sweep-count. The cap is stated
+        # once globally now, so two anchors could only fail together. Keep the scope
+        # and non-reset limit in one span: either half alone leaves a plausible route
+        # to a fresh budget.
+        "sweep-cap-is-global-and-nothing-resets-it",
+        "a restart, re-arm, or fix round buys a fresh sweep allowance, so the cap "
+        "never binds over the whole servicing of the PR",
         _CROSS_REVIEW,
-        "5. bot `eyes`, or CI still pending -> engaged; under the cap, re-arm and "
-        "loop. 6. anything else -> under the cap, re-arm and loop.",
+        "Cap the sweeps, and the cap is over the whole servicing of this PR: every "
+        "re-arm, every restart after a head change, and every round of fixes draw "
+        "on one budget. Nothing resets it.",
     ),
     (
         # The cap terminates the loop from EVERY row. This is separate from the

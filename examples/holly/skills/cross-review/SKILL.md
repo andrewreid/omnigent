@@ -320,9 +320,10 @@ END REVIEWER-MANDATE-V1
    open, to push the reviewed commits to it. For directly-authored
    work Holly pushes and opens its own reviewed PR. Record the PR URL in the
    registry, then service the review bot below. Mark it ready only once that
-   loop ends with no outstanding findings: ready means ready for the human to
-   merge, and a PR carrying a live bot finding is not. **Holly does NOT
-   merge.**
+   loop ends on a clean bot verdict ESTABLISHED for the current HEAD (row 5
+   below). Absence of findings is not a verdict: silence, a burnt cap, a bot
+   that never engaged and the catch-all row all leave zero findings
+   outstanding, and none of them clears the PR. **Holly does NOT merge.**
 
 9. **Terminal branches.** If no different-vendor reviewer is available, you
    CANNOT run independent review: STOP, do not open the PR on unreviewed code,
@@ -344,26 +345,40 @@ re-review.
 
 The bot posts on its own wall-clock lag, so sweep on a re-armed single-shot
 timer (~2 min); that is a genuine scheduled delay, not sub-agent polling. Never
-leave a `repeat=true` timer running. Cap the sweeps. Each sweep read the bot's
-reactions, root comments, reviews and inline review comments, and the check
-runs, then take the FIRST row below that matches. The ORDER is part of the
-rule: these are overlapping predicates, not a narrowing hierarchy, so a broad
-row placed early would swallow the case beneath it.
+leave a `repeat=true` timer running. Cap the sweeps, and the cap is over the
+whole servicing of this PR: every re-arm, every restart after a head change,
+and every round of fixes draw on one budget. Nothing resets it.
+
+Each sweep, read the PR's current head sha, the bot's reactions, root comments,
+reviews and inline review comments, and the check runs, then take the FIRST row
+below that matches. Every row classifies only on what that read collects. The
+ORDER is part of the rule: these are overlapping predicates, not a narrowing
+hierarchy, so a broad row placed early would swallow the case beneath it.
 
 1. the PR head is no longer your recorded sha -> unreviewed code is on the PR.
    Re-record it, then run the gates and the full independent review on the new
-   HEAD per rule 7 before resuming. Restarting does NOT reset the sweep count;
-   the cap is over the whole loop. Otherwise a verdict below judges other code,
+   HEAD per rule 7 before resuming. Otherwise a verdict below judges other code,
    or accepts a bot verdict on code no different vendor ever reviewed.
-2. any check FAILED -> a finding, even while other checks are still pending.
+2. a check run on your recorded HEAD concluded anything other than `success`,
+   `skipped` or `neutral` -> a finding, even while other checks are still
+   pending. Those three are an ALLOWLIST of clean conclusions, so `failure`,
+   `timed_out`, `cancelled`, `action_required`, `stale` and any conclusion you
+   do not recognise are all findings rather than passes. A check that concluded
+   on an earlier sha is not a verdict on this one.
 3. bot findings newer than your push -> service them below.
-4. a clean verdict, and what counts as one differs by round: on the FIRST, a
-   bot `+1` newer than your push, because a clean first round may post NO
-   comment at all and you must not wait for one. After a FIX PUSH, only a bot
-   comment, review or inline comment saying so — its `+1` is already sitting
-   there and cannot say anything about this round.
-5. bot `eyes`, or CI still pending -> engaged; under the cap, re-arm and loop.
-6. anything else -> under the cap, re-arm and loop.
+4. any check run on your recorded HEAD is still queued or running -> engaged;
+   re-arm and loop. CI has not finished, so no clean verdict below can speak
+   for this PR yet, and this row deliberately outranks one that would.
+5. a clean verdict, and what counts as one differs by round: on the FIRST, a
+   bot `+1` newer than your push OR a bot comment or review stating it found
+   nothing, because a clean first round may post either one alone and you must
+   not wait for a particular shape. After a FIX PUSH, only a bot comment,
+   review or inline comment saying so — its `+1` is already sitting there and
+   cannot say anything about this round.
+6. a bot `eyes` newer than your push, on the FIRST round only -> engaged;
+   re-arm and loop. A reaction keeps its original timestamp, so an `eyes` from
+   an earlier round says nothing about this one and falls through to row 7.
+7. anything else -> re-arm and loop.
 
 Reaching the cap ends the loop from any row, and it is not a verdict:
 STOP and tell the human exactly what you could and could not establish.
