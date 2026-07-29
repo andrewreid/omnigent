@@ -1169,6 +1169,37 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "before handing back.",
     ),
     (
+        # ADMISSIBILITY, and the recording that makes it performable. One sentence in
+        # the prose and one span here, because the three parts are useless apart:
+        # "newer than that push" has no referent without the recorded push time,
+        # "your recorded sha" in row 1 has none without the recorded sha, and the
+        # BOT qualification is what stops the human's own comment from ending the
+        # loop. Deleting the whole sentence was measured green before this entry —
+        # every row below reads as performable while nothing defines what a signal
+        # is.
+        "bot-signal-admissibility",
+        "any comment from anyone, of any age, ends the loop — the human's own "
+        "question reads as a verdict, and no recorded sha or push time exists for "
+        "the rows below to compare against",
+        _CROSS_REVIEW,
+        "Record your HEAD sha and push time, and identify the bot's account: a "
+        "signal counts only if the BOT produced it and it is newer than that push, "
+        "or it is a verdict on the previous commit.",
+    ),
+    (
+        # New in the corrected prose, and a claim about how the API behaves rather
+        # than a preference: an edit moves `updated_at` and leaves `created_at`
+        # alone, so a bot that revises its comment instead of posting a new one is
+        # invisible to a created-time comparison. The reversal keeps every word and
+        # loses the round.
+        "editable-signal-uses-the-later-timestamp",
+        "a bot that revises an existing comment rather than posting a new one is "
+        "read as silent, because only the created time is compared",
+        _CROSS_REVIEW,
+        "For a signal that can be edited, use the LATER of its created and updated "
+        "times — the bot may revise a comment rather than post a new one.",
+    ),
+    (
         # A PREMISE plus the consequence that follows from it, kept in one span
         # because the prose states them in one sentence and neither half is usable
         # alone: the idempotency fact without the limit is trivia, and the limit
@@ -1183,6 +1214,108 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "Reactions are idempotent per account and content — an existing one is not "
         "recreated on a later trigger and keeps its original timestamp — so a "
         "reaction can settle the first round and never a re-review.",
+    ),
+    (
+        # CONVERTED from the `bot-sweep-uses-a-timer` vocabulary anchor, which was
+        # deleted in the same change rather than kept beside this one. That anchor
+        # matched (timer, sweep|lag, polling|genuine|delay) anywhere in the block,
+        # and both halves of the inversion were measured against it: dropping
+        # "re-armed single-shot" left it green, and replacing the sentence with one
+        # prescribing a `repeat=true` timer left running for the whole loop ALSO
+        # left it green, because the inverted sentence still says timer, sweep,
+        # genuine, delay and polling. The mechanism is the rule here — a repeating
+        # timer keeps firing after the loop ends and a busy-poll is what the whole
+        # paragraph exists to forbid — so it is pinned.
+        "sweep-timer-is-single-shot-and-re-armed",
+        "the sweep becomes a busy-poll, or a `repeat=true` timer outlives the loop "
+        "and keeps waking holly after the round is over",
+        _CROSS_REVIEW,
+        "sweep on a re-armed single-shot timer (~2 min); that is a genuine "
+        "scheduled delay, not sub-agent polling. Never leave a `repeat=true` timer "
+        "running.",
+    ),
+    (
+        # Two obligations in one sentence and pinned as one span, because the prose
+        # states them as one step and the second is meaningless without the first: a
+        # first-match rule over a table read from three of the four surfaces
+        # classifies on evidence it never gathered. Inline review comments are the
+        # surface a bot most often puts findings on, and narrowing the list is the
+        # cheap edit that looks harmless.
+        "sweep-reads-every-signal-surface-then-first-match",
+        "findings on a surface nobody read are invisible, and the table stops being "
+        "a classifier because more than one row may be applied",
+        _CROSS_REVIEW,
+        "Each sweep read the bot's reactions, root comments, reviews and inline "
+        "review comments, and the check runs, then take the FIRST row below that "
+        "matches.",
+    ),
+    (
+        # The premise of the first-match rule, pinned separately from it. Deleting
+        # this sentence leaves "take the FIRST row that matches" standing while
+        # nothing says the rows may not be re-sorted — and a re-sort is exactly the
+        # defect the corrected prose exists to fix: a broad `+1` row placed above
+        # the findings row swallowed every finding, and a pending row placed above
+        # the failure row re-armed on a failed build. A conclusion whose premise is
+        # gone is prose nobody can act on, which is the trap this file has fallen
+        # into twice.
+        "row-order-is-part-of-the-rule",
+        "the rows are re-sorted as an editorial tidy-up and the table silently stops "
+        "classifying — a broad row placed early swallows every case beneath it",
+        _CROSS_REVIEW,
+        "The ORDER is part of the rule: each row is narrower than the one under it, "
+        "so a broad match placed early would swallow the case beneath it.",
+    ),
+    (
+        # Row 1, with its reason inside the span. The reason is the discriminator:
+        # without "every verdict below would otherwise judge other code" the row
+        # reads as bookkeeping about a sha, and re-recording without restarting
+        # looks like a reasonable economy. Its ordinal is part of the pin because
+        # this row must be FIRST — a head change invalidates every row under it.
+        "head-changed-restarts-the-loop",
+        "a force-push or a human commit lands mid-loop and a timestamp-qualified "
+        "verdict is accepted as a verdict on code it never saw",
+        _CROSS_REVIEW,
+        "1. the PR head is no longer your recorded sha -> someone pushed. Re-record "
+        "and restart the loop; every verdict below would otherwise judge other code.",
+    ),
+    (
+        # Row 2, and the "even while other checks are still pending" clause is the
+        # whole point: it is what makes a failure outrank the pending row below.
+        # Without the clause the fail-plus-pending case falls to row 5 and re-arms,
+        # which is the defect the reviewer found in the previous form.
+        "failed-check-outranks-pending",
+        "a failed check plus a still-pending one is read as engaged and re-armed, so "
+        "a red build is never serviced as a finding",
+        _CROSS_REVIEW,
+        "2. any check FAILED -> a finding, even while other checks are still pending.",
+    ),
+    (
+        # Row 3. Short, and pinned anyway: it is the row a broad clean-verdict row
+        # short-circuited in the previous form, and with it gone a bot comment
+        # carrying findings falls through to row 4 or to the catch-all, so findings
+        # are re-armed on instead of serviced.
+        "findings-row-routes-to-servicing",
+        "bot findings have no row of their own, so a comment full of them is matched "
+        "by a later row and the round loops or hands off with them unserviced",
+        _CROSS_REVIEW,
+        "3. bot findings newer than your push -> service them below.",
+    ),
+    (
+        # Row 4, pinned whole. The per-round split IS the rule — the previous form
+        # accepted any post-push `+1` as clean, which the idempotency paragraph
+        # above already said was impossible, and the table won. Both halves stay in
+        # one span: the first-round half without the fix-push half is the old bug,
+        # and the fix-push half without the first-round half makes holly wait for a
+        # comment a clean first round may never post.
+        "clean-verdict-differs-by-round",
+        "a fix round is handed off on the `+1` the first round earned, or a clean "
+        "first round waits forever for a comment that was never going to come",
+        _CROSS_REVIEW,
+        "4. a clean verdict, and what counts as one differs by round: on the FIRST, "
+        "a bot `+1` newer than your push, because a clean first round may post NO "
+        "comment at all and you must not wait for one. After a FIX PUSH, only a bot "
+        "comment, review or inline comment saying so — its `+1` is already sitting "
+        "there and cannot say anything about this round.",
     ),
     (
         # RENAMED from sweep-cap-applies-to-every-branch, and re-derived rather than
@@ -1222,6 +1355,37 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "establish. Silence is not approval, a `+1` left from an earlier round is "
         "not a verdict on this one, and a bot that reacted and then went quiet has "
         "reviewed nothing.",
+    ),
+    # The two config-side halves of the same loop. They live in _ROOT_CONFIG rather
+    # than the skill, but they are pinned here, beside the rows they feed, because
+    # each is a claim about what a github tool DOES — the class this bundle keeps
+    # getting wrong — and each one's reversal silently disables a row above.
+    (
+        # A negative capability claim, the same shape as the pinned
+        # `sys_session_get_info` one in the fanout block: the tool holly would
+        # naturally reach for cannot answer this question. Reversed, holly looks for
+        # reactions where the API does not expose them, finds none, and concludes
+        # the bot never reacted — which reads as silence at rows 4 and 5.
+        "pr-reactions-live-on-the-issue-path",
+        "reactions are looked for on a PR path that never returns them, so `+1` and "
+        "`eyes` are invisible and every sweep reads as silence",
+        _ROOT_CONFIG,
+        "`gh api repos/O/R/issues/N/reactions` (no method exposes PR reactions; a "
+        "PR's reactions live on its issue path)",
+    ),
+    (
+        # The stronger of the two, and pinned with its reason: `get_status` does not
+        # merely fail, it answers WRONGLY in the one direction that hurts — a PR
+        # whose checks are all complete reads as `pending`, which matches row 5 and
+        # re-arms until the cap on a branch that was ready. Deleting the reason
+        # leaves a bare preference an editor can drop as fussiness.
+        "get-status-is-not-a-ci-read",
+        "CI is read from the legacy commit-status API, which reports `pending` with "
+        "zero rows on a complete PR, so the loop re-arms to the cap on a green "
+        "branch and a failure is never surfaced as a finding",
+        _ROOT_CONFIG,
+        "Do not read CI from `get_status` — it is the legacy commit-status API and "
+        "reports `pending` with zero rows on a PR whose checks are all complete.",
     ),
     (
         "bot-findings-clustered-and-the-mandate-not-narrowed",
@@ -1705,12 +1869,10 @@ _LIFECYCLE_ANCHORS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
         "the human is never handed a PR URL or told it is ready",
         (r"registry", r"PR URL|record", r"ready|human"),
     ),
-    (
-        "bot-sweep-uses-a-timer",
-        _CROSS_REVIEW,
-        "holly busy-polls a bot that posts on its own lag",
-        (r"timer", r"sweep|lag", r"polling|genuine|delay"),
-    ),
+    # `bot-sweep-uses-a-timer` was here and is deleted, not moved: its three
+    # patterns are all inside the sentence `sweep-timer-is-single-shot-and-re-armed`
+    # now pins, so it could no longer fail on any mutation that pin survives. It
+    # was also measured blind to both halves of its own rule — see that entry.
 )
 
 # What the contract handed to an IMPLEMENTER must enumerate. Upstream of the
