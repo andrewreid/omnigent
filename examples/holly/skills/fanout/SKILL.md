@@ -60,9 +60,10 @@ dependency).
 4. Send each finished task's local branch diff through `cross-review`.
 5. Each implementer commits and STOPS. Cross-review runs on the local branch
    diff; only after it is clean do you tell that implementer to push and open
-   its PR. holly does NOT merge — the PR is the deliverable. When cross-review passes,
-   the task is done: mark it ready in the registry with its PR URL and leave it
-   for the human to review and merge. Never run `git merge` / `gh pr merge`.
+   its PR. holly does NOT merge — the PR is the deliverable. Opening the PR is not
+   the end of the task: service the review bot per `cross-review`, and mark it
+   ready in the registry with its PR URL only once that loop ends with no
+   outstanding findings. Never run `git merge` / `gh pr merge`.
 6. Remove a finished worktree (`git worktree remove`) only once its PR is open
    and review is clean — the branch lives on the remote, so the worktree is
    disposable. Don't remove a worktree that still has open fix-tasks.
