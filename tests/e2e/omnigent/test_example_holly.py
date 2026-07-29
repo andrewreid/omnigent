@@ -115,8 +115,9 @@ def test_declared_executor_shape(holly_spec: AgentSpec) -> None:
     author-recorded-versus-reviewer-recorded compares vendors, identical recorded
     models are a definite failure, DIFFERENT ones prove nothing — and that under
     Smart Routing the executing model is unidentifiable, so independence is
-    UNCONFIRMABLE and holly stops rather than comparing. Those rules live in ``examples/holly/config.yaml`` and the
-    cross-review skill, pinned in ``tests/spec/test_holly_bundle.py``.
+    UNCONFIRMABLE and holly stops rather than comparing. Those rules live in
+    ``examples/holly/config.yaml`` and the cross-review skill, pinned in
+    ``tests/spec/test_holly_bundle.py``.
 
     Models stay unpinned where the contract requires it: the orchestrator brain
     must resolve whatever Claude provider the deployment configured, and ``pi``
