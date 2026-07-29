@@ -42,16 +42,17 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
 
+from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
-from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_anyio_subprocess_transport
+from .async_utils import run_sync_on_thread
 from .claude_gateway_shim import DATABRICKS_CLAUDE_ADAPTIVE_THINKING_PREFIXES, ClaudeGatewayShim
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
@@ -266,6 +267,7 @@ class _ResultMessageObj(Protocol):
     """Structural view of ``claude_agent_sdk.ResultMessage``."""
 
     result: str | None
+    is_error: bool | None
     usage: dict[str, Any] | None  # type: ignore[explicit-any]
 
 
@@ -740,8 +742,6 @@ def _best_effort_close(resource: _Stream | _Process) -> None:
 # Default model for the Databricks-profile gateway path (no gateway base URL
 # supplied directly), used when no spec/cfg model is set. On the ucode-cached
 # path the Omnigent producer resolves the model instead (see workflow.py).
-_DATABRICKS_CLAUDE_DEFAULT_MODEL = DATABRICKS_CLAUDE_DEFAULT_MODEL
-
 _CLAUDE_API_KEY_HELPER_ENV_KEY = "OMNIGENT_CLAUDE_API_KEY_HELPER"
 
 
@@ -2182,7 +2182,12 @@ class ClaudeSDKExecutor(Executor):
         # spawning, so no ``databricks-*`` default is injected there.
         model = cfg.model or self._model_override
         if model is None and self._gateway_uses_databricks_profile:
-            model = _DATABRICKS_CLAUDE_DEFAULT_MODEL
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                "databricks",
+                family="claude",
+            )
+            model = resolution.model_id
 
         # Build env: Databricks gateway settings derived from profile-backed
         # creds. CLAUDECODE removal happens around the subprocess spawn in
@@ -2649,7 +2654,17 @@ class ClaudeSDKExecutor(Executor):
                     elif isinstance(message, sdk.ResultMessage):
                         result_msg = cast(_ResultMessageObj, message)
                         claude_session_id = getattr(result_msg, "session_id", None)
-                        if not response_text and result_msg.result:
+                        if getattr(result_msg, "is_error", None):
+                            # Harness-level failure (e.g. expired login). Surface
+                            # as an executor error rather than assistant content.
+                            failure_text = result_msg.result or "claude-sdk harness error"
+                            logger.error(
+                                "claude-sdk ResultMessage is_error=True for agent %r: %s",
+                                self._agent_name,
+                                failure_text,
+                            )
+                            terminal_error = failure_text
+                        elif not response_text and result_msg.result:
                             response_text = result_msg.result
                         raw_usage = getattr(result_msg, "usage", None)
                         if isinstance(raw_usage, dict) and raw_usage:

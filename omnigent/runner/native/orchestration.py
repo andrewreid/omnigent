@@ -19,7 +19,7 @@ import sys
 import time
 import urllib.parse
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -39,7 +39,10 @@ from omnigent.entities.session_resources import (
     session_resource_view_to_dict,
     terminal_resource_id,
 )
+from omnigent.harness_plugins import native_provider_for_key
 from omnigent.model_override import validate_model_override
+from omnigent.native_coding_agents import native_coding_agent_for_harness
+from omnigent.native_dispatch import resolve_hook
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -66,15 +69,6 @@ _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
 _REPL_TERMINAL_NAME = "tui"
 _REPL_TERMINAL_SESSION_KEY = "main"
 _NO_BODY_STATUS_CODES = {204, 304}
-
-_BACKGROUND_TITLE_HARNESS_ADAPTERS = {
-    "claude-sdk": "claude-sdk",
-    "claude-native": "claude-sdk",
-    "codex": "codex",
-}
-_BACKGROUND_TITLE_MAX_PROMPT_CHARS = 4_000
-_BACKGROUND_TITLE_MAX_OUTPUT_TOKENS = 32
-_BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS = 60.0
 
 
 def _publish_tmux_target_for_bridge(
@@ -135,7 +129,6 @@ _AUTO_FORWARDER_CANCEL_TIMEOUT_S = 10.0
 # Delegated runner bearers last 30 minutes and refresh five minutes before
 # expiry. A one-minute cadence allows several retries without giving the child
 # the runner binding token; cached factory calls stay local and cheap.
-_PERMISSION_HOOK_AUTH_REFRESH_INTERVAL_S = 60.0
 
 
 class _CodexNativeModelOptionsNotReady(RuntimeError):
@@ -194,36 +187,6 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[Any]) -> N
             del _AUTO_FORWARDER_TASKS[session_id]
 
     task.add_done_callback(_evict)
-
-
-async def _refresh_claude_permission_hook_auth(
-    *,
-    bridge_dir: Path,
-    server_url: str,
-    auth_token_factory: Callable[[], str | None],
-    refresh_interval_s: float = _PERMISSION_HOOK_AUTH_REFRESH_INTERVAL_S,
-) -> None:
-    """Keep the Claude permission hook's bearer snapshot current.
-
-    :param bridge_dir: Owner-only Claude bridge directory.
-    :param server_url: Omnigent server receiving permission requests.
-    :param auth_token_factory: Refresh-capable runner bearer factory.
-    :param refresh_interval_s: Delay between snapshot refresh attempts.
-    """
-    from omnigent.claude_native_bridge import update_permission_hook_auth_headers
-    from omnigent.cli_auth import databricks_request_headers
-
-    while True:
-        await asyncio.sleep(refresh_interval_s)
-        try:
-            token = await asyncio.to_thread(auth_token_factory)
-            if token:
-                headers = databricks_request_headers(server_url, bearer_token=token)
-                update_permission_hook_auth_headers(bridge_dir, headers)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 — retain the last still-valid snapshot
-            _logger.warning("Could not refresh Claude permission-hook auth")
 
 
 # Background tasks that re-pop a still-pending cost-budget approval on a
@@ -1013,9 +976,13 @@ async def _auto_create_opencode_terminal(
         config["plugin"] = [str(plugin_path)]
         policy_env["OMNIGENT_POLICY_URL"] = runner_server_url
         policy_env["OMNIGENT_SESSION_ID"] = session_id
-        # One-shot auth-token snapshot (mirrors codex's policy_hook.json /
-        # cost-popup). Long-session staleness degrades to fail-open (no
-        # enforcement), like codex; a refreshable token file is the follow-up.
+        # Point the plugin at tool_relay.json so it can pick up relay
+        # credentials as soon as the relay starts (written later by
+        # ensure_comment_relay). The plugin re-reads on every call.
+        from omnigent.claude_native_bridge import _TOOL_RELAY_FILE
+
+        policy_env["OMNIGENT_RELAY_FILE"] = str(bridge_dir / _TOOL_RELAY_FILE)
+        # Bake fallback headers for the first calls before relay starts.
         from omnigent.runner._entry import _make_auth_token_factory
 
         _policy_factory = _make_auth_token_factory()
@@ -1023,10 +990,6 @@ async def _auto_create_opencode_terminal(
         if _policy_token:
             from omnigent.cli_auth import databricks_request_headers
 
-            # Bake the FULL routing header map (bearer + workspace / deployment
-            # selectors), not a bare bearer: the plugin POSTs /policies/evaluate
-            # to the omnigent server out-of-process, so without the selectors it
-            # could land on a different server instance than the runner's.
             policy_env["OMNIGENT_POLICY_HEADERS"] = json.dumps(
                 databricks_request_headers(runner_server_url, bearer_token=_policy_token)
             )
@@ -1748,6 +1711,7 @@ async def _auto_create_pi_terminal(
     *,
     server_client: httpx.AsyncClient | None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Pi terminal for a pi-native session.
@@ -1763,6 +1727,7 @@ async def _auto_create_pi_terminal(
         spec; callers must not pass ``None`` to paper over a resolution error.
     :returns: Created terminal resource view.
     """
+    await _cancel_auto_forwarder_task(session_id)
     from omnigent.conversation_browser import conversation_url
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.pi_native import resolve_pi_executable
@@ -1857,6 +1822,7 @@ async def _auto_create_pi_terminal(
     # terminal_launch_args, or when no usable provider is configured (Pi then
     # falls back to its own login). Writes a managed per-session Pi config dir,
     # never touching the user's global ``~/.pi/agent``.
+    credential_warning: str | None = None
     if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
         from omnigent.pi_native_credentials import (
             pi_native_provider_launch,
@@ -1876,6 +1842,7 @@ async def _auto_create_pi_terminal(
             cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
             pi_env.update(cred_env)
             pi_args.extend(cred_args)
+            credential_warning = provider.credential_warning
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
@@ -1913,7 +1880,79 @@ async def _auto_create_pi_terminal(
         session_id,
         pi_extension,
     )
+
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
+        from omnigent.claude_native_bridge import _TOOL_RELAY_FILE, _read_json_file
+        from omnigent.pi_native_bridge import inject_relay_into_config
+
+        relay_info = _read_json_file(bridge_dir / _TOOL_RELAY_FILE)
+        relay_url = relay_info.get("url") if relay_info else None
+        relay_token = relay_info.get("token") if relay_info else None
+        if isinstance(relay_url, str) and isinstance(relay_token, str):
+            inject_relay_into_config(bridge_dir, relay_url, relay_token)
+
+    # Surface an unresolved-credential warning to the session. Without it, a Pi
+    # session whose Databricks token can't be refreshed launches fine but every
+    # message silently fails to reach the model — the user sees no reply and no
+    # reason. Best-effort: a delivery failure must not fail the launch.
+    if credential_warning is not None:
+        await _post_pi_native_credential_warning(
+            session_id=session_id,
+            server_client=server_client,
+            warning=credential_warning,
+        )
     return terminal_view
+
+
+async def _post_pi_native_credential_warning(
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+    warning: str,
+) -> None:
+    """Surface a credential warning into the session as an error banner.
+
+    Posts an ``error`` item via ``external_conversation_item`` so the notice
+    renders as the web UI's distinct destructive banner (not a misleading
+    assistant bubble), persists across reload, and — because ``error`` is a
+    non-content item type — never enters the next turn's model context. The
+    event persists without queuing an agent turn, so it's safe on a session
+    whose model is unreachable.
+
+    :param session_id: Session/conversation identifier.
+    :param server_client: Runner Omnigent server client (``None`` in tests).
+    :param warning: The user-facing warning text to surface.
+    """
+    if server_client is None:
+        return
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "error",
+                    "item_data": {
+                        "source": "execution",
+                        "code": "pi_credentials_unresolved",
+                        "message": warning,
+                    },
+                },
+            },
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "pi-native: failed to surface credential warning for session %s",
+            session_id,
+            exc_info=True,
+        )
 
 
 async def _auto_create_cursor_terminal(
@@ -2126,7 +2165,10 @@ async def _auto_create_cursor_terminal(
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
     from omnigent.cursor_native_forwarder import supervise_cursor_forwarder
-    from omnigent.cursor_native_permissions import supervise_cursor_transcript_elicitations
+    from omnigent.cursor_native_permissions import (
+        cursor_launch_args_enable_yolo,
+        supervise_cursor_transcript_elicitations,
+    )
     from omnigent.cursor_native_usage import supervise_cursor_usage_forwarder
 
     if server_client is not None and ensure_comment_relay is not None:
@@ -2171,6 +2213,12 @@ async def _auto_create_cursor_terminal(
                 workspace=workspace,
                 launch_epoch_ms=launch_epoch_ms,
                 auth=_runner_auth,
+                # Yolo / force sessions still sometimes leave pending markers;
+                # answer those in-pane instead of mirroring a card to a parent
+                # that cannot click it.
+                auto_accept_approvals=cursor_launch_args_enable_yolo(
+                    launch_config.terminal_launch_args
+                ),
             ),
             supervise_cursor_usage_forwarder(
                 base_url=server_url,
@@ -2553,6 +2601,19 @@ async def _auto_create_hermes_terminal(
             explicit_bridge_dir=bridge_dir,
             await_notify=False,
         )
+        # After the relay starts, rewrite the policy hook wrapper to use the
+        # relay's non-expiring local token so subsequent hook invocations
+        # never need a server bearer.
+        from omnigent.claude_native_bridge import _TOOL_RELAY_FILE, _read_json_file
+        from omnigent.hermes_native_bridge import inject_relay_into_policy_hook
+
+        relay_info = _read_json_file(bridge_dir / _TOOL_RELAY_FILE)
+        relay_url = relay_info.get("url") if relay_info else None
+        relay_token = relay_info.get("token") if relay_info else None
+        if isinstance(relay_url, str) and isinstance(relay_token, str):
+            inject_relay_into_policy_hook(
+                bridge_dir, relay_url, relay_token, server_url, session_id
+            )
 
     async def _supervise_hermes_native_bridges() -> None:
         """Run the transcript forwarder and the approval mirror together.
@@ -3334,6 +3395,7 @@ async def _auto_create_codex_terminal(
     from pathlib import Path
 
     from omnigent.codex_native_app_server import (
+        _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION,
         CodexAppServerClient,
         build_codex_native_server,
         build_codex_remote_args,
@@ -3477,6 +3539,7 @@ async def _auto_create_codex_terminal(
                 workspace=clone_workspace,
                 model_provider=_session_meta_provider,
                 codex_path=_codex_cli_path,
+                terminal_launch_args=launch_config.terminal_launch_args,
             )
         except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
             built_rollout = None
@@ -3524,6 +3587,7 @@ async def _auto_create_codex_terminal(
             workspace=Path(workspace).resolve(),
             model_provider=_session_meta_provider,
             codex_path=_codex_cli_path,
+            terminal_launch_args=launch_config.terminal_launch_args,
         )
     # Link the bundle's skills into the per-bridge CODEX_HOME before the
     # app-server boots — Codex discovers ``$CODEX_HOME/skills/<name>/``
@@ -3618,7 +3682,11 @@ async def _auto_create_codex_terminal(
     else:
         from omnigent.codex_native_bridge import CodexNativeBridgeState, write_bridge_state
 
-        await preload_codex_thread_for_resume(codex_ws_url, launch_config.external_session_id)
+        await preload_codex_thread_for_resume(
+            codex_ws_url,
+            launch_config.external_session_id,
+            terminal_launch_args=launch_config.terminal_launch_args,
+        )
         write_bridge_state(
             bridge_dir,
             CodexNativeBridgeState(
@@ -3671,6 +3739,15 @@ async def _auto_create_codex_terminal(
                     # OpenAI built-in (which would force the first-run
                     # login screen and block thread creation).
                     config_overrides=tuple(app_server.config_overrides),
+                    # Omnigent provisions the private CODEX_HOME and vets
+                    # hook sources itself; skip the interactive trust prompt
+                    # that headless sub-agents can never answer.
+                    # Gated on version: the flag was added in 0.140.0; on
+                    # older binaries it causes an immediate exit error.
+                    bypass_hook_trust=(
+                        app_server.codex_cli_version is None
+                        or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
+                    ),
                 ),
                 env=codex_terminal_env(app_server),
                 # Match the local ``omnigent codex`` terminal scrollback.
@@ -3713,6 +3790,7 @@ async def _auto_create_codex_terminal(
                 codex_ws_url=codex_ws_url,
                 codex_home=codex_home,
                 event_client=event_client,
+                routing_summary=_codex_launch.summary,
             )
             if launch_config.external_session_id is None
             else _codex_forward_known_thread(
@@ -3748,6 +3826,7 @@ async def _codex_discover_thread_and_forward(
     codex_ws_url: str,
     codex_home: Path,
     event_client: CodexAppServerClient,
+    routing_summary: str,
 ) -> None:
     """
     Adopt the fresh Codex TUI's thread, then mirror it into the Omnigent session.
@@ -3768,6 +3847,10 @@ async def _codex_discover_thread_and_forward(
     :param codex_home: Per-session private ``CODEX_HOME`` path.
     :param event_client: Connected app-server listener that will observe the
         TUI's ``thread/started``; reused to subscribe the forwarder.
+    :param routing_summary: One-line description of the resolved launch
+        routing (provider / profile / model, or the login-fallback state),
+        threaded into the startup-timeout error so hosted users can diagnose
+        without runner-log access (see #2745).
     """
     from omnigent.codex_native_bridge import (
         CodexNativeBridgeState,
@@ -3804,8 +3887,8 @@ async def _codex_discover_thread_and_forward(
             write_bridge_startup_error(
                 bridge_dir,
                 f"Codex app-server never started a thread ({cause}: "
-                f"{type(exc).__name__}). See the runner log near 'native-codex "
-                "routing' for the resolved provider/model.",
+                f"{type(exc).__name__}). Launch routing: {routing_summary}. "
+                "(The runner log has the same near 'native-codex routing'.)",
             )
             return
 
@@ -5921,30 +6004,15 @@ async def _auto_create_claude_terminal(
     from omnigent.claude_native_forwarder import supervise_forwarder
 
     async def _supervise_bridge() -> None:
-        refresh_task: asyncio.Task[None] | None = None
-        if _auth_factory is not None:
-            refresh_task = asyncio.create_task(
-                _refresh_claude_permission_hook_auth(
-                    bridge_dir=bridge_dir,
-                    server_url=server_url,
-                    auth_token_factory=_auth_factory,
-                ),
-                name=f"claude-hook-auth-{session_id}",
-            )
-        try:
-            await supervise_forwarder(
-                base_url=server_url,
-                headers=_runner_headers,
-                session_id=session_id,
-                bridge_dir=bridge_dir,
-                agent_name="claude-native-ui",
-                start_at_end=resume_external_session_id is not None,
-                auth=_runner_auth,
-            )
-        finally:
-            if refresh_task is not None:
-                refresh_task.cancel()
-                _ = await asyncio.gather(refresh_task, return_exceptions=True)
+        await supervise_forwarder(
+            base_url=server_url,
+            headers=_runner_headers,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=resume_external_session_id is not None,
+            auth=_runner_auth,
+        )
 
     _forwarder_task = asyncio.create_task(
         _supervise_bridge(),
@@ -6249,6 +6317,340 @@ async def _claude_native_bridge_id_with_optional_labels(
         session_id=session_id,
         session_labels=session_labels,
     )
+
+
+async def _resolve_native_spawn_env(
+    harness_name: str,
+    session_id: str,
+    *,
+    server_client: httpx.AsyncClient,
+    optional_labels: Mapping[str, str] | None,
+) -> dict[str, str] | None:
+    """Build the spawn env for a native harness through the provider seam.
+
+    Replaces the per-harness ``if harness_name == "<x>-native"`` spawn-env
+    dispatch: resolves the harness's ``spawn_env_builder`` from the registry and
+    supplies the bridge id the way that harness needs it.
+
+    Three shapes: *bare* builders take only the session id; *label* builders
+    (codex/opencode/antigravity) take ``bridge_id=`` read from a session label
+    named by ``provider.bridge_id_label_key``; and two specials — claude
+    (bridge id via a runner helper with a server-side fallback) and hermes
+    (writes its policy-hook config before building).
+
+    :param harness_name: Harness id, e.g. ``"codex-native"``.
+    :param session_id: Omnigent conversation id.
+    :param server_client: Runner's client to the Omnigent server, for label reads.
+    :param optional_labels: Envelope labels already in hand (claude prefers these
+        over a fresh fetch), or ``None``.
+    :returns: The spawn env mapping, or ``None`` when *harness_name* is not a
+        native harness with a registered spawn-env builder (caller keeps its
+        existing ``spawn_env``).
+    """
+    agent = native_coding_agent_for_harness(harness_name)
+    if agent is None:
+        return None
+    provider = native_provider_for_key(agent.key)
+    if provider is None or provider.spawn_env_builder is None:
+        return None
+    builder = resolve_hook(provider, "spawn_env_builder")
+
+    if agent.key == "claude":
+        bridge_id = await _claude_native_bridge_id_with_optional_labels(
+            server_client=server_client,
+            session_id=session_id,
+            session_labels=optional_labels,
+        )
+        return builder(session_id, bridge_id=bridge_id)
+
+    if agent.key == "hermes":
+        from omnigent.hermes_native_bridge import (
+            bridge_dir_for_session_id,
+            write_policy_hook_config,
+        )
+
+        server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/")
+        write_policy_hook_config(bridge_dir_for_session_id(session_id), server_url, session_id)
+        return builder(session_id)
+
+    if provider.bridge_id_label_key is not None:
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=session_id,
+        )
+        return builder(session_id, bridge_id=labels.get(provider.bridge_id_label_key))
+
+    return builder(session_id)
+
+
+@dataclasses.dataclass(frozen=True)
+class NativeLaunchContext:
+    """Inputs a native harness's terminal builder may need at launch.
+
+    One flat context passed to every ``_launch_<x>`` adapter so the launch
+    dispatch can be uniform. Each adapter reads only the subset its
+    ``_auto_create_<x>_terminal`` builder accepts; fields it doesn't use stay at
+    their defaults. The claude-only callables (``auth_token_factory`` etc.) are
+    per-session closures built by the runner and carried here rather than
+    decomposed, since claude's adapter is their only reader.
+    """
+
+    session_id: str
+    resource_registry: SessionResourceRegistry
+    publish_event: Callable[[str, dict[str, Any]], None]
+    server_client: httpx.AsyncClient | None = None
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None
+    agent_spec: AgentSpec | ResolvedSpec | None = None
+    bundle_dir: Path | None = None
+    skills_filter: str | list[str] = "all"
+    agent_name: str | None = None
+    session_init: RunnerSessionInitEnvelope | None = None
+    auth_token_factory: Callable[[], str | None] | None = None
+    resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None
+    record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class PreLaunchResult:
+    """Outcome of a harness-specific pre-launch check (see the special arms).
+
+    :param skip: When ``True``, do not auto-create (e.g. a sibling session's
+        terminal is transferring in).
+    :param force_recreate: When ``True``, tear down an existing terminal and
+        recreate (e.g. claude rebuild after an in-place agent switch).
+    :param needs_terminal: When ``False``, skip auto-create because the session
+        snapshot said a runner terminal is not needed (codex/antigravity).
+    """
+
+    skip: bool = False
+    force_recreate: bool = False
+    needs_terminal: bool = True
+
+
+async def _launch_pi(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the pi-native terminal from a launch context."""
+    return await _auto_create_pi_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        server_client=ctx.server_client,
+        agent_spec=ctx.agent_spec,
+        ensure_comment_relay=ctx.ensure_comment_relay,
+    )
+
+
+async def _launch_cursor(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the cursor-native terminal from a launch context."""
+    return await _auto_create_cursor_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        server_client=ctx.server_client,
+        ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
+    )
+
+
+async def _launch_kiro(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the kiro-native terminal from a launch context."""
+    return await _auto_create_kiro_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        server_client=ctx.server_client,
+        ensure_comment_relay=ctx.ensure_comment_relay,
+    )
+
+
+async def _launch_opencode(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the opencode-native terminal from a launch context."""
+    return await _auto_create_opencode_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        agent_spec=ctx.agent_spec,
+        server_client=ctx.server_client,
+        ensure_comment_relay=ctx.ensure_comment_relay,
+    )
+
+
+async def _launch_goose(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the goose-native terminal from a launch context."""
+    return await _auto_create_goose_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        server_client=ctx.server_client,
+        ensure_comment_relay=ctx.ensure_comment_relay,
+    )
+
+
+async def _launch_hermes(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the hermes-native terminal from a launch context."""
+    return await _auto_create_hermes_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        server_client=ctx.server_client,
+        ensure_comment_relay=ctx.ensure_comment_relay,
+    )
+
+
+async def _launch_qwen(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the qwen-native terminal from a launch context."""
+    return await _auto_create_qwen_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        server_client=ctx.server_client,
+        ensure_comment_relay=ctx.ensure_comment_relay,
+    )
+
+
+async def _launch_kimi(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the kimi-native terminal from a launch context."""
+    return await _auto_create_kimi_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        server_client=ctx.server_client,
+        ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
+    )
+
+
+async def _launch_codex(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the codex-native terminal from a launch context."""
+    return await _auto_create_codex_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        bundle_dir=ctx.bundle_dir,
+        skills_filter=ctx.skills_filter,
+        agent_spec=ctx.agent_spec,
+        server_client=ctx.server_client,
+        ensure_comment_relay=ctx.ensure_comment_relay,
+    )
+
+
+async def _launch_antigravity(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the antigravity-native terminal from a launch context."""
+    return await _auto_create_antigravity_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        server_client=ctx.server_client,
+        ensure_comment_relay=ctx.ensure_comment_relay,
+    )
+
+
+async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the claude-native terminal from a launch context.
+
+    ``server_client`` is required by the builder; the launch dispatch only
+    reaches this adapter with a bound client.
+    """
+    assert ctx.server_client is not None  # guaranteed by the claude launch arm
+    return await _auto_create_claude_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        server_client=ctx.server_client,
+        bundle_dir=ctx.bundle_dir,
+        agent_name=ctx.agent_name,
+        agent_spec=ctx.agent_spec,
+        skills_filter=ctx.skills_filter,
+        session_init=ctx.session_init,
+        auth_token_factory=ctx.auth_token_factory,
+        resolve_launch_config=ctx.resolve_launch_config,
+        record_launch_config=ctx.record_launch_config,
+    )
+
+
+async def _launch_native_terminal(
+    harness_name: str,
+    ctx: NativeLaunchContext,
+    *,
+    ensure_locks: MutableMapping[str, asyncio.Lock],
+    pre_launch: PreLaunchResult | None = None,
+    resolve_agent_spec: (Callable[[], Awaitable[AgentSpec | ResolvedSpec | None]] | None) = None,
+) -> bool | None:
+    """Auto-create a native harness terminal through the provider seam.
+
+    Replaces the per-harness ``if harness_name == "<x>-native"`` launch arms:
+    resolves ``provider.auto_create_terminal`` from the registry and runs the
+    shared lock / existence-check / pending-event / error-event mechanics every
+    arm shared. Harness-specific pre-call logic (claude rebuild+transfer,
+    codex/antigravity needs-checks) is computed by the caller and passed as
+    *pre_launch*.
+
+    ``agent_spec`` is resolved lazily via *resolve_agent_spec*, called inside the
+    create block only when a terminal is actually being created — matching the
+    original arms, which resolved the spec only on creation and with per-harness
+    error semantics (pi lets a resolution error surface as a terminal-start
+    error; cursor/opencode/kimi swallow ``OmnigentError`` in their resolver;
+    kiro/goose/hermes/qwen pass no resolver at all). The resolved spec replaces
+    ``ctx.agent_spec`` before the adapter runs.
+
+    :param harness_name: Harness id, e.g. ``"pi-native"``.
+    :param ctx: Launch inputs; the resolved adapter reads the subset it needs.
+    :param ensure_locks: Per-harness ``{session_id: Lock}`` map owned by the
+        runner (kept there so session cleanup can pop the lock by name).
+    :param pre_launch: Optional pre-launch decision from a special arm.
+    :param resolve_agent_spec: Optional async callback that resolves the session
+        agent spec, invoked once inside the create block. Its exceptions are
+        surfaced as terminal-start errors (a resolver that wants to tolerate
+        ``OmnigentError`` must swallow it itself and return ``None``).
+    :returns: ``True`` when a terminal exists or was created, ``False`` when
+        creation failed or was skipped, or ``None`` when *harness_name* is not a
+        native harness with a launch adapter (caller handles it another way).
+    """
+    agent = native_coding_agent_for_harness(harness_name)
+    if agent is None:
+        return None
+    provider = native_provider_for_key(agent.key)
+    if provider is None:
+        return None
+    decision = pre_launch or PreLaunchResult()
+
+    lock = ensure_locks.setdefault(ctx.session_id, asyncio.Lock())
+    async with lock:
+        registry = ctx.resource_registry.terminal_registry
+        has_terminal = (
+            registry is not None
+            and registry.get(ctx.session_id, agent.terminal_name, "main") is not None
+        )
+        if has_terminal and decision.force_recreate:
+            if registry is not None:
+                await registry.cleanup_conversation(ctx.session_id)
+            has_terminal = False
+        if has_terminal:
+            return True
+        if decision.skip or not decision.needs_terminal:
+            return False
+
+        adapter = resolve_hook(provider, "auto_create_terminal")
+        _publish_terminal_pending(ctx.publish_event, ctx.session_id, True)
+        try:
+            if resolve_agent_spec is not None:
+                ctx = dataclasses.replace(ctx, agent_spec=await resolve_agent_spec())
+            await adapter(ctx)
+            return True
+        except Exception as exc:
+            _logger.exception(
+                "Failed to auto-create %s terminal for %s",
+                agent.terminal_name,
+                ctx.session_id,
+            )
+            _publish_native_terminal_start_error(
+                ctx.publish_event,
+                ctx.session_id,
+                agent.display_name,
+                exc,
+            )
+            return False
+        finally:
+            _publish_terminal_pending(ctx.publish_event, ctx.session_id, False)
 
 
 async def _claude_native_session_wants_rebuild(

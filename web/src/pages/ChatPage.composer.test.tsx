@@ -126,6 +126,30 @@ describe("Composer Claude goal control", () => {
   });
 });
 
+describe("Composer Codex goal control", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("sends the completion condition as a Codex /goal command", () => {
+    const onSend = vi.fn();
+    useChatStore.setState({ conversationId: "conv_polly" });
+    renderWithTooltips(
+      <Composer {...composerProps({ onSend, showPollyCodexGoalControl: true })} />,
+    );
+
+    fireEvent.click(screen.getByTestId("goal-toggle"));
+    expect(screen.getByText(/Codex keeps working until this condition is met/)).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("goal-condition"), {
+      target: { value: "  Finish the implementation and pass tests  " },
+    });
+    fireEvent.click(screen.getByTestId("goal-start"));
+
+    expect(onSend).toHaveBeenCalledWith("/goal Finish the implementation and pass tests");
+  });
+});
+
 describe("Composer slash-command menu", () => {
   beforeEach(() => {
     // Two skills so the menu has skill rows distinct from the built-ins.
@@ -1647,6 +1671,27 @@ describe("Composer config gear", () => {
     // Claude native → Model + Effort selects present.
     expect(screen.getByTestId("composer-config-model")).toBeTruthy();
     expect(screen.getByTestId("composer-config-effort")).toBeTruthy();
+  });
+
+  it("uses the Default sentinel when Kiro marks no catalog row as default", async () => {
+    const options = [
+      { id: "auto", displayName: "Automatic", isDefault: false },
+      { id: "provider-latest", displayName: "Latest", isDefault: false },
+    ];
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: false,
+          showModels: true,
+          modelPickerKind: "kiro",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+    expect(screen.getByTestId("composer-config-model")).toHaveTextContent("Default");
   });
 
   it("does not open the modal via bare /model when the gear is disabled (not live)", async () => {

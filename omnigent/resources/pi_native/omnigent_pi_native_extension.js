@@ -99,6 +99,22 @@ function freshAuthHeaders(fallback) {
   return fallback || {};
 }
 
+// Return the relay URL and token from config.json when available. The runner
+// writes relayUrl + relayToken into config.json after the tool relay starts,
+// so policy POSTs can use the relay's non-expiring local token instead of a
+// baked server bearer.
+function relayCredentials() {
+  const cfg = readConfig();
+  if (
+    cfg &&
+    typeof cfg.relayUrl === "string" &&
+    typeof cfg.relayToken === "string"
+  ) {
+    return { url: cfg.relayUrl, token: cfg.relayToken };
+  }
+  return null;
+}
+
 /**
  * Evaluate a TOOL_CALL policy for a native Pi tool via the Omnigent server's
  * session-level HTTP endpoint (POST /v1/sessions/{sessionId}/policies/evaluate).
@@ -153,7 +169,11 @@ async function evalNativePolicyHttp(config, toolName, args) {
     typeof fetch !== "function"
   )
     return null;
-  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
+  // Prefer relay (non-expiring local token); fall back to direct server call.
+  const relay = relayCredentials();
+  const url = relay
+    ? `${relay.url}/policies/evaluate`
+    : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
   // Mint one stable re-attach id for this tool call. Every (re)POST carries
   // it so a re-park lands on the SAME elicitation — no duplicate approval
   // card. Kept for the whole call, across both the park loop and any
@@ -168,10 +188,15 @@ async function evalNativePolicyHttp(config, toolName, args) {
     },
     _omnigent_elicitation_id: elicitationId,
   });
-  const reqHeaders = {
-    "content-type": "application/json",
-    ...freshAuthHeaders(config.authHeaders),
-  };
+  const reqHeaders = relay
+    ? {
+        "content-type": "application/json",
+        authorization: `Bearer ${relay.token}`,
+      }
+    : {
+        "content-type": "application/json",
+        ...freshAuthHeaders(config.authHeaders),
+      };
 
   const parkDeadline = Date.now() + _PARK_TOTAL_BUDGET_MS;
   // Independent transient-error budget so a server that is actually down
@@ -1776,6 +1801,28 @@ module.exports = function (pi) {
     // assistant message per LLM call); fold its token counts into the
     // cumulative session totals and flush to the server for pricing.
     if (accumulateUsage(message)) await postSessionUsage();
+    // Surface Pi-reported errors (e.g. 404 for unknown model ids, 400 for
+    // unsupported API types) as visible error items in the web UI so users
+    // aren't left staring at an empty turn.
+    const stopReason =
+      message && typeof message.stopReason === "string" ? message.stopReason : "";
+    const errorMessage =
+      message && typeof message.errorMessage === "string" ? message.errorMessage : "";
+    if (stopReason === "error" && errorMessage) {
+      await postEvent(config, {
+        type: "external_conversation_item",
+        data: {
+          response_id: responseId,
+          item_type: "error",
+          item_data: {
+            source: "execution",
+            code: "RuntimeError",
+            message: `Pi model error: ${errorMessage}`,
+          },
+        },
+      });
+      return;
+    }
     const text = textFromMessage(message);
     if (!text) return;
     // The authoritative assistant item. The web UI retires + replaces the
