@@ -1150,10 +1150,12 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
     # sat waiting for a trigger nobody sent. Every rule below was unpinned when
     # that happened — the only anchor over this section was the generic timer
     # vocabulary in _LIFECYCLE_ANCHORS, which matches the sweep paragraph whether
-    # these sentences are there or not. All four are NORMATIVE by this file's own
-    # test (when the loop starts, what may end it, what must terminate it), so all
-    # four are fixed strings: a vocabulary tuple over "bot", "sweep" or "verdict"
-    # is satisfied by the sentence that inverts the rule.
+    # these sentences are there or not. Every entry in this block is NORMATIVE by
+    # this file's own test — when the loop starts, which signals are admissible,
+    # which row wins, what may end it, what must terminate it — so every one of
+    # them is a fixed string: a vocabulary tuple over "bot", "sweep", "cap" or
+    # "verdict" is satisfied just as well by the sentence that inverts the rule,
+    # and the reversals written for these rows all keep the same words.
     (
         # WHEN the loop starts, which is the half of the live failure that needed
         # a human to notice. Pinned rather than anchored because the inverted
@@ -1183,33 +1185,43 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "reaction can settle the first round and never a re-review.",
     ),
     (
-        # The cap's SCOPE, not the cap. The sweep paragraph's vocabulary anchor
-        # matches on the timer sentence beside it, so deleting this one leaves the
-        # anchor green and leaves the engaged branch — `eyes`, or CI pending
-        # forever — with no terminating condition at all.
-        "sweep-cap-applies-to-every-branch",
-        "an engaged-but-stalled bot, or permanently pending CI, loops until something "
-        "external stops it, because the cap is read as belonging to the silent branch",
+        # RENAMED from sweep-cap-applies-to-every-branch, and re-derived rather than
+        # reworded. There is no longer one sentence claiming the cap for every
+        # branch — the prose was corrected because that claim disagreed with a table
+        # that re-armed unconditionally. The obligation now lives in the two rows
+        # that loop back, each carrying its own "under the cap", so the span is both
+        # rows together: pinning one leaves the other free to loop forever, which is
+        # the defect in its original form. Row 6 is the catch-all and is the more
+        # important half — an unmatched signal is exactly the case that used to fall
+        # off the end of the table.
+        "sweep-cap-binds-both-looping-rows",
+        "an engaged-but-stalled bot, permanently pending CI, or a signal matching no "
+        "row at all, loops until something external stops it",
         _CROSS_REVIEW,
-        "Cap the sweeps, and apply the cap to EVERY branch — an engaged bot that "
-        "never finishes has to terminate too.",
+        "5. bot `eyes`, or CI still pending -> engaged; under the cap, re-arm and "
+        "loop. 6. anything else -> under the cap, re-arm and loop.",
     ),
     (
-        # The terminal branch, pinned whole. The STOP and the two things silence is
-        # NOT are one decision: a span that kept only the STOP would let the reasons
-        # be replaced by "hand off, nothing came back" while the word STOP survived,
-        # and a span that kept only the reasons would leave nothing saying what to
-        # do instead. The stale-`+1` clause restates the limit pinned above; it is
-        # kept because it is separately deletable and is the one statement of it at
-        # the point of decision — see the redundancy note in the test's docstring.
+        # The terminus, pinned whole and re-synced to the corrected prose. Three
+        # changes, all load-bearing: it is now reached from rows 5 and 6 rather than
+        # from a row restricted to "nothing newer"; reaching the cap is stated NOT to
+        # be a verdict; and the reacted-then-went-quiet clause is new. The STOP and
+        # the things silence is NOT stay one span — a span keeping only the STOP
+        # would let the reasons be replaced by "hand off, nothing came back" while
+        # the word STOP survived, and one keeping only the reasons would leave
+        # nothing saying what to do instead. The stale-`+1` clause restates the limit
+        # pinned above; it is kept because it is separately deletable and is the one
+        # statement of it at the point of decision — see the test's docstring.
         "silence-is-not-approval",
-        "the cap expires and holly infers a verdict — from nothing at all, or from a "
-        "reaction the previous round earned — instead of reporting what it could not "
-        "establish",
+        "the cap expires and holly infers a verdict — from nothing at all, from a "
+        "reaction the previous round earned, or from a bot that reacted and then "
+        "stopped — instead of reporting what it could not establish",
         _CROSS_REVIEW,
-        "cap reached with nothing newer than your push -> STOP and tell the human "
-        "exactly what you could and could not establish. Silence is not approval, "
-        "and a `+1` left from an earlier round is not a verdict on this one.",
+        "Rows 5 and 6 share one terminus at the cap, and reaching it is not a "
+        "verdict: STOP and tell the human exactly what you could and could not "
+        "establish. Silence is not approval, a `+1` left from an earlier round is "
+        "not a verdict on this one, and a bot that reacted and then went quiet has "
+        "reviewed nothing.",
     ),
     (
         "bot-findings-clustered-and-the-mandate-not-narrowed",
