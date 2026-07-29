@@ -332,28 +332,38 @@ END REVIEWER-MANDATE-V1
 
 After opening a PR — and after every push of fixes to it — service the bot
 before handing back. Record your HEAD sha and push time, and identify the bot's
-account: a signal counts only if the BOT produced it and it is NEWER than that
-push, or it is a verdict on the previous commit. Reactions are idempotent per
-account and content — an existing one is not recreated on a later trigger and
-keeps its original timestamp — so a reaction can settle the first round and
-never a re-review.
+account: a signal counts only if the BOT produced it and it is newer than that
+push, or it is a verdict on the previous commit. For a signal that can be
+edited, use the LATER of its created and updated times — the bot may revise a
+comment rather than post a new one. Reactions are idempotent per account and
+content — an existing one is not recreated on a later trigger and keeps its
+original timestamp — so a reaction can settle the first round and never a
+re-review.
 
 The bot posts on its own wall-clock lag, so sweep on a re-armed single-shot
 timer (~2 min); that is a genuine scheduled delay, not sub-agent polling. Never
-leave a `repeat=true` timer running. Cap the sweeps, and apply the cap to EVERY
-branch — an engaged bot that never finishes has to terminate too. Each sweep
-read the bot's reactions, root comments, reviews and inline review comments,
-and the check runs, then branch:
+leave a `repeat=true` timer running. Cap the sweeps. Each sweep read the bot's
+reactions, root comments, reviews and inline review comments, and the check
+runs, then take the FIRST row below that matches. The ORDER is part of the
+rule: each row is narrower than the one under it, so a broad match placed
+early would swallow the case beneath it.
 
-- bot `+1` newer than your push -> CLEAN, hand off. A clean round may post NO
-  comment at all, so never wait for one.
-- any bot comment, review or inline comment newer than your push -> read it: a
-  clean verdict ends the loop, findings go to servicing below.
-- bot `eyes`, or CI still pending -> engaged, re-arm and loop.
-- CI failed -> treat it as a finding.
-- cap reached with nothing newer than your push -> STOP and tell the human
-  exactly what you could and could not establish. Silence is not approval, and
-  a `+1` left from an earlier round is not a verdict on this one.
+1. the PR head is no longer your recorded sha -> someone pushed. Re-record and
+   restart the loop; every verdict below would otherwise judge other code.
+2. any check FAILED -> a finding, even while other checks are still pending.
+3. bot findings newer than your push -> service them below.
+4. a clean verdict, and what counts as one differs by round: on the FIRST, a
+   bot `+1` newer than your push, because a clean first round may post NO
+   comment at all and you must not wait for one. After a FIX PUSH, only a bot
+   comment, review or inline comment saying so — its `+1` is already sitting
+   there and cannot say anything about this round.
+5. bot `eyes`, or CI still pending -> engaged; under the cap, re-arm and loop.
+6. anything else -> under the cap, re-arm and loop.
+
+Rows 5 and 6 share one terminus at the cap, and reaching it is not a verdict:
+STOP and tell the human exactly what you could and could not establish.
+Silence is not approval, a `+1` left from an earlier round is not a verdict on
+this one, and a bot that reacted and then went quiet has reviewed nothing.
 
 Servicing findings. Cluster its findings by BUG CLASS before fixing anything,
 and feed them in as additional FOCUSED inputs to a re-run of the identical
