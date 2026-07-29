@@ -89,8 +89,15 @@ Cause: a pattern matches a bag of words, not a claim, so REPLACING the anchored
 sentence with one that keeps the vocabulary and reverses the rule leaves every
 pattern satisfied. Nothing is added and the anchored sentence is gone, which is
 what makes this a different failure from the one above. Mitigation: this one
-DOES have one — pin the rule as a fixed string. Fourteen anchors were converted
+DOES have one — pin the rule as a fixed string. Fifteen anchors were converted
 for that reason, and each was observed to fail on its inverting replacement.
+The fifteenth is the clearest case yet and is worth recording as evidence rather
+than as argument: ``bot-sweep-uses-a-timer`` matched (timer, sweep|lag,
+polling|genuine|delay) over the sweep paragraph, and BOTH halves of its own rule
+were measured green against it — dropping ``re-armed single-shot`` from the
+sentence, and replacing the sentence with one prescribing a ``repeat=true``
+timer left running for the whole loop, which still says timer, sweep, genuine,
+delay and polling. It is now a fixed string and the anchor is deleted.
 What remains is the anchors whose wording is genuinely incidental, and they
 stay blind. These four replacements were RUN against this file and PASS:
 
@@ -156,21 +163,36 @@ The enumerated gaps:
 8. Anything NOT enumerated. ``_LIFECYCLE_CANONICAL`` and ``_LIFECYCLE_ANCHORS``
    are a list of named branches, not a completeness claim; a branch absent from
    both is protected by nothing, and adding a branch to the prose adds no test.
-   The bot-servicing section is the worked example of both halves. Its entry
-   point, its reaction-idempotency limit, the cap's scope over EVERY branch, the
-   silence-is-not-approval terminus and the re-request after a fix push were all
-   unprotected while a live run reproduced two of them; each is now a fixed
-   string in ``_LIFECYCLE_CANONICAL``, verified to fail on both its deletion and
-   its reversal. That moves those five and no others.
-9. Still unprotected in that same section, and listed because the five above
-   are easy to mistake for coverage of the block: the branch rows for a fresh
-   ``+1`` and for ``eyes`` / pending CI, the instruction that a clean round may
-   post no comment at all, the CI-failure-is-a-finding row, ``Never leave a
-   `repeat=true` timer running``, and the sentence giving the reason for the
-   re-request (``A fix pushed without a re-request leaves the bot waiting``).
-   Deleting any of them is green. The last is deliberate — it is a rationale for
-   a pinned obligation, and this file does not pin rationales — the rest are
-   simply not enumerated yet.
+   The bot-servicing loop is the worked example, and the honest form of its
+   history is that TWO rounds of pinning were each reported as coverage of that
+   section and each left most of it open. Round one pinned five obligations. An
+   independent mutation run then showed the gate still green on deleting the
+   bot-actor qualification, the HEAD-and-push-time recording, the four-surface
+   read, the findings row, the ``re-armed single-shot`` instruction, and both
+   config.yaml corrections the loop depends on. Round two pins those, plus the
+   rules the corrected prose introduced — explicit row order, the head-changed
+   row, failure outranking pending, the later-of-created-and-updated timestamp
+   rule, and the per-round split of what counts as a clean verdict — as fixed
+   strings, each measured to fail on its own deletion AND on its reversal. What
+   that history should be read as saying is that "this section is now covered"
+   has been wrong twice; the entries are enumerated and nothing more.
+9. Still unprotected, listed because the block above is easy to mistake for
+   coverage of the whole loop. Each of these was RUN and the gate stayed green.
+   Deliberate, being rationale for a rule pinned beside it: ``The bot posts on
+   its own wall-clock lag``, and ``A fix pushed without a re-request leaves the
+   bot waiting``. Deliberate, being subsumed: the bare ``Cap the sweeps.``,
+   whose obligation survives in rows 5 and 6 and in the terminus, both pinned.
+   NOT deliberate, and the largest of them: in ``config.yaml`` the read/write
+   routing rule — ``every MUTATION goes through the shell, and reads prefer
+   MCP`` — together with the sentence giving its reason, that ``blast_radius``
+   inspects shell command text only and ALLOWs every non-shell tool. Deleting
+   the rule is green, and so is REPLACING that reason with its inverse (that
+   either route is protected alike), which is a false claim about the one
+   mechanical protection the bundle has and is the exact defect class this file
+   exists for. It is unpinned because it was not part of the prose this round
+   corrected, not because it is low value; it is the first candidate for the
+   next round. Also green: the other known shell-only read, ``gh pr checks
+   --required (no required-only method)``.
 10. DIRTY RUNNER-ROOT CONTAMINATION is not tested, and the fanout pins do not
     test it. They prove the INSTRUCTION survives — that the three baselines, the
     porcelain clause and the moved-HEAD check are still in the file a reader
