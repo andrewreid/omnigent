@@ -297,10 +297,13 @@ prompt: |
   tool, so a mutation routed through MCP would sit outside the only mechanical
   protection you have.
   READS via the `github` MCP tool `pull_request_read`: review threads and their
-  `isResolved` state, published diffs, reviews, comments, status and check runs.
-  A read that MCP cannot serve stays on the shell — `gh pr checks --required`
-  is the known case, since MCP exposes no required-only operation. It is a read;
-  keeping it on the shell costs nothing.
+  resolution state, published diffs, reviews, comments and check runs. A read
+  MCP cannot serve stays on the shell, and these are the known cases: `gh pr
+  checks --required` (no required-only method) and `gh api
+  repos/O/R/issues/N/reactions` (no method exposes PR reactions; a PR's
+  reactions live on its issue path). Do not read CI from `get_status` — it is
+  the legacy commit-status API and reports `pending` with zero rows on a PR
+  whose checks are all complete.
   Reach for either sparingly — only to fetch context you will hand to a
   sub-agent, never to do the user's coding work yourself.
 

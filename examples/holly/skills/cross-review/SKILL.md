@@ -319,8 +319,8 @@ END REVIEWER-MANDATE-V1
    SAME implementer to push its branch and open the PR — or, if a PR is already
    open, to push the reviewed commits to it. For directly-authored
    work Holly pushes and opens its own reviewed PR. Record the PR URL in the
-   registry, mark it ready, and leave it for the human. **Holly does NOT
-   merge.**
+   registry, mark it ready, then service the review bot below. **Holly does
+   NOT merge.**
 
 9. **Terminal branches.** If no different-vendor reviewer is available, you
    CANNOT run independent review: STOP, do not open the PR on unreviewed code,
@@ -330,15 +330,40 @@ END REVIEWER-MANDATE-V1
 
 ## Servicing an external review bot
 
-Where a review bot comments on the PR, it posts on its own wall-clock lag, so
-arm a timer for its sweep — that is a genuine scheduled delay, not sub-agent
-polling. Cluster its findings by BUG CLASS before fixing anything, and feed
-them in as additional FOCUSED inputs to a re-run of the identical complete
-mandate — never a "confirm these are fixed" scope. Every fix diff gets the same
-pre-push review as any other change. Reply in-thread rather than as a new
+After opening a PR — and after every push of fixes to it — service the bot
+before handing back. Record your HEAD sha and push time, and identify the bot's
+account: a signal counts only if the BOT produced it and it is NEWER than that
+push, or it is a verdict on the previous commit. Reactions are idempotent per
+account and content — an existing one is not recreated on a later trigger and
+keeps its original timestamp — so a reaction can settle the first round and
+never a re-review.
+
+The bot posts on its own wall-clock lag, so sweep on a re-armed single-shot
+timer (~2 min); that is a genuine scheduled delay, not sub-agent polling. Never
+leave a `repeat=true` timer running. Cap the sweeps, and apply the cap to EVERY
+branch — an engaged bot that never finishes has to terminate too. Each sweep
+read the bot's reactions, root comments, reviews and inline review comments,
+and the check runs, then branch:
+
+- bot `+1` newer than your push -> CLEAN, hand off. A clean round may post NO
+  comment at all, so never wait for one.
+- any bot comment, review or inline comment newer than your push -> read it: a
+  clean verdict ends the loop, findings go to servicing below.
+- bot `eyes`, or CI still pending -> engaged, re-arm and loop.
+- CI failed -> treat it as a finding.
+- cap reached with nothing newer than your push -> STOP and tell the human
+  exactly what you could and could not establish. Silence is not approval, and
+  a `+1` left from an earlier round is not a verdict on this one.
+
+Servicing findings. Cluster its findings by BUG CLASS before fixing anything,
+and feed them in as additional FOCUSED inputs to a re-run of the identical
+complete mandate — never a "confirm these are fixed" scope. Every fix diff gets
+the same pre-push review as any other change. Reply in-thread rather than as a new
 top-level comment. A repeated class is a hard stop for point-fixing: escalate
-to whole-surface closure. When handing status to the human, report the count of
-UNRESOLVED review threads alongside your summary, because replies do not
+to whole-surface closure. After pushing fixes, comment on the PR root to
+re-request review, naming any finding you did NOT fix and why — then loop. A
+fix pushed without a re-request leaves the bot waiting. When handing status to
+the human, report the count of UNRESOLVED review threads alongside your summary, because replies do not
 establish resolution — "findings serviced" is not "threads resolved", and the
 human is merging on that distinction. Holly's hand-off wording must not imply
 completeness ('findings serviced' ≠ 'threads resolved'). **Holly never declares
