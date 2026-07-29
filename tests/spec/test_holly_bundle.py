@@ -156,19 +156,34 @@ The enumerated gaps:
 8. Anything NOT enumerated. ``_LIFECYCLE_CANONICAL`` and ``_LIFECYCLE_ANCHORS``
    are a list of named branches, not a completeness claim; a branch absent from
    both is protected by nothing, and adding a branch to the prose adds no test.
-9. DIRTY RUNNER-ROOT CONTAMINATION is not tested, and the fanout pins do not
-   test it. They prove the INSTRUCTION survives — that the three baselines, the
-   porcelain clause and the moved-HEAD check are still in the file a reader
-   receives. They prove NOTHING about whether contamination is actually caught,
-   because catching it is holly's runtime judgement rather than a mechanism:
-   nothing compares a baseline for it, and nothing fails if it never looks. The
-   behavioural test was considered and deliberately not built — it needs a git
-   fixture with a runner root plus worktree and a scripted brain, and against a
-   scripted brain the assertion is about the script, not about holly. This is
-   the same wall as review sequencing (see the e2e module's own disclaimer), and
-   it is a reviewer's job for the same reason.
+   The bot-servicing section is the worked example of both halves. Its entry
+   point, its reaction-idempotency limit, the cap's scope over EVERY branch, the
+   silence-is-not-approval terminus and the re-request after a fix push were all
+   unprotected while a live run reproduced two of them; each is now a fixed
+   string in ``_LIFECYCLE_CANONICAL``, verified to fail on both its deletion and
+   its reversal. That moves those five and no others.
+9. Still unprotected in that same section, and listed because the five above
+   are easy to mistake for coverage of the block: the branch rows for a fresh
+   ``+1`` and for ``eyes`` / pending CI, the instruction that a clean round may
+   post no comment at all, the CI-failure-is-a-finding row, ``Never leave a
+   `repeat=true` timer running``, and the sentence giving the reason for the
+   re-request (``A fix pushed without a re-request leaves the bot waiting``).
+   Deleting any of them is green. The last is deliberate — it is a rationale for
+   a pinned obligation, and this file does not pin rationales — the rest are
+   simply not enumerated yet.
+10. DIRTY RUNNER-ROOT CONTAMINATION is not tested, and the fanout pins do not
+    test it. They prove the INSTRUCTION survives — that the three baselines, the
+    porcelain clause and the moved-HEAD check are still in the file a reader
+    receives. They prove NOTHING about whether contamination is actually caught,
+    because catching it is holly's runtime judgement rather than a mechanism:
+    nothing compares a baseline for it, and nothing fails if it never looks. The
+    behavioural test was considered and deliberately not built — it needs a git
+    fixture with a runner root plus worktree and a scripted brain, and against a
+    scripted brain the assertion is about the script, not about holly. This is
+    the same wall as review sequencing (see the e2e module's own disclaimer), and
+    it is a reviewer's job for the same reason.
 
-All nine now depend on review rather than on CI.
+All ten now depend on review rather than on CI.
 """
 
 from __future__ import annotations
@@ -1128,6 +1143,74 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         _CROSS_REVIEW,
         "Every fix diff gets the same pre-push review as any other change.",
     ),
+    # ── servicing an external review bot: the loop's own obligations ──
+    #
+    # The live failure this block exists for had two halves: holly opened a PR and
+    # stopped, and then, after pushing fixes, never re-requested review, so the bot
+    # sat waiting for a trigger nobody sent. Every rule below was unpinned when
+    # that happened — the only anchor over this section was the generic timer
+    # vocabulary in _LIFECYCLE_ANCHORS, which matches the sweep paragraph whether
+    # these sentences are there or not. All four are NORMATIVE by this file's own
+    # test (when the loop starts, what may end it, what must terminate it), so all
+    # four are fixed strings: a vocabulary tuple over "bot", "sweep" or "verdict"
+    # is satisfied by the sentence that inverts the rule.
+    (
+        # WHEN the loop starts, which is the half of the live failure that needed
+        # a human to notice. Pinned rather than anchored because the inverted
+        # version — service the bot only once a comment is known to exist — is
+        # exactly the behaviour that was observed, and it carries the same words.
+        "bot-servicing-entry-point",
+        "holly opens a PR, or pushes fixes to one, and hands back without servicing "
+        "the bot at all — waiting for a signal that only its own trigger produces",
+        _CROSS_REVIEW,
+        "After opening a PR — and after every push of fixes to it — service the bot "
+        "before handing back.",
+    ),
+    (
+        # A PREMISE plus the consequence that follows from it, kept in one span
+        # because the prose states them in one sentence and neither half is usable
+        # alone: the idempotency fact without the limit is trivia, and the limit
+        # without the fact is an assertion holly has no reason to believe and every
+        # reason to explain away when a `+1` is sitting there. The timestamp clause
+        # is load-bearing too — it is why a stale reaction never reads as "newer
+        # than your push" in the branch table below.
+        "reaction-idempotency-limits-what-a-reaction-settles",
+        "a reaction left over from the first round is read as a fresh verdict on a "
+        "re-review, so a fix round is handed off on a signal the bot never re-sent",
+        _CROSS_REVIEW,
+        "Reactions are idempotent per account and content — an existing one is not "
+        "recreated on a later trigger and keeps its original timestamp — so a "
+        "reaction can settle the first round and never a re-review.",
+    ),
+    (
+        # The cap's SCOPE, not the cap. The sweep paragraph's vocabulary anchor
+        # matches on the timer sentence beside it, so deleting this one leaves the
+        # anchor green and leaves the engaged branch — `eyes`, or CI pending
+        # forever — with no terminating condition at all.
+        "sweep-cap-applies-to-every-branch",
+        "an engaged-but-stalled bot, or permanently pending CI, loops until something "
+        "external stops it, because the cap is read as belonging to the silent branch",
+        _CROSS_REVIEW,
+        "Cap the sweeps, and apply the cap to EVERY branch — an engaged bot that "
+        "never finishes has to terminate too.",
+    ),
+    (
+        # The terminal branch, pinned whole. The STOP and the two things silence is
+        # NOT are one decision: a span that kept only the STOP would let the reasons
+        # be replaced by "hand off, nothing came back" while the word STOP survived,
+        # and a span that kept only the reasons would leave nothing saying what to
+        # do instead. The stale-`+1` clause restates the limit pinned above; it is
+        # kept because it is separately deletable and is the one statement of it at
+        # the point of decision — see the redundancy note in the test's docstring.
+        "silence-is-not-approval",
+        "the cap expires and holly infers a verdict — from nothing at all, or from a "
+        "reaction the previous round earned — instead of reporting what it could not "
+        "establish",
+        _CROSS_REVIEW,
+        "cap reached with nothing newer than your push -> STOP and tell the human "
+        "exactly what you could and could not establish. Silence is not approval, "
+        "and a `+1` left from an earlier round is not a verdict on this one.",
+    ),
     (
         "bot-findings-clustered-and-the-mandate-not-narrowed",
         "the same class is point-fixed once per comment, and the bot's list becomes "
@@ -1148,6 +1231,21 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "a recurring class keeps being point-fixed during bot servicing",
         _CROSS_REVIEW,
         "A repeated class is a hard stop for point-fixing: escalate to whole-surface closure.",
+    ),
+    (
+        # The live failure itself: fixes were pushed and the bot was never told, so
+        # the round ended waiting on a trigger that was never sent. Nothing pinned
+        # it. The obligation alone is pinned; the sentence after it ("A fix pushed
+        # without a re-request leaves the bot waiting") is the reason, it can be
+        # re-explained without changing what a round must do, and by this file's
+        # rule for incidental wording it stays unpinned — deleting it is disclosed
+        # in the module docstring rather than guarded here.
+        "fix-push-re-requests-review",
+        "fixes land on the branch and no trigger is sent, so the bot waits forever "
+        "and the round ends looking serviced",
+        _CROSS_REVIEW,
+        "After pushing fixes, comment on the PR root to re-request review, naming "
+        "any finding you did NOT fix and why — then loop.",
     ),
     (
         "unresolved-thread-count-on-handoff",
@@ -1630,6 +1728,13 @@ def test_review_lifecycle_branches_survive() -> None:
 
     The list is an enumeration, not a completeness claim: a branch not listed
     is not protected by this test.
+
+    One deliberate redundancy: ``reaction-idempotency-limits-what-a-reaction-settles``
+    and ``silence-is-not-approval`` both say a stale ``+1`` settles nothing. They
+    are kept apart because they are separately deletable — the first states the
+    fact and its limit where the signals are defined, the second applies it at
+    the branch where holly would otherwise act on one — and neither fires on the
+    other's deletion, so each is independently falsifying rather than dead weight.
 
     Rules whose exact sentence IS the obligation are pinned verbatim; procedure
     steps whose wording is incidental stay as per-block vocabulary. Presence
