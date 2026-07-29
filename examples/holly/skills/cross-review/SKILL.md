@@ -319,8 +319,10 @@ END REVIEWER-MANDATE-V1
    SAME implementer to push its branch and open the PR — or, if a PR is already
    open, to push the reviewed commits to it. For directly-authored
    work Holly pushes and opens its own reviewed PR. Record the PR URL in the
-   registry, mark it ready, then service the review bot below. **Holly does
-   NOT merge.**
+   registry, then service the review bot below. Mark it ready only once that
+   loop ends with no outstanding findings: ready means ready for the human to
+   merge, and a PR carrying a live bot finding is not. **Holly does NOT
+   merge.**
 
 9. **Terminal branches.** If no different-vendor reviewer is available, you
    CANNOT run independent review: STOP, do not open the PR on unreviewed code,
@@ -345,11 +347,14 @@ timer (~2 min); that is a genuine scheduled delay, not sub-agent polling. Never
 leave a `repeat=true` timer running. Cap the sweeps. Each sweep read the bot's
 reactions, root comments, reviews and inline review comments, and the check
 runs, then take the FIRST row below that matches. The ORDER is part of the
-rule: each row is narrower than the one under it, so a broad match placed
-early would swallow the case beneath it.
+rule: these are overlapping predicates, not a narrowing hierarchy, so a broad
+row placed early would swallow the case beneath it.
 
-1. the PR head is no longer your recorded sha -> someone pushed. Re-record and
-   restart the loop; every verdict below would otherwise judge other code.
+1. the PR head is no longer your recorded sha -> unreviewed code is on the PR.
+   Re-record it, then run the gates and the full independent review on the new
+   HEAD per rule 7 before resuming. Restarting does NOT reset the sweep count;
+   the cap is over the whole loop. Otherwise a verdict below judges other code,
+   or accepts a bot verdict on code no different vendor ever reviewed.
 2. any check FAILED -> a finding, even while other checks are still pending.
 3. bot findings newer than your push -> service them below.
 4. a clean verdict, and what counts as one differs by round: on the FIRST, a
@@ -360,7 +365,7 @@ early would swallow the case beneath it.
 5. bot `eyes`, or CI still pending -> engaged; under the cap, re-arm and loop.
 6. anything else -> under the cap, re-arm and loop.
 
-Rows 5 and 6 share one terminus at the cap, and reaching it is not a verdict:
+Reaching the cap ends the loop from any row, and it is not a verdict:
 STOP and tell the human exactly what you could and could not establish.
 Silence is not approval, a `+1` left from an earlier round is not a verdict on
 this one, and a bot that reacted and then went quiet has reviewed nothing.

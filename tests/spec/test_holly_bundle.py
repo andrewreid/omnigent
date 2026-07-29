@@ -1280,25 +1280,86 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         # the failure row re-armed on a failed build. A conclusion whose premise is
         # gone is prose nobody can act on, which is the trap this file has fallen
         # into twice.
+        #
+        # RE-POINTED, and the reason is worth stating plainly: the sentence this
+        # entry used to pin was FALSE. It claimed each row is NARROWER than the one
+        # under it, and the rows are not a narrowing hierarchy — row 2 (a failed
+        # check) and row 3 (bot findings) are independent predicates that can both
+        # hold, which is why the table needs a precedence order at all. A pin
+        # guarantees that a wording survives; it does not make the wording true, and
+        # for two rounds this one kept a false premise alive under the heading of
+        # coverage. No fragment of it is preserved here.
         "row-order-is-part-of-the-rule",
         "the rows are re-sorted as an editorial tidy-up and the table silently stops "
-        "classifying — a broad row placed early swallows every case beneath it",
+        "classifying — a broad row placed early swallows every case beneath it, and "
+        "the false narrowing-hierarchy claim can return unnoticed",
         _CROSS_REVIEW,
-        "The ORDER is part of the rule: each row is narrower than the one under it, "
-        "so a broad match placed early would swallow the case beneath it.",
+        "The ORDER is part of the rule: these are overlapping predicates, not a "
+        "narrowing hierarchy, so a broad row placed early would swallow the case "
+        "beneath it.",
     ),
     (
-        # Row 1, with its reason inside the span. The reason is the discriminator:
-        # without "every verdict below would otherwise judge other code" the row
-        # reads as bookkeeping about a sha, and re-recording without restarting
-        # looks like a reasonable economy. Its ordinal is part of the pin because
-        # this row must be FIRST — a head change invalidates every row under it.
-        "head-changed-restarts-the-loop",
+        # Row 1, now FOUR spans rather than one. The single span was re-synced
+        # rather than split in the previous round, and that hid the fact that the
+        # row carries four separately deletable obligations: what the row matches,
+        # what must RUN before sweeping resumes, what the restart does NOT do to the
+        # budget, and why. Deleting any one of them left the other three reading as
+        # complete, so one span could not say which had gone. The ordinal stays with
+        # the first span because this row must be FIRST — a head change invalidates
+        # every row under it.
+        #
+        # The row's own text changed because "Re-record and restart the loop" was
+        # defective twice over: a restart reset the sweep budget, so repeated pushes
+        # made the loop unbounded through a new branch, and it sent unreviewed code
+        # back into the BOT loop, where a bot's clean verdict could land on code no
+        # different-vendor reviewer had ever seen.
+        "head-changed-row-matches-a-moved-head",
         "a force-push or a human commit lands mid-loop and a timestamp-qualified "
         "verdict is accepted as a verdict on code it never saw",
         _CROSS_REVIEW,
-        "1. the PR head is no longer your recorded sha -> someone pushed. Re-record "
-        "and restart the loop; every verdict below would otherwise judge other code.",
+        "1. the PR head is no longer your recorded sha -> unreviewed code is on the "
+        "PR. Re-record it",
+    ),
+    (
+        # The obligation the corrected row introduces, and the one the old text got
+        # wrong: a moved head is not a bookkeeping event, it is unreviewed code, so
+        # the gates and the FULL independent review run again on the new HEAD before
+        # the sweep resumes. Without this span the row re-records a sha and carries
+        # straight on, and the bot loop becomes a route by which code that never had
+        # a different-vendor review collects a clean verdict.
+        "head-change-re-runs-gates-and-independent-review",
+        "sweeping resumes on a new HEAD that no gate and no different-vendor reviewer "
+        "ever saw, and the bot's verdict launders it",
+        _CROSS_REVIEW,
+        "then run the gates and the full independent review on the new HEAD per rule "
+        "7 before resuming.",
+    ),
+    (
+        # The budget rule, and it is a claim about the CAP rather than about the
+        # row — which is why it is its own span and not part of either neighbour. A
+        # restart that reset the count made the cap unbounded: every push bought a
+        # fresh allowance, so the terminus below could be deferred forever by an
+        # external actor. The reversal keeps restart, reset, sweep and cap and loses
+        # the bound.
+        "restart-does-not-reset-the-sweep-count",
+        "each push buys a fresh sweep allowance, so the cap never binds and the loop "
+        "runs as long as anyone keeps pushing",
+        _CROSS_REVIEW,
+        "Restarting does NOT reset the sweep count; the cap is over the whole loop.",
+    ),
+    (
+        # The reason, pinned because it is the discriminator and because its second
+        # half names a failure mode stated nowhere else: not merely that a verdict
+        # judges other code, but that a BOT verdict stands in for the different-vendor
+        # review that never ran on this HEAD. The predecessor span carried a reason
+        # too, so dropping it here would be a coverage regression rather than a
+        # tidy-up.
+        "head-change-reason-covers-the-laundered-verdict",
+        "the row reads as bookkeeping about a sha, so re-recording without re-running "
+        "the review looks like a reasonable economy",
+        _CROSS_REVIEW,
+        "Otherwise a verdict below judges other code, or accepts a bot verdict on "
+        "code no different vendor ever reviewed.",
     ),
     (
         # Row 2, and the "even while other checks are still pending" clause is the
@@ -1357,26 +1418,31 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "loop. 6. anything else -> under the cap, re-arm and loop.",
     ),
     (
-        # The terminus, pinned whole and re-synced to the corrected prose. Three
-        # changes, all load-bearing: it is now reached from rows 5 and 6 rather than
-        # from a row restricted to "nothing newer"; reaching the cap is stated NOT to
-        # be a verdict; and the reacted-then-went-quiet clause is new. The STOP and
-        # the things silence is NOT stay one span — a span keeping only the STOP
-        # would let the reasons be replaced by "hand off, nothing came back" while
-        # the word STOP survived, and one keeping only the reasons would leave
-        # nothing saying what to do instead. The stale-`+1` clause restates the limit
-        # pinned above; it is kept because it is separately deletable and is the one
-        # statement of it at the point of decision — see the test's docstring.
+        # The cap terminates the loop from EVERY row. This is separate from the
+        # verdict span below because it is independently deletable and reversible:
+        # limiting the terminus to rows 5 and 6 leaves an engaged-but-stalled bot or
+        # permanently pending CI able to re-arm forever through another row.
+        "sweep-cap-ends-loop-from-any-row",
+        "a row other than 5 or 6 can re-arm forever, so an engaged-but-stalled bot "
+        "or permanently pending CI makes the supposedly capped loop unbounded",
+        _CROSS_REVIEW,
+        "Reaching the cap ends the loop from any row",
+    ),
+    (
+        # The verdict terminus stays one span. Keeping only the STOP would let its
+        # reasons be replaced by "hand off, nothing came back" while the word STOP
+        # survived; keeping only the reasons would leave nothing saying what to do
+        # instead. The stale-`+1` clause restates the limit pinned above, but it is
+        # separately deletable here at the point of decision — see the docstring.
         "silence-is-not-approval",
         "the cap expires and holly infers a verdict — from nothing at all, from a "
         "reaction the previous round earned, or from a bot that reacted and then "
         "stopped — instead of reporting what it could not establish",
         _CROSS_REVIEW,
-        "Rows 5 and 6 share one terminus at the cap, and reaching it is not a "
-        "verdict: STOP and tell the human exactly what you could and could not "
-        "establish. Silence is not approval, a `+1` left from an earlier round is "
-        "not a verdict on this one, and a bot that reacted and then went quiet has "
-        "reviewed nothing.",
+        "it is not a verdict: STOP and tell the human exactly what you could and "
+        "could not establish. Silence is not approval, a `+1` left from an earlier "
+        "round is not a verdict on this one, and a bot that reacted and then went "
+        "quiet has reviewed nothing.",
     ),
     # The two config-side halves of the same loop. They live in _ROOT_CONFIG rather
     # than the skill, but they are pinned here, beside the rows they feed, because
