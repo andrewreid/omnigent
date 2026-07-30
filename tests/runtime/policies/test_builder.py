@@ -25,6 +25,8 @@ Covers:
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -961,7 +963,7 @@ def test_normalize_usage_for_engine_drops_display_fields() -> None:
     """
     _normalize_usage_for_engine removes by_model and promotes policy_cost_usd.
 
-    Both _policy_usage_seed and _subtree_usage_seed use this helper to
+    Both the session-wide and subtree usage seeds use this helper to
     prepare usage for the engine: strip the display-only ``by_model``
     breakdown, and swap ``policy_cost_usd`` to ``total_cost_usd`` for
     enforcement cost (falling back to ``total_cost_usd`` when no enforcement
@@ -1001,3 +1003,683 @@ def test_normalize_usage_for_engine_drops_display_fields() -> None:
     assert "by_model" not in normalized3
     assert "policy_cost_usd" not in normalized3
     assert normalized3["input_tokens"] == 0
+
+
+@contextmanager
+def _count_sql(store: SqlAlchemyConversationStore) -> Iterator[list[str]]:
+    """Capture every statement the store executes, on either bind."""
+    from sqlalchemy import event as sa_event
+
+    seen: list[str] = []
+
+    def _on(conn, cursor, statement, params, context, many):
+        seen.append(statement)
+
+    engines = {store._engine, store._conv_engine}
+    for engine in engines:
+        sa_event.listen(engine, "before_cursor_execute", _on)
+    try:
+        yield seen
+    finally:
+        for engine in engines:
+            sa_event.remove(engine, "before_cursor_execute", _on)
+
+
+@pytest.mark.parametrize("preloaded", [False, True], ids=["no-preload", "preload"])
+def test_build_issues_one_read_and_one_tree_scan(
+    conversation_store: SqlAlchemyConversationStore,
+    preloaded: bool,
+) -> None:
+    """
+    One engine build costs one conversation read plus ONE spawn-tree scan,
+    and nothing at all for the read when the caller supplies the row.
+
+    Counts SQL STATEMENTS, not store-method calls: the redundancy this
+    change removes was measured in queries, and a store-call count cannot
+    see a helper that issues three statements per call. The builder used to
+    re-fetch the conversation ~4x and walk the tree twice, once per usage
+    seed.
+
+    Both seeds must stay correct and identical either way: session-wide
+    gating from the whole tree, subtree display from the node's own subtree.
+    """
+    from omnigent.spec.types import FunctionPolicySpec, FunctionRef
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
+    )
+    sibling = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
+    )
+    conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 0.05})
+    conversation_store.set_session_usage(sibling.id, {"total_cost_usd": 0.03})
+    child_row = conversation_store.get_conversation(child.id) if preloaded else None
+
+    subagent_budget = FunctionPolicySpec(
+        name="subtree_budget",
+        on=None,
+        function=FunctionRef(
+            path="omnigent.policies.builtins.cost.subagent_cost_budget",
+            arguments={"max_cost_usd": 10.0},
+        ),
+    )
+    with _count_sql(conversation_store) as statements:
+        engine = build_policy_engine(
+            spec=AgentSpec(spec_version=1, name="child"),
+            conversation_id=child.id,
+            conversation_store=conversation_store,
+            conversation=child_row,
+            default_policies=[subagent_budget],
+        )
+
+    # Semantics preserved: session-wide gate vs per-subtree display.
+    assert engine.usage["total_cost_usd"] == pytest.approx(0.18)
+    assert engine._subtree_usage is not None
+    assert engine._subtree_usage["total_cost_usd"] == pytest.approx(0.05)
+
+    # The tree scan is one paged listing; the conversation read is a triplet
+    # (row + metadata + labels) and disappears entirely with a preload.
+    # Shape first, then the total. SQLite's connection PRAGMAs are setup, not
+    # work the builder asked for.
+    executed = [" ".join(q.split()) for q in statements if not q.startswith("PRAGMA")]
+    tree_scans = [q for q in executed if "root_conversation_id = " in q]
+    point_reads = [q for q in executed if "FROM conversations" in q and "conversations.id = " in q]
+    assert len(tree_scans) == 1, executed
+    assert len(point_reads) == (0 if preloaded else 1), executed
+    # A conversation read is a triplet (row + metadata + labels), and so is the
+    # tree scan; the preload removes one whole triplet.
+    assert len(executed) == (3 if preloaded else 6), [q[:80] for q in executed]
+
+
+def test_build_counts_archived_spend_and_inherits_approval(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Archiving must not move a budget gate. An archived root's own spend
+    still counts toward the session total, and its approval checkpoint is
+    still inherited — archiving is a listing concern, not an accounting
+    one. (This previously asserted the opposite, codifying an omission
+    that let an archive-after-preload seed $0 and ALLOW over budget.)
+    """
+    from omnigent.policies.schema import SESSION_COST_ASK_APPROVED_STATE_KEY
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
+    )
+    conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 0.05})
+    conversation_store.set_session_state(parent.id, {SESSION_COST_ASK_APPROVED_STATE_KEY: 9.99})
+    conversation_store.update_conversation(parent.id, archived=True)
+
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="child"),
+        conversation_id=child.id,
+        conversation_store=conversation_store,
+    )
+
+    # Whole-tree total including the archived root's own spend.
+    assert engine.usage["total_cost_usd"] == pytest.approx(0.15)
+    assert engine.session_state[SESSION_COST_ASK_APPROVED_STATE_KEY] == pytest.approx(9.99)
+
+
+def test_build_rejects_mismatched_preloaded_conversation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A preloaded row for a different session must fail closed, not mix
+    one session's labels/state/usage into another's policy decision."""
+    from omnigent.errors import OmnigentError
+
+    a = conversation_store.create_conversation(title="a")
+    b = conversation_store.create_conversation(title="b")
+    row_b = conversation_store.get_conversation(b.id)
+
+    with pytest.raises(OmnigentError, match="does not match"):
+        build_policy_engine(
+            spec=AgentSpec(spec_version=1, name="x"),
+            conversation_id=a.id,
+            conversation_store=conversation_store,
+            conversation=row_b,
+        )
+
+
+def test_build_with_preloaded_row_sees_concurrent_mutable_writes(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    The preloaded row contributes only immutable identity: labels,
+    session_state, and model written AFTER the row was captured must
+    still reach the engine (re-derived from the fresh tree row), so a
+    concurrent guard-label write can't be skipped by a stale snapshot.
+    """
+    conv = conversation_store.create_conversation(title="fresh-check")
+    stale_row = conversation_store.get_conversation(conv.id)
+
+    # Writes that land between the handler's read and the engine build.
+    conversation_store.set_labels(conv.id, {"guard": "tripped"})
+    conversation_store.set_session_state(conv.id, {"checkpoint": 1.5})
+    conversation_store.update_conversation(conv.id, model_override="claude-sonnet-4-6")
+
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="x"),
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+        conversation=stale_row,
+    )
+
+    assert engine.labels.get("guard") == "tripped"
+    assert engine.session_state.get("checkpoint") == 1.5
+    assert engine.model == "claude-sonnet-4-6"
+
+
+def test_build_uses_fresh_state_for_a_row_archived_after_preload(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A row archived after the preload still authorizes from FRESH state.
+
+    The tree now includes archived rows, so the fresh row is found there
+    and the preload contributes only identity. (This test previously
+    described the tree as EXCLUDING archived rows and asserted the
+    re-read branch — a premise the ``include_archived=True`` fix
+    inverted, which made the test unable to fail for its stated reason.)
+    """
+    conv = conversation_store.create_conversation(title="archive-race")
+    stale_row = conversation_store.get_conversation(conv.id)
+
+    conversation_store.set_labels(conv.id, {"guard": "tripped"})
+    conversation_store.update_conversation(
+        conv.id, model_override="claude-opus-4-8", archived=True
+    )
+
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="x"),
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+        conversation=stale_row,
+    )
+
+    # Mutable fields come from the fresh (archived) row, not the preload.
+    assert engine.model == "claude-opus-4-8"
+    assert engine.labels.get("guard") == "tripped"
+
+
+def test_initial_label_seed_does_not_clobber_a_concurrent_write(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Seeding declared initials must not overwrite a value written between a
+    caller's snapshot and the seed.
+
+    Calls ``_seed_and_load_labels`` with a STALE ``existing`` snapshot —
+    exactly the state a builder holds when a policy write lands in the
+    window. Insert-if-absent leaves the persisted value alone; the old
+    diff-then-``set_labels`` path recomputed "missing" from the stale
+    snapshot and reset it to the initial value.
+    """
+    from omnigent.runtime.policies.builder import _seed_and_load_labels
+    from omnigent.spec.types import LabelDef
+
+    conv = conversation_store.create_conversation()
+    stale_snapshot: dict[str, str] = {}  # taken before the write below
+    conversation_store.set_labels(conv.id, {"integrity": "7"})
+
+    result = _seed_and_load_labels(
+        conversation_id=conv.id,
+        label_defs={"integrity": LabelDef(initial="0")},
+        conversation_store=conversation_store,
+        existing=stale_snapshot,
+    )
+
+    assert result["integrity"] == "7", "seed overwrote a concurrent write"
+    persisted = dict(conversation_store.get_conversation(conv.id).labels)
+    assert persisted["integrity"] == "7"
+
+
+def test_initial_label_seed_uses_the_atomic_store_operation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Seeding must go through ``seed_labels_if_absent``, never ``set_labels``.
+
+    A mechanism assertion on top of the semantic one above: the race is
+    only impossible while the decision about which keys are missing is made
+    inside the insert statement, so the choice of store operation is itself
+    part of the contract.
+    """
+    from omnigent.runtime.policies.builder import _seed_and_load_labels
+    from omnigent.spec.types import LabelDef
+
+    conv = conversation_store.create_conversation()
+    calls: list[str] = []
+
+    class _RecordingStore:
+        def __init__(self, inner: SqlAlchemyConversationStore) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str):
+            attr = getattr(self._inner, name)
+            if not callable(attr):
+                return attr
+
+            def _wrapper(*args: object, **kwargs: object) -> object:
+                calls.append(name)
+                return attr(*args, **kwargs)
+
+            return _wrapper
+
+    _seed_and_load_labels(
+        conversation_id=conv.id,
+        label_defs={"integrity": LabelDef(initial="0")},
+        conversation_store=_RecordingStore(conversation_store),  # type: ignore[arg-type]
+        existing={},
+    )
+
+    assert "seed_labels_if_absent" in calls, calls
+    assert "set_labels" not in calls, calls
+
+
+def test_deleted_after_preload_fails_closed(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A row deleted after the preload must fail closed, not authorize
+    from the stale snapshot nor from empty ($0) state."""
+    import asyncio
+
+    from omnigent.errors import OmnigentError
+
+    conv = conversation_store.create_conversation(title="deleted")
+    conversation_store.set_session_usage(conv.id, {"total_cost_usd": 5.0})
+    stale_row = conversation_store.get_conversation(conv.id)
+    asyncio.run(conversation_store.delete_conversation(conv.id))
+
+    with pytest.raises(OmnigentError, match="disappeared"):
+        build_policy_engine(
+            spec=AgentSpec(spec_version=1, name="x"),
+            conversation_id=conv.id,
+            conversation_store=conversation_store,
+            conversation=stale_row,
+        )
+
+
+def test_agent_rebind_after_spec_resolution_fails_closed(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``agent_id`` selects the spec, so it is read before the engine exists
+    and cannot be re-derived. The builder confirms it against the row it
+    freshly read — NOT against the caller's preload, which is the snapshot
+    whose staleness is the whole hazard.
+
+    Four cases, all of which an earlier revision accepted because the
+    comparison ran before the fresh read (and skipped on ``None``):
+
+    1. rebind with no preload
+    2. rebind WITH a stale preload naming the old agent  <- the reproduction
+    3. fresh row whose binding is ``None``
+    4. no fresh row at all (deleted)
+    """
+    import asyncio
+
+    from omnigent.errors import OmnigentError
+
+    spec = AgentSpec(spec_version=1, name="x")
+    agent_a = "1" * 32
+
+    def _switch(conv_id: str, new_agent_id: str) -> None:
+        # switch_conversation_agent inserts the target agent row, so each
+        # switch needs its own id.
+        conversation_store.switch_conversation_agent(
+            conv_id,
+            new_agent_id=new_agent_id,
+            new_agent_name="other",
+            new_agent_bundle_location="other/bundle",
+            new_agent_description=None,
+            copy_model_settings=False,
+            carry_history_into_native=False,
+            presentation_labels={},
+            previous_builtin_id=None,
+        )
+
+    # Matching agent proceeds (guard must not be a blanket refusal).
+    ok_conv = conversation_store.create_conversation(title="match", agent_id=agent_a)
+    assert build_policy_engine(
+        spec=spec,
+        conversation_id=ok_conv.id,
+        conversation_store=conversation_store,
+        expected_agent_id=agent_a,
+    )
+
+    # 1. Rebind, no preload.
+    c1 = conversation_store.create_conversation(title="rebind-nopreload", agent_id=agent_a)
+    _switch(c1.id, uuid.uuid4().hex)
+    with pytest.raises(OmnigentError, match="no longer resolves to agent"):
+        build_policy_engine(
+            spec=spec,
+            conversation_id=c1.id,
+            conversation_store=conversation_store,
+            expected_agent_id=agent_a,
+        )
+
+    # 2. Rebind WITH a stale preload still naming agent A. Comparing against
+    #    that preload would have found agent A == expected and accepted.
+    c2 = conversation_store.create_conversation(title="rebind-preload", agent_id=agent_a)
+    stale_row = conversation_store.get_conversation(c2.id)
+    assert stale_row.agent_id == agent_a
+    _switch(c2.id, uuid.uuid4().hex)
+    with pytest.raises(OmnigentError, match="no longer resolves to agent"):
+        build_policy_engine(
+            spec=spec,
+            conversation_id=c2.id,
+            conversation_store=conversation_store,
+            conversation=stale_row,
+            expected_agent_id=agent_a,
+        )
+
+    # 3. Fresh row with NO binding: previously skipped by an ``is not None``
+    #    guard, so an unbound session accepted any spec.
+    c3 = conversation_store.create_conversation(title="unbound")
+    assert conversation_store.get_conversation(c3.id).agent_id is None
+    with pytest.raises(OmnigentError, match="no longer resolves to agent"):
+        build_policy_engine(
+            spec=spec,
+            conversation_id=c3.id,
+            conversation_store=conversation_store,
+            expected_agent_id=agent_a,
+        )
+
+    # 4. No fresh row at all (deleted, no preload): also a mismatch.
+    c4 = conversation_store.create_conversation(title="gone", agent_id=agent_a)
+    asyncio.run(conversation_store.delete_conversation(c4.id))
+    with pytest.raises(OmnigentError, match="no longer resolves to agent"):
+        build_policy_engine(
+            spec=spec,
+            conversation_id=c4.id,
+            conversation_store=conversation_store,
+            expected_agent_id=agent_a,
+        )
+
+
+def test_increments_from_independent_snapshots_merge(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Two engines holding independent snapshots each INCREMENT one key, and
+    both increments survive. A blind whole-blob write persisted 1.
+
+    Sequential by construction, and named for what it proves: the MERGE, not
+    the race. Serialisation of overlapping transactions is a store-level
+    property and is pinned there, against each dialect's own mechanism
+    (``test_two_real_writers_race_on_one_metadata_row``) — this test stays
+    green with the row lock removed and should not be read as covering it.
+    """
+    from omnigent.spec.types import StateUpdate, StateUpdateAction
+
+    conv = conversation_store.create_conversation(title="state-race")
+    spec = AgentSpec(spec_version=1, name="x")
+    engine_a = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    engine_b = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+
+    op = StateUpdate(key="risk", action=StateUpdateAction.INCREMENT, value=1)
+    engine_a.apply_state_updates([op])
+    engine_b.apply_state_updates([op])
+
+    persisted = conversation_store.get_conversation(conv.id)
+    assert dict(persisted.session_state)["risk"] == 2
+
+
+def test_sets_from_independent_snapshots_preserve_other_keys(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A second engine's SET must not drop a key the first one wrote.
+
+    Sequential, like its sibling above: the merge is the contract here.
+    """
+    from omnigent.spec.types import StateUpdate, StateUpdateAction
+
+    conv = conversation_store.create_conversation(title="state-keys")
+    spec = AgentSpec(spec_version=1, name="x")
+    engine_a = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+    engine_b = build_policy_engine(
+        spec=spec, conversation_id=conv.id, conversation_store=conversation_store
+    )
+
+    engine_a.apply_state_updates(
+        [StateUpdate(key="from_a", action=StateUpdateAction.SET, value="a")]
+    )
+    engine_b.apply_state_updates(
+        [StateUpdate(key="from_b", action=StateUpdateAction.SET, value="b")]
+    )
+
+    state = dict(conversation_store.get_conversation(conv.id).session_state)
+    assert state["from_a"] == "a", state
+    assert state["from_b"] == "b", state
+
+
+def test_supplied_root_is_a_hint_that_gets_verified(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A caller's tree root saves a read when right and is corrected when wrong.
+
+    ``root_conversation_id`` is immutable per ROW, not per conversation id.
+    Delete a conversation and recreate it under the same id and the new row
+    can sit in a different tree, so a row read earlier in the request names a
+    root this conversation no longer belongs to. Trusting it silently summed
+    the wrong tree — the recreated child reported nothing at all.
+
+    Three properties, because the argument has to be observably load-bearing
+    AND observably safe:
+
+    1. right root → same answer as self-resolving, one conversation read
+       fewer (a build that ignored the argument fails on the read count);
+    2. wrong tree's root → still the right answer (a build that trusts it
+       fails here);
+    3. the delete/recreate case that produced the regression.
+    """
+    from omnigent.runtime.policies.builder import load_session_usage
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
+    )
+    conversation_store.set_session_usage(parent.id, {"total_cost_usd": 0.10})
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 0.05})
+    other_tree = conversation_store.create_conversation(title="unrelated")
+
+    with _count_sql(conversation_store) as self_resolved_sql:
+        resolved = load_session_usage(child.id, conversation_store)
+    assert resolved["total_cost_usd"] == pytest.approx(0.05)
+
+    with _count_sql(conversation_store) as supplied_sql:
+        supplied = load_session_usage(child.id, conversation_store, root_conversation_id=parent.id)
+    assert supplied == resolved
+    # The saved read is the point of the argument: a triplet fewer.
+    executed = lambda caught: [q for q in caught if not q.startswith("PRAGMA")]  # noqa: E731
+    assert len(executed(supplied_sql)) == len(executed(self_resolved_sql)) - 3, (
+        executed(supplied_sql),
+        executed(self_resolved_sql),
+    )
+
+    # Wrong tree's root: verified against the tree it produced, so the sum is
+    # still right. Trusting it returned {} — the shape of the regression.
+    assert (
+        load_session_usage(child.id, conversation_store, root_conversation_id=other_tree.id)
+        == resolved
+    )
+
+
+def test_recreated_conversation_is_summed_in_its_new_tree(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A row read before a delete/recreate must not decide which tree to sum.
+
+    The reported regression: a child is deleted and recreated under the same
+    id in a different tree while a caller holds the old row. Summing from the
+    stale row's root found no such conversation and emitted nothing, so the
+    session's cost silently stopped updating.
+    """
+    import asyncio
+
+    from omnigent.runtime.policies.builder import load_session_usage
+
+    old_parent = conversation_store.create_conversation(title="old-root")
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=old_parent.id, title=_sub_agent_title()
+    )
+    stale_row = conversation_store.get_conversation(child.id)
+    assert stale_row.root_conversation_id == old_parent.root_conversation_id
+
+    # Recreate the same id under a different tree, as the delete/recreate
+    # boundary does.
+    asyncio.run(conversation_store.delete_conversation(child.id))
+    new_parent = conversation_store.create_conversation(title="new-root")
+    conversation_store.create_conversation(
+        conversation_id=child.id,
+        kind="sub_agent",
+        parent_conversation_id=new_parent.id,
+        title=_sub_agent_title(),
+    )
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 2.0})
+
+    summed = load_session_usage(
+        child.id,
+        conversation_store,
+        root_conversation_id=stale_row.root_conversation_id,
+    )
+    assert summed["total_cost_usd"] == pytest.approx(2.0), (
+        "a stale root must not silence a recreated conversation's spend"
+    )
+
+
+class _MutateOnTreeLoad:
+    """Store proxy that commits *hazard* the first time the tree is scanned.
+
+    The builder reads the conversation, then scans the spawn tree. Anything
+    committed in between makes the earlier read stale — which is the window
+    the freshness refresh exists to close, whoever performed that read.
+    """
+
+    def __init__(self, inner: object, hazard: Callable[[], None]) -> None:
+        self._inner = inner
+        self._hazard = hazard
+        self._fired = False
+
+    def list_conversations(self, *args: object, **kwargs: object) -> object:
+        if not self._fired:
+            self._fired = True
+            self._hazard()
+        return self._inner.list_conversations(*args, **kwargs)  # type: ignore[attr-defined]
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+@pytest.mark.parametrize("preloaded", [True, False], ids=["preload", "no-preload"])
+@pytest.mark.parametrize("hazard", ["switch", "delete"])
+def test_mid_build_change_fails_closed_on_every_provenance(
+    conversation_store: SqlAlchemyConversationStore,
+    preloaded: bool,
+    hazard: str,
+) -> None:
+    """
+    A change landing between the conversation read and the tree scan must
+    fail closed — regardless of who performed that read.
+
+    Parametrized over provenance on purpose. An earlier revision gated the
+    refresh on ``conversation is not None``, so the caller-preload path was
+    closed and the builder's own read had the identical window wide open: a
+    switch enforced the old agent's spec, a deletion seeded empty usage and
+    authorized a $0 budget. Provenance is a row here, not a separate test,
+    so a third way of acquiring the row is covered by construction.
+    """
+    import asyncio
+
+    from omnigent.errors import OmnigentError
+
+    agent_a = "2" * 32
+    conv = conversation_store.create_conversation(title=f"mid-build-{hazard}", agent_id=agent_a)
+    conversation_store.set_session_usage(conv.id, {"total_cost_usd": 5.0})
+    row = conversation_store.get_conversation(conv.id)
+
+    if hazard == "switch":
+
+        def _apply() -> None:
+            conversation_store.switch_conversation_agent(
+                conv.id,
+                new_agent_id=uuid.uuid4().hex,
+                new_agent_name="other",
+                new_agent_bundle_location="other/bundle",
+                new_agent_description=None,
+                copy_model_settings=False,
+                carry_history_into_native=False,
+                presentation_labels={},
+                previous_builtin_id=None,
+            )
+
+        expected = "no longer resolves to agent"
+    else:
+
+        def _apply() -> None:
+            asyncio.run(conversation_store.delete_conversation(conv.id))
+
+        expected = "disappeared"
+
+    store = _MutateOnTreeLoad(conversation_store, _apply)
+    with pytest.raises(OmnigentError, match=expected):
+        build_policy_engine(
+            spec=AgentSpec(spec_version=1, name="x"),
+            conversation_id=conv.id,
+            conversation_store=store,  # type: ignore[arg-type]
+            conversation=row if preloaded else None,
+            expected_agent_id=agent_a,
+        )
+
+
+def test_archived_descendant_spend_counts_toward_the_displayed_total(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Including archived rows in the tree changes DISPLAY as well as gating.
+
+    The change was made so archiving cannot reset a cost gate, but
+    ``load_session_usage`` is also the display path for the session badge
+    (``session.usage`` SSE) and the usage report, so an archived
+    descendant's spend now shows in the total a user sees. That is the
+    deliberate choice — the alternative, separate tree semantics for
+    display and enforcement, lets the badge disagree with the gate that
+    blocks the user — and it belongs with the change that caused it rather
+    than in a later PR.
+    """
+    from omnigent.runtime.policies.builder import load_session_usage
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
+    )
+    conversation_store.set_session_usage(parent.id, {"total_cost_usd": 1.0})
+    conversation_store.set_session_usage(child.id, {"total_cost_usd": 2.0})
+    conversation_store.update_conversation(child.id, archived=True)
+
+    displayed = load_session_usage(parent.id, conversation_store)
+    assert displayed["total_cost_usd"] == pytest.approx(3.0), (
+        "archived descendant spend must reach the displayed subtree total"
+    )
+
+    # The same number the badge and the enforcement seed derive from, so the
+    # two cannot diverge.
+    engine = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="parent"),
+        conversation_id=parent.id,
+        conversation_store=conversation_store,
+    )
+    assert engine.usage["total_cost_usd"] == pytest.approx(3.0)

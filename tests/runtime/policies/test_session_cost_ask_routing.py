@@ -62,6 +62,18 @@ def _engine_on(
     )
 
 
+def _drop_metadata_row(store: SqlAlchemyConversationStore, conversation_id: str) -> None:
+    """Delete a conversation's metadata row, leaving nothing to mutate."""
+    from sqlalchemy import delete as sa_delete
+
+    from omnigent.db.db_models import SqlConversationMetadata
+
+    with store._session() as session:
+        session.execute(
+            sa_delete(SqlConversationMetadata).where(SqlConversationMetadata.id == conversation_id)
+        )
+
+
 def _set_approved(value: float) -> StateUpdate:
     return StateUpdate(
         key=SESSION_COST_ASK_APPROVED_STATE_KEY,
@@ -246,3 +258,26 @@ async def test_subagent_gate_sees_parent_spend_not_just_own(
     )
 
     assert await _evaluate_bash(engine) == PolicyAction.ASK
+
+
+def test_deleted_root_does_not_fail_the_subagent_turn(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A root deleted mid-turn must not turn an approval into a failed call.
+
+    The store now refuses to report a state mutation it could not persist, so
+    the root mirror can raise where it used to write nothing. Recording the
+    checkpoint on the root is best-effort — losing it re-prompts, it does not
+    overspend — so the sub-agent's own turn continues, with the approval still
+    visible to this engine's later evaluations.
+    """
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id
+    )
+    engine = _engine_on(conversation_store, child.id, parent.id)
+    _drop_metadata_row(conversation_store, parent.id)
+
+    engine.apply_state_updates([_set_approved(0.05)])
+
+    assert engine._session_state.get(SESSION_COST_ASK_APPROVED_STATE_KEY) == 0.05

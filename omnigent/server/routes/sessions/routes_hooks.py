@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -14,6 +15,7 @@ from fastapi import (
 from fastapi.responses import Response
 
 from omnigent.codex_native_elicitation import codex_elicitation_id
+from omnigent.entities import Conversation
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.policies.types import (
     PolicyAction,
@@ -416,6 +418,15 @@ def register_hooks_routes(
         # events). The prompt text rides in ``event.data.text``.
         "PHASE_REQUEST": Phase.REQUEST,
     }
+    # Phases whose gate is scoped by a tool name, and where that name
+    # lives: (container key on the event, dotted path for the error).
+    # Both tool phases must be here — TOOL_RESULT reads its name from
+    # ``request_data``, and omitting it let an empty name through, which
+    # silently skipped every tool-scoped selector.
+    _REQUIRED_NON_EMPTY_NAME_BY_PHASE: dict[Phase, tuple[str, str]] = {
+        Phase.TOOL_CALL: ("data", "event.data.name"),
+        Phase.TOOL_RESULT: ("request_data", "event.request_data.name"),
+    }
     _PHASE_TO_PROTO_ACTION: dict[PolicyAction, str] = {
         PolicyAction.ALLOW: "POLICY_ACTION_ALLOW",
         PolicyAction.DENY: "POLICY_ACTION_DENY",
@@ -487,6 +498,13 @@ def register_hooks_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
         event_type = event.get("type")
+        if event_type is not None and not isinstance(event_type, str):
+            # An unhashable type (list / dict) would raise inside the phase
+            # lookup below and surface as a 500 instead of a client error.
+            raise OmnigentError(
+                f"Policy evaluate 'event.type' must be a string; got {type(event_type).__name__}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
         phase = _PROTO_EVENT_TYPE_TO_PHASE.get(event_type or "")
         if phase is None:
             raise OmnigentError(
@@ -508,9 +526,68 @@ def register_hooks_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             hook_elicitation_id = raw_elicitation_id
-        data = event.get("data") or {}
+        # Payload validation is driven from ONE per-phase table rather than a
+        # chain of conditionals: the previous shape validated TOOL_CALL's tool
+        # name but let TOOL_RESULT through with an empty one, because each
+        # phase's rule lived in its own branch. Adding a phase now means
+        # adding a row.
+        #
+        # Validate the RAW value before normalizing: ``or {}`` turns
+        # null / false / 0 / "" / [] into an empty object, and a TOOL_CALL
+        # with no name evaluates with ``tool_name=None``, which SKIPS every
+        # tool-name-scoped policy on a blocking hook — failing open.
+        raw_data = event.get("data")
+        # Two independent checks, deliberately not chained. The shape of
+        # ``event.data`` is wrong for every phase; a phase in the table
+        # additionally needs a tool name, which for TOOL_RESULT lives in a
+        # different container. Chaining them behind ``elif`` meant every phase
+        # in the table skipped the shape check entirely — TOOL_RESULT accepted
+        # ``False`` / ``0`` / ``[]`` as ``data`` and normalized them to ``{}``,
+        # which is the same fail-open the guard exists to prevent.
+        if raw_data is not None and not isinstance(raw_data, (dict, str)):
+            raise OmnigentError(
+                f"Policy evaluate 'event.data' must be an object or string; "
+                f"got {type(raw_data).__name__}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        required = _REQUIRED_NON_EMPTY_NAME_BY_PHASE.get(phase)
+        if required is not None:
+            container_key, field_path = required
+            container = raw_data if container_key == "data" else event.get(container_key)
+            if not isinstance(container, dict):
+                raise OmnigentError(
+                    f"Policy evaluate {field_path!r} requires "
+                    f"'event.{container_key}' to be an object for "
+                    f"{event_type!r}; got {type(container).__name__}.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            name = container.get("name")
+            if not isinstance(name, str) or not name:
+                # A gate scoped by tool name cannot run without one, and
+                # allowing by default is the wrong direction on a blocking
+                # hook.
+                raise OmnigentError(
+                    f"Policy evaluate {field_path!r} must be a non-empty string "
+                    f"for {event_type!r}.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        data = raw_data or {}
+        raw_event_context = event.get("context")
+        if raw_event_context is not None and not isinstance(raw_event_context, dict):
+            raise OmnigentError(
+                f"Policy evaluate 'event.context' must be an object; got "
+                f"{type(raw_event_context).__name__}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
-        conv = conversation_store.get_conversation(session_id)
+        # Reuse the row the ACL check already fetched — same point in the
+        # request, so no less fresh than reading it again here, one query
+        # fewer on the blocking PreToolUse path. Absent for admin callers
+        # (who bypass the conversation lookup) and when permissions are
+        # disabled, which fall back to their own read.
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
             raise OmnigentError(
                 f"Session {session_id!r} not found.",
@@ -570,7 +647,7 @@ def register_hooks_routes(
             _caps.policy_llm_connection_factory() if _caps.policy_llm_connection_factory else None
         )
 
-        def _build_engine() -> PolicyEngine:
+        def _build_engine(preloaded_conv: Conversation | None = None) -> PolicyEngine:
             """
             Build a policy engine for this session from the loaded spec.
 
@@ -579,6 +656,10 @@ def register_hooks_routes(
             does not re-query it during ``evaluate``, so a fresh build is the
             only way to observe a concurrent sibling's just-recorded approval.
 
+            :param preloaded_conv: The conversation row this handler already
+                loaded, passed on the FIRST build only to skip the builder's
+                re-read. Rebuilds that must observe concurrent writes (the
+                ASK-gate re-evaluation) pass ``None`` for a fresh read.
             :returns: A :class:`PolicyEngine` seeded with the latest
                 persisted state for ``session_id``.
             """
@@ -586,20 +667,30 @@ def register_hooks_routes(
                 spec=loaded.spec,
                 conversation_id=session_id,
                 conversation_store=conversation_store,
+                conversation=preloaded_conv,
+                # ``agent`` below was resolved from conv.agent_id; the builder
+                # re-reads the row and fails closed if it was rebound since.
+                expected_agent_id=agent.id,
                 default_policies=_caps.default_policies,
                 policy_store=get_policy_store(),
                 server_llm=_caps.llm,
                 host_connection=_host_conn,
             )
 
-        engine = _build_engine()
+        engine = _build_engine(conv)
         # Use the turn-initiating human's identity (persisted at forward time)
         # so per-user policies gate on the correct actor even when the HTTP
         # caller is the runner's service-account credential.  Falls back to
         # user_id for direct API callers and native-terminal sessions (whose
         # turns go via _dispatch_session_event_to_runner, which does not write
         # this label).
-        turn_actor = conv.labels.get(_TURN_ACTOR_LABEL)
+        # Read the actor from the engine's label snapshot, not from the row
+        # fetched at the top of this handler: the engine's labels come from a
+        # read taken after the agent/spec load, so a turn-actor label written
+        # in that window still gates on the right principal. (``agent_id``
+        # cannot be treated the same way — it selects the spec the engine is
+        # built from, so it is necessarily read first.)
+        turn_actor = engine.labels.get(_TURN_ACTOR_LABEL)
         ctx = _build_evaluation_context(
             phase, data, event, actor=_build_actor(turn_actor or user_id)
         )
