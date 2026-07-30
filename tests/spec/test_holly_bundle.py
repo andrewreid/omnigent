@@ -181,17 +181,22 @@ The enumerated gaps:
    read as saying is that "this section is now covered" has been wrong twice;
    the entries are enumerated and nothing more.
 9. Still unprotected, listed because the block above is easy to mistake for
-   coverage of the whole loop. The standalone rationale ``The bot posts on its
-   own wall-clock lag`` is green only under the literal, ungrammatical deletion
-   that leaves lowercase ``sweep on a re-armed...``. Capitalising that survivor
-   to ``Sweep`` is red on ``sweep-timer-is-single-shot-and-re-armed``; the
-   rationale is not counted as independently covered. Deleting ``A fix pushed
-   without a re-request leaves the bot waiting`` is also green deliberately:
-   the operative re-request rule beside it is pinned. The former read/write
-   routing residual is now pinned together with its shell-only reason and
-   mutation enumeration; this disclosure no longer calls it the "largest" gap
-   or a future candidate. Still green and unprotected: the other known
-   shell-only read, ``gh pr checks --required (no required-only method)``.
+   coverage of the whole loop. A fresh sentence-deletion sweep leaves the
+   standalone rationale ``The bot posts on its own wall-clock lag`` green only
+   under the literal, ungrammatical deletion that leaves lowercase ``sweep on a
+   re-armed...``. Capitalising that survivor to ``Sweep`` is red on
+   ``sweep-timer-is-single-shot-and-re-armed``; the rationale is disclosed
+   rather than counted as independently covered because the operative timer
+   rule is pinned. Deleting ``A fix pushed without a re-request leaves the bot
+   waiting`` is also green deliberately; it is disclosed rather than pinned
+   because the operative re-request rule beside it is pinned and this sentence
+   only explains the failure mode. The former read/write routing residual is
+   pinned together with its shell-only reason and mutation enumeration; this
+   disclosure does not call it the "largest" gap or a future candidate. The
+   other known shell-only read, ``gh pr checks --required (no required-only
+   method)``, remains green and unprotected; it is disclosed rather than pinned
+   because it records a missing tool capability while the executable
+   required-checks instruction remains outside this fixed-string table.
 10. DIRTY RUNNER-ROOT CONTAMINATION is not tested, and the fanout pins do not
     test it. They prove the INSTRUCTION survives — that the three baselines, the
     porcelain clause and the moved-HEAD check are still in the file a reader
@@ -1383,8 +1388,7 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
     (
         # Row 3. Short, and pinned anyway: it is the row a broad clean-verdict row
         # short-circuited in the previous form, and with it gone a bot comment
-        # carrying findings falls through to row 4 or to the catch-all, so findings
-        # are re-armed on instead of serviced.
+        # carrying findings falls through to row 5 and can be handed off as clean.
         "findings-row-routes-to-servicing",
         "bot findings have no row of their own, so a comment full of them is matched "
         "by a later row and the round loops or hands off with them unserviced",
@@ -1462,6 +1466,16 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "from an earlier round says nothing about this one and falls through to row 7.",
     ),
     (
+        # Row 7 is the catch-all that keeps an unmatched signal from clearing the
+        # PR. The global cap does not imply this branch: deleting it, or reversing
+        # it to a clean hand-off, previously left every test green.
+        "catch-all-re-arms-instead-of-handing-off",
+        "an unmatched or zero-finding signal is treated as a serviced PR and handed "
+        "back without an established clean verdict",
+        _CROSS_REVIEW,
+        "7. anything else -> re-arm and loop.",
+    ),
+    (
         # The cap terminates the loop from EVERY row. This is separate from the
         # verdict span below because it is independently deletable and reversible:
         # limiting the terminus to rows 5 and 6 leaves an engaged-but-stalled bot or
@@ -1488,6 +1502,20 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "round is not a verdict on this one, and a bot that reacted and then went "
         "quiet has reviewed nothing.",
     ),
+    (
+        # A failed check still blocks, but this conclusion changes who can clear it
+        # and what holly should do meanwhile. Keep the human-gate premise with the
+        # no-review-round consequence so a CLA or approval is neither handed off as
+        # clean nor point-fixed as a code defect.
+        "action-required-is-a-human-gate",
+        "holly treats a CLA or deployment approval as a code defect, spends review "
+        "rounds trying to fix it, or hands off past the still-blocking check",
+        _CROSS_REVIEW,
+        "A check whose conclusion is `action_required` is a human gate — a CLA, a "
+        "deployment approval — not a code defect. It is still a finding, so the "
+        "loop does not hand off past it, but do not spend review rounds on it: name "
+        "it to the human and let them clear it.",
+    ),
     # The two config-side halves of the same loop. They live in _ROOT_CONFIG rather
     # than the skill, but they are pinned here, beside the rows they feed, because
     # each is a claim about what a github tool DOES — the class this bundle keeps
@@ -1497,7 +1525,8 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         # `sys_session_get_info` one in the fanout block: the tool holly would
         # naturally reach for cannot answer this question. Reversed, holly looks for
         # reactions where the API does not expose them, finds none, and concludes
-        # the bot never reacted — which reads as silence at rows 4 and 5.
+        # the bot never reacted — which reads as unfinished CI at row 4 or falls
+        # through to the catch-all at row 7.
         "pr-reactions-live-on-the-issue-path",
         "reactions are looked for on a PR path that never returns them, so `+1` and "
         "`eyes` are invisible and every sweep reads as silence",
@@ -1508,7 +1537,7 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
     (
         # The stronger of the two, and pinned with its reason: `get_status` does not
         # merely fail, it answers WRONGLY in the one direction that hurts — a PR
-        # whose checks are all complete reads as `pending`, which matches row 5 and
+        # whose checks are all complete reads as `pending`, which matches row 4 and
         # re-arms until the cap on a branch that was ready. Deleting the reason
         # leaves a bare preference an editor can drop as fussiness.
         "get-status-is-not-a-ci-read",
