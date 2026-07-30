@@ -1218,8 +1218,10 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "the rows below to compare against",
         _CROSS_REVIEW,
         "Record your HEAD sha and push time, and identify the bot's account: a "
-        "signal counts only if the BOT produced it and it is newer than that push, "
-        "or it is a verdict on the previous commit.",
+        "signal counts only if the BOT produced it and it is newer than that push. "
+        "A finding from an EARLIER round that you declined to fix does not expire "
+        "with its round: it stays outstanding until the bot withdraws it or the "
+        "human rules on it.",
     ),
     (
         # New in the corrected prose, and a claim about how the API behaves rather
@@ -1390,35 +1392,49 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "3. bot findings newer than your push -> service them below.",
     ),
     (
-        # Row 4 is the ordering rule that prevents a clean bot signal from ending a
-        # round while CI is unfinished. Keep the recorded-HEAD premise, pending
-        # predicate, and precedence reason together; without any one, the conclusion
-        # can classify the wrong checks or be moved below the clean row.
-        "pending-check-outranks-a-clean-bot-verdict",
-        "a clean bot signal ends the round while CI on the recorded HEAD is still "
-        "queued or running",
+        # Row 4 is the completeness and ordering rule that prevents a clean bot
+        # signal from ending a round while CI is unfinished. Keep the recorded-HEAD
+        # premise, no-checks case, completeness predicate, and precedence reason
+        # together; without any one, the conclusion can classify missing or
+        # unfinished checks as clean, or be moved below the clean row.
+        "incomplete-checks-outrank-a-clean-bot-verdict",
+        "a clean bot signal ends the round while CI on the recorded HEAD is "
+        "unfinished or has not reported any check runs",
         _CROSS_REVIEW,
-        "4. any check run on your recorded HEAD is still queued or running -> "
-        "engaged; re-arm and loop. CI has not finished, so no clean verdict below "
-        "can speak for this PR yet, and this row deliberately outranks one that would.",
+        "4. CI on your recorded HEAD is not finished -> engaged; re-arm and loop. "
+        "This is a COMPLETENESS test, not a list of pending statuses: it matches "
+        "when ANY check run on that sha is not `completed`, and it also matches "
+        "when that sha has NO check runs at all. `queued`, `in_progress`, `waiting`, "
+        "`requested`, `pending` and any status you do not recognise all count as "
+        "unfinished, and an empty read is NOT evidence of completion — GitHub "
+        "routinely has not created checks yet in the moments after a push, and a "
+        "repo reporting via the legacy commit-status API has none for you to read. "
+        "If this repo genuinely runs no checks on PRs, establish that with the "
+        "human once and record it; never infer it from an empty read. This row "
+        "deliberately outranks the clean verdict below, which cannot speak for a PR "
+        "whose CI has not finished.",
     ),
     (
-        # Row 5, pinned whole. The per-round split IS the rule — the previous form
-        # accepted any post-push `+1` as clean, which the idempotency paragraph
-        # above already said was impossible, and the table won. Both halves stay in
-        # one span: the first-round half without the fix-push half is the old bug,
-        # and the fix-push half without the first-round half makes holly wait for a
-        # comment a clean first round may never post.
+        # Row 5, pinned whole. Its completeness, outstanding-finding, and bot-verdict
+        # premises are inseparable from the clean terminus. The per-round split is
+        # part of that last premise: the previous form accepted any post-push `+1`
+        # as clean, which the idempotency paragraph above already said was
+        # impossible, and the table won.
         "clean-verdict-differs-by-round",
-        "a fix round is handed off on the `+1` the first round earned, or a clean "
-        "first round waits forever for a comment that was never going to come",
+        "a round is handed off without completed clean checks or while an "
+        "earlier-round finding remains outstanding, a fix round is handed off on "
+        "the `+1` the first round earned, or a clean first round waits forever for "
+        "a comment that was never going to come",
         _CROSS_REVIEW,
-        "5. a clean verdict, and what counts as one differs by round: on the FIRST, "
-        "a bot `+1` newer than your push OR a bot comment or review stating it "
-        "found nothing, because a clean first round may post either one alone and "
-        "you must not wait for a particular shape. After a FIX PUSH, only a bot "
-        "comment, review or inline comment saying so — its `+1` is already sitting "
-        "there and cannot say anything about this round.",
+        "5. every check run on your recorded HEAD is `completed` with a clean "
+        "conclusion, AND no finding from an earlier round is still outstanding, "
+        "AND there is a clean bot verdict — what counts as one differs by round: "
+        "on the FIRST, a bot `+1` newer than your push OR a bot comment or review "
+        "stating it found nothing, because a clean first round may post either one "
+        "alone and you must not wait for a particular shape. After a FIX PUSH, "
+        "only a bot comment, review or inline comment saying so — its `+1` is "
+        "already sitting there and cannot say anything about this round. All three "
+        "together -> CLEAN: the loop ends here and step 8 may mark the PR ready.",
     ),
     (
         # COLLAPSED with restart-does-not-reset-the-sweep-count. The cap is stated
