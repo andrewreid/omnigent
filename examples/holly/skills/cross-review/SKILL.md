@@ -380,7 +380,12 @@ hierarchy, so a broad row placed early would swallow the case beneath it.
    an empty read looks permanent, ask the human and record the answer on the
    task; until that record exists an empty read keeps matching here, and
    without it this row would match forever and every PR would end at the cap.
-   Never infer the record from an empty read. This row deliberately outranks
+   Never infer the record from an empty read, and a check run appearing
+   ANYWHERE on this PR RETIRES the record: CI exists after all, so go back to
+   reading it. Otherwise a repo that gains CI after the record was taken, or
+   one whose checks have landed on an earlier sha but not yet on the recorded
+   HEAD, would be exempted here and handed off below on an empty read — the
+   state this row exists to catch. This row deliberately outranks
    the clean verdict below, which cannot speak for a PR whose CI has not
    finished.
 5. every check run on your recorded HEAD is `completed` with a clean

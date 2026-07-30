@@ -1426,14 +1426,23 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "read. So if an empty read looks permanent, ask the human and record the "
         "answer on the task; until that record exists an empty read keeps matching "
         "here, and without it this row would match forever and every PR would end "
-        "at the cap. Never infer the record from an empty read.",
+        "at the cap. Never infer the record from an empty read,",
+    ),
+    (
+        # A check anywhere on the PR proves that CI exists, even when the recorded
+        # HEAD has none yet. Keep this retirement rule independently reversible.
+        "check-run-retires-held-no-check-record",
+        "a held no-checks record remains valid after a check run appears on the PR, "
+        "so an empty read on the recorded HEAD can still bypass CI",
+        _CROSS_REVIEW,
+        "and a check run appearing ANYWHERE on this PR RETIRES the record: CI "
+        "exists after all, so go back to reading it.",
     ),
     (
         # Keep row 4 ahead of the clean terminus. The predicates overlap, so the
         # completeness rules alone do not preserve this precedence.
         "incomplete-checks-outrank-a-clean-bot-verdict",
-        "a clean bot signal ends the round while CI on the recorded HEAD is "
-        "unfinished",
+        "a clean bot signal ends the round while CI on the recorded HEAD is unfinished",
         _CROSS_REVIEW,
         "This row deliberately outranks the clean verdict below, which cannot speak "
         "for a PR whose CI has not finished.",
