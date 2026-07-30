@@ -1408,15 +1408,18 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "4. CI on your recorded HEAD is not finished -> engaged; re-arm and loop. "
         "This is a COMPLETENESS test, not a list of pending statuses: it matches "
         "when ANY check run on that sha is not `completed`, and it also matches "
-        "when that sha has NO check runs at all. `queued`, `in_progress`, `waiting`, "
-        "`requested`, `pending` and any status you do not recognise all count as "
-        "unfinished, and an empty read is NOT evidence of completion — GitHub "
-        "routinely has not created checks yet in the moments after a push, and a "
-        "repo reporting via the legacy commit-status API has none for you to read. "
-        "If this repo genuinely runs no checks on PRs, establish that with the "
-        "human once and record it; never infer it from an empty read. This row "
-        "deliberately outranks the clean verdict below, which cannot speak for a PR "
-        "whose CI has not finished.",
+        "when that sha has NO check runs at all — UNLESS you hold a record, from "
+        "the human, that this repo runs no checks on PRs. `queued`, `in_progress`, "
+        "`waiting`, `requested`, `pending` and any status you do not recognise all "
+        "count as unfinished, and an empty read is NOT evidence of completion — "
+        "GitHub routinely has not created checks yet in the moments after a push, "
+        "and a repo reporting via the legacy commit-status API has none for you to "
+        "read. So if an empty read looks permanent, ask the human and record the "
+        "answer on the task; until that record exists an empty read keeps matching "
+        "here, and without it this row would match forever and every PR would end "
+        "at the cap. Never infer the record from an empty read. This row deliberately "
+        "outranks the clean verdict below, which cannot speak for a PR whose CI has "
+        "not finished.",
     ),
     (
         # Row 5, pinned whole. Its completeness, outstanding-finding, and bot-verdict
@@ -1431,14 +1434,17 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "a comment that was never going to come",
         _CROSS_REVIEW,
         "5. every check run on your recorded HEAD is `completed` with a clean "
-        "conclusion, AND no finding from an earlier round is still outstanding, "
-        "AND there is a clean bot verdict — what counts as one differs by round: "
-        "on the FIRST, a bot `+1` newer than your push OR a bot comment or review "
-        "stating it found nothing, because a clean first round may post either one "
-        "alone and you must not wait for a particular shape. After a FIX PUSH, "
-        "only a bot comment, review or inline comment saying so — its `+1` is "
-        "already sitting there and cannot say anything about this round. All three "
-        "together -> CLEAN: the loop ends here and step 8 may mark the PR ready.",
+        "conclusion — `success`, `skipped` or `neutral`, the allowlist from row 2 — "
+        "or you hold row 4's record that this repo runs no checks, which satisfies "
+        "this premise with none to read; AND no finding from an earlier round is "
+        "still outstanding, AND there is a clean bot verdict — what counts as one "
+        "differs by round: on the FIRST, a bot `+1` newer than your push OR a bot "
+        "comment or review stating it found nothing, because a clean first round "
+        "may post either one alone and you must not wait for a particular shape. "
+        "After a FIX PUSH, only a bot comment, review or inline comment saying so — "
+        "its `+1` is already sitting there and cannot say anything about this round. "
+        "All three together -> CLEAN: the loop ends here and step 8 may mark the PR "
+        "ready.",
     ),
     (
         # COLLAPSED with restart-does-not-reset-the-sweep-count. The cap is stated
