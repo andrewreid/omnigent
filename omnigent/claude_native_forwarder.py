@@ -908,6 +908,12 @@ _FORWARDER_OWNED_BRIDGE_FILES = (
     _HOOK_STATE_FILE,
     _SUBAGENT_STATE_FILE,
     _DELTA_STATE_FILE,
+    # Compaction-boundary cursor. Only this module reads or writes it, and
+    # every access sits inside the poll-loop body, so its changes are always
+    # our own output. A pending boundary whose POST failed is retried off
+    # ``status_retries`` / ``item_retries``, which the gate already consults —
+    # so nothing here needs the fingerprint to notice the write.
+    _COMPACTION_STATE_FILE,
     # Sink for permanently-undeliverable payloads, shared by every native
     # forwarder. Written for operators to inspect, not consumed by the loop.
     _DEAD_LETTER_FILE,

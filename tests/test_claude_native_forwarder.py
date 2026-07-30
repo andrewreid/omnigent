@@ -8177,6 +8177,77 @@ async def test_fingerprint_classifies_every_file_a_live_session_writes(tmp_path:
     _assert_all_classified(on_disk)
 
 
+@pytest.mark.asyncio
+async def test_fingerprint_never_watches_a_file_the_forwarder_itself_writes(
+    tmp_path: Path,
+) -> None:
+    """
+    Nothing the forwarder writes is in the watched set.
+
+    The classification tests catch a bridge file that is *unclassified*, but not
+    one misfiled as watched — and watching our own output is the specific defect
+    that made each full body trigger the next, holding gate engagement at ~54 %.
+    A new cursor added to the wrong tuple would reintroduce it silently.
+
+    So this asserts the invariant directly and without relying on naming: run a
+    real forwarder, diff the bridge directory around it to see what *it* wrote,
+    and require none of that to be watched.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir, _transcript = _seed_idle_session(tmp_path)
+
+    def _snapshot() -> dict[str, tuple[int, int, int]]:
+        return {
+            entry.name: (
+                entry.stat().st_mtime_ns,
+                entry.stat().st_size,
+                entry.stat().st_ino,
+            )
+            for entry in bridge_dir.iterdir()
+            if entry.is_file() and not entry.name.startswith(".")
+        }
+
+    before = _snapshot()
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_own_writes",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        # Let it forward the seeded turn, which is what makes it write cursors.
+        await _get_recorded_item_request(server)
+        await asyncio.sleep(0.3)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    after = _snapshot()
+    written = {name for name, stamp in after.items() if before.get(name) != stamp}
+    assert written, "forwarder wrote nothing — the check would be vacuous"
+
+    watched = set(forwarder._WATCHED_BRIDGE_FILES)
+    self_watched = sorted(written & watched)
+    assert not self_watched, (
+        f"the forwarder writes {self_watched}, which the fingerprint also watches — "
+        "each write re-opens the gate on our own output, so a full body triggers "
+        "the next. Move them to _FORWARDER_OWNED_BRIDGE_FILES."
+    )
+
+
 def _assert_all_classified(candidates: dict[str, str]) -> None:
     """
     Require every bridge-dir filename to be watched or declared forwarder-owned.
