@@ -181,22 +181,24 @@ The enumerated gaps:
    read as saying is that "this section is now covered" has been wrong twice;
    the entries are enumerated and nothing more.
 9. Still unprotected, listed because the block above is easy to mistake for
-   coverage of the whole loop. A fresh sentence-deletion sweep leaves the
-   standalone rationale ``The bot posts on its own wall-clock lag`` green only
-   under the literal, ungrammatical deletion that leaves lowercase ``sweep on a
-   re-armed...``. Capitalising that survivor to ``Sweep`` is red on
-   ``sweep-timer-is-single-shot-and-re-armed``; the rationale is disclosed
-   rather than counted as independently covered because the operative timer
-   rule is pinned. Deleting ``A fix pushed without a re-request leaves the bot
-   waiting`` is also green deliberately; it is disclosed rather than pinned
+   coverage of the whole loop. A fresh sweep of all 46 sentence units leaves
+   exactly two green: ``Servicing findings.`` and ``A fix pushed without a
+   re-request leaves the bot waiting``. The first is a two-word paragraph
+   lead-in and carries no rule. The second is disclosed rather than pinned
    because the operative re-request rule beside it is pinned and this sentence
-   only explains the failure mode. The former read/write routing residual is
-   pinned together with its shell-only reason and mutation enumeration; this
-   disclosure does not call it the "largest" gap or a future candidate. The
-   other known shell-only read, ``gh pr checks --required (no required-only
-   method)``, remains green and unprotected; it is disclosed rather than pinned
-   because it records a missing tool capability while the executable
-   required-checks instruction remains outside this fixed-string table.
+   only explains the failure mode. A narrower clause deletion of the standalone
+   rationale ``The bot posts on its own wall-clock lag`` is green only when it
+   leaves the ungrammatical lowercase survivor ``sweep on a re-armed...``;
+   capitalising that survivor to ``Sweep`` is red on
+   ``sweep-timer-is-single-shot-and-re-armed``. The rationale is disclosed
+   rather than counted as independently covered because the operative timer
+   rule is pinned. The former read/write routing residual is pinned together
+   with its shell-only reason and mutation enumeration; this disclosure does
+   not call it the "largest" gap or a future candidate. The other known
+   shell-only read, ``gh pr checks --required (no required-only method)``,
+   remains green and unprotected; it is disclosed rather than pinned because it
+   records a missing tool capability while the executable required-checks
+   instruction remains outside this fixed-string table.
 10. DIRTY RUNNER-ROOT CONTAMINATION is not tested, and the fanout pins do not
     test it. They prove the INSTRUCTION survives — that the three baselines, the
     porcelain clause and the moved-HEAD check are still in the file a reader
@@ -1396,18 +1398,25 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "3. bot findings newer than your push -> service them below.",
     ),
     (
-        # Row 4 is the completeness and ordering rule that prevents a clean bot
-        # signal from ending a round while CI is unfinished. Keep the recorded-HEAD
-        # premise, no-checks case, completeness predicate, and precedence reason
-        # together; without any one, the conclusion can classify missing or
-        # unfinished checks as clean, or be moved below the clean row.
-        "incomplete-checks-outrank-a-clean-bot-verdict",
-        "a clean bot signal ends the round while CI on the recorded HEAD is "
-        "unfinished or has not reported any check runs",
+        # The reported-check half of row 4's completeness predicate is separately
+        # reversible from both its no-check exception and its ordering rule.
+        "incomplete-reported-checks-keep-the-loop-engaged",
+        "a reported check that has not completed is ignored while the loop proceeds "
+        "toward a clean hand-off",
         _CROSS_REVIEW,
         "4. CI on your recorded HEAD is not finished -> engaged; re-arm and loop. "
         "This is a COMPLETENESS test, not a list of pending statuses: it matches "
-        "when ANY check run on that sha is not `completed`, and it also matches "
+        "when ANY check run on that sha is not `completed`,",
+    ),
+    (
+        # An empty read stays incomplete unless Holly already holds the human's
+        # repo-specific record. Pin both the exception's premise and the bar against
+        # manufacturing that premise from the same empty read.
+        "no-check-runs-require-held-human-record",
+        "an empty check read either clears CI without a human record or manufactures "
+        "the record that exempts it from the completeness row",
+        _CROSS_REVIEW,
+        "and it also matches "
         "when that sha has NO check runs at all — UNLESS you hold a record, from "
         "the human, that this repo runs no checks on PRs. `queued`, `in_progress`, "
         "`waiting`, `requested`, `pending` and any status you do not recognise all "
@@ -1417,26 +1426,41 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "read. So if an empty read looks permanent, ask the human and record the "
         "answer on the task; until that record exists an empty read keeps matching "
         "here, and without it this row would match forever and every PR would end "
-        "at the cap. Never infer the record from an empty read. This row deliberately "
-        "outranks the clean verdict below, which cannot speak for a PR whose CI has "
-        "not finished.",
+        "at the cap. Never infer the record from an empty read.",
     ),
     (
-        # Row 5, pinned whole. Its completeness, outstanding-finding, and bot-verdict
-        # premises are inseparable from the clean terminus. The per-round split is
-        # part of that last premise: the previous form accepted any post-push `+1`
-        # as clean, which the idempotency paragraph above already said was
-        # impossible, and the table won.
-        "clean-verdict-differs-by-round",
-        "a round is handed off without completed clean checks or while an "
-        "earlier-round finding remains outstanding, a fix round is handed off on "
-        "the `+1` the first round earned, or a clean first round waits forever for "
-        "a comment that was never going to come",
+        # Keep row 4 ahead of the clean terminus. The predicates overlap, so the
+        # completeness rules alone do not preserve this precedence.
+        "incomplete-checks-outrank-a-clean-bot-verdict",
+        "a clean bot signal ends the round while CI on the recorded HEAD is "
+        "unfinished",
+        _CROSS_REVIEW,
+        "This row deliberately outranks the clean verdict below, which cannot speak "
+        "for a PR whose CI has not finished.",
+    ),
+    (
+        # Premise 1 is fail-closed in both supported shapes: every reported check
+        # has a row-2 allowlisted conclusion, or Holly holds the human's no-checks
+        # record. An empty read alone satisfies neither side.
+        "clean-check-premise-is-allowlisted-or-human-recorded",
+        "row 5 treats an unknown conclusion as clean or treats an empty check read "
+        "as proof that the repository has no checks",
         _CROSS_REVIEW,
         "5. every check run on your recorded HEAD is `completed` with a clean "
         "conclusion — `success`, `skipped` or `neutral`, the allowlist from row 2 — "
         "or you hold row 4's record that this repo runs no checks, which satisfies "
-        "this premise with none to read; AND no finding from an earlier round is "
+        "this premise with none to read;",
+    ),
+    (
+        # Row 5's outstanding-finding and bot-verdict premises stay with the clean
+        # terminus. The per-round split prevents an old `+1` from clearing a fix
+        # round while accepting either clean signal shape on the first round.
+        "clean-verdict-differs-by-round",
+        "a round is handed off while an earlier-round finding remains outstanding, "
+        "a fix round is handed off on the `+1` the first round earned, or a clean "
+        "first round waits forever for a comment that was never going to come",
+        _CROSS_REVIEW,
+        "AND no finding from an earlier round is "
         "still outstanding, AND there is a clean bot verdict — what counts as one "
         "differs by round: on the FIRST, a bot `+1` newer than your push OR a bot "
         "comment or review stating it found nothing, because a clean first round "
@@ -1445,6 +1469,21 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         "its `+1` is already sitting there and cannot say anything about this round. "
         "All three together -> CLEAN: the loop ends here and step 8 may mark the PR "
         "ready.",
+    ),
+    (
+        # Independent-review follow-ups do not generalize to bot findings. Pin the
+        # actor boundary, the any-severity rule, and the two authorities that can
+        # clear a declined bot finding.
+        "reviewer-followups-do-not-clear-bot-findings",
+        "a bot finding is treated as a non-blocking reviewer follow-up and row 5 "
+        "clears the PR before the bot withdraws it or the human rules on it",
+        _CROSS_REVIEW,
+        "Non-blocking issues and suggestions from the INDEPENDENT REVIEWER become "
+        "registry follow-ups; they do not block the PR. A REVIEW BOT's findings are "
+        "not covered by this: whatever severity you assign one, it stays outstanding "
+        "until the bot withdraws it or the human rules on it, and row 5 of the "
+        "servicing loop will not clear the PR while it stands. Take that ruling to "
+        "the human when you decline a bot finding rather than waiting for the cap.",
     ),
     (
         # COLLAPSED with restart-does-not-reset-the-sweep-count. The cap is stated
@@ -1484,11 +1523,11 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
     (
         # The cap terminates the loop from EVERY row. This is separate from the
         # verdict span below because it is independently deletable and reversible:
-        # limiting the terminus to rows 5 and 6 leaves an engaged-but-stalled bot or
-        # permanently pending CI able to re-arm forever through another row.
+        # limiting the terminus to rows 4 and 6 leaves the catch-all at row 7 able
+        # to re-arm forever.
         "sweep-cap-ends-loop-from-any-row",
-        "a row other than 5 or 6 can re-arm forever, so an engaged-but-stalled bot "
-        "or permanently pending CI makes the supposedly capped loop unbounded",
+        "a row other than 4 or 6 can re-arm forever, so an engaged-but-stalled bot "
+        "falling through to catch-all row 7 makes the supposedly capped loop unbounded",
         _CROSS_REVIEW,
         "Reaching the cap ends the loop from any row",
     ),
@@ -1531,7 +1570,7 @@ _LIFECYCLE_CANONICAL: tuple[tuple[str, str, str, str], ...] = (
         # `sys_session_get_info` one in the fanout block: the tool holly would
         # naturally reach for cannot answer this question. Reversed, holly looks for
         # reactions where the API does not expose them, finds none, and concludes
-        # the bot never reacted — which reads as unfinished CI at row 4 or falls
+        # the bot never reacted — which makes rows 5 and 6 both fail and falls
         # through to the catch-all at row 7.
         "pr-reactions-live-on-the-issue-path",
         "reactions are looked for on a PR path that never returns them, so `+1` and "
