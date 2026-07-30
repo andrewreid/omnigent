@@ -336,7 +336,9 @@ END REVIEWER-MANDATE-V1
 After opening a PR — and after every push of fixes to it — service the bot
 before handing back. Record your HEAD sha and push time, and identify the bot's
 account: a signal counts only if the BOT produced it and it is newer than that
-push, or it is a verdict on the previous commit. For a signal that can be
+push. A finding from an EARLIER round that you declined to fix does not expire
+with its round: it stays outstanding until the bot withdraws it or the human
+rules on it. For a signal that can be
 edited, use the LATER of its created and updated times — the bot may revise a
 comment rather than post a new one. Reactions are idempotent per account and
 content — an existing one is not recreated on a later trigger and keeps its
@@ -366,15 +368,27 @@ hierarchy, so a broad row placed early would swallow the case beneath it.
    do not recognise are all findings rather than passes. A check that concluded
    on an earlier sha is not a verdict on this one.
 3. bot findings newer than your push -> service them below.
-4. any check run on your recorded HEAD is still queued or running -> engaged;
-   re-arm and loop. CI has not finished, so no clean verdict below can speak
-   for this PR yet, and this row deliberately outranks one that would.
-5. a clean verdict, and what counts as one differs by round: on the FIRST, a
-   bot `+1` newer than your push OR a bot comment or review stating it found
-   nothing, because a clean first round may post either one alone and you must
-   not wait for a particular shape. After a FIX PUSH, only a bot comment,
+4. CI on your recorded HEAD is not finished -> engaged; re-arm and loop. This
+   is a COMPLETENESS test, not a list of pending statuses: it matches when ANY
+   check run on that sha is not `completed`, and it also matches when that sha
+   has NO check runs at all. `queued`, `in_progress`, `waiting`, `requested`,
+   `pending` and any status you do not recognise all count as unfinished, and
+   an empty read is NOT evidence of completion — GitHub routinely has not
+   created checks yet in the moments after a push, and a repo reporting via
+   the legacy commit-status API has none for you to read. If this repo
+   genuinely runs no checks on PRs, establish that with the human once and
+   record it; never infer it from an empty read. This row deliberately
+   outranks the clean verdict below, which cannot speak for a PR whose CI has
+   not finished.
+5. every check run on your recorded HEAD is `completed` with a clean
+   conclusion, AND no finding from an earlier round is still outstanding, AND
+   there is a clean bot verdict — what counts as one differs by round: on the
+   FIRST, a bot `+1` newer than your push OR a bot comment or review stating it
+   found nothing, because a clean first round may post either one alone and you
+   must not wait for a particular shape. After a FIX PUSH, only a bot comment,
    review or inline comment saying so — its `+1` is already sitting there and
-   cannot say anything about this round.
+   cannot say anything about this round. All three together -> CLEAN: the loop
+   ends here and step 8 may mark the PR ready.
 6. a bot `eyes` newer than your push, on the FIRST round only -> engaged;
    re-arm and loop. A reaction keeps its original timestamp, so an `eyes` from
    an earlier round says nothing about this one and falls through to row 7.
@@ -384,6 +398,11 @@ Reaching the cap ends the loop from any row, and it is not a verdict:
 STOP and tell the human exactly what you could and could not establish.
 Silence is not approval, a `+1` left from an earlier round is not a verdict on
 this one, and a bot that reacted and then went quiet has reviewed nothing.
+
+A check whose conclusion is `action_required` is a human gate — a CLA, a
+deployment approval — not a code defect. It is still a finding, so the loop does
+not hand off past it, but do not spend review rounds on it: name it to the human
+and let them clear it.
 
 Servicing findings. Cluster its findings by BUG CLASS before fixing anything,
 and feed them in as additional FOCUSED inputs to a re-run of the identical
