@@ -10,11 +10,12 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy import Connection, Engine, create_engine, event, inspect, text
 
 if TYPE_CHECKING:
     from alembic.config import Config
@@ -540,6 +541,233 @@ def clear_engine_cache() -> None:
         _engine_cache.clear()
 
 
+# ── Request-scoped connection reuse ────────────────────
+#
+# A managed session normally checks a connection out of the engine pool for
+# just its own transaction. Server request handlers make many short store
+# calls back to back (conversation row, metadata, labels, permissions), so a
+# single request pays the checkout — and its ``pool_pre_ping`` liveness
+# round-trip — many times over. A connection scope lets one request hold a
+# single checked-out connection per engine and lend it to each managed
+# session in turn: one pool checkout per engine per request instead of one
+# per store call.
+#
+# Correctness properties:
+#
+# - Scoped per engine, so split-DB deployments (separate Omnigent and AP
+#   engines) never share a connection across binds.
+# - Each managed session still runs its own transaction on the lent
+#   connection — commit on clean exit, rollback on exception — so per-call
+#   commit visibility is identical to the unscoped path.
+# - A connection is lent to at most one managed session at a time.
+#   Concurrent sessions within the same scope (e.g. parallel
+#   ``asyncio.to_thread`` store calls in one request) fall back to plain
+#   pool checkouts, so a session never runs on a connection another thread
+#   is using.
+# - After the scope closes, late callers that still see it (e.g. a
+#   streaming response body that outlives the request handler) fall back to
+#   plain pool checkouts.
+
+_connection_scope_var: ContextVar[_ConnectionScope | None] = ContextVar(
+    "omnigent_db_connection_scope", default=None
+)
+
+
+# A held connection bypasses the pool's checkout-time ``pool_pre_ping``
+# (and its ``pool_recycle`` age check) for as long as the scope keeps it.
+# Bound that window by ABSOLUTE age since checkout — not by idle time
+# between calls, which a steady request stream would keep resetting
+# forever. Past this age the held connection is dropped and the next call
+# takes a fresh, pre-pinged checkout, so a database restart or failover
+# is recovered from within one window instead of never.
+_SCOPE_HELD_MAX_SECONDS = 30.0
+
+
+class _ConnectionScope:
+    """Holds one checked-out connection per engine, lent out serially."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # engine -> (connection, monotonic time it was checked out)
+        self._idle: dict[Engine, tuple[Connection, float]] = {}
+        self._closed = False
+        # connection -> monotonic checkout time, preserved across
+        # lend/restore cycles so age is absolute, not per-idle-period.
+        self._checked_out_at: dict[Connection, float] = {}
+        # >0 while the request is parked on a non-DB wait: no connection
+        # may be pinned to the scope, so store calls borrow from the pool
+        # and return it immediately (see :func:`db_connections_unpinned`).
+        self._suspend_depth = 0
+
+    def lend(self, engine: Engine) -> Connection | None:
+        """
+        Return a connection for *engine*, checking one out if needed.
+
+        Returns ``None`` when the scope is closed or currently suspended —
+        the caller falls back to a plain pooled session. While a
+        connection is lent out it is absent from the idle map, so an
+        overlapping call for the same engine checks out its own connection
+        instead of sharing. A held connection older than
+        ``_SCOPE_HELD_MAX_SECONDS`` (measured from its checkout, not from
+        its last use) is dropped and replaced by a fresh, pre-pinged
+        checkout.
+        """
+        with self._lock:
+            if self._closed or self._suspend_depth:
+                return None
+            entry = self._idle.pop(engine, None)
+        conn = entry[0] if entry is not None else None
+        if conn is not None and (
+            conn.closed
+            or conn.invalidated
+            or time.monotonic() - entry[1] > _SCOPE_HELD_MAX_SECONDS
+        ):
+            conn.close()
+            conn = None
+        if conn is None:
+            conn = engine.connect()
+            self._checked_out_at[conn] = time.monotonic()
+        return conn
+
+    def restore(self, engine: Engine, conn: Connection) -> None:
+        """
+        Return a lent connection to the scope, or to the pool.
+
+        Drops the connection instead of retaining it when it is no longer
+        usable, when the scope has closed, or when an overlapping call
+        already restored one for this engine.
+        """
+        try:
+            if conn.closed or conn.invalidated:
+                conn.close()
+                return
+            # A managed session always commits or rolls back before the
+            # connection comes back, so an open transaction here means an
+            # abnormal exit (e.g. GeneratorExit) — discard the work.
+            if conn.in_transaction():
+                conn.rollback()
+        except Exception:  # noqa: BLE001 — any failure here means: don't retain the connection
+            conn.close()
+            return
+        checked_out_at = self._checked_out_at.pop(conn, time.monotonic())
+        with self._lock:
+            if not self._closed and not self._suspend_depth and engine not in self._idle:
+                self._idle[engine] = (conn, checked_out_at)
+                self._checked_out_at[conn] = checked_out_at
+                return
+        conn.close()
+
+    def suspend(self) -> None:
+        """Stop pinning connections and hand back the ones held now.
+
+        Entered before a request parks on a non-DB wait. Returning the
+        idle connections is not enough on its own: a store call between
+        the release and the actual wait would pin a new one for the whole
+        park, so pinning stays disabled until :meth:`resume`.
+        """
+        with self._lock:
+            self._suspend_depth += 1
+            entries = list(self._idle.values())
+            self._idle.clear()
+        for conn, _ in entries:
+            self._checked_out_at.pop(conn, None)
+            conn.close()
+
+    def resume(self) -> None:
+        """Re-enable pinning after a parked wait ends."""
+        with self._lock:
+            if self._suspend_depth:
+                self._suspend_depth -= 1
+
+    def close(self) -> None:
+        """Release all held connections back to their pools."""
+        with self._lock:
+            entries = list(self._idle.values())
+            self._idle.clear()
+            self._closed = True
+        for conn, _ in entries:
+            self._checked_out_at.pop(conn, None)
+            conn.close()
+
+
+def suspend_scoped_connection_pinning() -> None:
+    """Stop pinning DB connections to the active request scope.
+
+    The imperative half of :func:`db_connections_unpinned`, for regions
+    whose entry and exit are already separated by an existing
+    ``try`` / ``finally`` (re-indenting those to fit a ``with`` would
+    bury the change in whitespace). Every call must be paired with
+    :func:`resume_scoped_connection_pinning` in a ``finally``.
+
+    No-op when no scope is active.
+    """
+    scope = _connection_scope_var.get()
+    if scope is not None:
+        scope.suspend()
+
+
+def resume_scoped_connection_pinning() -> None:
+    """Re-enable pinning after :func:`suspend_scoped_connection_pinning`.
+
+    No-op when no scope is active.
+    """
+    scope = _connection_scope_var.get()
+    if scope is not None:
+        scope.resume()
+
+
+@contextmanager
+def db_connections_unpinned() -> Iterator[None]:
+    """Hold no pooled connection for the duration of a non-DB wait.
+
+    Wrap any region that awaits a human verdict, a runner round-trip, or
+    a host handshake. On entry the request's held connections go back to
+    the pool and pinning is disabled; store calls inside the region still
+    work, borrowing from the pool per call and returning immediately.
+    Pinning resumes on exit.
+
+    Without this, a request parked on a wait keeps its connection: enough
+    parked requests exhaust the pool, and the approval (or handshake)
+    that would end the wait cannot get a connection to do its own reads —
+    a self-deadlock that resolves only on timeout. Waits reach up to a
+    day (a policy ASK gate), so this boundary is what keeps the
+    request-scoped lease safe.
+
+    No-op when no scope is active. Nests safely.
+    """
+    suspend_scoped_connection_pinning()
+    try:
+        yield
+    finally:
+        resume_scoped_connection_pinning()
+
+
+@contextmanager
+def db_connection_scope() -> Iterator[None]:
+    """
+    Reuse one pooled connection per engine across managed sessions.
+
+    While the scope is active on the current context, every session from a
+    :func:`make_managed_session_maker` factory runs on a connection held by
+    the scope instead of checking one out of the pool, eliminating
+    per-call checkout and ``pool_pre_ping`` overhead. The context variable
+    propagates into ``asyncio.to_thread`` workers, so store calls made from
+    a request handler share the request's connection.
+
+    Nested scopes are a no-op — the outermost scope owns the connections.
+    """
+    if _connection_scope_var.get() is not None:
+        yield
+        return
+    scope = _ConnectionScope()
+    token = _connection_scope_var.set(scope)
+    try:
+        yield
+    finally:
+        _connection_scope_var.reset(token)
+        scope.close()
+
+
 # ── Managed session ────────────────────────────────────
 
 
@@ -571,8 +799,29 @@ def make_managed_session_maker(
     # DetachedInstanceError. This is safe here because each managed session
     # is short-lived and single-writer, so there is no cross-session stale
     # data concern.
-    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    # Shared by the pooled factory and the scope-lent Session below so the
+    # two code paths cannot drift apart.
+    session_kwargs: dict[str, Any] = {"expire_on_commit": False}
+    factory = sessionmaker(bind=engine, **session_kwargs)
     is_sqlite = engine.dialect.name == "sqlite"
+
+    def _session_lifecycle(session: Session) -> Iterator[Session]:
+        try:
+            if is_sqlite:
+                # PRAGMAs must run before BEGIN IMMEDIATE: foreign_keys is
+                # a no-op inside a transaction, and busy_timeout must be
+                # set before lock acquisition or it doesn't apply.
+                session.execute(text("PRAGMA foreign_keys = ON"))
+                session.execute(text("PRAGMA busy_timeout = 20000"))  # 20s
+                if immediate:
+                    # Acquire write lock before any read to prevent
+                    # concurrent check-then-insert races on SQLite.
+                    session.execute(text("BEGIN IMMEDIATE"))
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
 
     @contextmanager
     def managed_session() -> Iterator[Session]:
@@ -581,25 +830,26 @@ def make_managed_session_maker(
 
         Commits on clean exit, rolls back on exception. For SQLite
         backends, enables foreign key enforcement and sets a
-        busy timeout before yielding.
+        busy timeout before yielding. Inside an active
+        :func:`db_connection_scope`, the session runs on the scope's held
+        connection instead of checking one out of the pool; transaction
+        semantics are unchanged.
         """
-        with factory() as session:
-            try:
-                if is_sqlite:
-                    # PRAGMAs must run before BEGIN IMMEDIATE: foreign_keys is
-                    # a no-op inside a transaction, and busy_timeout must be
-                    # set before lock acquisition or it doesn't apply.
-                    session.execute(text("PRAGMA foreign_keys = ON"))
-                    session.execute(text("PRAGMA busy_timeout = 20000"))  # 20s
-                    if immediate:
-                        # Acquire write lock before any read to prevent
-                        # concurrent check-then-insert races on SQLite.
-                        session.execute(text("BEGIN IMMEDIATE"))
-                yield session
-                session.commit()
-            except Exception:
-                session.rollback()
-                raise
+        scope = _connection_scope_var.get()
+        conn = scope.lend(engine) if scope is not None else None
+        if conn is None:
+            with factory() as session:
+                yield from _session_lifecycle(session)
+            return
+        try:
+            # Binding to the scope's connection skips the pool checkout.
+            # The session still owns its transaction: the connection is
+            # never lent while inside one, so commit/rollback here commit
+            # or roll back a real transaction, not a savepoint.
+            with Session(bind=conn, **session_kwargs) as session:
+                yield from _session_lifecycle(session)
+        finally:
+            scope.restore(engine, conn)
 
     return managed_session
 

@@ -32,7 +32,7 @@ from omnigent.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
     reserved_cost_control_keys,
 )
-from omnigent.db.utils import generate_task_id
+from omnigent.db.utils import db_connections_unpinned, generate_task_id
 from omnigent.entities import (
     Agent,
     Conversation,
@@ -4322,10 +4322,12 @@ async def _await_settled_managed_launch(launch: ManagedLaunch) -> None:
     from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
 
     try:
-        await asyncio.wait_for(
-            launch.settled.wait(),
-            timeout=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
-        )
+        # Sandbox provisioning, not DB work — stay unpinned for the wait.
+        with db_connections_unpinned():
+            await asyncio.wait_for(
+                launch.settled.wait(),
+                timeout=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
+            )
     except asyncio.TimeoutError:
         raise OmnigentError(
             "The session's managed sandbox is still provisioning; try again shortly",
@@ -5359,11 +5361,13 @@ async def _dispatch_skill_slash_command_to_runner(
         runner_body["harness_override"] = conv.harness_override
 
     try:
-        await runner_client.post(
-            f"/v1/sessions/{session_id}/events",
-            json=runner_body,
-            timeout=_RUNNER_FORWARD_TIMEOUT,
-        )
+        # Runner round-trip, not DB work — stay unpinned.
+        with db_connections_unpinned():
+            await runner_client.post(
+                f"/v1/sessions/{session_id}/events",
+                json=runner_body,
+                timeout=_RUNNER_FORWARD_TIMEOUT,
+            )
         event = OutputItemDoneEvent(type="response.output_item.done", item=visible.to_api_dict())
         session_stream.publish(session_id, event.model_dump())
     except (httpx.HTTPError, ConnectionError) as exc:

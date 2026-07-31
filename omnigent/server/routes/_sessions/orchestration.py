@@ -22,7 +22,12 @@ from fastapi import (
 from fastapi.responses import Response
 from pydantic import ValidationError
 
-from omnigent.db.utils import generate_agent_id, generate_task_id
+from omnigent.db.utils import (
+    generate_agent_id,
+    generate_task_id,
+    resume_scoped_connection_pinning,
+    suspend_scoped_connection_pinning,
+)
 from omnigent.entities import (
     Agent,
     CommentsFingerprint,
@@ -248,6 +253,13 @@ async def _publish_and_wait_for_harness_elicitation(
     # severed wait instead defers the clear so a hook retry can re-park.
     published_request = False
     settled = False
+    # This request is about to park on a human verdict — up to a day. Give
+    # up the request's pooled DB connection and stay unpinned for the whole
+    # region: the reads below (the ancestor mirror) would otherwise re-pin
+    # one right before the wait. At pool exhaustion the approval that would
+    # unpark this wait could not get a connection for its own ACL read — a
+    # self-deadlock resolving only on timeout.
+    suspend_scoped_connection_pinning()
     try:
         tombstone = _consume_pre_resolved_harness_elicitation(session_id, elicitation_id)
         if tombstone is not None:
@@ -315,6 +327,7 @@ async def _publish_and_wait_for_harness_elicitation(
         settled = parked.resolved_elsewhere.is_set()
         return None
     finally:
+        resume_scoped_connection_pinning()
         # Pop only our own entries — a hook retry may have re-parked
         # this id with a new future while this wait was unwinding.
         if _harness_elicitation_registry.get(elicitation_id) is future:

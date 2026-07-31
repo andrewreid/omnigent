@@ -30,7 +30,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from omnigent.cost_plan import (
     reserved_cost_control_keys,
 )
-from omnigent.db.utils import generate_agent_id
+from omnigent.db.utils import db_connections_unpinned, generate_agent_id
 from omnigent.entities import (
     CommentsFingerprint,
     Conversation,
@@ -441,7 +441,9 @@ def register_core_routes(
                 )
                 host_registry.send_text(conn, launch_frame)
                 try:
-                    result = await asyncio.wait_for(future, timeout=30.0)
+                    # Waiting on the host, not the DB — stay unpinned.
+                    with db_connections_unpinned():
+                        result = await asyncio.wait_for(future, timeout=30.0)
                 except asyncio.TimeoutError:
                     conn.pending_launches.pop(request_id, None)
                     result = {"status": "failed", "error": "host launch timed out"}

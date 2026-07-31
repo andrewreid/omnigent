@@ -12,3 +12,7 @@ data:
   OMNIGENT_AUTH_ENABLED: "1"
   OMNIGENT_AUTH_PROVIDER: "accounts"
   OMNIGENT_ACCOUNTS_AUTO_OPEN: "0"
+  # Per-request DB connection reuse. "0" falls back to
+  # checkout-per-store-call (kill switch for suspected pool saturation);
+  # roll the deployment for it to take effect.
+  OMNIGENT_DB_CONNECTION_SCOPE: "1"
