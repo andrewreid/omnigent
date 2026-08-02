@@ -838,6 +838,41 @@ def test_instrument_sqlalchemy_engine_missing_package_is_noop(
     telemetry.instrument_sqlalchemy_engine(engine)
 
 
+def test_instrument_db_pool_ping_gate_disabled_or_failing_never_blocks_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``instrument_db_pool_ping_gate`` is best-effort like its SQLAlchemy
+    tracing sibling: telemetry disabled leaves the gate on its default null
+    sinks (still fully functional), and a meter/instrument construction
+    failure must not propagate -- engine creation is a correctness-relevant
+    path and must never gain a hard dependency on telemetry.
+    """
+    from sqlalchemy import create_engine
+
+    from omnigent.db.ping_gate import _NULL_SINKS, _install_db_pool_ping_gate
+
+    engine = create_engine("sqlite://")
+    gate = _install_db_pool_ping_gate(engine, window_seconds=3.0)
+
+    monkeypatch.delenv("OMNIGENT_TELEMETRY_ENABLED", raising=False)
+    telemetry.instrument_db_pool_ping_gate(engine)
+    assert gate.sinks is _NULL_SINKS
+
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
+
+    def _raising_get_meter(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("meter provider unavailable")
+
+    monkeypatch.setattr(
+        "opentelemetry.metrics.get_meter",
+        _raising_get_meter,
+    )
+    # Must not raise despite the meter provider failing.
+    telemetry.instrument_db_pool_ping_gate(engine)
+    assert gate.sinks is _NULL_SINKS
+
+
 def test_inject_extract_frame_round_trip(
     in_memory_exporter: InMemorySpanExporter,
 ) -> None:

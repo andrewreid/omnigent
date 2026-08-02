@@ -612,6 +612,7 @@ explicit consent and PII handling in place.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Workspace URL (same as `DATABRICKS_HOST`) | Apps env |
 | `OTEL_EXPORTER_OTLP_HEADERS` | `Authorization=Bearer $DATABRICKS_TOKEN` | Apps env |
 | `OMNIGENT_OTEL_CAPTURE_CONTENT` | `true` to include message bodies in traces | Apps env (default off) |
+| `OMNIGENT_DB_PING_SKIP_WINDOW_SECONDS` | Recency-gated pre-ping skip window (suggested starting value `3.0`) — see [`docs/db-pre-ping-gate.md`](db-pre-ping-gate.md); Lakebase is *expected* to benefit more than a co-located database because the gate's win scales with network round-trip time, but this has not been measured on Lakebase — the only measurements available are local, where round trips drop to zero while wall-clock stays within noise | Apps env (default off) |
 
 ---
 
