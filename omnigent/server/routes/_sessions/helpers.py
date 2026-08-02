@@ -7323,20 +7323,19 @@ def _require_declared_subagent(
     """
     Reject a ``sub_agent_name`` the parent's spec does not declare.
 
-    ``POST /v1/sessions`` persists ``sub_agent_name`` verbatim, and every
-    downstream site that swaps in the resolved child spec is guarded by
-    ``if ... is not None`` with no ``else`` — so a name that resolves to
-    nothing leaves the parent's spec, workdir, harness and instructions in
-    place and the child silently boots as a full clone of the parent
-    (runaway recursion for an orchestrator). This gate fails the create
-    loud instead, mirroring normal dispatch (``tool_dispatch`` rejects an
-    undeclared ``agent``) and the ``AGENTSPEC.md`` contract that unlisted
-    names are rejected.
+    ``POST /v1/sessions`` persists ``sub_agent_name`` verbatim, so an
+    undeclared name would otherwise be stored and only caught later, at
+    whichever runner spec-swap site it reaches — which may fail the turn,
+    answer 404, or degrade to no spec at all, depending on the caller. This
+    gate rejects it up front, before any row is persisted, mirroring normal
+    dispatch
+    (``tool_dispatch`` rejects an undeclared ``agent``) and the
+    ``AGENTSPEC.md`` contract that unlisted names are rejected.
 
     Only rejects when the bundle loads AND the name is positively absent:
     a load failure or absent cache cannot prove the negative, so it is
-    left to fail-loud downstream rather than blocking a create we cannot
-    adjudicate here.
+    left to the runner's own no-match handling rather than blocking a
+    create we cannot adjudicate here.
 
     :param agent: The parent agent row whose bundle declares the
         sub-agents.

@@ -49,7 +49,13 @@ from omnigent.harness_aliases import (
     is_native_harness,
     native_terminal_name,
 )
-from omnigent.harness_plugins import load_object, model_env_keys, spawn_env_builders
+from omnigent.harness_capabilities import InstructionDelivery
+from omnigent.harness_plugins import (
+    harness_capabilities,
+    load_object,
+    model_env_keys,
+    spawn_env_builders,
+)
 from omnigent.inner.native_attachments import has_unresolved_file_id, resolve_file_id_block
 from omnigent.llms.summarize import (
     build_summarization_input,
@@ -132,8 +138,11 @@ from omnigent.runner.session_init_protocol import (
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
     SHARED_SESSION_AUTHORSHIP_INSTRUCTION,
+    build_instructions,
+    build_instructions_nullable,
     input_items_have_multiple_authors,
     prepare_input_items_for_model,
+    raw_author_instructions,
     shared_message_attribution_enabled,
 )
 from omnigent.server.schemas import (
@@ -159,13 +168,13 @@ def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> N
     """
     Log that a sub-agent name did not resolve to a declared child spec.
 
-    Every spec-swap site is guarded by ``if sub_spec is not None`` with no
-    ``else`` and falls back to the already-resolved PARENT spec — so a
-    renamed/removed sub-agent or stale session metadata silently boots the
-    child as a parent clone (parent prompt, tools, harness, workdir). The
-    create route now rejects an undeclared name up front, but stale rows
-    and post-create bundle edits can still reach these sites; a loud log
-    makes the fallback diagnosable instead of invisible.
+    A renamed/removed sub-agent or stale session metadata can still reach
+    the spec-swap sites even though the create route rejects an undeclared
+    name up front. No site binds the session to the PARENT spec on a
+    no-match, so this records which name failed while the caller still has
+    it. What happens next varies by caller: raising, answering the request
+    with a 404, or — for a tolerant resolver — swallowing the failure and
+    continuing with no spec at all.
 
     :param session_id: The session whose turn is resolving the spec.
     :param sub_agent_name: The name that failed to resolve in the parent
@@ -173,9 +182,8 @@ def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> N
     """
     _logger.warning(
         "Sub-agent %r for session %s did not resolve in the parent spec; "
-        "falling back to the parent spec (child runs with the parent's "
-        "prompt, tools and harness). Likely a renamed/removed sub-agent or "
-        "stale session metadata.",
+        "refusing parent-spec binding. Likely a renamed/removed sub-agent "
+        "or stale session metadata.",
         sub_agent_name,
         session_id,
     )
@@ -575,6 +583,46 @@ class _SessionSnapshot:
     agent_name: str | None = None
 
 
+def _cache_get_for_agent(
+    cache: dict[str, tuple[str | None, Any]], conv_id: str, agent_id: str | None
+) -> Any | None:
+    """Read an agent-tagged per-session cache entry.
+
+    Every entry is a ``(tagged_agent_id, value)`` pair written by
+    :func:`_cache_set_for_agent` — provenance travels with the value
+    itself instead of a parallel marker dict that a write could touch
+    without the paired cache write (or vice versa). A read only returns
+    *value* when the stored tag is ``None`` (agent-independent — e.g. no
+    spec resolver is configured, so the entry is valid regardless of who
+    this turn is for) or matches *agent_id* exactly.
+
+    A concretely-tagged entry left over from a DIFFERENT agent is always
+    a miss — including when *agent_id* is ``None``, i.e. this turn's
+    agent is not positively known. "Unknown" must never be treated as
+    "no conflict" with a previously-cached agent's data; that conflation
+    is exactly the leak this accessor closes.
+    """
+    entry = cache.get(conv_id)
+    if entry is None:
+        return None
+    tagged_agent_id, value = entry
+    if tagged_agent_id is not None and tagged_agent_id != agent_id:
+        return None
+    return value
+
+
+def _cache_set_for_agent(
+    cache: dict[str, tuple[str | None, Any]],
+    conv_id: str,
+    agent_id: str | None,
+    value: Any,
+) -> None:
+    """Write *value* into *cache*, tagged with *agent_id* for
+    :func:`_cache_get_for_agent` to verify on later reads.
+    """
+    cache[conv_id] = (agent_id, value)
+
+
 @dataclasses.dataclass(frozen=True)
 class _SessionInitContext:
     """Metadata source selected before shared session initialization runs."""
@@ -660,6 +708,16 @@ class TurnDispatch:
     :param instructions: System prompt for the LLM.
     :param agent_version: Spec version for invalidation.
     :param spawn_env: Harness subprocess environment overrides.
+    :param per_request_instructions: The turn's RAW per-request
+        instruction text, exactly as the caller sent it, kept separate
+        from the already-composed ``instructions`` above. The two are
+        not interchangeable: ``instructions`` has the agent's authored
+        text (and any framework additions) folded in already, so feeding
+        it back into composition would duplicate them, while treating
+        the raw text as composed would discard the author's. Carried
+        runner-locally rather than on the wire: no wire field distinguishes
+        composed from raw text, so the distinction cannot survive a
+        round trip and is kept in process instead.
     :param client_side_tool_names: Names of request-supplied
         client-side tools for this turn (e.g. ``{"Read", "Glob"}``).
         These are executed by the caller, not the runner, so the
@@ -671,9 +729,41 @@ class TurnDispatch:
     harness: str | None = None
     has_mcp_servers: bool = False
     instructions: str | None = None
+    per_request_instructions: str | None = None
     agent_version: int | None = None
     spawn_env: dict[str, str] | None = None
     client_side_tool_names: frozenset[str] = frozenset()
+
+
+@dataclasses.dataclass
+class InstructionComposition:
+    """Runner-local, never-serialized view of this turn's instruction state.
+
+    Computed once inside ``_stream_message_to_harness`` (the point where the
+    background and direct-stream dispatch paths converge) and consumed
+    in-process by the single delivery-gap warn check and by delivery
+    channels (opencode-native, hermes) that must not leak the fabricated
+    ``"You are a helpful assistant."`` fallback. Never attached to
+    ``TurnDispatch``, ``MessageEvent``, ``CreateResponseRequest``, or
+    ``ExecutorConfig`` — the wire shape is unchanged from today.
+
+    :param authored_present: Whether ``AgentSpec.instructions`` is
+        non-empty/non-whitespace, resolved pre-composition.
+    :param composed: The meaningful composed text (author + applicable
+        framework instructions), or ``None`` if there is truly nothing.
+    """
+
+    authored_present: bool
+    composed: str | None
+
+
+# Harnesses whose executor reads the wire ``instructions`` field itself and
+# needs the gated ``InstructionComposition.composed`` value there instead of
+# the default fallback-including composed-per-turn string — opencode-native
+# via its NativePrompt.system_prompt; hermes via HermesExecutor.run_turn's
+# system_prompt param. See the harness-conditional swap in
+# _stream_message_to_harness.
+_GATED_COMPOSED_INSTRUCTION_HARNESSES = frozenset({"opencode-native", "hermes"})
 
 
 def _wrap_as_message_event(body: dict[str, Any]) -> dict[str, Any]:
@@ -1812,23 +1902,312 @@ def create_runner_app(
         _rt_globals._terminal_registry = terminal_registry
 
     _version_cache: dict[str, int] = {}  # conversation_id → last seen agent_version
-    _spec_cache: dict[str, Any] = {}  # agent_id → cached AgentSpec for terminal tools
+    # conversation_id → EVERY (effective_harness, InstructionDelivery) pair the
+    # delivery-gap warning has already fired for in that conversation.
+    #
+    # At most once per (conversation, effective harness, instruction-delivery
+    # value), for the LIFETIME of the conversation. That is a membership
+    # question, not a comparison against the most recent pair:
+    # holding only the last pair would let A -> B -> A warn for A twice, since
+    # B displaces A's record and A then looks unseen. Presence of the
+    # conversation alone is equally wrong in the other direction — it cannot
+    # distinguish "already warned about THIS agent's harness" from "already
+    # warned about SOME agent's", which silently suppresses a genuine new gap.
+    # Popped only at delete_session; deliberately NOT cleared by
+    # _clear_session_agent_caches, which would collapse this to per-switch
+    # behaviour.
+    _instruction_delivery_warned: dict[str, set[tuple[str | None, InstructionDelivery]]] = {}
+    # agent_id → cached AgentSpec for terminal tools. GLOBAL and keyed by agent
+    # id, not by session — so unlike the per-session caches below, entries are
+    # shared across conversations, and its write guard
+    # (_agent_spec_cache_put) can only see the INITIATING session's
+    # invalidations. A stale entry reinstated by one conversation is therefore
+    # visible to the others; see that function for the exact sequence and why
+    # closing it is deferred.
+    _spec_cache: dict[str, Any] = {}
     _resp_to_conv: dict[str, str] = {}  # harness response_id → conversation_id
     _live_response_id: dict[str, str] = {}
     _session_start_cache: dict[str, float] = {}  # session_id → registered start time
-    _session_spec_cache: dict[str, Any | None] = {}  # session_id → session AgentSpec
+    # Agent-tagged per-session caches: each value is a
+    # ``(tagged_agent_id, value)`` pair. Writes go through
+    # _cache_set_for_agent (itself reached only via _session_cache_put); reads
+    # normally go through _cache_get_for_agent, which will not hand back a
+    # value alongside provenance it was not written with (see those functions'
+    # docstrings).
+    #
+    # Two reads deliberately bypass the accessor, because they want the TAG
+    # rather than a provenance-checked value — the accessor only returns the
+    # value half and would discard exactly what they came for:
+    #   - app.py's direct-stream cold-boot read of ``_session_spec_cache[conv]``
+    #     asks WHICH agent the entry it just resolved was tagged for, so the
+    #     rest of that turn tags its own writes identically instead of guessing.
+    #   - ``_resolve_session_skills`` reads the same tag to key the skills TTL
+    #     cache to the agent the spec cache actually resolved.
+    # Both unpack the pair and use ``[0]``; neither treats the value half as
+    # provenance-checked.
+    #
+    # ``_session_snapshot_cache`` is the one cache with no separate tag — its
+    # value (_SessionSnapshot) already carries its own ``agent_id`` field, so
+    # the entry is self-describing.
+    _session_spec_cache: dict[str, tuple[str | None, Any | None]] = {}  # session_id → AgentSpec
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
     _session_init_tasks: dict[tuple[str, str, str | None], asyncio.Task[JSONResponse]] = {}
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
-    _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
+    _session_skills_cache: dict[str, tuple[str | None, tuple[float, list[SkillSpec]]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
     _session_claude_launch_config_tasks: dict[
         str, asyncio.Task[ClaudeNativeUcodeConfig | None]
     ] = {}
+
+    # Monotonic per-session fill guard. Evicting a cache cannot stop a fill
+    # that is already in flight: a resolve started before an agent switch can
+    # complete after it and write the OLD agent's value straight back over the
+    # eviction, so the next reader sees the previous agent again with no fetch
+    # of its own. Every fill that spans an await captures this counter before
+    # its first await and discards its result on write if
+    # _clear_session_agent_caches has bumped it since.
+    _session_cache_generations: dict[str, int] = {}
+
+    def _session_cache_generation(session_id: str) -> int:
+        """Return the fill generation a cache fill for *session_id* starts under.
+
+        Materializes the counter so that a later teardown (which pops it) is
+        distinguishable from "never switched" — see
+        :func:`_session_cache_generation_is_current`.
+        """
+        return _session_cache_generations.setdefault(session_id, 0)
+
+    def _session_cache_generation_is_current(session_id: str, generation: int) -> bool:
+        """Return whether a fill that started at *generation* may still write.
+
+        An ABSENT counter means the session was torn down while this fill was
+        in flight, and is never current: a fill that captured generation 0
+        would otherwise match the ``0`` default and land its write after
+        ``delete_session`` had already dropped every cache for that id —
+        re-creating entries for a dead session, and for the comment relay
+        re-creating a live bridge that nothing is left to close.
+
+        This does NOT amount to a lifecycle guarantee. Two conditions defeat
+        it, both pre-existing and both deliberately out of scope here:
+
+        - Session ids are caller-supplied and imports reuse them
+          deterministically, so a torn-down id can come back. A fill parked
+          across teardown, followed by re-creation of the SAME id, sees the
+          counter re-materialize at 0 and matches its captured 0 — a genuine
+          ABA, publishing an entry created for the old session into the new
+          one wearing that id. Only the timing makes it rare, not the design.
+        - Normal server-side session deletion calls the runner's ``/resources``
+          cleanup, NOT full runner session teardown. So these caches and the
+          comment relay can outlive a deletion outright, with no race involved
+          at all — an entry simply survives the session it was created for.
+
+        Both mean an entry can outlive its session, so read a "current"
+        verdict as "this session did not invalidate me", never as "this entry
+        certainly belongs to a live session".
+        """
+        current = _session_cache_generations.get(session_id)
+        return current is not None and current == generation
+
+    _UNTAGGED_CACHE_WRITE = object()
+
+    def _session_cache_put(
+        cache: dict[str, Any],
+        session_id: str,
+        value: Any,
+        *,
+        generation: int,
+        agent_tag: Any = _UNTAGGED_CACHE_WRITE,
+    ) -> bool:
+        """THE sanctioned write path for every per-session agent-derived cache.
+
+        Guarding fill *sites* individually cannot hold the invariant: a
+        writer that does not pass through an enumerated site is invisible to
+        the enumeration. Routing every write through here makes the invariant
+        a property of the write path instead of a convention: no raw
+        ``cache[session_id] = value`` assignment to a protected container may
+        exist outside this function.
+
+        :param cache: The protected per-session container.
+        :param session_id: Session the value was resolved for.
+        :param value: Value to publish.
+        :param generation: Generation captured BEFORE the fill's first await.
+        :param agent_tag: Provenance tag for agent-tagged caches; omit for
+            plain untagged containers.
+        Scope: CACHED VALUES only. Resources built alongside those values —
+        terminals, forwarders, bridge state, harness clients — are not fenced
+        by this and are not rolled back when a write is dropped.
+
+        Coverage is counted in WRITER CLASSES rather than caches: two writer
+        classes target the same cache, and one does not come through this
+        function at all. Every writer class sits behind TWO guarded setters:
+        this one, and :func:`_agent_spec_cache_put` for the agent-keyed
+        ``_spec_cache``. The protected containers are exactly those
+        :func:`_clear_session_agent_caches` evicts — read that function for
+        the current inventory rather than trusting a count written here,
+        which drifts the moment a cache is added.
+
+        Coverage splits two ways, and the split is discoverable from the test
+        names rather than enumerated here. Writers with an isolated mid-flight
+        invalidate/release race test proving the guard directly are covered by
+        the ``test_invalidate_midflight_drops_the_stale_fill`` parametrization
+        and the ``test_*_parked_past_invalidation_does_not_publish`` tests.
+        Every remaining writer is covered by construction instead: it reaches
+        one of the two setters and nothing else, so the guard cannot be
+        bypassed without introducing a raw assignment. That is a structural
+        argument, not an executed one; state it that way rather than implying
+        equivalent test coverage.
+
+        Both setters answer the SAME-SESSION question — "did this session's
+        agent change while my fill was in flight" — and answer it correctly.
+        Neither answers the cross-conversation one, which only matters for the
+        global agent-keyed ``_spec_cache``; see :func:`_agent_spec_cache_put`
+        for that gap. "Covered by construction" above is a claim about the
+        write PATH being unbypassable, not about that cache being safe against
+        another conversation's concurrent invalidation.
+
+        :returns: ``True`` if the value was published, ``False`` if the fill
+            was invalidated while in flight and the write was dropped. Callers
+            holding a real resource should act on ``False``, but see
+            :func:`_terminal_survives_fence` for why that cleanup is
+            best-effort rather than a rollback.
+        """
+        if not _session_cache_generation_is_current(session_id, generation):
+            return False
+        if agent_tag is _UNTAGGED_CACHE_WRITE:
+            cache[session_id] = value
+        else:
+            _cache_set_for_agent(cache, session_id, agent_tag, value)
+        return True
+
+    def _agent_spec_cache_put(
+        agent_id: str, value: Any, *, session_id: str, generation: int
+    ) -> bool:
+        """Sanctioned write path for the agent-keyed ``_spec_cache``.
+
+        Keying by agent id does NOT make this safe on its own: a same-agent
+        spec/MCP edit resets the session and pops the entry, after which an
+        older in-flight fill would reinstate the stale spec under the
+        UNCHANGED agent id. The generation of the SESSION the fill was started
+        for decides whether it may publish, regardless of what the value is
+        keyed by.
+
+        WHAT THIS VALIDATES: the generation of ``session_id`` — the session
+        that initiated this fill. It answers "did THIS session's agent change
+        while I was in flight", and for that question it is effective. That is
+        the same-session staleness the guard was built for and what its race
+        tests cover.
+
+        WHAT IT DOES NOT VALIDATE: anything driven by a DIFFERENT conversation.
+        ``_spec_cache`` is global and keyed by agent id, while the generation
+        counter is per-session, so it cannot answer "did THIS AGENT change
+        while I was in flight" — which is the question a globally-shared
+        agent-keyed cache actually needs to ask. Concretely: conversation S1
+        starts resolving agent A; conversation S2 resets agent A and pops
+        ``_spec_cache[A]``; S1's own generation never moved, because S2's reset
+        is not S1's reset, so S1's write is judged current and REINSTATES the
+        stale entry, which later reads then consume across conversations.
+
+        That cross-conversation stale reinstatement is a known gap. This
+        guard closes the same-session half and leaves the cross-conversation
+        half no worse than before. Closing it properly needs an agent-scoped
+        epoch rather than a session-scoped one.
+
+        :param agent_id: Cache key.
+        :param value: Resolved spec entry.
+        :param session_id: Session whose generation fences this fill. Only
+            this session's invalidations are seen; see above.
+        :param generation: Generation captured before the resolver await.
+        :returns: ``True`` if published, ``False`` if dropped as stale by the
+            initiating session's own generation. ``True`` does NOT mean no
+            other conversation invalidated this agent meanwhile.
+        """
+        if not _session_cache_generation_is_current(session_id, generation):
+            return False
+        _spec_cache[agent_id] = value
+        return True
+
+    def _guarded_launch_config_recorder(
+        session_id: str,
+    ) -> Callable[[str, ClaudeNativeUcodeConfig | None], None]:
+        """Return a generation-checked ``record_launch_config`` callback.
+
+        The raw ``dict.__setitem__`` used to be handed across the module
+        boundary into ``_auto_create_claude_terminal``, which calls it after
+        awaiting resolution — so a reset during that await repopulated the old
+        config after eviction. The guard has to travel with the callback, not
+        stay on this side of the boundary.
+
+        :param session_id: Session the terminal is being created for.
+        :returns: Callback that publishes only if still current.
+        """
+        _generation = _session_cache_generation(session_id)
+
+        def _record(sid: str, config: ClaudeNativeUcodeConfig | None) -> None:
+            _session_cache_put(_session_claude_launch_configs, sid, config, generation=_generation)
+
+        return _record
+
+    async def _terminal_survives_fence(
+        session_id: str,
+        generation: int,
+        terminal_name: str,
+        session_key: str,
+    ) -> bool:
+        """Report whether a terminal created across an await is still current.
+
+        The generation guard covers cached VALUES. A terminal is a RESOURCE,
+        and by the time this runs the creator has ALREADY registered it,
+        emitted its lifecycle event and started its forwarder — so this is a
+        best-effort after-the-fact check, NOT a transactional rollback. What it
+        genuinely provides is that the CALLER does not return a terminal view
+        built from a superseded agent's spec (the Claude ensure route answers
+        409 instead, so the caller retries).
+
+        The ``close`` below is scoped to the instance this creator published:
+        it is passed as ``expected``, so a successor that took the same key
+        for the current agent is left running. That makes the close safe, not
+        transactional.
+
+        What it does NOT provide:
+
+        - it does not cancel the forwarder the creator started, nor retract the
+          lifecycle event already published to subscribers.
+        - it does not roll back bridge state or harness clients built alongside
+          the terminal.
+
+        :param session_id: Session the terminal was created for.
+        :param generation: Generation captured before the creation await.
+        :param terminal_name: Terminal name, e.g. ``"claude"``.
+        :param session_key: Per-launch session key, e.g. ``"main"``.
+        :returns: ``True`` when the generation still matches. ``False`` means
+            only that THIS caller must not return the result — the terminal
+            may well remain published, with its forwarder running and its
+            lifecycle event already delivered.
+        """
+        # Read before the generation check, so this is the instance THIS
+        # creator published rather than whatever holds the key later.
+        _tr = resource_registry.terminal_registry
+        _created = _tr.get(session_id, terminal_name, session_key) if _tr is not None else None
+        if _session_cache_generation_is_current(session_id, generation):
+            return True
+        _logger.info(
+            "Not returning %s:%s terminal for %s to its caller — created under "
+            "a superseded agent generation. The instance this creator published "
+            "is closed only if it still holds that key; a successor created for "
+            "the current agent is left running. The forwarder already started "
+            "is not cancelled",
+            terminal_name,
+            session_key,
+            session_id,
+        )
+        if _tr is not None and _created is not None:
+            with contextlib.suppress(OSError, RuntimeError, KeyError):
+                await _tr.close(session_id, terminal_name, session_key, expected=_created)
+        return False
 
     async def _resolve_session_claude_launch_config(
         session_id: str,
@@ -1839,10 +2218,19 @@ def create_runner_app(
         if task is None:
             from omnigent.claude_native import resolve_native_claude_config
 
+            _load_generation = _session_cache_generation(session_id)
+
             async def _load() -> ClaudeNativeUcodeConfig | None:
-                spec = await _resolve_session_agent_spec(session_id)
+                spec = await _resolve_session_agent_spec(
+                    session_id, agent_id_hint=_session_agent_ids.get(session_id)
+                )
                 config = await asyncio.to_thread(resolve_native_claude_config, spec=spec)
-                _session_claude_launch_configs[session_id] = config
+                _session_cache_put(
+                    _session_claude_launch_configs,
+                    session_id,
+                    config,
+                    generation=_load_generation,
+                )
                 return config
 
             task = asyncio.create_task(_load())
@@ -1866,8 +2254,8 @@ def create_runner_app(
 
     _session_agent_ids = _session_agent_ids_ref  # shared with module-level get_session_agent_id
     _session_sub_agent_names: dict[str, str] = {}
-    _session_tool_schemas: dict[str, list[dict[str, Any]]] = {}  # session_id → cached tool schemas
-    _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
+    _session_tool_schemas: dict[str, tuple[str | None, list[dict[str, Any]]]] = {}
+    _session_mcp_spec_hash: dict[str, tuple[str | None, str]] = {}  # session_id → last MCP hash
     _session_comment_relays: dict[str, Any] = {}
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -2207,6 +2595,7 @@ def create_runner_app(
         cached = _session_snapshot_cache.get(session_id)
         if cached is not None:
             return cached
+        _fill_generation = _session_cache_generation(session_id)
         lock = _session_snapshot_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
             cached = _session_snapshot_cache.get(session_id)
@@ -2253,13 +2642,21 @@ def create_runner_app(
                 agent_name=agent_name,
             )
             if snapshot.ok and snapshot.agent_id is not None:
-                _session_snapshot_cache[session_id] = snapshot
+                _session_cache_put(
+                    _session_snapshot_cache,
+                    session_id,
+                    snapshot,
+                    generation=_fill_generation,
+                )
             return snapshot
 
     async def _session_workspace_value(session_id: str) -> str | None:
         if session_id not in _session_workspace_cache:
             snapshot = await _session_snapshot(session_id)
-            _session_workspace_cache[session_id] = snapshot.workspace
+            if snapshot.ok:
+                _session_workspace_cache[session_id] = snapshot.workspace
+            else:
+                return snapshot.workspace
         return _session_workspace_cache.get(session_id)
 
     async def _session_runtime_cwd(session_id: str) -> Path | None:
@@ -2277,14 +2674,22 @@ def create_runner_app(
         *,
         session_id: str,
         agent_id: str,
+        generation: int,
     ) -> _SessionInitContext:
+        """Publish the envelope's derived state under the CALLER's generation.
+
+        *generation* must be the one captured before the envelope was
+        obtained, not one read here: a fill's guard only rejects a stale
+        write if its generation predates the resolution of the data being
+        written, and this function only formats data resolved upstream.
+        """
         if envelope.session_id != session_id or envelope.agent_id != agent_id:
             raise ValueError("session initialization envelope identity mismatch")
 
         global _server_version
         _server_version = envelope.server_version
         snapshot = envelope.snapshot
-        _session_snapshot_cache[session_id] = _SessionSnapshot(
+        _envelope_snapshot = _SessionSnapshot(
             ok=True,
             status_code=200,
             created_at=float(snapshot.created_at),
@@ -2293,11 +2698,22 @@ def create_runner_app(
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
         )
+        _session_cache_put(
+            _session_snapshot_cache,
+            session_id,
+            _envelope_snapshot,
+            generation=generation,
+        )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
         if envelope.sub_agent_name:
             _session_sub_agent_names[session_id] = envelope.sub_agent_name
-        _session_init_envelopes[session_id] = (time.monotonic(), envelope)
+        _session_cache_put(
+            _session_init_envelopes,
+            session_id,
+            (time.monotonic(), envelope),
+            generation=generation,
+        )
         return _SessionInitContext(envelope=envelope)
 
     def _fresh_session_init_envelope(session_id: str) -> RunnerSessionInitEnvelope | None:
@@ -2315,6 +2731,7 @@ def create_runner_app(
         *,
         session_id: str,
         agent_id: str,
+        generation: int,
     ) -> _SessionInitContext:
         envelope = parse_runner_session_init_envelope(body)
         if envelope is None:
@@ -2328,6 +2745,7 @@ def create_runner_app(
             envelope,
             session_id=session_id,
             agent_id=agent_id,
+            generation=generation,
         )
 
     async def _resolve_session_fs_registry(
@@ -2475,7 +2893,9 @@ def create_runner_app(
             process_manager=process_manager,
             cwd=resolver_kwargs["cwd"],
             model_override=body.model_override,
-            session_spec=_session_spec_cache.get(conversation_id),
+            session_spec=_cache_get_for_agent(
+                _session_spec_cache, conversation_id, resolver_kwargs["agent_id"]
+            ),
         )
         try:
             title = await run_background_title(context)
@@ -2525,6 +2945,7 @@ def create_runner_app(
             )
         session_id = body.get("session_id")
         agent_id = body.get("agent_id")
+        _init_generation = _session_cache_generation(session_id) if session_id else 0
         if not session_id or not agent_id:
             return JSONResponse(
                 status_code=400,
@@ -2539,6 +2960,7 @@ def create_runner_app(
                 body,
                 session_id=session_id,
                 agent_id=agent_id,
+                generation=_init_generation,
             )
         except ValueError:
             return JSONResponse(
@@ -2570,15 +2992,29 @@ def create_runner_app(
                 from omnigent.runtime.workflow import _find_spec_by_name
 
                 _sub_spec = _find_spec_by_name(spec, _sa_name_assign)
-                if _sub_spec is not None:
-                    spec = _sub_spec
-                    spec_entry = (
-                        ResolvedSpec(spec=spec, workdir=_resolved_spec_workdir(spec_entry))
-                        if _resolved_spec_workdir(spec_entry) is not None
-                        else spec
-                    )
-                else:
+                if _sub_spec is None:
+                    # A requested sub-agent that doesn't exist in the spec
+                    # tree is not "fall back to the parent" — silently
+                    # creating the session bound to the PARENT's identity
+                    # (wrong harness, wrong instructions) would treat a
+                    # non-match as authoritative. Fail the request instead
+                    # of guessing.
                     _warn_unresolved_sub_agent(session_id, _sa_name_assign)
+                    return JSONResponse(
+                        status_code=404,
+                        content={
+                            "error": "sub_agent_not_found",
+                            "detail": (
+                                f"Sub-agent {_sa_name_assign!r} not found in this agent's spec."
+                            ),
+                        },
+                    )
+                spec = _sub_spec
+                spec_entry = (
+                    ResolvedSpec(spec=spec, workdir=_resolved_spec_workdir(spec_entry))
+                    if _resolved_spec_workdir(spec_entry) is not None
+                    else spec
+                )
             harness_name = spec.executor.config.get("harness") or spec.executor.type
             harness_name = canonicalize_harness(harness_name) or harness_name
 
@@ -2608,7 +3044,13 @@ def create_runner_app(
                     server_client=server_client,
                     optional_labels=init_context.labels,
                 )
-            _session_spec_cache[session_id] = spec_entry
+            _session_cache_put(
+                _session_spec_cache,
+                session_id,
+                spec_entry,
+                generation=_init_generation,
+                agent_tag=agent_id,
+            )
         else:
             harness_name = "runner-test-default"
             spawn_env = None
@@ -2629,7 +3071,7 @@ def create_runner_app(
             )
 
         _session_start_cache.setdefault(session_id, time.time())
-        _session_agent_ids[session_id] = agent_id
+        _session_cache_put(_session_agent_ids, session_id, agent_id, generation=_init_generation)
         if session_id not in _session_event_queues:
             _session_event_queues[session_id] = asyncio.Queue()
         if session_id not in _session_inboxes:
@@ -2679,6 +3121,11 @@ def create_runner_app(
                 Callable[[], Awaitable[AgentSpec | ResolvedSpec | None]] | None
             ) = None
 
+            # Set when the launch shell actually builds a terminal (build_context
+            # runs only on the create path), so the generation fence below is
+            # applied to a terminal this init created, not one it found.
+            _claude_terminal_built = False
+
             if harness_name == "claude-native":
 
                 async def _claude_pre_launch(has_terminal: bool) -> PreLaunchResult:
@@ -2718,11 +3165,15 @@ def create_runner_app(
                     return PreLaunchResult(force_recreate=wants_rebuild, skip=inbound)
 
                 async def _claude_build_context(ctx: NativeLaunchContext) -> NativeLaunchContext:
+                    nonlocal _claude_terminal_built
+                    _claude_terminal_built = True
                     bundle_dir: Path | None = None
                     agent_name: str | None = None
                     skills_filter: str | list[str] = "all"
                     try:
-                        spec = await _resolve_session_agent_spec(session_id)
+                        spec = await _resolve_session_agent_spec(
+                            session_id, agent_id_hint=agent_id
+                        )
                     except OmnigentError:
                         spec = None
                         _logger.info(
@@ -2731,7 +3182,7 @@ def create_runner_app(
                             session_id,
                         )
                     if spec is not None:
-                        entry = _session_spec_cache.get(session_id)
+                        entry = _cache_get_for_agent(_session_spec_cache, session_id, agent_id)
                         bundle_dir = _resolved_spec_workdir(entry) if entry is not None else None
                         agent_name = getattr(spec, "name", None)
                         skills_filter = getattr(spec, "skills_filter", "all")
@@ -2757,7 +3208,7 @@ def create_runner_app(
                         resolve_launch_config=lambda: _resolve_session_claude_launch_config(
                             session_id
                         ),
-                        record_launch_config=_session_claude_launch_configs.__setitem__,
+                        record_launch_config=_guarded_launch_config_recorder(session_id),
                     )
 
                 _launch_pre = _claude_pre_launch
@@ -2779,11 +3230,13 @@ def create_runner_app(
                     bundle_dir: Path | None = None
                     skills_filter: str | list[str] = "all"
                     try:
-                        spec = await _resolve_session_agent_spec(session_id)
+                        spec = await _resolve_session_agent_spec(
+                            session_id, agent_id_hint=agent_id
+                        )
                     except OmnigentError:
                         spec = None
                     if spec is not None:
-                        entry = _session_spec_cache.get(session_id)
+                        entry = _cache_get_for_agent(_session_spec_cache, session_id, agent_id)
                         bundle_dir = _resolved_spec_workdir(entry) if entry is not None else None
                         skills_filter = getattr(spec, "skills_filter", "all")
                     if bundle_dir is not None and spec is not None:
@@ -2833,10 +3286,12 @@ def create_runner_app(
             elif harness_name == "pi-native":
                 # pi resolves its spec unwrapped — a resolution error surfaces as
                 # a terminal-start error (the resolver does not swallow it).
-                _launch_resolve_spec = lambda: _resolve_session_agent_spec(session_id)  # noqa: E731
+                _launch_resolve_spec = lambda: _resolve_session_agent_spec(  # noqa: E731
+                    session_id, agent_id_hint=agent_id
+                )
             elif harness_name in ("cursor-native", "opencode-native", "kimi-native"):
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec_or_none(  # noqa: E731
-                    session_id
+                    session_id, agent_id_hint=agent_id
                 )
 
             _launch_result = await _launch_native_terminal(
@@ -2850,6 +3305,13 @@ def create_runner_app(
             # Only claude reported terminal_ready in the create-session response.
             if harness_name == "claude-native":
                 terminal_ready = _launch_result
+                # Session init is not cancelled by a concurrent reset/teardown,
+                # so the terminal it just built can outlive the agent it was
+                # built for.
+                if _launch_result and _claude_terminal_built:
+                    terminal_ready = await _terminal_survives_fence(
+                        session_id, _init_generation, "claude", "main"
+                    )
 
         if (
             spec is not None
@@ -2867,7 +3329,9 @@ def create_runner_app(
                 if not _has_repl_terminal:
                     _publish_terminal_pending(_publish_event, session_id, True)
                     try:
-                        repl_agent_spec = await _resolve_session_agent_spec(session_id)
+                        repl_agent_spec = await _resolve_session_agent_spec(
+                            session_id, agent_id_hint=agent_id
+                        )
                     except OmnigentError:
                         repl_agent_spec = None
                     try:
@@ -3150,10 +3614,12 @@ def create_runner_app(
         _session_snapshot_cache.pop(session_id, None)
         _session_snapshot_locks.pop(session_id, None)
         _session_init_envelopes.pop(session_id, None)
+        _session_cache_generations.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
+        _session_mcp_spec_hash.pop(session_id, None)
         if _relay := _session_comment_relays.pop(session_id, None):
             _relay.close()
         _session_histories.pop(session_id, None)
@@ -3172,6 +3638,7 @@ def create_runner_app(
         for _tmr in _session_timers.pop(session_id, {}).values():
             _tmr.cancel()
         _version_cache.pop(session_id, None)
+        _instruction_delivery_warned.pop(session_id, None)
         stale_resp_ids = [rid for rid, cid in _resp_to_conv.items() if cid == session_id]
         for rid in stale_resp_ids:
             _resp_to_conv.pop(rid, None)
@@ -3515,7 +3982,9 @@ def create_runner_app(
 
         items_to_persist: list[dict[str, Any]] = []
         synthetic_items: list[dict[str, Any]] = []
-        cached_spec_entry = _session_spec_cache.get(conv_id)
+        cached_spec_entry = _cache_get_for_agent(
+            _session_spec_cache, conv_id, _session_agent_ids.get(conv_id)
+        )
         cached_spec = _unwrap_resolved_spec(cached_spec_entry)
         agent_name = cached_spec.name if cached_spec else "unknown"
         for fc in dangling_calls:
@@ -3621,7 +4090,7 @@ def create_runner_app(
         )
 
     def _session_harness_name(conv_id: str) -> str | None:
-        spec = _session_spec_cache.get(conv_id)
+        spec = _cache_get_for_agent(_session_spec_cache, conv_id, _session_agent_ids.get(conv_id))
         if spec is None:
             return None
         h = spec.executor.config.get("harness") or spec.executor.type
@@ -3775,7 +4244,9 @@ def create_runner_app(
                 )
 
         if model is None:
-            model = _codex_native_model_from_spec(_session_spec_cache.get(conv_id))
+            model = _codex_native_model_from_spec(
+                _cache_get_for_agent(_session_spec_cache, conv_id, _session_agent_ids.get(conv_id))
+            )
         return model, effort
 
     async def _handle_codex_native_plan_mode_change(
@@ -3805,6 +4276,39 @@ def create_runner_app(
                     "detail": "Codex-native plan-mode update requires a current model.",
                 },
             )
+        from omnigent.codex_native_bridge import (
+            DeveloperInstructionsReadState,
+            read_codex_config_developer_instructions_state_from_home,
+        )
+
+        # Read the current developer_instructions from the bridge's private
+        # config so this settings update doesn't silently overwrite what
+        # build_codex_native_server persisted. Unlike model/effort above,
+        # this has no persistent runner-side state to fall back to, so a
+        # transient read failure (UNREADABLE) must not be collapsed into
+        # "genuinely absent" — that would send developer_instructions: null
+        # and wipe live state on nothing more than a momentary read glitch.
+        # Only a genuine ABSENT reads as None; UNREADABLE fails the request
+        # instead, matching this handler's existing precondition-failure
+        # style (missing bridge / unknown model both already 503 here).
+        _di_read = read_codex_config_developer_instructions_state_from_home(Path(state.codex_home))
+        if _di_read.state is DeveloperInstructionsReadState.UNREADABLE:
+            _logger.warning(
+                "Codex-native plan-mode update skipped for %s: developer_instructions "
+                "config unreadable — refusing to guess and risk wiping live state.",
+                conv_id,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_settings_update_failed",
+                    "detail": (
+                        "Codex-native plan-mode update requires reading the current "
+                        "developer_instructions config; it could not be read."
+                    ),
+                },
+            )
+        developer_instructions = _di_read.value
         return await _handle_codex_native_settings_update(
             conv_id,
             {
@@ -3813,7 +4317,7 @@ def create_runner_app(
                     "settings": {
                         "model": model,
                         "reasoning_effort": effort,
-                        "developer_instructions": None,
+                        "developer_instructions": developer_instructions,
                     },
                 },
             },
@@ -4178,7 +4682,9 @@ def create_runner_app(
                     timeout=10.0,
                 )
         try:
-            spec = await _resolve_session_agent_spec(conv_id)
+            spec = await _resolve_session_agent_spec(
+                conv_id, agent_id_hint=_session_agent_ids.get(conv_id)
+            )
         except OmnigentError:
             spec = None
         try:
@@ -4805,6 +5311,8 @@ def create_runner_app(
         if session_id in _session_comment_relays:
             return
 
+        _fill_generation = _session_cache_generation(session_id)
+
         import json as _json
 
         from omnigent.claude_native_bridge import (
@@ -4830,7 +5338,9 @@ def create_runner_app(
             bridge_dir = bridge_dir_for_bridge_id(bridge_id or session_id)
 
         try:
-            relay_spec = await _resolve_session_agent_spec(session_id)
+            relay_spec = await _resolve_session_agent_spec(
+                session_id, agent_id_hint=_session_agent_ids.get(session_id)
+            )
         except OmnigentError:
             relay_spec = None
         if session_id in _session_comment_relays:
@@ -4869,7 +5379,20 @@ def create_runner_app(
                 exc_info=True,
             )
             return
-        _session_comment_relays[session_id] = relay
+        if not _session_cache_put(
+            _session_comment_relays, session_id, relay, generation=_fill_generation
+        ):
+            # An agent switch landed while this relay was being built off the
+            # PREVIOUS agent's spec, so it is not RETAINED IN THE SESSION
+            # CACHE and is closed best-effort here. That is narrower than it
+            # may look: start_tool_relay has already written tool_relay.json,
+            # bound its HTTP server and started its thread by the time it
+            # returns, so the stale relay may already have been externally
+            # visible. Dropping the cache entry stops the session serving it
+            # onward; it does not un-publish what was published.
+            with contextlib.suppress(OSError, RuntimeError):
+                relay.close()
+            return
 
         async def _notify_tools_changed() -> None:
             try:
@@ -4918,33 +5441,64 @@ def create_runner_app(
         msg_body: dict[str, Any],
         conv: str,
     ) -> None:
+        # This path resolves the turn's spec inline rather than through
+        # _resolve_effective_turn, and fails DIFFERENTLY from the other two on
+        # purpose: the 202 has already gone out by the time resolution runs, so
+        # a resolver exception or a missing requested child can only surface
+        # asynchronously, as a terminal ``failed`` session status. The
+        # three-path matrix is pinned by ``test_cross_path_resolution_contract``.
         _dispatched_agent_id = msg_body.get("agent_id")
         _prior_agent_id = _session_agent_ids.get(conv)
-        if (
-            _dispatched_agent_id
-            and _prior_agent_id is not None
-            and _prior_agent_id != _dispatched_agent_id
-        ):
+        # A known, EXPLICIT agent switch (prior dispatch recorded a
+        # different agent than this one) releases the harness subprocess
+        # and drops the agent-keyed ``_spec_cache`` entry — that part
+        # still needs _session_agent_ids as the "what did we last
+        # dispatch as" fact. Whether any *cache* below is trustworthy for
+        # THIS turn is decided separately, per read, by the agent tag
+        # stored on the cache entry itself (see _cache_get_for_agent) —
+        # not by this dict, so a write to one can never drift from the
+        # other.
+        if _dispatched_agent_id and _prior_agent_id != _dispatched_agent_id:
             _logger.info(
-                "agent switch detected for %s: %s -> %s; resetting session caches",
+                "agent provenance mismatch for %s: prior=%s dispatched=%s; "
+                "invalidating session agent state",
                 conv,
                 _prior_agent_id,
                 _dispatched_agent_id,
             )
-            _session_spec_cache.pop(conv, None)
-            _session_skills_cache.pop(conv, None)
-            _session_cursor_model_names.pop(conv, None)
-            _drop_session_claude_launch_config(conv)
-            _session_tool_schemas.pop(conv, None)
-            _session_snapshot_cache.pop(conv, None)
-            if process_manager is not None:
-                await process_manager.release(conv)
+            await _invalidate_session_agent_state(conv, _dispatched_agent_id)
+        # Captured after this path's OWN invalidation above (so that
+        # invalidation cannot cancel this path's own writes) and before every
+        # await below that can publish into a protected cache, so an
+        # invalidation landing mid-turn drops those writes.
+        _bg_fill_generation = _session_cache_generation(conv)
         if _dispatched_agent_id:
-            _session_agent_ids[conv] = _dispatched_agent_id
+            _session_cache_put(
+                _session_agent_ids, conv, _dispatched_agent_id, generation=_bg_fill_generation
+            )
 
-        cached_spec_entry = _session_spec_cache.get(conv)
+        # Tracks the agent id the currently-held ``cached_spec`` is tagged
+        # for, so every subsequent write of ``_session_spec_cache[conv]``
+        # in this function tags the entry consistently instead of leaving
+        # an untagged/mistagged value for the next reader.
+        _current_cache_agent_tag: str | None = _dispatched_agent_id
+        cached_spec_entry = _cache_get_for_agent(_session_spec_cache, conv, _dispatched_agent_id)
         cached_spec = _unwrap_resolved_spec(cached_spec_entry)
         cached_spec_workdir = _resolved_spec_workdir(cached_spec_entry)
+        # Tracks whether ``cached_spec`` is a FRESH, un-swapped PARENT/root
+        # (True only immediately after the raw ``spec_resolver(_aid, conv)``
+        # call below, which returns the parent regardless of sub_agent_name)
+        # versus already the resolved SUB-AGENT spec (a pre-existing cache
+        # hit — session-create and every prior turn's swap below always
+        # leave the CHILD spec cached — or the ``_resolve_session_agent_spec``
+        # branch, which internally applies the same swap via
+        # ``_resolve_session_spec_entry``). Only a fresh, unswapped parent
+        # may coincidentally share its name with the requested sub-agent
+        # without actually BEING it (a top-level coordinator named e.g.
+        # "worker" asked to resolve sub_agent_name "worker" with no such
+        # child) — that must still search as a parent tree and correctly
+        # miss, not self-match.
+        _cached_spec_is_fresh_parent = False
         if cached_spec is None and spec_resolver is not None:
             _aid = msg_body.get("agent_id")
             if _aid:
@@ -4953,10 +5507,24 @@ def create_runner_app(
                     if isinstance(resolved, ResolvedSpec):
                         cached_spec = _unwrap_resolved_spec(resolved)
                         cached_spec_workdir = _resolved_spec_workdir(resolved)
-                        _session_spec_cache[conv] = resolved
+                        _session_cache_put(
+                            _session_spec_cache,
+                            conv,
+                            resolved,
+                            generation=_bg_fill_generation,
+                            agent_tag=_aid,
+                        )
                     elif resolved is not None:
                         cached_spec = resolved
-                        _session_spec_cache[conv] = resolved
+                        _session_cache_put(
+                            _session_spec_cache,
+                            conv,
+                            resolved,
+                            generation=_bg_fill_generation,
+                            agent_tag=_aid,
+                        )
+                    _current_cache_agent_tag = _aid
+                    _cached_spec_is_fresh_parent = cached_spec is not None
                 except (httpx.HTTPError, RuntimeError):
                     _logger.warning(
                         "Spec resolution failed for %s",
@@ -4964,9 +5532,27 @@ def create_runner_app(
                         exc_info=True,
                     )
             else:
+                # No explicit agent id on THIS turn's wire body (e.g. a
+                # buffered/continuation turn) — but _prior_agent_id (this
+                # session's last-known agent, already computed above) is a
+                # real identity fact, not a guess, so pass it as a hint:
+                # _resolve_session_spec_entry then trusts a same-session
+                # cache hit tagged for that agent, and falls back to a
+                # snapshot fetch only when even that's unknown.
+                # _resolve_session_agent_spec tags the cache entry it
+                # writes with the agent id it actually resolved, so read
+                # that tag back rather than assuming it matches the hint.
                 try:
-                    cached_spec = await _resolve_session_agent_spec(conv)
-                    cached_spec_workdir = _resolved_spec_workdir(_session_spec_cache.get(conv))
+                    cached_spec = await _resolve_session_agent_spec(
+                        conv, agent_id_hint=_prior_agent_id
+                    )
+                    _resolved_entry = _session_spec_cache.get(conv)
+                    _current_cache_agent_tag = (
+                        _resolved_entry[0] if _resolved_entry is not None else None
+                    )
+                    cached_spec_workdir = _resolved_spec_workdir(
+                        _resolved_entry[1] if _resolved_entry is not None else None
+                    )
                 except (OmnigentError, httpx.HTTPError, RuntimeError):
                     _logger.warning(
                         "On-demand agent resolution failed for %s",
@@ -4978,28 +5564,55 @@ def create_runner_app(
         if _sa_name and cached_spec is not None:
             from omnigent.runtime.workflow import _find_spec_by_name
 
-            sub_spec = _find_spec_by_name(cached_spec, _sa_name)
-            if sub_spec is not None:
-                cached_spec = sub_spec
-                _session_spec_cache[conv] = (
-                    ResolvedSpec(spec=cached_spec, workdir=cached_spec_workdir)
-                    if cached_spec_workdir is not None
-                    else cached_spec
-                )
-            else:
+            sub_spec = (
+                cached_spec
+                if not _cached_spec_is_fresh_parent and cached_spec.name == _sa_name
+                else _find_spec_by_name(cached_spec, _sa_name)
+            )
+            if sub_spec is None:
+                # A recorded sub_agent_name that no longer resolves (removed
+                # from the spec tree, or a stale record) must not silently
+                # fall back to the PARENT's identity — that would treat a
+                # non-match as authoritative, and here it would mean the
+                # wrong harness/wrong instructions drive the whole turn
+                # without any signal.
+                # Fail the turn loudly instead: caught by _run_turn_bg's
+                # generic except clause, which publishes a "failed" status.
                 _warn_unresolved_sub_agent(conv, _sa_name)
+                raise OmnigentError(
+                    f"sub-agent {_sa_name!r} not found in the agent spec for session {conv!r}",
+                    code=ErrorCode.NOT_FOUND,
+                )
+            cached_spec = sub_spec
+            _session_cache_put(
+                _session_spec_cache,
+                conv,
+                ResolvedSpec(spec=cached_spec, workdir=cached_spec_workdir)
+                if cached_spec_workdir is not None
+                else cached_spec,
+                generation=_bg_fill_generation,
+                agent_tag=_current_cache_agent_tag,
+            )
 
         cached_spec = _spec_with_workdir_paths(cached_spec, cached_spec_workdir)
         if cached_spec is not None:
-            _session_spec_cache[conv] = (
+            _session_cache_put(
+                _session_spec_cache,
+                conv,
                 ResolvedSpec(spec=cached_spec, workdir=cached_spec_workdir)
                 if cached_spec_workdir is not None
-                else cached_spec
+                else cached_spec,
+                generation=_bg_fill_generation,
+                agent_tag=_current_cache_agent_tag,
             )
 
         harness_name: str | None = None
         spawn_env: dict[str, str] | None = None
         instructions: str | None = None
+        # RAW per-request text off the caller's body, captured before any
+        # composition so it stays distinguishable from the composed string
+        # built below. See TurnDispatch.per_request_instructions.
+        _raw_per_request_instructions = msg_body.get("instructions")
         if cached_spec is not None:
             h = (
                 msg_body.get("harness_override")
@@ -5031,9 +5644,14 @@ def create_runner_app(
                 if shared_message_attribution_enabled() and conv in _author_attribution_sessions
                 else ()
             )
+            # The turn's own per-request text composes with the agent's
+            # authored instructions rather than being dropped: this body is
+            # the caller's, so its ``instructions`` is raw user text, never an
+            # internally-composed string (this function builds a fresh
+            # harness_body below and never copies one back in).
             instructions = build_instructions(
                 cached_spec,
-                None,
+                _raw_per_request_instructions,
                 [],
                 framework_instructions=framework_instructions,
             )
@@ -5041,6 +5659,7 @@ def create_runner_app(
         ctx = TurnDispatch(
             agent_id=msg_body.get("agent_id"),
             harness=harness_name,
+            per_request_instructions=_raw_per_request_instructions,
             spawn_env=spawn_env,
             has_mcp_servers=(
                 (cached_spec is not None and bool(cached_spec.mcp_servers))
@@ -5089,7 +5708,13 @@ def create_runner_app(
         if instructions:
             harness_body["instructions"] = instructions
 
-        if conv not in _session_tool_schemas:
+        _cached_tool_schemas = _cache_get_for_agent(
+            _session_tool_schemas, conv, _current_cache_agent_tag
+        )
+        # A cache entry is only ever written once the builtin half genuinely
+        # resolved (below), so an existing entry already proves it.
+        _tools_resolved = _cached_tool_schemas is not None
+        if _cached_tool_schemas is None:
             all_tools: list[dict[str, Any]] = []
             if cached_spec is not None:
                 try:
@@ -5102,6 +5727,7 @@ def create_runner_app(
                         workdir=cached_spec_workdir or runner_workspace,
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
+                    _tools_resolved = True
                 except (
                     ImportError,
                     ValueError,
@@ -5112,13 +5738,27 @@ def create_runner_app(
                         conv,
                         exc_info=True,
                     )
-            _session_tool_schemas[conv] = all_tools
+            if _tools_resolved:
+                _session_cache_put(
+                    _session_tool_schemas,
+                    conv,
+                    all_tools,
+                    generation=_bg_fill_generation,
+                    agent_tag=_current_cache_agent_tag,
+                )
 
-        if cached_spec and cached_spec.mcp_servers:
+        # Gated on the builtin half having resolved: merging MCP schemas onto
+        # an absent builtin set reads it as `[]` and would cache (and hash) a
+        # partial, MCP-only tool list as final, blocking any later retry of
+        # the builtin half for the rest of the conversation.
+        if cached_spec and cached_spec.mcp_servers and _tools_resolved:
             from omnigent.runner.mcp_manager import compute_spec_hash
 
             _mcp_hash = compute_spec_hash(list(cached_spec.mcp_servers))
-            if _mcp_hash != _session_mcp_spec_hash.get(conv):
+            _cached_mcp_hash = _cache_get_for_agent(
+                _session_mcp_spec_hash, conv, _current_cache_agent_tag
+            )
+            if _mcp_hash != _cached_mcp_hash:
                 _session_mcp_proxy: Any = ProxyMcpManager(conv, server_client)
                 try:
                     mcp_result = await _session_mcp_proxy.schemas_for(
@@ -5126,11 +5766,28 @@ def create_runner_app(
                     )
                     _builtin_tools = [
                         t
-                        for t in _session_tool_schemas.get(conv, [])
+                        for t in (
+                            _cache_get_for_agent(
+                                _session_tool_schemas, conv, _current_cache_agent_tag
+                            )
+                            or []
+                        )
                         if not (isinstance(t, dict) and "__" in (t.get("name") or ""))
                     ]
-                    _session_tool_schemas[conv] = _builtin_tools + list(mcp_result.schemas)
-                    _session_mcp_spec_hash[conv] = _mcp_hash
+                    _session_cache_put(
+                        _session_tool_schemas,
+                        conv,
+                        _builtin_tools + list(mcp_result.schemas),
+                        generation=_bg_fill_generation,
+                        agent_tag=_current_cache_agent_tag,
+                    )
+                    _session_cache_put(
+                        _session_mcp_spec_hash,
+                        conv,
+                        _mcp_hash,
+                        generation=_bg_fill_generation,
+                        agent_tag=_current_cache_agent_tag,
+                    )
                 except (
                     httpx.HTTPError,
                     RuntimeError,
@@ -5142,7 +5799,9 @@ def create_runner_app(
                         exc_info=True,
                     )
 
-        _spec_tools = _session_tool_schemas.get(conv) or []
+        _spec_tools = (
+            _cache_get_for_agent(_session_tool_schemas, conv, _current_cache_agent_tag) or []
+        )
         _client_tools = msg_body.get("tools") or []
         merged_tools = _merge_request_client_tools(_spec_tools, _client_tools)
         if merged_tools:
@@ -5281,15 +5940,107 @@ def create_runner_app(
         conv_id: str,
         dispatch: TurnDispatch | None = None,
     ) -> Any:
-        harness_name = dispatch.harness if dispatch else body.get("harness")
-        spawn_env = dispatch.spawn_env if dispatch else body.get("spawn_env")
+        _harness_override_applied = False
+        # The turn's RAW per-request instruction text, kept apart from any
+        # already-composed string so composition below can include it instead
+        # of discarding it. Silently dropping caller-supplied input is the
+        # defect class this whole area exists to close, and the
+        # gated-delivery swap reintroduced it: that swap replaces
+        # body["instructions"]
+        # wholesale, so genuine caller text was lost whenever the spec
+        # resolved). Which of the two ``body["instructions"]`` holds depends
+        # on the caller, and only the caller can tell us: on the background
+        # path it is the composed value that path just built, so the raw text
+        # arrives out-of-band on the dispatch context; on a direct
+        # caller-supplied body it IS the raw per-request text.
+        _raw_per_request_instructions = (
+            dispatch.per_request_instructions if dispatch else body.get("instructions")
+        )
+        # A known agent switch evicts every agent-derived cache and
+        # releases the harness subprocess BEFORE anything in this function
+        # reads them (same shared routine the background dispatch path
+        # uses — see _invalidate_session_agent_state's docstring).
+        # _session_agent_ids[conv_id] is written only after cold-boot
+        # completes (further down): cold-boot receives this turn's agent id
+        # directly as a hint, so marking it authoritative before that
+        # resolution runs would be premature.
+        _early_turn_agent_id = dispatch.agent_id if dispatch else body.get("agent_id")
+        if _early_turn_agent_id and _session_agent_ids.get(conv_id) != _early_turn_agent_id:
+            await _invalidate_session_agent_state(conv_id, _early_turn_agent_id)
+        # Captured after this path's OWN invalidation above and before the
+        # resolution awaits below, so a reset landing while this turn resolves
+        # drops the marker write rather than republishing a superseded agent.
+        _early_turn_generation = _session_cache_generation(conv_id)
+        if dispatch:
+            # TurnDispatch is built by _run_turn_bg_setup_and_stream, which
+            # already applied harness_override and canonicalize_harness when
+            # constructing ctx.harness — trust it (and its already-matching
+            # spawn_env) verbatim.
+            harness_name = dispatch.harness
+        else:
+            # Caller-supplied body: only a caller-supplied `harness` (not a
+            # bare `harness_override` with no base harness — that case still
+            # needs full spec-driven resolution below, see
+            # test_runner_stream_emits_failed_when_tool_spec_resolver_fails
+            # vs test_runner_post_returns_503_when_spec_resolver_fails). When
+            # `harness` IS present, `harness_override` must not silently lose
+            # to it, and either spelling may be an alias (e.g. "opencode",
+            # "acp:foo") that must be canonicalized before capability lookup
+            # / gated delivery — matching the resolver path below and the
+            # alias-inheritance contract in docs/AGENT_YAML_SPEC.md.
+            _raw_harness = body.get("harness")
+            if _raw_harness:
+                _override = body.get("harness_override")
+                # Compare CANONICAL identities, not raw spellings: an
+                # override that's merely an alias of the same harness
+                # (e.g. harness="opencode-native", harness_override="opencode",
+                # or harness="claude-sdk", harness_override="claude") is not
+                # an actual swap and must not trigger a spawn_env rebuild —
+                # a raw-string compare would falsely register one and
+                # discard a valid caller-supplied spawn_env for no reason.
+                if _override and (canonicalize_harness(_override) or _override) != (
+                    canonicalize_harness(_raw_harness) or _raw_harness
+                ):
+                    _harness_override_applied = True
+                    _raw_harness = _override
+                harness_name = canonicalize_harness(_raw_harness) or _raw_harness
+            else:
+                harness_name = None
+        # When an override actually swapped the harness, any caller-supplied
+        # ``spawn_env`` was built for the ORIGINAL harness and must not be
+        # trusted for the overridden one — harness and spawn_env are resolved
+        # together as one effective-turn result, not independently. Cleared
+        # here; rebuilt below (once the spec is available) or via the
+        # native-provider fallback further down.
+        spawn_env = (
+            dispatch.spawn_env
+            if dispatch
+            else (None if _harness_override_applied else body.get("spawn_env"))
+        )
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
+        _agent_id = dispatch.agent_id if dispatch else body.get("agent_id")
+        _sub_agent_name = await _recover_sub_agent_name(conv_id)
+        # ``_turn_spec_for_instructions`` is the single source of truth for
+        # "do we have a positively resolved spec to compose instructions
+        # from" — every consumer below (the gated wire-swap, the warn
+        # check) gates directly on ``is not None`` rather than a
+        # separately-tracked boolean. A parallel flag that has to be kept
+        # in sync by hand across every branch that can leave the spec
+        # unresolved (stale cache, missing provenance, no agent id, no
+        # resolver, resolver exception, resolver None) is exactly how this
+        # class of bug (indeterminate composition state silently treated as
+        # positive absence) arises — collapsing to one gate removes the
+        # possibility of the two drifting apart.
+        _turn_spec_for_instructions: Any = None
         if not harness_name:
-            _agent_id = dispatch.agent_id if dispatch else body.get("agent_id")
-            _sub_agent_name = await _recover_sub_agent_name(conv_id)
             try:
-                harness_name, spawn_env = await _resolve_harness_config(
+                (
+                    harness_name,
+                    spawn_env,
+                    _turn_spec_for_instructions,
+                    _,
+                ) = await _resolve_effective_turn(
                     agent_id=_agent_id,
                     spec_resolver=spec_resolver,
                     session_id=conv_id,
@@ -5306,6 +6057,214 @@ def create_runner_app(
                         "detail": _client_safe_error_detail(exc, context="spec resolve"),
                     },
                 )
+        else:
+            # Harness is already known independent of the resolver (dispatch
+            # from the background path, or caller-supplied in the body) —
+            # resolving the spec for InstructionComposition is best-effort
+            # only. That graceful degradation is deliberate and is the third
+            # leg of a three-way split: the no-harness branch above answers a
+            # resolver failure with a synchronous 503 and the background path
+            # with an async terminal failure, while this one logs, leaves the
+            # spec unknown, keeps the caller's own instructions and continues.
+            # Pinned by ``test_cross_path_resolution_contract``. A failure here
+            # must not escalate to a 503 or drop any caller-supplied
+            # ``instructions`` already in the body; it just means composition
+            # and the warn check degrade to "unknown".
+            # The background-turn twin (_run_turn_bg_setup_and_stream)
+            # invalidates _session_spec_cache on an in-conversation agent
+            # switch (dispatched agent_id differs from the previously
+            # recorded one) before reading it. This direct-stream path must
+            # apply the same check — otherwise a cache entry left over from
+            # the PREVIOUS agent (still keyed by conv_id) would silently
+            # drive this turn's composition/warn decision. Provenance must
+            # match EXACTLY: the cache entry's own agent tag (see
+            # _cache_get_for_agent) must equal ``_agent_id``, or be the
+            # agent-independent ``None`` tag. An unset/unknown ``_agent_id``
+            # is not evidence the cache belongs to the CURRENT turn — it is
+            # treated as a miss against any concretely-tagged entry, same as
+            # an explicit mismatch, never as automatic "no conflict".
+            _cached_entry = _cache_get_for_agent(_session_spec_cache, conv_id, _agent_id)
+            _turn_spec_for_instructions = _unwrap_resolved_spec(_cached_entry)
+            _turn_workdir_for_instructions = _resolved_spec_workdir(_cached_entry)
+            # Same fresh-parent-vs-already-resolved-child distinction as
+            # ``_run_turn_bg_setup_and_stream``'s cache read: only a spec
+            # resolved fresh right here (raw ``spec_resolver`` call, never
+            # sub-agent-aware) may coincidentally share its name with
+            # ``_sub_agent_name`` without actually being that sub-agent —
+            # a cache hit is always already the swapped child (this
+            # closure's own sub-agent swap below writes the child back,
+            # and every other writer of this cache does the same).
+            _turn_spec_is_fresh_parent = False
+            if _turn_spec_for_instructions is None and _agent_id and spec_resolver is not None:
+                try:
+                    _resolved_for_instructions = await spec_resolver(_agent_id, conv_id)
+                except (httpx.HTTPError, RuntimeError):
+                    _logger.warning(
+                        "instruction composition spec resolution failed for %s; "
+                        "composition/warn check degrade gracefully",
+                        conv_id,
+                        exc_info=True,
+                    )
+                    _turn_spec_for_instructions = None
+                else:
+                    _turn_spec_for_instructions = _unwrap_resolved_spec(_resolved_for_instructions)
+                    _turn_workdir_for_instructions = _resolved_spec_workdir(
+                        _resolved_for_instructions
+                    )
+                    _turn_spec_is_fresh_parent = _turn_spec_for_instructions is not None
+            # Every path above that leaves ``_turn_spec_for_instructions``
+            # ``None`` — stale/no-provenance cache, no agent id, no
+            # configured resolver, a raised resolver exception, or a
+            # resolver that legitimately returned ``None`` — is equally
+            # "we do not positively know the composed value" and must be
+            # treated identically by every downstream consumer: composition
+            # degrades to "unknown", and the gated wire-swap below (gated on
+            # this same ``is not None`` check) leaves caller-supplied
+            # ``instructions`` untouched rather than guessing.
+            if _turn_spec_for_instructions is not None and _sub_agent_name:
+                from omnigent.runtime.workflow import _find_spec_by_name
+
+                _sub_spec_for_instructions = (
+                    _turn_spec_for_instructions
+                    if not _turn_spec_is_fresh_parent
+                    and _turn_spec_for_instructions.name == _sub_agent_name
+                    else _find_spec_by_name(_turn_spec_for_instructions, _sub_agent_name)
+                )
+                # A miss here (a recorded sub_agent_name no longer resolving)
+                # must not leave the PARENT spec in place — that would
+                # silently compose the parent's instructions for a turn
+                # that's actually running as the (now-unresolvable)
+                # sub-agent. Null it out instead: the same "positively
+                # resolved spec, or None" gate every other consumer already
+                # uses (see the comment above _turn_spec_for_instructions)
+                # then correctly treats this as indeterminate — composition
+                # degrades to unknown, caller-supplied instructions survive.
+                _turn_spec_for_instructions = _sub_spec_for_instructions
+            if (
+                _harness_override_applied
+                and spawn_env is None
+                and _turn_spec_for_instructions is not None
+            ):
+                # harness + spawn_env are resolved together: rebuild the
+                # spawn_env for the FINAL (overridden) harness_name now that
+                # the spec is available, mirroring _resolve_effective_turn's
+                # single-pass resolution on the other dispatch path.
+                spawn_env = _build_spawn_env_from_spec(
+                    _turn_spec_for_instructions,
+                    harness_name,
+                    cwd=await _session_runtime_cwd(conv_id),
+                    workdir=_turn_workdir_for_instructions,
+                    model_override=body.get("model_override"),
+                )
+
+        instruction_composition = InstructionComposition(authored_present=False, composed=None)
+        _ordinary_composed: str | None = None
+        if _turn_spec_for_instructions is not None:
+            _authored = raw_author_instructions(_turn_spec_for_instructions) is not None
+            _framework_instructions = (
+                (SHARED_SESSION_AUTHORSHIP_INSTRUCTION,)
+                if shared_message_attribution_enabled() and conv_id in _author_attribution_sessions
+                else ()
+            )
+            # Ordinary harnesses take the standard composed-per-turn string,
+            # fallback seed and all, exactly as the background dispatch path
+            # builds it — the two paths must agree on what an ordinary harness
+            # receives. Only the two gated harnesses take the nullable variant
+            # below, because their executors read the wire field directly and
+            # must never be handed the fabricated fallback literal.
+            _ordinary_composed = build_instructions(
+                _turn_spec_for_instructions,
+                _raw_per_request_instructions,
+                [],
+                framework_instructions=_framework_instructions,
+            )
+            instruction_composition = InstructionComposition(
+                authored_present=_authored,
+                composed=build_instructions_nullable(
+                    _turn_spec_for_instructions,
+                    _raw_per_request_instructions,
+                    [],
+                    framework_instructions=_framework_instructions,
+                ),
+            )
+
+        if instruction_composition.authored_present:
+            _delivery_caps = harness_capabilities().get(harness_name)
+            _delivery_value = (
+                _delivery_caps.instruction_delivery
+                if _delivery_caps is not None
+                else InstructionDelivery.UNKNOWN
+            )
+            # At most once per (conversation, harness, delivery value) over
+            # the conversation's whole lifetime. The harness is part of the
+            # key, so two harnesses sharing one delivery value each warn once.
+            # Membership in the set of pairs already warned for — NOT a
+            # comparison against the last one, which would re-warn for a pair
+            # that recurs after an intervening different one.
+            _warned_for = (harness_name, _delivery_value)
+            _already_warned = _warned_for in _instruction_delivery_warned.get(conv_id, ())
+        else:
+            _delivery_value = InstructionDelivery.UNKNOWN
+            _warned_for = (harness_name, _delivery_value)
+            _already_warned = True
+
+        if not _already_warned:
+            if _delivery_value is InstructionDelivery.NOT_DELIVERED:
+                _instruction_delivery_warned.setdefault(conv_id, set()).add(_warned_for)
+                _logger.warning(
+                    "conversation %s: agent-authored instructions are not delivered to "
+                    "harness %r (instruction_delivery=not-delivered) — the vendor agent "
+                    "will not see AgentSpec.instructions for this conversation",
+                    conv_id,
+                    harness_name,
+                )
+            elif _delivery_value is InstructionDelivery.UNKNOWN:
+                _instruction_delivery_warned.setdefault(conv_id, set()).add(_warned_for)
+                _logger.warning(
+                    "conversation %s: agent-authored instructions are present, but harness "
+                    "%r declares no instruction_delivery capability (instruction_delivery="
+                    "unknown) — whether the vendor agent sees AgentSpec.instructions for "
+                    "this conversation is undetermined",
+                    conv_id,
+                    harness_name,
+                )
+
+        if (
+            harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES
+            and _turn_spec_for_instructions is not None
+        ):
+            # These harnesses read the wire ``instructions`` field
+            # themselves (opencode-native's NativePrompt.system_prompt via
+            # its executor's run_turn `system_prompt` param; hermes the
+            # same). The wire value set upstream (if any) is still the old
+            # fallback-including composed-per-turn string — swap in the
+            # gated nullable value computed above so neither harness ever
+            # sees the fabricated "You are a helpful assistant." literal,
+            # framework-only or otherwise. No new wire field: same
+            # ``instructions`` key, harness-conditional value only.
+            # Overwriting is safe ONLY because the composed value already
+            # folded this turn's raw per-request text in (see
+            # _raw_per_request_instructions). Compose first, then overwrite —
+            # overwriting a body whose text was never composed silently drops
+            # genuine caller instructions.
+            # Gated on a POSITIVELY resolved spec (not a "did resolution
+            # fail" flag) — any indeterminate state leaves caller-supplied
+            # ``instructions`` already in the body untouched rather than
+            # guessing. See the comment above ``_turn_spec_for_instructions``.
+            if instruction_composition.composed:
+                body["instructions"] = instruction_composition.composed
+            else:
+                body.pop("instructions", None)
+        elif _ordinary_composed is not None:
+            # Every OTHER harness on this path. Without this, a direct
+            # ?stream=true turn carries only whatever raw text the caller
+            # sent, so an agent's own authored instructions never reach
+            # codex, copilot, open-responses, openai-agents, pi and the rest,
+            # and a turn with no caller text carries no instructions field at
+            # all. Composition belongs on both dispatch paths, not just the
+            # background one.
+            body["instructions"] = _ordinary_composed
+
         if spawn_env is None:
             spawn_env = await _resolve_native_spawn_env(
                 harness_name,
@@ -5322,6 +6281,28 @@ def create_runner_app(
             _version_cache[conv_id] = agent_version
 
         if harness_name == "opencode-native":
+
+            async def _opencode_boot_spec() -> AgentSpec | ResolvedSpec | None:
+                """Resolve this turn's spec for the cold-boot, tolerating failure.
+
+                Passes the already-known dispatched agent id for THIS turn
+                directly, rather than letting ``_resolve_session_agent_spec``
+                fall back to a fresh session-snapshot fetch — see the
+                provenance-eviction comment above this function's entry for
+                why that fallback races an in-flight agent switch. A resolver
+                failure degrades to no spec, matching every other
+                resolver-failure-tolerant path here (``InstructionComposition``
+                catches the same exception set below): a transient failure must
+                not 503 the turn when the harness is known and the terminal can
+                boot without a spec.
+                """
+                try:
+                    return await _resolve_session_agent_spec(
+                        conv_id, agent_id_hint=_early_turn_agent_id
+                    )
+                except (OmnigentError, httpx.HTTPError, RuntimeError):
+                    return None
+
             # Turn-path cold-boot: ensure the terminal exists before the turn.
             # A launch failure here aborts the turn with a 503 (reraise=True),
             # unlike the create-session arms that publish a start-error event.
@@ -5336,7 +6317,7 @@ def create_runner_app(
                         ensure_comment_relay=_ensure_comment_relay_started,
                     ),
                     ensure_locks=_opencode_terminal_ensure_locks,
-                    resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(conv_id),
+                    resolve_agent_spec=_opencode_boot_spec,
                     reraise=True,
                 )
             except Exception as exc:
@@ -5348,6 +6329,22 @@ def create_runner_app(
                         "detail": _client_safe_error_detail(exc, context="opencode-native boot"),
                     },
                 )
+
+        # Attest provenance only now that every resolution step this
+        # function performs on this turn's behalf (the opencode-native
+        # cold-boot block above, agent-hinted so it cannot race a lagging
+        # snapshot) has actually completed — never before the value it
+        # gates exists. The generation captured before those steps is what
+        # makes that hold across them: a reset landing while they run
+        # supersedes this turn, and the marker write is dropped rather than
+        # republishing an agent the session has already moved off.
+        if _early_turn_agent_id:
+            _session_cache_put(
+                _session_agent_ids,
+                conv_id,
+                _early_turn_agent_id,
+                generation=_early_turn_generation,
+            )
 
         try:
             client = await process_manager.get_client(conv_id, harness_name, env=spawn_env)
@@ -5361,6 +6358,12 @@ def create_runner_app(
             )
 
         _turn_agent_id = dispatch.agent_id if dispatch else body.get("agent_id")
+        # Every ``_session_spec_cache`` read further down (eager MCP
+        # resolution, the lazy resolver, and the local-tool dispatch hint)
+        # goes through ``_cache_get_for_agent(..., _turn_agent_id)``, which
+        # checks the entry's own agent tag rather than a parallel marker —
+        # an entry left over for a different agent is a miss regardless of
+        # what ``_session_agent_ids`` currently says.
         _has_mcp_hint = dispatch.has_mcp_servers if dispatch else body.get("has_mcp_servers")
         _turn_spec: Any = None
         _turn_spec_entry: Any = None
@@ -5369,13 +6372,18 @@ def create_runner_app(
         _mcp_tool_names: set[str] = set()
         _eager_spec_error: tuple[str, str] | None = None
         if _has_mcp_hint is True and _turn_agent_id:
+            # Cross-conversation read of the global agent-keyed cache: a hit
+            # here may have been reinstated by a DIFFERENT conversation's
+            # in-flight fill after this agent was reset. Known deferred gap,
+            # not closed by the generation guard — see _agent_spec_cache_put.
             _turn_spec_entry = _spec_cache.get(_turn_agent_id)
             _turn_spec = _unwrap_resolved_spec(_turn_spec_entry)
             if _turn_spec is None:
-                _session_entry = _session_spec_cache.get(conv_id)
+                _session_entry = _cache_get_for_agent(_session_spec_cache, conv_id, _turn_agent_id)
                 _turn_spec_entry = _session_entry
                 _turn_spec = _unwrap_resolved_spec(_session_entry)
             if _turn_spec is None and spec_resolver is not None:
+                _eager_spec_generation = _session_cache_generation(conv_id)
                 try:
                     _resolved_turn_spec = await spec_resolver(_turn_agent_id, conv_id)
                     _turn_spec = _unwrap_resolved_spec(_resolved_turn_spec)
@@ -5392,7 +6400,12 @@ def create_runner_app(
                     )
                 else:
                     if _turn_spec is not None:
-                        _spec_cache[_turn_agent_id] = _resolved_turn_spec
+                        _agent_spec_cache_put(
+                            _turn_agent_id,
+                            _resolved_turn_spec,
+                            session_id=conv_id,
+                            generation=_eager_spec_generation,
+                        )
                         _turn_spec_entry = _resolved_turn_spec
             _turn_spec_resolved = True
             _turn_mcp: Any = ProxyMcpManager(conv_id, server_client)
@@ -5411,18 +6424,22 @@ def create_runner_app(
             if _turn_spec_resolved:
                 return _turn_spec_entry or _turn_spec, None
             _turn_spec_resolved = True
-            session_cached = _session_spec_cache.get(conv_id)
+            session_cached = _cache_get_for_agent(_session_spec_cache, conv_id, _turn_agent_id)
             if session_cached is not None:
                 _turn_spec_entry = session_cached
                 _turn_spec = _unwrap_resolved_spec(session_cached)
                 return session_cached, None
             if not _turn_agent_id or spec_resolver is None:
                 return None, None
+            # Same cross-conversation caveat as the eager read above: this
+            # global agent-keyed hit is not fenced against another
+            # conversation's stale reinstatement.
             cached = _spec_cache.get(_turn_agent_id)
             if cached is not None:
                 _turn_spec_entry = cached
                 _turn_spec = _unwrap_resolved_spec(cached)
                 return cached, None
+            _lazy_spec_generation = _session_cache_generation(conv_id)
             try:
                 resolved = await spec_resolver(_turn_agent_id, conv_id)
             except (httpx.HTTPError, RuntimeError) as exc:
@@ -5437,7 +6454,12 @@ def create_runner_app(
                     "Failed to resolve the agent spec for this turn.",
                 )
             if resolved is not None:
-                _spec_cache[_turn_agent_id] = resolved
+                _agent_spec_cache_put(
+                    _turn_agent_id,
+                    resolved,
+                    session_id=conv_id,
+                    generation=_lazy_spec_generation,
+                )
                 _turn_spec_entry = resolved
                 _turn_spec = _unwrap_resolved_spec(resolved)
                 return resolved, None
@@ -5615,7 +6637,9 @@ def create_runner_app(
                                     tool_name = get_tool_name(event)
                                     is_mcp = tool_name in _mcp_tool_names
                                     _spec_for_dispatch_hint = _unwrap_resolved_spec(
-                                        _session_spec_cache.get(conv_id)
+                                        _cache_get_for_agent(
+                                            _session_spec_cache, conv_id, _turn_agent_id
+                                        )
                                     )
                                     _is_spec_local = _is_spec_local_native_python_tool(
                                         _spec_for_dispatch_hint,
@@ -6265,7 +7289,9 @@ def create_runner_app(
     ) -> JSONResponse:
         from omnigent.entities.pagination import paginate_in_memory
 
-        spec = await _resolve_session_agent_spec(session_id)
+        spec = await _resolve_session_agent_spec(
+            session_id, agent_id_hint=_session_agent_ids.get(session_id)
+        )
         full = resource_registry.list_resources(
             session_id,
             resource_type=type,
@@ -6348,7 +7374,9 @@ def create_runner_app(
         session_id: str,
         environment_id: str,
     ) -> JSONResponse:
-        agent_spec = await _resolve_session_agent_spec(session_id)
+        agent_spec = await _resolve_session_agent_spec(
+            session_id, agent_id_hint=_session_agent_ids.get(session_id)
+        )
         resource = resource_registry.get_resource(
             session_id,
             environment_id,
@@ -6456,13 +7484,22 @@ def create_runner_app(
             ) = None
             _ensure_finalize: Callable[[SessionResourceView], JSONResponse] | None = None
             _ensure_conflict: str | None = None
+            # Captured before the create await so a concurrent agent switch
+            # can be detected afterwards; set when a terminal was actually
+            # built (build_context runs only on the create path).
+            _ensure_generation = _session_cache_generation(session_id)
+            _ensure_built = False
 
             if terminal_name == "claude":
 
                 async def _claude_ensure_build(
                     ctx: NativeLaunchContext,
                 ) -> NativeLaunchContext:
-                    claude_agent_spec = await _resolve_session_agent_spec(session_id)
+                    nonlocal _ensure_built
+                    _ensure_built = True
+                    claude_agent_spec = await _resolve_session_agent_spec(
+                        session_id, agent_id_hint=_session_agent_ids.get(session_id)
+                    )
                     return dataclasses.replace(
                         ctx,
                         agent_spec=claude_agent_spec,
@@ -6470,7 +7507,7 @@ def create_runner_app(
                         resolve_launch_config=lambda: _resolve_session_claude_launch_config(
                             session_id
                         ),
-                        record_launch_config=_session_claude_launch_configs.__setitem__,
+                        record_launch_config=_guarded_launch_config_recorder(session_id),
                     )
 
                 _ensure_build = _claude_ensure_build
@@ -6480,7 +7517,9 @@ def create_runner_app(
                 async def _codex_ensure_build(
                     ctx: NativeLaunchContext,
                 ) -> NativeLaunchContext:
-                    codex_agent_spec = await _resolve_session_agent_spec(session_id)
+                    codex_agent_spec = await _resolve_session_agent_spec(
+                        session_id, agent_id_hint=_session_agent_ids.get(session_id)
+                    )
                     return dataclasses.replace(ctx, agent_spec=codex_agent_spec)
 
                 _ensure_build = _codex_ensure_build
@@ -6508,7 +7547,10 @@ def create_runner_app(
                     ctx: NativeLaunchContext,
                 ) -> NativeLaunchContext:
                     return dataclasses.replace(
-                        ctx, agent_spec=await _resolve_session_agent_spec(session_id)
+                        ctx,
+                        agent_spec=await _resolve_session_agent_spec(
+                            session_id, agent_id_hint=_session_agent_ids.get(session_id)
+                        ),
                     )
 
                 _ensure_build = _spec_ensure_build
@@ -6519,7 +7561,10 @@ def create_runner_app(
                     ctx: NativeLaunchContext,
                 ) -> NativeLaunchContext:
                     return dataclasses.replace(
-                        ctx, agent_spec=await _resolve_session_agent_spec_or_none(session_id)
+                        ctx,
+                        agent_spec=await _resolve_session_agent_spec_or_none(
+                            session_id, agent_id_hint=_session_agent_ids.get(session_id)
+                        ),
                     )
 
                 _ensure_build = _spec_or_none_ensure_build
@@ -6534,6 +7579,31 @@ def create_runner_app(
                 finalize=_ensure_finalize,
             )
             if _ensure_result is not None:
+                if (
+                    terminal_name == "claude"
+                    and _ensure_built
+                    and _ensure_result.status_code == 200
+                    and not await _terminal_survives_fence(
+                        session_id, _ensure_generation, "claude", "main"
+                    )
+                ):
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "error": {
+                                "code": "session_agent_changed",
+                                "message": (
+                                    "The session's agent changed while this Claude "
+                                    "terminal was being created, so it is not "
+                                    "returned here. Cleanup was attempted but is "
+                                    "not guaranteed: the terminal may remain "
+                                    "published and its forwarder running. Retrying "
+                                    "creates a new terminal; it does not roll this "
+                                    "one back."
+                                ),
+                            }
+                        },
+                    )
                 return _ensure_result
 
         from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -6542,7 +7612,9 @@ def create_runner_app(
         sandbox_override = body.get("sandbox")
         spec = body.get("spec") or {}
 
-        agent_spec = await _resolve_session_agent_spec(session_id)
+        agent_spec = await _resolve_session_agent_spec(
+            session_id, agent_id_hint=_session_agent_ids.get(session_id)
+        )
         agent_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
 
         declared_terminal = None
@@ -6836,7 +7908,9 @@ def create_runner_app(
             if existing is None or not existing.running or not await existing.is_alive():
                 await registry.close(session_id, _REPL_TERMINAL_NAME, _REPL_TERMINAL_SESSION_KEY)
                 try:
-                    repl_agent_spec = await _resolve_session_agent_spec(session_id)
+                    repl_agent_spec = await _resolve_session_agent_spec(
+                        session_id, agent_id_hint=_session_agent_ids.get(session_id)
+                    )
                 except OmnigentError:
                     repl_agent_spec = None
                 try:
@@ -6946,7 +8020,9 @@ def create_runner_app(
         )
 
     async def _require_os_env(session_id: str) -> Any | None:
-        spec = await _resolve_session_agent_spec(session_id)
+        spec = await _resolve_session_agent_spec(
+            session_id, agent_id_hint=_session_agent_ids.get(session_id)
+        )
         if spec is not None and getattr(spec, "os_env", None) is None:
             raise HTTPException(
                 status_code=404,
@@ -7320,31 +8396,59 @@ def create_runner_app(
             return
         snapshot = await _session_snapshot(session_id)
         _session_start_cache[session_id] = snapshot.created_at
-        _session_workspace_cache[session_id] = snapshot.workspace
+        if snapshot.ok:
+            _session_workspace_cache[session_id] = snapshot.workspace
 
-    async def _resolve_session_spec_entry(session_id: str) -> Any | None:
-        if session_id in _session_spec_cache:
-            return _session_spec_cache[session_id]
+    async def _resolve_session_spec_entry(
+        session_id: str, agent_id_hint: str | None = None
+    ) -> Any | None:
+        # A cache read needs to know WHICH agent's entry it's looking for
+        # before it can trust a hit (see _cache_get_for_agent) — with a
+        # hint that's known up front, so check without taking the lock.
+        # Without one, the agent is only known after the snapshot fetch
+        # below, so the cache is consulted again once that's resolved.
+        if agent_id_hint:
+            _fast_hit = _cache_get_for_agent(_session_spec_cache, session_id, agent_id_hint)
+            if _fast_hit is not None:
+                return _fast_hit
+        _fill_generation = _session_cache_generation(session_id)
         if spec_resolver is None:
-            _session_spec_cache[session_id] = None
             return None
         lock = _session_spec_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
-            if session_id in _session_spec_cache:
-                return _session_spec_cache[session_id]
-            snapshot = await _session_snapshot(session_id)
-            if not snapshot.ok:
-                raise OmnigentError(
-                    f"session spec resolver: GET /v1/sessions/{session_id} "
-                    f"failed with HTTP {snapshot.status_code}",
-                    code=ErrorCode.INTERNAL_ERROR,
-                )
-            agent_id = snapshot.agent_id
-            if not agent_id:
-                raise OmnigentError(
-                    f"session spec resolver: session {session_id!r} has no agent_id",
-                    code=ErrorCode.NOT_FOUND,
-                )
+            # ``agent_id_hint`` lets a caller that ALREADY knows the correct
+            # current agent for this turn (e.g. a just-dispatched agent_id
+            # from the request body) skip the session-snapshot lookup below
+            # entirely. That snapshot is a separate, independently-lagging
+            # source of truth: on the server side, an in-flight agent
+            # switch may not have landed yet, so a snapshot fetched WHILE
+            # the switch is in flight can report the PREVIOUS agent_id.
+            # Without the hint, this function would resolve and cache a
+            # spec for that stale agent — tagged, in the caller's mind, as
+            # "the spec for the session's CURRENT agent" — a race a caller
+            # who already has ground truth for this turn should never be
+            # exposed to.
+            if agent_id_hint:
+                agent_id = agent_id_hint
+                sub_agent_name = _session_sub_agent_names.get(session_id)
+            else:
+                snapshot = await _session_snapshot(session_id)
+                if not snapshot.ok:
+                    raise OmnigentError(
+                        f"session spec resolver: GET /v1/sessions/{session_id} "
+                        f"failed with HTTP {snapshot.status_code}",
+                        code=ErrorCode.INTERNAL_ERROR,
+                    )
+                agent_id = snapshot.agent_id
+                if not agent_id:
+                    raise OmnigentError(
+                        f"session spec resolver: session {session_id!r} has no agent_id",
+                        code=ErrorCode.NOT_FOUND,
+                    )
+                sub_agent_name = snapshot.sub_agent_name
+            _cached = _cache_get_for_agent(_session_spec_cache, session_id, agent_id)
+            if _cached is not None:
+                return _cached
             spec_entry = await spec_resolver(agent_id, session_id)
             if spec_entry is None:
                 raise OmnigentError(
@@ -7352,7 +8456,6 @@ def create_runner_app(
                     f"session {session_id!r} was not found",
                     code=ErrorCode.NOT_FOUND,
                 )
-            sub_agent_name = snapshot.sub_agent_name
             if sub_agent_name:
                 _session_sub_agent_names[session_id] = sub_agent_name
                 from omnigent.runtime.workflow import _find_spec_by_name
@@ -7360,23 +8463,52 @@ def create_runner_app(
                 parent_spec = _unwrap_resolved_spec(spec_entry)
                 if parent_spec is not None:
                     sub_spec = _find_spec_by_name(parent_spec, sub_agent_name)
-                    if sub_spec is not None:
-                        workdir = _resolved_spec_workdir(spec_entry)
-                        spec_entry = (
-                            ResolvedSpec(spec=sub_spec, workdir=workdir)
-                            if workdir is not None
-                            else sub_spec
-                        )
-                    else:
+                    if sub_spec is None:
+                        # Same none-match-treated-as-authoritative class as
+                        # every other no-match site: silently caching
+                        # spec_entry as the PARENT would make every one of
+                        # this function's many downstream callers (terminal
+                        # auto-create, resource listing, os_env checks, ...)
+                        # believe the parent's identity is correct for a
+                        # session actually bound to a (now-unresolvable)
+                        # sub-agent. Raise, consistent with this function's
+                        # existing failure modes above (bad snapshot, no
+                        # agent_id, agent not found) — the module-level
+                        # OmnigentError handler turns this into a clean 404
+                        # for callers with no local try/except, and callers
+                        # that already catch OmnigentError degrade to "no
+                        # spec available" rather than "wrong spec available".
                         _warn_unresolved_sub_agent(session_id, sub_agent_name)
-            _session_spec_cache[session_id] = spec_entry
+                        raise OmnigentError(
+                            f"session spec resolver: sub-agent {sub_agent_name!r} "
+                            f"not found in agent {agent_id!r}'s spec for "
+                            f"session {session_id!r}",
+                            code=ErrorCode.NOT_FOUND,
+                        )
+                    workdir = _resolved_spec_workdir(spec_entry)
+                    spec_entry = (
+                        ResolvedSpec(spec=sub_spec, workdir=workdir)
+                        if workdir is not None
+                        else sub_spec
+                    )
+            _session_cache_put(
+                _session_spec_cache,
+                session_id,
+                spec_entry,
+                generation=_fill_generation,
+                agent_tag=agent_id,
+            )
             return spec_entry
 
-    async def _resolve_session_agent_spec(session_id: str) -> Any | None:
-        entry = await _resolve_session_spec_entry(session_id)
+    async def _resolve_session_agent_spec(
+        session_id: str, agent_id_hint: str | None = None
+    ) -> Any | None:
+        entry = await _resolve_session_spec_entry(session_id, agent_id_hint)
         return _unwrap_resolved_spec(entry) if entry is not None else None
 
-    async def _resolve_session_agent_spec_or_none(session_id: str) -> Any | None:
+    async def _resolve_session_agent_spec_or_none(
+        session_id: str, agent_id_hint: str | None = None
+    ) -> Any | None:
         """Resolve the session agent spec, tolerating resolution failure.
 
         The cursor/opencode/kimi launch arms swallow ``OmnigentError`` and
@@ -7384,17 +8516,25 @@ def create_runner_app(
         ``_launch_native_terminal``.
         """
         try:
-            return await _resolve_session_agent_spec(session_id)
+            return await _resolve_session_agent_spec(session_id, agent_id_hint=agent_id_hint)
         except OmnigentError:
             return None
 
     async def _resolve_session_skills(session_id: str) -> list[SkillSpec]:
-        cached = _session_skills_cache.get(session_id)
+        _fill_generation = _session_cache_generation(session_id)
+        # Skills are derived from the resolved spec, so the TTL cache below
+        # must be tagged with the same agent id _resolve_session_spec_entry
+        # resolved — read that back off the spec cache entry it just wrote
+        # (or hit) rather than guessing, so a stale skills list can never
+        # survive an agent switch that the spec cache itself already caught.
+        entry = await _resolve_session_spec_entry(session_id, _session_agent_ids.get(session_id))
+        _spec_cache_entry = _session_spec_cache.get(session_id)
+        _skills_agent_tag = _spec_cache_entry[0] if _spec_cache_entry is not None else None
+        cached = _cache_get_for_agent(_session_skills_cache, session_id, _skills_agent_tag)
         if cached is not None:
             expires_at, cached_skills = cached
             if time.monotonic() < expires_at:
                 return cached_skills
-        entry = await _resolve_session_spec_entry(session_id)
         spec = _unwrap_resolved_spec(entry) if entry is not None else None
         if spec is None:
             return []
@@ -7438,9 +8578,12 @@ def create_runner_app(
             return merged
 
         skills = await asyncio.to_thread(_discover)
-        _session_skills_cache[session_id] = (
-            time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS,
-            skills,
+        _session_cache_put(
+            _session_skills_cache,
+            session_id,
+            (time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS, skills),
+            generation=_fill_generation,
+            agent_tag=_skills_agent_tag,
         )
         return skills
 
@@ -7454,7 +8597,9 @@ def create_runner_app(
 
     @app.get("/v1/sessions/{session_id}/models")
     async def get_session_models(session_id: str) -> JSONResponse:
-        spec = await _resolve_session_agent_spec(session_id)
+        spec = await _resolve_session_agent_spec(
+            session_id, agent_id_hint=_session_agent_ids.get(session_id)
+        )
         if spec is None:
             return JSONResponse(status_code=200, content={"workers": {}})
         from omnigent.model_catalog import catalog_for_spec
@@ -7552,6 +8697,10 @@ def create_runner_app(
             return JSONResponse(status_code=200, content={"models": []})
         from omnigent.cursor_native import list_cursor_cli_model_options
 
+        # Captured before the discovery await: a reset or agent switch landing
+        # while it runs must drop this mapping rather than republish it over
+        # the cleared state, since model confirmation reads it later.
+        _model_names_generation = _session_cache_generation(session_id)
         try:
             models = await asyncio.to_thread(list_cursor_cli_model_options)
         except Exception as exc:  # noqa: BLE001 - picker failures are retryable.
@@ -7569,11 +8718,16 @@ def create_runner_app(
                     ),
                 },
             )
-        _session_cursor_model_names[session_id] = {
-            str(option["id"]): str(option["displayName"])
-            for option in models
-            if option.get("id") and option.get("displayName")
-        }
+        _session_cache_put(
+            _session_cursor_model_names,
+            session_id,
+            {
+                str(option["id"]): str(option["displayName"])
+                for option in models
+                if option.get("id") and option.get("displayName")
+            },
+            generation=_model_names_generation,
+        )
         return JSONResponse(status_code=200, content={"models": models})
 
     @app.get("/v1/sessions/{session_id}/claude-model-options")
@@ -7678,7 +8832,9 @@ def create_runner_app(
         )
 
         await _ensure_session_registered(session_id)
-        agent_spec = await _resolve_session_agent_spec(session_id)
+        agent_spec = await _resolve_session_agent_spec(
+            session_id, agent_id_hint=_session_agent_ids.get(session_id)
+        )
         env = resource_registry.resolve_environment(
             session_id,
             environment_id,
@@ -7819,6 +8975,10 @@ def create_runner_app(
         )
 
     def _clear_session_agent_caches(session_id: str, agent_id: str | None = None) -> None:
+        # Bump FIRST: any fill already in flight captured the previous
+        # generation and must lose its write, including one that completes
+        # between here and the last pop below.
+        _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
         _session_cursor_model_names.pop(session_id, None)
@@ -7826,8 +8986,81 @@ def create_runner_app(
         _session_tool_schemas.pop(session_id, None)
         _session_mcp_spec_hash.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
+        # The comment relay is agent-derived too: its advertised tool set is
+        # built from the resolved spec (build_native_relay_tool_schemas), and
+        # native harnesses ignore the wire `tools` list, so the relay IS their
+        # whole tool surface. Left running across a switch it would keep
+        # serving the previous agent's gated tools; the relay is untagged and
+        # presence-gated, so it must be closed and evicted here for the next
+        # _ensure_comment_relay_started to rebuild it from the new spec.
+        if (_relay := _session_comment_relays.pop(session_id, None)) is not None:
+            with contextlib.suppress(OSError, RuntimeError):
+                _relay.close()
+        # The session-init envelope is agent-derived: it carries the agent id
+        # it was created for and the session labels chosen for it (bridge id
+        # among them), and _fresh_session_init_envelope hands those straight
+        # to native spawn/bridge lookups as optional_labels for its whole TTL.
+        # Surviving a switch, it points the NEW agent at the PREVIOUS agent's
+        # bridge.
+        _session_init_envelopes.pop(session_id, None)
+        # The tagged caches above are self-contained (their own eviction
+        # drops the provenance tag with them), but _session_agent_ids is a
+        # separate "what did we last dispatch as" fact some callers still
+        # read to pick which agent's tag to look up next — leaving it
+        # pointing at the agent whose caches were JUST cleared would let a
+        # later, unrelated cache write for that same agent look validly
+        # "current" again. Clear it too so the next read starts unknown.
+        _session_agent_ids.pop(session_id, None)
         if agent_id:
+            # Global, agent-keyed: this pop is visible to every conversation,
+            # but the generation bump above is not — it belongs to THIS session
+            # only. So another conversation with a fill for this agent already
+            # in flight can reinstate the entry right after this pop, and its
+            # write will be judged current because its own session never reset.
+            # Known deferred gap; see _agent_spec_cache_put.
             _spec_cache.pop(agent_id, None)
+
+    async def _invalidate_session_agent_state(session_id: str, new_agent_id: str | None) -> None:
+        """Invalidate every agent-derived CACHE and release the cached
+        harness subprocess for *session_id*, on an in-conversation agent
+        switch.
+
+        Scope: the per-session value caches listed in
+        :func:`_clear_session_agent_caches` plus the harness subprocess. It
+        does NOT fence or tear down agent-derived RESOURCES — terminals,
+        forwarders, and bridge state outlive this call, and a creator already
+        in flight can still register one afterwards (see
+        :func:`_terminal_survives_fence`); that is not transactional.
+
+        The single shared routine both dispatch paths (background
+        ``_run_turn_bg_setup_and_stream`` and direct-stream
+        ``_stream_message_to_harness``) call for this, so their eviction
+        scope cannot silently diverge.
+
+        Releasing the subprocess matters as much as clearing the specs:
+        ``process_manager.get_client()`` reuses an existing cached
+        subprocess entry regardless of a new env/config on that call — it
+        only spawns fresh when no entry exists — so a same-harness agent
+        switch would otherwise keep serving the PREVIOUS agent's
+        process-start-seeded config (claude-sdk's SDK options, Hermes's
+        instruction-prefix-once-per-vendor-session) even after every
+        spec/skills/schema cache is correctly invalidated.
+
+        :param session_id: Conversation id whose agent-derived state is
+            no longer trustworthy.
+        :param new_agent_id: The agent id this session is now believed to
+            be dispatching as, if known — passed through to
+            :func:`_clear_session_agent_caches` so the agent-keyed
+            ``_spec_cache`` entry for it is dropped too, not just the
+            session-keyed caches. Dropping it is not the same as fencing it:
+            that cache is global, so another conversation's in-flight fill for
+            the same agent can reinstate the entry right afterwards. See
+            :func:`_agent_spec_cache_put`.
+        :returns: None.
+        """
+        _clear_session_agent_caches(session_id, new_agent_id)
+        if process_manager is not None:
+            await process_manager.release(session_id)
 
     @app.delete("/v1/sessions/{session_id}/resources")
     async def cleanup_session_resources(
@@ -7932,10 +9165,10 @@ def create_runner_app(
                         }
                     },
                 )
-            spec_entry = _session_spec_cache.get(session_id)
+            agent_id = _session_agent_ids.get(session_id)
+            spec_entry = _cache_get_for_agent(_session_spec_cache, session_id, agent_id)
             spec = _unwrap_resolved_spec(spec_entry)
             if spec is None and spec_resolver is not None:
-                agent_id = _session_agent_ids.get(session_id)
                 if agent_id:
                     try:
                         resolved = await spec_resolver(agent_id, session_id)
@@ -8000,10 +9233,10 @@ def create_runner_app(
                             }
                         },
                     )
-                spec_entry = _session_spec_cache.get(session_id)
+                _agent_id = _session_agent_ids.get(session_id)
+                spec_entry = _cache_get_for_agent(_session_spec_cache, session_id, _agent_id)
                 spec = _unwrap_resolved_spec(spec_entry)
                 if spec is None and spec_resolver is not None:
-                    _agent_id = _session_agent_ids.get(session_id)
                     if _agent_id:
                         try:
                             resolved = await spec_resolver(_agent_id, session_id)
@@ -8071,11 +9304,12 @@ def create_runner_app(
                         },
                     )
             else:
-                spec_entry = _session_spec_cache.get(session_id)
+                _agent_id_local = _session_agent_ids.get(session_id)
+                spec_entry = _cache_get_for_agent(_session_spec_cache, session_id, _agent_id_local)
                 spec_workdir = _resolved_spec_workdir(spec_entry)
                 spec = _unwrap_resolved_spec(spec_entry)
                 if spec is None and spec_resolver is not None:
-                    _agent_id = _session_agent_ids.get(session_id)
+                    _agent_id = _agent_id_local
                     if _agent_id:
                         try:
                             resolved = await spec_resolver(_agent_id, session_id)
@@ -8083,7 +9317,6 @@ def create_runner_app(
                             spec = _unwrap_resolved_spec(resolved)
                         except Exception:  # noqa: BLE001
                             pass
-                _agent_id_local = _session_agent_ids.get(session_id)
                 dispatch_workspace = (
                     spec_workdir
                     if spec_workdir is not None
@@ -8135,7 +9368,9 @@ def create_runner_app(
     ) -> dict[str, str] | None:
         from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth
 
-        spec_entry = _session_spec_cache.get(session_id)
+        spec_entry = _cache_get_for_agent(
+            _session_spec_cache, session_id, _session_agent_ids.get(session_id)
+        )
         if spec_entry is None:
             return None
         spec = spec_entry.spec if hasattr(spec_entry, "spec") else spec_entry
@@ -8493,7 +9728,7 @@ def create_runner_app_from_env() -> FastAPI:
     return create_runner_app(server_client=server_client)
 
 
-async def _resolve_harness_config(
+async def _resolve_effective_turn(
     *,
     agent_id: str | None,
     spec_resolver: SpecResolver | None,
@@ -8502,8 +9737,44 @@ async def _resolve_harness_config(
     harness_override: str | None = None,
     sub_agent_name: str | None = None,
     cwd: Path | None = None,
-) -> tuple[str, dict[str, str] | None]:
-    """Resolve harness type + spawn-env from the agent spec.
+) -> tuple[str, dict[str, str] | None, Any, Path | None]:
+    """Resolve harness, spawn-env, effective ``AgentSpec``, and workdir together.
+
+    Despite the name, this is NOT the single resolution path every turn goes
+    through — three genuinely different code paths compute the effective
+    spec/harness for a turn, and only ONE of them calls this function:
+
+    - The direct ``?stream=true`` bypass, when no harness is already known
+      (``_stream_message_to_harness``'s ``if not harness_name:`` branch) —
+      calls this function directly.
+    - The direct ``?stream=true`` bypass, when a harness IS already known
+      (dispatch from the background path, or caller-supplied in the body) —
+      does its OWN inline cache read + resolver call + sub-agent swap,
+      entirely separate from this function (see the ``else:`` branch
+      immediately below the branch above).
+    - The background-turn path (``_run_turn_bg_setup_and_stream``) — also
+      does its OWN inline cache read + resolver call + sub-agent swap,
+      structurally similar to but independent from both of the above.
+
+    All three converge only on the OUTPUT contract (a harness name, a
+    spawn_env, and — separately, in the caller-known-harness branch and the
+    background path — an effective spec used for
+    ``InstructionComposition``), not on a single resolution call. They are not
+    unified because they differ in what's already known at entry: no harness
+    at all here, a known harness/dispatch elsewhere, and a persistent
+    ``_session_spec_cache`` with its own agent-switch/provenance
+    invalidation rules in the other two. This docstring describes three
+    paths; it is inaccurate the moment that stops being true.
+
+    The differing FAILURE behaviour is deliberate, not drift. This path
+    answers synchronously, so a resolver exception or a missing requested
+    child becomes an HTTP 503 here, where the other two cannot report that
+    way. The full matrix is pinned by
+    ``test_cross_path_resolution_contract``; change it there deliberately
+    rather than re-aligning the paths.
+
+    :func:`_resolve_harness_config` wraps this for callers that only need the
+    2-tuple.
 
     :param agent_id: Agent id to resolve the spec for.
     :param spec_resolver: Resolver that returns the spec for *agent_id*.
@@ -8523,7 +9794,9 @@ async def _resolve_harness_config(
         :func:`_find_spec_by_name` before harness derivation. ``None`` for
         top-level sessions.
     :param cwd: Runtime working directory for harnesses that need it.
-    :returns: ``(harness, spawn_env)``; a default for unresolved specs.
+    :returns: ``(harness, spawn_env, spec, workdir)``; ``spec``/``workdir``
+        are ``None`` for unresolved specs (matches the harness/spawn_env
+        default-for-unresolved-specs fallback).
     """
     if agent_id and spec_resolver:
         spec_entry = await spec_resolver(agent_id, session_id)
@@ -8539,19 +9812,70 @@ async def _resolve_harness_config(
                 from omnigent.runtime.workflow import _find_spec_by_name
 
                 sub_spec = _find_spec_by_name(spec, sub_agent_name)
-                if sub_spec is not None:
-                    spec = sub_spec
-                else:
+                if sub_spec is None:
+                    # A requested sub-agent that doesn't resolve must not
+                    # silently fall back to deriving harness/spawn_env from
+                    # the PARENT spec — same none-match-treated-as-
+                    # authoritative class as every other site in this
+                    # no-match site. Raise so this degrades exactly like every
+                    # other resolution failure this function's callers
+                    # already handle (RuntimeError -> 503 spec_resolver_failed
+                    # on the direct-stream no-harness path).
                     _warn_unresolved_sub_agent(session_id, sub_agent_name)
+                    raise RuntimeError(
+                        f"sub-agent {sub_agent_name!r} not found in agent "
+                        f"{agent_id!r}'s spec for session {session_id!r}"
+                    )
+                spec = sub_spec
             harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
             harness = canonicalize_harness(harness) or harness
             spawn_env = _build_spawn_env_from_spec(
                 spec, harness, cwd=cwd, workdir=workdir, model_override=model_override
             )
-            return harness, spawn_env
+            return harness, spawn_env, spec, workdir
 
     # Fallback for tests that register a custom harness in _HARNESS_MODULES.
-    return "runner-test-default", None
+    return "runner-test-default", None, None, None
+
+
+async def _resolve_harness_config(
+    *,
+    agent_id: str | None,
+    spec_resolver: SpecResolver | None,
+    session_id: str | None = None,
+    model_override: str | None = None,
+    harness_override: str | None = None,
+    sub_agent_name: str | None = None,
+    cwd: Path | None = None,
+) -> tuple[str, dict[str, str] | None]:
+    """Resolve harness type + spawn-env from the agent spec.
+
+    Thin 2-tuple wrapper over :func:`_resolve_effective_turn` for callers
+    that don't need the resolved spec/workdir.
+
+    :param agent_id: Agent id to resolve the spec for.
+    :param spec_resolver: Resolver that returns the spec for *agent_id*.
+    :param session_id: Session/conversation id, threaded to the resolver.
+    :param model_override: Per-session ``/model`` override, applied to the
+        spawn-env model so it takes effect on the SDK harnesses.
+    :param harness_override: Per-session brain-harness override (validated
+        at session create, forwarded by the server in the message body),
+        e.g. ``"pi"``. Replaces the spec's ``executor.config.harness``.
+    :param sub_agent_name: For a sub-agent session, the dispatched
+        sub-agent's name. See :func:`_resolve_effective_turn`.
+    :param cwd: Runtime working directory for harnesses that need it.
+    :returns: ``(harness, spawn_env)``; a default for unresolved specs.
+    """
+    harness, spawn_env, _spec, _workdir = await _resolve_effective_turn(
+        agent_id=agent_id,
+        spec_resolver=spec_resolver,
+        session_id=session_id,
+        model_override=model_override,
+        harness_override=harness_override,
+        sub_agent_name=sub_agent_name,
+        cwd=cwd,
+    )
+    return harness, spawn_env
 
 
 # The per-harness env var that carries the model into the spawn-env (SDK /

@@ -887,6 +887,18 @@ async def test_create_session_repl_terminal_dispatch(
         spec_version=1,
         name="dispatch-agent",
         executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+        # Sub-agent param case dispatches sub_agent_name="worker" — must
+        # resolve for real (POST /v1/sessions now 404s on an unresolvable
+        # sub-agent, no more silent fallback to the parent), not just be
+        # accepted by a fixture gap. Harmless for the other param cases,
+        # which never set sub_agent_name.
+        sub_agents=[
+            AgentSpec(
+                spec_version=1,
+                name="worker",
+                executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+            )
+        ],
     )
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
 

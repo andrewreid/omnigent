@@ -726,8 +726,9 @@ class CodexNativeAppServer:
     :param codex_home: Private per-session ``CODEX_HOME`` path.
     :param env: Environment for the app-server subprocess.
     :param config_overrides: Codex ``-c`` config override values.
-    :param developer_instructions: Optional framework-owned instructions
-        appended to the private session config before app-server startup.
+    :param developer_instructions: Optional raw ``AgentSpec.instructions``
+        (author-supplied, not framework-composed) appended to the private
+        session config before app-server startup.
     :param cwd: Working directory for the app-server process.
     :param bridge_dir: Native Codex bridge directory, e.g.
         ``Path("~/.omnigent/codex-native/<hash>")``. The policy hook
@@ -1429,8 +1430,9 @@ def build_codex_native_server(
     :param extra_config_overrides: Additional ``-c`` config overrides
         appended after Databricks routing overrides, e.g. MCP server
         registration for the Omnigent tool relay.
-    :param developer_instructions: Optional framework-owned instructions
-        appended to Codex's private per-session config.
+    :param developer_instructions: Optional raw ``AgentSpec.instructions``
+        (author-supplied, not framework-composed) appended to Codex's
+        private per-session config.
     :param bypass_sandbox: When ``True``, append config overrides that put
         the app-server's threads into the full-bypass stance
         (``approval_policy="never"`` + ``sandbox_mode="danger-full-access"``)
