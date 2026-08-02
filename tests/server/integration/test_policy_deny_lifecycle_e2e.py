@@ -350,3 +350,68 @@ async def test_input_deny_publishes_committed_item_event(
     assert "Blocked by test policy" in text, (
         f"deny sentinel missing from committed item; got {item}"
     )
+
+
+async def test_root_policy_denies_a_policy_free_child_through_the_hook_route(
+    policy_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A sub-agent with no policies of its own is still bound by its root's.
+
+    The hook route consults a fast path before building an engine at all;
+    when it reports "nothing applies" the route returns an unconditional
+    ALLOW. The builder inherits the ROOT conversation's stored policies for
+    a sub-agent, so a fast path given only the child's own id answers
+    "nothing applies" for exactly the session a root-level policy is meant
+    to govern, and the policy is silently unenforced.
+
+    Asserted through the route because the route is where the lineage has
+    to be supplied — a caller that simply passes no root is invisible to
+    the builder-level check.
+    """
+    from omnigent.runtime.policies.builder import (
+        _DEFAULT_POLICY_SPECS_CACHE,
+        _SESSION_POLICY_SPECS_CACHE,
+    )
+
+    # Both memos are process-global and outlive individual tests; a warm
+    # default-policy entry would produce a DENY for the wrong reason.
+    _SESSION_POLICY_SPECS_CACHE.clear()
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+
+    agent = await create_test_agent(policy_client)
+    root_session_id = await _create_session(policy_client, agent["id"])
+    await _attach_deny_policy(
+        policy_client,
+        root_session_id,
+        name="root_only_deny",
+        reason="Blocked by the root session policy",
+    )
+
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=root_session_id,
+        agent_id=agent["id"],
+    )
+    assert child.root_conversation_id == root_session_id
+    # The child carries no policy of its own — only the root does.
+    assert SqlAlchemyPolicyStore(db_uri).list_for_session(child.id) == []
+
+    resp = await policy_client.post(
+        f"/v1/sessions/{child.id}/policies/evaluate",
+        json={
+            "event": {
+                "type": "PHASE_TOOL_CALL",
+                "target": "",
+                "data": {"name": "Bash", "arguments": {}},
+                "context": {},
+            },
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["result"] == "POLICY_ACTION_DENY", (
+        "child session was allowed despite a policy on its root — the fast "
+        "path skipped the engine build and dropped inherited enforcement"
+    )

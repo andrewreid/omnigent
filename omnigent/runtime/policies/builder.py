@@ -92,6 +92,14 @@ _DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, list[PolicySpec]] = cachet
     maxsize=256, ttl=30
 )
 
+# Guards publication into _DEFAULT_POLICY_SPECS_CACHE against the same
+# fill-after-invalidate race as the session cache below. Counted separately
+# from _SESSION_POLICY_CACHE_GENERATION because the two caches are evicted by
+# disjoint events: sharing one counter would make a session-policy mutation
+# suppress an unrelated in-flight default publish on the hottest path.
+_DEFAULT_POLICY_CACHE_LOCK = threading.Lock()
+_DEFAULT_POLICY_CACHE_GENERATION = 0
+
 # Invalidation-based LRU cache of ``(workspace_id, conversation_id) -> list[PolicySpec]``
 # for session-scoped policies. Unlike defaults, session policies can be added
 # mid-session (via sys_add_policy), so a TTL would delay enforcement. Instead,
@@ -381,6 +389,7 @@ def any_policies_apply(
     *,
     spec: AgentSpec,
     conversation_id: str,
+    root_conversation_id: str | None,
     default_policies: list[PolicySpec] | None,
     policy_store: PolicyStore | None,
     phase: Phase | None = None,
@@ -396,15 +405,30 @@ def any_policies_apply(
     Reads from the same caches as :func:`build_policy_engine`, so the check
     is O(1) for warm cache hits.
 
+    The policy set checked here must match the one
+    :func:`build_policy_engine` assembles, or the fast path silently skips
+    enforcement. That includes the ROOT conversation's stored policies, which
+    a sub-agent inherits — so a caller that cannot supply lineage gets
+    ``True`` (build the engine) rather than a fast-path ALLOW. Requiring the
+    parameter only makes its *omission* loud; passing ``None`` has to be safe
+    on its own, because absent lineage is indistinguishable here from a root
+    that carries policies.
+
     :param spec: The agent's parsed spec.
     :param conversation_id: Conversation id, e.g. ``"conv_abc123"``.
+    :param root_conversation_id: ``root_conversation_id`` of the conversation
+        being evaluated, so an inheriting sub-agent is checked against its
+        root's policies too. ``None`` means the lineage is unknown and forces
+        the slow path.
     :param default_policies: Server-wide policies from ``RuntimeCaps``.
     :param policy_store: Session-scoped policy store; ``None`` means no DB
         policies are configured.
     :param phase: The evaluation phase, if known.
     :param tool_name: The tool being called (for ``PHASE_TOOL_CALL`` events).
-    :returns: ``False`` when the engine would have an empty policy list and
-        ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
+    :returns: ``False`` only when no policy the engine would assemble — agent
+        guardrails, server defaults, DB-stored defaults, or this
+        conversation's or its root's stored session policies — could produce
+        anything other than ALLOW/UNSPECIFIED for this evaluation.
     """
     # The engine unconditionally injects _ASK_ON_ADD_POLICY_SPEC so agents
     # cannot silently install session policies. Never fast-path sys_add_policy
@@ -417,10 +441,20 @@ def any_policies_apply(
         return True
     if _load_default_policy_specs(policy_store):
         return True
+    # Sub-agents inherit their root's stored policies, so a policy-free child
+    # under a policy-carrying root must not be fast-pathed. Without lineage
+    # the root's policies cannot be checked at all, and "no lineage" is not
+    # evidence of "no inherited policy" — fail towards building the engine.
+    if root_conversation_id is None:
+        return True
     # Batched and cache-aware through the same LRU build_policy_engine uses,
     # so this is a cache hit on any call after the first for the session.
-    specs_by_session = _load_session_policy_specs_batch([conversation_id], policy_store)
-    return bool(specs_by_session.get(conversation_id))
+    session_ids = [canonical_conversation_id(conversation_id)]
+    root_id = canonical_conversation_id(root_conversation_id)
+    if root_id not in session_ids:
+        session_ids.append(root_id)
+    specs_by_session = _load_session_policy_specs_batch(session_ids, policy_store)
+    return any(specs_by_session.get(sid) for sid in session_ids)
 
 
 def build_policy_engine(
@@ -1284,6 +1318,15 @@ def _load_default_policy_specs(
     tenants. Call :func:`invalidate_default_policy_specs_cache` after any
     mutation to make changes visible before the TTL expires.
 
+    Loads sample a generation counter that every invalidation advances and
+    install nothing if an invalidation landed while the store query was in
+    flight, so a load that read before a mutation committed cannot republish
+    its stale result afterwards. The caller still uses the rows it read;
+    only publication is guarded, so a concurrent mutation costs a cache miss
+    on the next build rather than a missed policy. Without this,
+    :func:`any_policies_apply` could serve a stale-empty default set — a
+    fast-path ALLOW while a committed default policy exists.
+
     :param policy_store: The policy store. ``None`` returns an empty list.
     :returns: List of :class:`FunctionPolicySpec` for enabled default
         policies, in ``created_at ASC`` order.
@@ -1294,7 +1337,9 @@ def _load_default_policy_specs(
     from omnigent.db.db_models import current_workspace_id
 
     workspace_id = current_workspace_id()
-    cached: list[PolicySpec] | None = _DEFAULT_POLICY_SPECS_CACHE.get(workspace_id)
+    with _DEFAULT_POLICY_CACHE_LOCK:
+        generation = _DEFAULT_POLICY_CACHE_GENERATION
+        cached: list[PolicySpec] | None = _DEFAULT_POLICY_SPECS_CACHE.get(workspace_id)
     if cached is not None:
         return cached
     specs: list[PolicySpec] = []
@@ -1317,7 +1362,9 @@ def _load_default_policy_specs(
             )
             continue
         specs.append(_stored_policy_to_spec(policy))
-    _DEFAULT_POLICY_SPECS_CACHE[workspace_id] = specs
+    with _DEFAULT_POLICY_CACHE_LOCK:
+        if generation == _DEFAULT_POLICY_CACHE_GENERATION:
+            _DEFAULT_POLICY_SPECS_CACHE[workspace_id] = specs
     return specs
 
 
@@ -1330,9 +1377,15 @@ def invalidate_default_policy_specs_cache() -> None:
     DB rather than serving a stale TTL entry. Scoped to the current
     workspace context via :func:`~omnigent.db.db_models.current_workspace_id`.
     """
+    global _DEFAULT_POLICY_CACHE_GENERATION
+
     from omnigent.db.db_models import current_workspace_id
 
-    _DEFAULT_POLICY_SPECS_CACHE.pop(current_workspace_id(), None)
+    # Advance the generation under the same lock that guards publication, so
+    # a loader holding pre-commit rows cannot reinstate them afterwards.
+    with _DEFAULT_POLICY_CACHE_LOCK:
+        _DEFAULT_POLICY_CACHE_GENERATION += 1
+        _DEFAULT_POLICY_SPECS_CACHE.pop(current_workspace_id(), None)
 
 
 def invalidate_session_policy_specs_cache(conversation_id: str) -> None:

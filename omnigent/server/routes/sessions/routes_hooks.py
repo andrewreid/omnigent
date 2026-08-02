@@ -694,6 +694,7 @@ def register_hooks_routes(
         if not any_policies_apply(
             spec=loaded.spec,
             conversation_id=session_id,
+            root_conversation_id=conv.root_conversation_id,
             default_policies=_caps.default_policies,
             policy_store=get_policy_store(),
             phase=phase,

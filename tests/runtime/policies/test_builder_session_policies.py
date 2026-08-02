@@ -723,6 +723,139 @@ def test_build_engine_ordering_session_agent_db_default_admin(db_uri: str) -> No
 # ── any_policies_apply fast path ───────────────────────────────────────────
 
 
+def test_fast_path_sees_inherited_root_policies(db_uri: str) -> None:
+    """A policy-free child under a policy-carrying root must not be skipped.
+
+    ``any_policies_apply`` guards the hook surface: returning ``False``
+    short-circuits to unconditional ALLOW without building an engine. The
+    builder inherits the ROOT's stored policies for a sub-agent, so a check
+    that looked only at the child's own id would silently drop enforcement
+    of every root policy.
+
+    :param db_uri: Per-test SQLite URI.
+    """
+    # Both memos are process-global and survive across tests in this file;
+    # a warm default-policy entry would make the fast path answer True for
+    # the wrong reason.
+    _SESSION_POLICY_SPECS_CACHE.clear()
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    handler = "tests.resources.examples._shared.tool_functions.block_long_sleep"
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    root_conv = conv_store.create_conversation()
+    child_conv = conv_store.create_conversation(
+        parent_conversation_id=root_conv.id,
+        kind="sub_agent",
+    )
+
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    policy_store.create(
+        policy_id="9a1c0f4b7d2e48a6b3c5d7e9f1a2b3c4",
+        session_id=root_conv.id,
+        name="root_guard",
+        type="python",
+        handler=handler,
+    )
+
+    # The child itself has no stored policy — only the root does.
+    assert _load_session_policy_specs_batch([child_conv.id], policy_store)[child_conv.id] == []
+
+    applies = any_policies_apply(
+        spec=_make_minimal_spec(),
+        conversation_id=child_conv.id,
+        root_conversation_id=root_conv.id,
+        default_policies=None,
+        policy_store=policy_store,
+    )
+    assert applies is True, (
+        "fast path skipped a child whose root carries a policy — inherited "
+        "root policies would go unenforced"
+    )
+
+    # The invariant the fast path exists to preserve: it may only return
+    # False when the engine it replaces would enforce nothing.
+    engine = build_policy_engine(
+        spec=_make_minimal_spec(),
+        conversation_id=child_conv.id,
+        conversation_store=conv_store,
+        policy_store=policy_store,
+    )
+    assert "root_guard" in [p.spec.name for p in engine.policies]
+
+
+def test_fast_path_false_only_when_engine_enforces_nothing(db_uri: str) -> None:
+    """With no policies anywhere, the fast path may skip the build.
+
+    The negative half of the previous test: without it, a fast path hardwired
+    to ``True`` would pass the inheritance assertion while destroying the
+    optimization entirely.
+
+    :param db_uri: Per-test SQLite URI.
+    """
+    _SESSION_POLICY_SPECS_CACHE.clear()
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    root_conv = conv_store.create_conversation()
+    child_conv = conv_store.create_conversation(
+        parent_conversation_id=root_conv.id,
+        kind="sub_agent",
+    )
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+
+    applies = any_policies_apply(
+        spec=_make_minimal_spec(),
+        conversation_id=child_conv.id,
+        root_conversation_id=root_conv.id,
+        default_policies=None,
+        policy_store=policy_store,
+    )
+    assert applies is False
+
+
+def test_fast_path_without_lineage_never_reports_nothing_applies(db_uri: str) -> None:
+    """``root_conversation_id=None`` must not yield a fast-path ALLOW.
+
+    Making the parameter required only makes its *omission* loud; a caller
+    that passes ``None`` still reaches the body. Absent lineage cannot
+    distinguish "no root policies" from "root policies this call cannot
+    see", so the only safe answer is to build the engine.
+
+    :param db_uri: Per-test SQLite URI.
+    """
+    _SESSION_POLICY_SPECS_CACHE.clear()
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    handler = "tests.resources.examples._shared.tool_functions.block_long_sleep"
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    root_conv = conv_store.create_conversation()
+    child_conv = conv_store.create_conversation(
+        parent_conversation_id=root_conv.id,
+        kind="sub_agent",
+    )
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    policy_store.create(
+        policy_id="3f8b1c92d074e5a6b81f3c2d9e405a71",
+        session_id=root_conv.id,
+        name="root_guard",
+        type="python",
+        handler=handler,
+    )
+
+    applies = any_policies_apply(
+        spec=_make_minimal_spec(),
+        conversation_id=child_conv.id,
+        root_conversation_id=None,
+        default_policies=None,
+        policy_store=policy_store,
+    )
+
+    assert applies is True, (
+        "fast path returned False without lineage — a caller that cannot "
+        "supply the root obtains an unconditional ALLOW for a child whose "
+        "root carries a policy"
+    )
+
+
 def test_session_policy_cache_invalidates_across_id_spellings(db_uri: str) -> None:
     """A mutation routed through a dashed id evicts the canonical entry.
 
@@ -808,6 +941,7 @@ def test_load_racing_an_invalidation_does_not_publish_its_stale_result(
         racing["applies"] = any_policies_apply(
             spec=_make_minimal_spec(),
             conversation_id=conv.id,
+            root_conversation_id=conv.id,
             default_policies=None,
             policy_store=_DescheduledAfterReadStore(db_uri),
         )
@@ -838,6 +972,7 @@ def test_load_racing_an_invalidation_does_not_publish_its_stale_result(
     assert any_policies_apply(
         spec=_make_minimal_spec(),
         conversation_id=conv.id,
+        root_conversation_id=conv.id,
         default_policies=None,
         policy_store=policy_store,
     ), (
@@ -845,6 +980,97 @@ def test_load_racing_an_invalidation_does_not_publish_its_stale_result(
         "eviction — the fast path now returns an unconditional ALLOW for a "
         "session carrying a policy, and no further mutation will clear it"
     )
+
+
+def test_default_load_racing_an_invalidation_does_not_publish_its_stale_result(
+    db_uri: str,
+) -> None:
+    """A default-policy load started before a create must not repopulate.
+
+    ``any_policies_apply``'s contract names DB-stored defaults, so a stale
+    empty entry republished after its own eviction grants a fast-path
+    unconditional ALLOW while a committed default policy exists — bounded
+    by the 30 s TTL, but a real bypass for that whole window.
+
+    :param db_uri: Per-test database URI (SQLite by default; the
+        session worker's PostgreSQL/MySQL database when OMNIGENT_TEST_DB_URI
+        is set).
+    """
+    _SESSION_POLICY_SPECS_CACHE.clear()
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation()
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+
+    read_done = threading.Event()
+    may_publish = threading.Event()
+    default_queries: list[int] = []
+
+    class _DescheduledAfterReadStore(SqlAlchemyPolicyStore):
+        """Stalls between reading the defaults and returning to the loader."""
+
+        def list_defaults(self) -> Any:
+            rows = super().list_defaults()
+            default_queries.append(len(rows))
+            # Stall AFTER the read has produced its rows: a probe that
+            # blocked before the query would publish a fresh result and
+            # report a false green.
+            read_done.set()
+            assert may_publish.wait(timeout=30)
+            return rows
+
+    racing: dict[str, bool] = {}
+
+    def _race() -> None:
+        racing["applies"] = any_policies_apply(
+            spec=_make_minimal_spec(),
+            conversation_id=conv.id,
+            root_conversation_id=conv.id,
+            default_policies=None,
+            policy_store=_DescheduledAfterReadStore(db_uri),
+        )
+
+    racer = threading.Thread(target=_race)
+    racer.start()
+    try:
+        assert read_done.wait(timeout=30), "racing load never reached the store"
+        # The default policy commits and evicts while that load is in flight.
+        policy_store.create_default(
+            policy_id="9a8b7c6d5e4f30211122334455667788",
+            name="default_added_mid_flight",
+            type="python",
+            handler="tests.resources.examples._shared.tool_functions.block_long_sleep",
+            enabled=True,
+        )
+        invalidate_default_policy_specs_cache()
+    finally:
+        may_publish.set()
+        racer.join(timeout=30)
+    assert not racer.is_alive()
+
+    # The racing call read before the commit, so its own answer may predate
+    # the policy; only what it leaves behind is under test.
+    assert racing["applies"] is False
+    assert default_queries == [0]
+
+    try:
+        assert any_policies_apply(
+            spec=_make_minimal_spec(),
+            conversation_id=conv.id,
+            root_conversation_id=conv.id,
+            default_policies=None,
+            policy_store=policy_store,
+        ), (
+            "the in-flight default load republished its pre-commit empty result "
+            "after the eviction — the fast path returns an unconditional ALLOW "
+            "while a committed DB default policy exists"
+        )
+    finally:
+        # The assertion above publishes this test's default policy into a
+        # process-wide TTL cache; leave it warm and a later test in the same
+        # worker inherits a phantom server-wide default.
+        _DEFAULT_POLICY_SPECS_CACHE.clear()
 
 
 # ── _SESSION_OWNER_CACHE keying ─────────────────────────────────────────────
