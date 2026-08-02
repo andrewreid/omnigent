@@ -76,6 +76,21 @@ class AuthModel(str, Enum):
     SESSION_SCOPED_CONFIG = "session-scoped-config"  # per-session synthesized vendor config
 
 
+class InstructionDelivery(str, Enum):
+    """Whether and how ``AgentSpec.instructions`` reach the vendor agent.
+
+    See ``docs/AGENT_YAML_SPEC.md`` for the full per-harness matrix and the
+    lifecycle meaning of each value.
+    """
+
+    COMPOSED_PER_TURN = "composed-per-turn"
+    COMPOSED_SESSION_SNAPSHOT = "composed-session-snapshot"
+    AGENT_STARTUP_ADDITIVE = "agent-startup-additive"
+    FIRST_USER_PREFIX = "first-user-prefix"
+    NOT_DELIVERED = "not-delivered"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class HarnessCapabilities:
     """The declared feature set one harness supports.
@@ -101,6 +116,9 @@ class HarnessCapabilities:
         Optional capability fields use ``None`` when the harness makes no claim;
         the bench reports those declarations as ``UNKNOWN`` rather than assuming
         the capability is unsupported.
+    :param instruction_delivery: Whether and how ``AgentSpec.instructions``
+        reach the vendor agent. Defaults to ``UNKNOWN`` for undeclared/
+        third-party harnesses.
     """
 
     integration_mode: IntegrationMode
@@ -116,6 +134,7 @@ class HarnessCapabilities:
     live_queue: bool | None = None
     images: bool | None = None
     compaction: bool | None = None
+    instruction_delivery: InstructionDelivery = InstructionDelivery.UNKNOWN
 
     def as_dict(self) -> dict[str, str | bool | None]:
         """Return a JSON-serializable view for the ``/v1/harnesses`` catalog."""
@@ -133,4 +152,5 @@ class HarnessCapabilities:
             "live_queue": self.live_queue,
             "images": self.images,
             "compaction": self.compaction,
+            "instruction_delivery": self.instruction_delivery.value,
         }
