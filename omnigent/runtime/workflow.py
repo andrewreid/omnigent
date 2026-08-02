@@ -2742,10 +2742,17 @@ def _find_spec_by_name(
     child ``__web_researcher`` session boots by re-parsing the bundle
     fresh (``runner/_entry.py`` spec resolver), so the researcher is
     absent from the re-parsed tree and a plain search returns ``None``.
-    Every caller swaps to the resolved sub-spec only ``if ... is not
-    None`` and otherwise keeps the parent spec, which boots the child as
-    a full clone of the parent (runaway recursion via ``sys_session_send``
-    when the parent is a coordinator). To keep that fallback safe, the
+    A ``None`` return is a genuine "not found" signal: callers must NOT
+    fall back to the parent spec on a miss (that would silently launch a
+    session under the PARENT's identity — wrong harness, wrong
+    instructions — for a request that named a specific, unresolvable
+    sub-agent; every ``omnigent/runner/app.py`` call site fails/degrades
+    explicitly on ``None`` rather than defaulting to the parent). The
+    ``__web_researcher`` reconstruction below exists precisely so that
+    THIS one legitimate case doesn't hit that miss path and get rejected:
+    without it, a runaway-recursion fallback to the full parent spec
+    (via ``sys_session_send`` when the parent is a coordinator) would be
+    the only alternative to a hard failure. To keep that reconstruction safe, the
     researcher is reconstructed deterministically from the parent (the
     same pure builder ``WebFetchTool`` uses) instead of returning ``None``,
     but only when some node in the tree actually declares the ``web_fetch``
@@ -2768,7 +2775,31 @@ def _find_spec_by_name(
     is out of scope). The root-owner case is unchanged: the owner is the
     root, so the output is identical to before.
 
-    :param spec: The root agent spec to search.
+    This function always treats ``spec`` as the PARENT/root to search
+    UNDER, never as a candidate match itself — even when ``spec.name``
+    happens to equal ``name``. A root named the same as a genuinely
+    nonexistent child must still report a miss (e.g. a coordinator named
+    "worker" with no "worker" sub-agent, asked to resolve sub_agent_name
+    "worker": this is NOT a resolved self-match, it is a fresh top-level
+    session whose sub_agent_name request cannot be satisfied). Conflating
+    "root's name coincides with the requested name" with "this spec IS
+    the already-resolved target" previously let a fresh top-level
+    resolution silently accept the ROOT as if it were the requested
+    child, bypassing every caller's ``sub_agent_not_found`` guard.
+
+    Callers that cache an ALREADY-RESOLVED child spec (so a later
+    re-resolution against that same cached value must be idempotent
+    rather than searching the child's own descendants for itself) are
+    responsible for their own identity pre-check before calling this
+    function — see ``omnigent/runner/app.py``'s background-dispatch and
+    direct-stream composition call sites, which special-case "the cached
+    spec already IS the target" before falling through to a tree search.
+    This function has no way to distinguish "root that happens to share
+    a name" from "already-resolved child" from ``spec`` alone, so it
+    always searches as a parent tree and only a caller with the actual
+    resolution history can tell the two apart safely.
+
+    :param spec: The PARENT/root agent spec to search under.
     :param name: The sub-agent name to find,
         e.g. ``"researcher"``.
     :returns: The matching sub-agent spec, the reconstructed
