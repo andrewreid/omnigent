@@ -295,6 +295,88 @@ async def test_session_snapshot_uses_child_spec_metadata(
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_unresolvable_sub_agent_does_not_use_parent_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A child session whose ``sub_agent_name`` no longer resolves in the
+    parent bundle must NOT silently publish the PARENT's identity/model/
+    context-window — the same none-match-treated-as-authoritative class
+    fixed for every runner-side consumer of ``_find_spec_by_name``. This is
+    the server-side snapshot twin of that fix, a separate process boundary
+    the runner-side fixes never touched.
+    """
+    parent_spec = AgentSpec(
+        spec_version=1,
+        name="advisor",
+        executor=ExecutorSpec(
+            config={"harness": "codex"},
+            model="openai-codex/gpt-5.6-sol:high",
+            context_window=200_000,
+        ),
+        # No sub_agents: "executor" (recorded on the child conversation row)
+        # cannot resolve — simulates a spec edit removing the sub-agent
+        # after the child session was created.
+    )
+    conversations = {
+        "conv_parent": Conversation(
+            id="conv_parent",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            agent_id="ag_advisor",
+        ),
+        "conv_child": Conversation(
+            id="conv_child",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            parent_conversation_id="conv_parent",
+            agent_id="ag_advisor",
+            kind="sub_agent",
+            sub_agent_name="executor",
+        ),
+    }
+    conv_store = _ConversationStore([], conversations=conversations)
+
+    class _AgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            assert agent_id == "ag_advisor"
+            return type(
+                "StoredAgent",
+                (),
+                {"id": agent_id, "name": "advisor-row", "bundle_location": "bundle"},
+            )()
+
+    class _AgentCache:
+        @staticmethod
+        def load(agent_id: str, bundle_location: str) -> Any:
+            assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
+            return type("LoadedAgent", (), {"spec": parent_spec})()
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    child = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_child",
+        agent_store=_AgentStore(),  # type: ignore[arg-type]
+        agent_cache=_AgentCache(),  # type: ignore[arg-type]
+    )
+
+    # Must use the recorded CHILD name ("executor") on a miss — not the
+    # agent ROW's name ("advisor-row") and not the parent spec's name
+    # ("advisor"), either of which would misrepresent this session as
+    # running (some form of) the PARENT's identity. llm_model/
+    # context_window stay unset — there is no resolved spec to derive
+    # them from, and showing the parent's would be equally wrong.
+    assert child.agent_name == "executor"
+    assert child.llm_model is None
+    assert child.context_window is None
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_populates_runner_online_from_session_lookup() -> None:
     """GET /sessions/{id} carries session-scoped runner + host liveness."""
     conv_store = _ConversationStore([_message_item("item_1", "hi")])

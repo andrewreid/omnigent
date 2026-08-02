@@ -36,6 +36,7 @@ from omnigent.harness_capabilities import (
     Elicitation,
     ForkHistory,
     HarnessCapabilities,
+    InstructionDelivery,
     IntegrationMode,
     ModelFamily,
     Resume,
@@ -308,6 +309,7 @@ _EF = EffortFamily
 _MF = ModelFamily
 _AU = AuthModel
 _FH = ForkHistory
+_ID = InstructionDelivery
 
 # Bench shell-tool provocation prompts (moved off the bench's hardcoded
 # _NATIVE_TOOL_PROVOCATION table): the generic variant, and a Bash-specific one
@@ -335,6 +337,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
     ),
     "codex-native": _C(
         _IM.NATIVE_TUI,
@@ -349,6 +352,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="shell",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
     ),
     # streaming is declared True unless a live bench run proves a harness does
     # NOT emit token-level deltas. Only kiro-native is so proven (0 deltas over
@@ -369,6 +373,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "cursor-native": _C(
@@ -384,6 +389,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.PREAMBLE,
         # No shell-tool provocation: cursor-native was intentionally absent from
         # the bench's table (its tool probe is skipped), so leave shell_tool_* None.
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     # kiro_native_permissions.py: "TUI ACP recorder -> web elicitation".
     # streaming=False is LIVE-VERIFIED: a full SSE capture recorded 0 text
@@ -401,6 +407,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="shell",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "antigravity-native": _C(
         _IM.NATIVE_TUI,
@@ -415,6 +422,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="run_command",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "goose-native": _C(
         _IM.NATIVE_TUI,
@@ -429,6 +437,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="developer__shell",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "qwen-native": _C(
@@ -444,6 +453,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="run_shell_command",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "kimi-native": _C(
         _IM.NATIVE_TUI,
@@ -458,6 +468,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "opencode-native": _C(
         _IM.NATIVE_SERVER,
@@ -472,6 +483,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.PREAMBLE,
         # NATIVE_SERVER, not driven by the bench's native-tui tool probe, so
         # shell_tool_* stay None.
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "hermes-native": _C(
         _IM.NATIVE_TUI,
@@ -486,6 +498,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="terminal",
         shell_tool_prompt=_SHELL_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     # SDK / subprocess harnesses (run the vendor model directly). The first four
     # are bench-verified interrupt=streaming=True.
@@ -499,6 +512,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_SESSION_SNAPSHOT,
     ),
     "codex": _C(
         _IM.CLI_SUBPROCESS,
@@ -510,6 +524,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "pi": _C(
         _IM.CLI_SUBPROCESS,
@@ -521,6 +536,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "openai-agents": _C(
         _IM.SDK_IN_PROCESS,
@@ -532,6 +548,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "cursor": _C(
         _IM.SDK_IN_PROCESS,
@@ -543,6 +560,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "antigravity": _C(
         _IM.SDK_IN_PROCESS,
@@ -554,6 +572,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     # Generic ACP harness — drives any user-configured ACP agent command. Same
     # profile as goose/qwen (own-auth, cold resume, SSE permission), but its
@@ -568,6 +587,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "goose": _C(
         _IM.ACP_SUBPROCESS,
@@ -579,6 +599,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "qwen": _C(
         _IM.ACP_SUBPROCESS,
@@ -590,6 +611,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "kimi": _C(
         _IM.CLI_SUBPROCESS,
@@ -601,6 +623,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "hermes": _C(
         _IM.CLI_SUBPROCESS,
@@ -612,6 +635,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "copilot": _C(
         _IM.SDK_IN_PROCESS,
@@ -623,6 +647,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     # open-responses is resolved via an alternate path, but its executor
     # (omnigent/inner/open_responses_sdk.py) is concrete: interrupt_session()
@@ -639,6 +664,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
 }
 

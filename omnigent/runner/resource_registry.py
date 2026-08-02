@@ -919,7 +919,12 @@ class SessionResourceRegistry:
         if self._terminal_registry is None:
             raise RuntimeError("Terminal registry not configured")
         if not getattr(instance, "running", False) or not await instance.is_alive():
-            await self._terminal_registry.close(session_id, terminal_name, session_key)
+            # Scoped to the instance just probed: the liveness check awaits, and
+            # a successor can take this key meanwhile. Closing by key alone
+            # would evict that successor instead of the dead instance.
+            await self._terminal_registry.close(
+                session_id, terminal_name, session_key, expected=instance
+            )
             raise RuntimeError(
                 f"terminal {terminal_name}:{session_key} is not running for session {session_id}"
             )
@@ -1181,7 +1186,11 @@ class SessionResourceRegistry:
 
         if self._terminal_registry is not None:
             try:
-                await self._terminal_registry.close(session_id, terminal_name, session_key)
+                # Evict the instance that exited, not whatever holds the key
+                # now — a replacement may already have been registered.
+                await self._terminal_registry.close(
+                    session_id, terminal_name, session_key, expected=instance
+                )
             except Exception:
                 _logger.exception(
                     "Error evicting exited terminal: session=%s terminal=%s:%s",
