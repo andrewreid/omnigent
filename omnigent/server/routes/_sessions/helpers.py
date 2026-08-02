@@ -6341,17 +6341,23 @@ def _load_agent_spec_for_session_impl(
     )
 
 
-def _build_policy_engine_from_spec(*args: Any, **kwargs: Any) -> PolicyEngine:
+def _build_policy_engine_from_spec(
+    *args: Any,
+    conversation: Conversation | None = None,
+    **kwargs: Any,
+) -> PolicyEngine:
     """Call-time proxy so a facade patch of this symbol is honored here."""
     from omnigent.server.routes import sessions as _facade
 
-    return _facade._build_policy_engine_from_spec(*args, **kwargs)
+    return _facade._build_policy_engine_from_spec(*args, conversation=conversation, **kwargs)
 
 
 def _build_policy_engine_from_spec_impl(
     spec: AgentSpec,
     session_id: str,
     conversation_store: ConversationStore,
+    *,
+    conversation: Conversation | None = None,
 ) -> PolicyEngine:
     caps = get_caps()
     host_connection = (
@@ -6361,6 +6367,7 @@ def _build_policy_engine_from_spec_impl(
         spec=spec,
         conversation_id=session_id,
         conversation_store=conversation_store,
+        conversation=conversation,
         default_policies=caps.default_policies,
         policy_store=get_policy_store(),
         server_llm=caps.llm,
@@ -6423,8 +6430,16 @@ async def _apply_pending_policy_ask_writes(
     spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
     if spec is None:
         return
+    # conversation=None (explicit): the writes applied here may be the
+    # decision-tipping event for a since-accrued INCREMENT (e.g. cost
+    # counters), so this build must observe the DB's latest state rather
+    # than any snapshot the caller happens to hold.
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec,
+        spec,
+        session_id,
+        conversation_store,
+        conversation=None,
     )
     # The label/state writes hit the DB synchronously too — keep them
     # off the loop.
@@ -6821,7 +6836,11 @@ async def _evaluate_output_policy(
         return None
 
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec,
+        spec,
+        session_id,
+        conversation_store,
+        conversation=conv,
     )
     ctx = EvaluationContext(
         phase=Phase.RESPONSE,

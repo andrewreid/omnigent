@@ -4886,7 +4886,11 @@ async def _evaluate_tool_call_policy(
     if spec is None:
         return None
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec,
+        spec,
+        session_id,
+        conversation_store,
+        conversation=conv,
     )
 
     try:
@@ -5038,7 +5042,11 @@ async def _evaluate_input_policy(
     request_content = {"user_content": user_text, "attachments": attachments}
 
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec,
+        spec,
+        session_id,
+        conversation_store,
+        conversation=conv,
     )
     ctx = EvaluationContext(
         phase=Phase.REQUEST,
@@ -5963,7 +5971,11 @@ async def _handle_mcp_tools_call(
     # only) and TOOL_RESULT (both paths). Engine construction reads
     # session-policy specs and labels from the DB, so keep it off-loop too.
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec,
+        spec,
+        session_id,
+        conversation_store,
+        conversation=conv,
     )
 
     if is_retry:

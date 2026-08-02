@@ -6,6 +6,8 @@ and ``delete`` methods against a real SQLite database.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from sqlalchemy.exc import IntegrityError
 
@@ -246,6 +248,74 @@ def test_list_for_session_empty(
 ) -> None:
     """``list_for_session`` returns an empty list for a session with no policies."""
     assert store.list_for_session(session_id) == []
+
+
+# ── list_for_sessions (batch) ───────────────────────────────────────────────
+
+
+def test_list_for_sessions_empty_input_no_query(
+    store: SqlAlchemyPolicyStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty input returns ``{}`` without opening a DB session.
+
+    Regression guard for the "no SQL executed" contract in the C1 batch
+    method — a caller building a root's engine (root == child, no root
+    fetch needed) must not pay a query for an empty id list.
+    """
+    monkeypatch.setattr(
+        store,
+        "_session",
+        lambda: (_ for _ in ()).throw(AssertionError("must not open a session")),
+    )
+    assert store.list_for_sessions([]) == {}
+
+
+def test_list_for_sessions_matches_list_for_session_ordering_and_content(
+    store: SqlAlchemyPolicyStore,
+    session_id: str,
+    other_session_id: str,
+) -> None:
+    """Batched load returns the same per-session ordering as ``list_for_session``.
+
+    Also covers: zero-policy sessions appear as ``[]`` (not omitted) and
+    duplicate input ids collapse to one query without duplicating results —
+    the shape callers (``build_policy_engine``) rely on to skip existence
+    checks.
+    """
+    store.create(
+        policy_id="1b0a4c7e5d9f42a8b3c6e17d0f8a2b54",
+        session_id=session_id,
+        name="first",
+        type="python",
+        handler="mod.a",
+    )
+    store.create(
+        policy_id="2c1b5d8f6e0a53b9c4d7f28e1a9b3c65",
+        session_id=session_id,
+        name="second",
+        type="python",
+        handler="mod.b",
+    )
+    store.create(
+        policy_id="3d2c6e9a7f1b64c0d5e8a39f2b0c4d76",
+        session_id=other_session_id,
+        name="other_first",
+        type="python",
+        handler="mod.c",
+    )
+
+    # Well-formed uuid that was never inserted — exercises the batched
+    # query's "session with no policies" branch.
+    empty_session_id = "9f8e7d6c5b4a39281706f5e4d3c2b1a0"
+    result = store.list_for_sessions([session_id, session_id, other_session_id, empty_session_id])
+
+    assert set(result) == {session_id, other_session_id, empty_session_id}
+    assert [p.name for p in result[session_id]] == [
+        p.name for p in store.list_for_session(session_id)
+    ]
+    assert [p.name for p in result[other_session_id]] == ["other_first"]
+    assert result[empty_session_id] == []
 
 
 # ── update_session_policy ───────────────────────────────────────────────────
@@ -724,3 +794,82 @@ def test_delete_default_rejects_session_policy(
         handler="mod.func",
     )
     assert store.delete_default("8e2f6fb3fda2fb90e2c97fcb29940858") is False
+
+
+@pytest.mark.parametrize("spelling", ["dashed", "prefixed"])
+def test_list_for_sessions_accepts_dashed_and_prefixed_ids(
+    store: SqlAlchemyPolicyStore,
+    session_id: str,
+    spelling: str,
+) -> None:
+    """A caller id spelled any accepted way resolves, keyed as the caller spelled it.
+
+    ``Uuid16`` always reads back bare hex, so keying the result on
+    ``row.session_id`` while seeding it from the caller's string drops (or
+    raises on) a dashed id — which ``get``/``update``/``delete`` accept via
+    ``normalize_uuid`` and ``list_for_session`` matches through the column
+    type. The batch loader must agree with both.
+
+    :param store: Policy store under test.
+    :param session_id: Bare-hex session id from the fixture.
+    :param spelling: Which accepted non-canonical form to query with.
+    """
+    store.create(
+        policy_id="4e3d7f0b8a2c75d1e6f9b40a3c1d5e87",
+        session_id=session_id,
+        name="guard",
+        type="python",
+        handler="mod.a",
+    )
+    if spelling == "dashed":
+        spelled = str(uuid.UUID(hex=session_id))
+    else:
+        spelled = f"pol_{session_id}"
+    assert spelled != session_id
+
+    result = store.list_for_sessions([spelled])
+
+    assert set(result) == {spelled}, "result must be keyed by the caller's own spelling"
+    assert [p.name for p in result[spelled]] == ["guard"]
+    # Agrees with the single-session loader for the same spelling.
+    assert [p.name for p in store.list_for_session(spelled)] == ["guard"]
+
+
+def test_list_for_sessions_constrains_scope_for_index_seek(db_uri: str) -> None:
+    """
+    The bulk load must filter ``scope='session'`` so it can seek
+    ``ix_policies_scope_session``, whose key is
+    ``(workspace_id, scope, session_id, id)``.
+
+    Behaviour alone cannot catch a missing scope predicate: default policies
+    have ``session_id IS NULL`` and so never match a real session id anyway.
+    The predicate is purely about index access, so this asserts the emitted
+    SQL shape. Measured on PostgreSQL 18 with 20k session + 80k default
+    rows, dropping it doubled index searches (2 -> 4) and buffers (9 -> 18)
+    and raised estimated cost 37.68 -> 163.88; on engines without btree
+    skip-scan the migration ``d4c1b9e6f3a2`` expects a far worse plan.
+    """
+    from sqlalchemy import event
+
+    from omnigent.db.utils import get_or_create_engine
+
+    store = SqlAlchemyPolicyStore(db_uri)
+    engine = get_or_create_engine(db_uri)
+    statements: list[str] = []
+
+    def _listener(conn, cursor, statement, parameters, context, executemany) -> None:
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _listener)
+    try:
+        store.list_for_sessions(["9f8e7d6c5b4a39281706f5e4d3c2b1a0"])
+    finally:
+        event.remove(engine, "before_cursor_execute", _listener)
+
+    selects = [s for s in statements if "FROM policies" in s]
+    assert selects, statements
+    # Only the WHERE clause counts -- "scope" also appears in the selected
+    # column list, so asserting on the whole statement would pass either way.
+    for stmt in selects:
+        where = stmt.split("WHERE", 1)[1]
+        assert "scope" in where, where

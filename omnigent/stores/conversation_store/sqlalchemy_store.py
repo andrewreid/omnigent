@@ -466,6 +466,83 @@ def _dialect_upsert_labels(
     session.execute(stmt)
 
 
+def _insert_missing_labels(
+    session: Session,
+    conversation_id: str,
+    seeds: dict[str, str],
+    updated_at: int,
+) -> None:
+    """
+    Insert label rows for keys that have none, leaving stored rows alone.
+
+    The initial-value seeding path. ``DO NOTHING`` rather than
+    ``DO UPDATE``: whether a key is already set is decided by the
+    database at write time, so a value stored between the caller's read
+    and this write is not clobbered by the seed.
+
+    :param session: Active SQLAlchemy session (the atomic unit of work).
+    :param conversation_id: Owning conversation ID.
+    :param seeds: Non-empty dict of label key → value to insert when absent.
+    :param updated_at: Timestamp to write on rows this call inserts.
+    """
+    dialect = session.bind.dialect.name if session.bind is not None else ""
+    # Same clamp as the upsert path: no label writer may overflow
+    # ``String(256)`` and raise ``DataError`` on PostgreSQL.
+    rows = [
+        {
+            "conversation_id": conversation_id,
+            "key": key,
+            "value": value[:LABEL_VALUE_MAX_LEN],
+            "updated_at": updated_at,
+        }
+        for key, value in seeds.items()
+    ]
+    if dialect in ("sqlite", "postgresql"):
+        _dialect_insert_missing_labels(session, dialect, rows)
+        return
+    # Generic dialect fallback — SELECT-then-INSERT of the absent keys in
+    # one transaction, matching _upsert_labels' fallback structure.
+    for row in rows:
+        existing = session.get(
+            SqlConversationLabel,
+            (current_workspace_id(), row["conversation_id"], row["key"]),
+        )
+        if existing is None:
+            session.add(SqlConversationLabel(**row))
+
+
+def _dialect_insert_missing_labels(
+    session: Session,
+    dialect: str,
+    rows: list[dict[str, Any]],
+) -> None:
+    """
+    Dialect-specific ``ON CONFLICT DO NOTHING`` path for SQLite / PostgreSQL.
+
+    Split out for the same reason as :func:`_dialect_upsert_labels`: the two
+    dialect ``insert`` builders produce incompatible type variances, so each
+    branch needs its own narrow scope.
+
+    :param session: Active SQLAlchemy session.
+    :param dialect: ``"sqlite"`` or ``"postgresql"``.
+    :param rows: Pre-built row dicts to insert where absent.
+    """
+    # Typed as Any for the same variance reason as the upsert path.
+    stmt: Any
+    if dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        stmt = sqlite_insert(SqlConversationLabel).values(rows)
+    else:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        stmt = pg_insert(SqlConversationLabel).values(rows)
+    stmt = stmt.on_conflict_do_nothing(
+        index_elements=["workspace_id", "conversation_id", "key"],
+    )
+    session.execute(stmt)
+
+
 def _fetch_labels(
     session: Session,
     conversation_id: str,
@@ -1258,6 +1335,35 @@ class SqlAlchemyConversationStore(ConversationStore):
         stamp = updated_at if updated_at is not None else now_epoch()
         with self._conv_session() as session:
             _upsert_labels(session, conversation_id, updates, stamp)
+
+    def seed_labels(
+        self,
+        conversation_id: str,
+        seeds: dict[str, str],
+        updated_at: int | None = None,
+    ) -> None:
+        """
+        Insert labels only where the key is not already stored.
+
+        Single-transaction batched insert. On SQLite / PostgreSQL this is
+        ``INSERT ... ON CONFLICT DO NOTHING``, so an existing row is left
+        untouched by the database itself; other dialects fall back to a
+        SELECT-then-INSERT of the absent keys inside the same transaction.
+        Empty seeds is a no-op.
+
+        :param conversation_id: The conversation to seed, e.g.
+            ``"conv_abc123"``.
+        :param seeds: Mapping from label key to the value to insert when
+            the key is absent.
+        :param updated_at: Caller-supplied timestamp for inserted rows
+            (``None`` → current wall-clock). See the abstract method
+            docstring.
+        """
+        if not seeds:
+            return
+        stamp = updated_at if updated_at is not None else now_epoch()
+        with self._conv_session() as session:
+            _insert_missing_labels(session, conversation_id, seeds, stamp)
 
     def set_session_state(
         self,

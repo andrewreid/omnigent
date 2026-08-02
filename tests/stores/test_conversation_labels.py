@@ -73,6 +73,53 @@ def test_set_labels_overwrites_existing(
     assert got.labels == {"integrity": "0"}
 
 
+def test_seed_labels_does_not_overwrite_a_stored_value(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``seed_labels`` is insert-if-absent: a stored value wins.
+
+    The distinguishing case against :meth:`set_labels`. Callers seeding
+    ``LabelDef.initial`` cannot decide this themselves — a writer can land
+    between their read and their write — so the database must, via
+    ``ON CONFLICT DO NOTHING``.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.set_labels(conv.id, {"integrity": "0"})
+    conversation_store.seed_labels(conv.id, {"integrity": "1"})
+    got = conversation_store.get_conversation(conv.id)
+    assert got is not None
+    assert got.labels == {"integrity": "0"}
+
+
+def test_seed_labels_inserts_absent_keys_only(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Absent keys are inserted in the same call that skips present ones.
+
+    Guards against an implementation that gives up on the whole batch when
+    any one key already exists — the seeding caller passes both kinds at
+    once, so a declared label that has never been written must still land.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.set_labels(conv.id, {"integrity": "0"})
+    conversation_store.seed_labels(conv.id, {"integrity": "1", "sensitivity": "public"})
+    got = conversation_store.get_conversation(conv.id)
+    assert got is not None
+    assert got.labels == {"integrity": "0", "sensitivity": "public"}
+
+
+def test_seed_labels_empty_dict_is_noop(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Empty seeds returns without touching stored labels."""
+    conv = conversation_store.create_conversation()
+    conversation_store.set_labels(conv.id, {"integrity": "0"})
+    conversation_store.seed_labels(conv.id, {})
+    got = conversation_store.get_conversation(conv.id)
+    assert got is not None
+    assert got.labels == {"integrity": "0"}
+
+
 def test_set_labels_leaves_unmentioned_keys_untouched(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
