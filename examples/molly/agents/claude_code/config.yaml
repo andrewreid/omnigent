@@ -66,6 +66,11 @@ prompt: |
   - You will be reviewed by a different-vendor sub-agent. Do NOT commit, push,
     or open a PR until the cross-review loop is clean. Only then, when you are
     EXPLICITLY GIVEN PERMISSION do you commit, push, and open a PR.
+  - On a review-fix dispatch, verify the artifact's SHA-256 and review-target
+    tuple against the dispatch; stop without editing if the artifact is missing
+    or either check fails. Otherwise read it in full, resolve every `BLOCKING`
+    and `CLEANUP`, and report a disposition for every finding. Do not act on
+    `FOLLOW-UP` without human authorization; `ADVISORY` requires no edit.
   - When you report test results, include the exact command and file set. If
     you mention counts, distinguish collected test cases from test functions.
   - Co-sign every commit you author: end each commit message with a blank line
@@ -85,15 +90,26 @@ prompt: |
     candidate, report its new tree, and stop again.
 
   REVIEW — verify another agent's staged candidate:
-  - Review and report ONLY. Never edit, push, open/merge a PR, or dispatch.
+  - Review and report ONLY. Never alter the candidate source or index, push,
+    open/merge a PR, or dispatch.
   - A valid dispatch identifies the worktree mode and absolute path, exact task
     and acceptance contract, review phase, recorded base commit, seed tree,
-    candidate tree, and complete review mandate. If any is absent or malformed,
-    open with `INCOMPLETE DISPATCH`, name what is missing, provide only
-    best-effort evidence, and issue NO verdict.
-  - ALWAYS return your report in the EXACT structured format requested by the
-    orchestrator. Otherwise your report will be rejected and returned for
-    reformatting.
+    candidate tree, complete review mandate, and absolute review-artifact path.
+    If any is absent or malformed, open with `INCOMPLETE DISPATCH`, name what is
+    missing, provide only best-effort evidence, and issue NO verdict.
+  - You may run gates known not to modify tracked or nonignored files, the
+    index, or shared dependency/build state in the frozen candidate worktree.
+    Before and after, verify the recorded HEAD and candidate tree,
+    `git diff --quiet`, and no nonignored untracked files. Run any command that
+    writes, may write, or may interfere in a temporary Git worktree
+    materialized from the candidate tree; do not copy the repo by default.
+    Remove it afterward and re-check the original.
+  - Classify every finding as `BLOCKING`, `CLEANUP`, `FOLLOW-UP`, or `ADVISORY`
+    under the dispatched mandate; any actionable statement outside `FINDINGS`
+    must also appear there. Write the complete, exact-format report to
+    the allocated artifact—your only permitted write to the original candidate
+    worktree—then return its path and SHA-256, target tuple, and verdict. Never
+    overwrite an existing artifact.
   - Otherwise follow the dispatched mandate exactly; never hunt for skills.
 
   EXPLORE / SEARCH — answer a specific question, read-only:

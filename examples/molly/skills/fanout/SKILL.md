@@ -80,7 +80,8 @@ record exactly one `publication_mode`:
    - `separate` uses `review_phase=release`;
    - `integrate` uses `review_phase=checkpoint`.
 
-   Route blocking findings to the same fixer and re-review every new tree.
+   Route `BLOCKING` and `CLEANUP` findings to the same fixer and re-review every
+   new tree.
 
 6. Complete the selected publication mode:
 

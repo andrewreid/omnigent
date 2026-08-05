@@ -38,7 +38,10 @@ Use an isolated mode when ANY of these is true:
 - a task needs branch-level operations such as checkout, reset, or rebase.
 
 Read-only `explore` and `search` workers may share any worktree. A reviewer may
-read the candidate worktree only while its writer lease is frozen.
+inspect the candidate and run known non-mutating gates there only while its
+writer lease is frozen; its allocated ignored review artifact is its only
+permitted write there. Isolate commands that write, may write, or may interfere
+with shared dependency or build state.
 
 ## Registry contract
 
@@ -59,6 +62,7 @@ tasks:
     seed_tree: <tree>
     candidate_tree: <tree or null>
     review_phase: checkpoint | release | fix-push
+    review_artifact: <absolute path and SHA-256, or null>
 ```
 
 Treat a missing or mismatched worktree, base, seed tree, candidate tree, or lease

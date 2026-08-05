@@ -18,6 +18,14 @@ DIFFERENT-vendor sub-agent reviews and returns a structured report.
 Direct the reviewer to the implementer's worktree, provide the implementer's exact
 tasking, and ask it to assess the work against that task.
 
+Freeze the worktree's writer lease for the review. The reviewer may run known
+non-mutating gates in the candidate worktree. Before and after, it must verify
+the recorded HEAD and `git write-tree`, `git diff --quiet`, and no nonignored
+untracked files. A command that writes, may write, or may interfere with shared
+dependency or build state runs instead in a temporary Git worktree materialized
+from `candidate_tree`; do not copy the repository by default. Remove the
+temporary worktree and re-check the original before reporting.
+
 Give the following mandate near-verbatim, adapting only task- and repo-specific
 details:
 
@@ -70,26 +78,26 @@ on surrounding code and the codebase's architecture. Evaluate:
 For every issue, determine whether it is an INDIVIDUAL error or represents a
 CLASS of bug across the codebase.
 
+Classify each finding: `BLOCKING` is a correctness, safety, regression, or
+contract failure; `CLEANUP` is actionable, in-scope quality, simplicity, or
+bloat work; `FOLLOW-UP` is valid but materially wider, riskier, or pre-existing;
+`ADVISORY` requires no change. `BLOCKING` and `CLEANUP` must be resolved before
+release.
+
 ## Reviewer's report
 
-The reviewer will ALWAYS provide a report structured the same way, as specified below between delimeters.
+The reviewer always writes exactly this report:
 
 ```
 ### REVIEW REPORT: <task_slug> — <implementer_name> / <reviewer_vendor>
 
 ## REVIEW TARGET: phase=<checkpoint|release|fix-push> base=<base_oid> seed=<seed_tree> tree=<candidate_tree>
 
-## VERDICT: <ONE of CHANGES REQUIRED / SUGGESTED CHANGES / NO CHANGES REQUIRED> <1 sentence summary>
+## VERDICT: <CHANGES REQUIRED if BLOCKING or CLEANUP exists / NO CHANGES REQUIRED otherwise> <1 sentence summary>
 
-## BLOCKING:
+## FINDINGS:
 
-1. [INDIVIDUAL / CLASS] <file>:<line> — <1 paragraph summary of the issue>
-2. [INDIVIDUAL / CLASS] <file>:<line> — <1 paragraph summary of the issue>
-
-## NON-BLOCKING:
-
-1. [INDIVIDUAL / CLASS] <file>:<line> — <1 paragraph summary of the issue>
-2. [INDIVIDUAL / CLASS] <file>:<line> — <1 paragraph summary of the issue>
+1. [BLOCKING / CLEANUP / FOLLOW-UP / ADVISORY] [INDIVIDUAL / CLASS] <file>:<line> — <1 paragraph summary and concrete fix or disposition>
 
 ## ARCHITECTURE:
 
@@ -108,9 +116,10 @@ The reviewer will ALWAYS provide a report structured the same way, as specified 
 <summary of tests and verification steps taken by the reviewer>
 ```
 
-EVERY review round reports in the SAME, structured format, and YOU, the orchestrator, 
-check the report for compliance with that format before accepting it. If the reviewer
-does not provide the required format, tell it to re-write the report in the required format.
+EVERY review round writes this complete report to its allocated review artifact.
+The orchestrator checks the artifact before accepting it; a malformed report is
+returned for rewrite. Any actionable statement outside `FINDINGS` must also
+appear there as a classified finding.
 
 ## Every review, every round: the identical full mandate
 
@@ -155,26 +164,44 @@ One dispatch runs the WHOLE mandate, ALWAYS. A re-review re-sends the
    at random. For prose Molly authored directly, the author vendor is Molly's
    model family (Claude). Give the reviewer the worktree mode and absolute path,
    exact task and acceptance contract, `review_phase`, `base_oid`, `seed_tree`,
-   `candidate_tree`, and the complete mandate and report format. The reviewer
-   first requires `git write-tree == candidate_tree`; a mismatch is an
-   `INCOMPLETE DISPATCH` with no verdict. Emit the dispatch in the same turn you
-   decide to review, then end the turn and collect it with `sys_read_inbox`.
+   `candidate_tree`, the complete mandate and report format, and an absolute,
+   write-once artifact path such as
+   `<absolute-worktree>/.molly/reviews/<task>/<phase>-<candidate_tree>-<round>.md`.
+   First confirm the path is ignored; otherwise use a recorded scratch path
+   outside the candidate.
+   The reviewer first requires `git write-tree == candidate_tree`; a mismatch
+   is an `INCOMPLETE DISPATCH` with no verdict. State whether each requested
+   gate is known non-mutating and may run in the frozen candidate worktree;
+   uncertain, writing, or interfering gates use the temporary-worktree rule
+   above. Emit the dispatch in the same turn you decide to review. Its only write to the
+   original candidate worktree is the full report artifact; it never overwrites
+   one. It returns the path, SHA-256, target tuple, and verdict. End the turn and
+   collect it with `sys_read_inbox`.
 
-3. **Validate the report before acting.** Require the exact structured format
-   and an exact phase/base/seed/candidate match. Otherwise tell the reviewer to
-   rewrite it; a verdict on another target is no verdict.
+3. **Validate the report before acting.** Read the artifact and require its
+   SHA-256, exact structured format, and phase/base/seed/candidate match. Record
+   its path and digest in the registry. Otherwise allocate a new artifact and
+   require a rewrite; a verdict on another target is no verdict. Molly may
+   summarize but never substitute its summary for the artifact.
 
-4. **Route blocking issues to the SAME fixer, on the SAME branch.** Re-send to
-   the same implementer conversation so it retains task context. Because no
-   runtime worktree binding exists, repeat the mode, phase, ABSOLUTE worktree,
-   base, and current accepted seed on every fix dispatch. Take fresh task and
+4. **Route required work to the SAME fixer, on the SAME branch.** Re-send to
+   the same implementer conversation so it retains task context. Include the
+   artifact path, SHA-256, exact review-target tuple, and an action list
+   enumerating every `BLOCKING` and `CLEANUP`. The fixer verifies the digest and
+   tuple against the dispatch and stops without editing if either differs;
+   otherwise it reads the full report, resolves those required findings, and
+   reports a disposition for every finding. It may challenge one with evidence;
+   `FOLLOW-UP` needs human authorization to enter scope and `ADVISORY` requires
+   no edit. Because no runtime worktree binding exists, repeat the mode, phase,
+   ABSOLUTE worktree, base, review seed, and reviewed candidate on every fix
+   dispatch; set `EXPECTED SEED TREE` to that candidate. Take fresh task and
    runner-root baselines using the same evidence as `fanout`, including hashes
    for already-dirty root paths. On return, require task HEAD and every root
    baseline to remain unchanged. The fixer reruns gates, stages the complete
    amended candidate, reports its new tree, and stops without committing. Open
    every fix dispatch with the no-delegation role boundary. For direct prose,
    Molly is the fixer and reruns the same gates and review loop. Log each
-   blocking issue as a registry fix task, then return to step 1.
+   required issue as a registry fix task, then return to step 1.
 
 5. **Class closure, and the recurrence STOP gate.** Before scoping any fix to
    its flagged site, ask whether it is a one-off or a class. A typo, wrong
@@ -200,7 +227,8 @@ One dispatch runs the WHOLE mandate, ALWAYS. A re-review re-sends the
    change, or "tiny" follow-up creates a new target: rerun gates and the
    identical full review. Never transfer a verdict between phases or tree OIDs.
 
-7. **Apply the phase transition.** Green gates and zero blocking issues permit
+7. **Apply the phase transition.** Green gates and zero unresolved `BLOCKING`
+   or `CLEANUP` findings permit
    only the transition named by `review_phase`:
 
    - `checkpoint`: record the accepted candidate and return it to
@@ -333,8 +361,8 @@ a clean bill and never merges.**
 
 ## Notes
 
-- Non-blocking issues and suggestions from the INDEPENDENT REVIEWER become
-  registry follow-ups; they do not block the PR. A REVIEW BOT's findings are
+- Record `FOLLOW-UP` findings in the registry and surface them to the human;
+  preserve `ADVISORY` findings in the artifact. A REVIEW BOT's findings are
   not covered by this: whatever severity you assign one, it stays outstanding
   until the bot withdraws it or the human rules on it, and row 5 of the
   servicing loop will not clear the PR while it stands. Take that ruling to the
