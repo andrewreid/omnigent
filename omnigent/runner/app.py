@@ -3294,27 +3294,19 @@ def create_runner_app(
             spec = _unwrap_spec_entry(spec_entry)
             raw_sub_agent_name = body.get("sub_agent_name")
             _sa_name_assign = cast(str | None, raw_sub_agent_name)
+            # A sub-agent's bundle assets live under its own directory; keeping
+            # the parent's workdir would load the parent's skills and local
+            # tools into the child.
             if _sa_name_assign:
-                from omnigent.runtime.workflow import _find_spec_by_name
-
-                _sub_spec = _find_spec_by_name(spec, _sa_name_assign)
-                if _sub_spec is None:
-                    # A requested sub-agent that no longer resolves leaves the
-                    # PARENT spec driving the session: the swap below is
-                    # skipped, so harness, instructions and start-gate all come
-                    # from the parent exactly as for a request that named no
-                    # sub-agent. This used to answer 404 instead. The logged
-                    # warning is the only signal a caller gets — the response
-                    # is an ordinary success and carries no marker.
+                _sub_entry = _native_runtime._resolve_sub_agent_spec_entry(
+                    spec_entry, _sa_name_assign
+                )
+                if _sub_entry is None:
                     _warn_unresolved_sub_agent(session_id, _sa_name_assign)
                     _sa_provenance = _sa_name_assign
                 else:
-                    spec = _sub_spec
-                    spec_entry = (
-                        ResolvedSpec(spec=spec, workdir=_resolved_spec_workdir(spec_entry))
-                        if _resolved_spec_workdir(spec_entry) is not None
-                        else spec
-                    )
+                    spec_entry = _sub_entry
+                    spec = _unwrap_resolved_spec(_sub_entry)
             harness_name = spec.executor.config.get("harness") or spec.executor.type
             harness_name = canonicalize_harness(harness_name) or harness_name
 
@@ -6303,56 +6295,33 @@ def create_runner_app(
                         exc_info=True,
                     )
 
+        # #3929 stores a record tuple, not a bare entry — read through its
+        # accessor so the provenance/agent-tag gate applies and the value shape
+        # is right. #3567's raw .get() here yielded the tuple itself, which then
+        # failed every isinstance(ResolvedSpec) wrapper check downstream.
+        _refreshed_entry = _cache_get_for_agent(
+            _session_spec_cache, conv, _current_cache_agent_tag
+        )
+        if _refreshed_entry is not None:
+            cached_spec_entry = _refreshed_entry
+
         _recovered = await _recover_sub_agent(conv)
         _sa_name = _recovered.name
-        # Starts UNDETERMINED, not RESOLVED: if the lookup above could not say
-        # whether this session names a sub-agent, no swap decision happens
-        # below and nothing has been resolved. Publishing RESOLVED there used
-        # to make one failed snapshot fetch silence the session permanently —
-        # the next turn's cache hit answered "already the child" by name.
         _sa_provenance: _SubAgentProvenanceValue = (
             _SubAgentProvenance.RESOLVED if _recovered.known else _SubAgentProvenance.UNDETERMINED
         )
         if _sa_name and cached_spec is not None:
-            from omnigent.runtime.workflow import _find_spec_by_name
-
-            # A cached PARENT kept after an earlier miss is NOT the resolved
-            # child, however its name reads. Recorded provenance settles that
-            # before name equality is consulted: a coordinator named "worker"
-            # asked for sub-agent "worker" satisfies the equality while
-            # _find_spec_by_name — the authority on the same question —
-            # correctly reports a miss, so the cache used to answer the
-            # opposite way on every turn after the first, silently. Only a
-            # positively RESOLVED entry may take the shortcut.
-            sub_spec = (
-                cached_spec
-                if not _cached_spec_is_fresh_parent
-                and _session_spec_is_resolved_child(conv, _current_cache_agent_tag)
-                and cached_spec.name == _sa_name
-                else _find_spec_by_name(cached_spec, _sa_name)
-            )
-            if sub_spec is None:
-                # A recorded sub_agent_name that no longer resolves (removed
-                # from the spec tree, or a stale record) leaves the PARENT
-                # spec driving the turn: its harness and instructions are what
-                # run. This used to raise NOT_FOUND and publish a "failed"
-                # status for the turn. The warning below is the only signal;
-                # the turn itself looks ordinary.
-                # This branch writes nothing. The fresh-resolution branch
-                # above may already have published an UNDETERMINED entry; the
-                # unconditional put below republishes over it with the final
-                # answer — the failed name — so the next turn reaches this
-                # branch too.
+            sub_entry = _native_runtime._resolve_sub_agent_spec_entry(cached_spec_entry, _sa_name)
+            if sub_entry is None:
                 _warn_unresolved_sub_agent(conv, _sa_name)
                 _sa_provenance = _sa_name
             else:
-                cached_spec = sub_spec
+                cached_spec_entry = sub_entry
+                cached_spec = _unwrap_resolved_spec(sub_entry)
+                cached_spec_workdir = _resolved_spec_workdir(sub_entry)
                 _sa_provenance = _SubAgentProvenance.RESOLVED
                 _session_spec_cache_put(
-                    conv,
-                    ResolvedSpec(spec=cached_spec, workdir=cached_spec_workdir)
-                    if cached_spec_workdir is not None
-                    else cached_spec,
+                    conv, sub_entry,
                     generation=_bg_fill_generation,
                     agent_tag=_current_cache_agent_tag,
                     provenance=_SubAgentProvenance.RESOLVED,
@@ -6360,11 +6329,18 @@ def create_runner_app(
 
         cached_spec = _spec_with_workdir_paths(cached_spec, cached_spec_workdir)
         if cached_spec is not None:
-            _session_spec_cache_put(
-                conv,
+            # Wrap if EITHER side's rule demands it: #3567 keeps a wrapper whose
+            # workdir verdict is None (re-widening that to the runner workspace is
+            # the leak it fixes), and #3929's callers expect a resolved workdir to
+            # be carried on the entry. A bare spec with no workdir stays bare so
+            # ordinary top-level sessions keep the workspace fallback.
+            cached_spec_entry = (
                 ResolvedSpec(spec=cached_spec, workdir=cached_spec_workdir)
-                if cached_spec_workdir is not None
-                else cached_spec,
+                if isinstance(cached_spec_entry, ResolvedSpec) or cached_spec_workdir is not None
+                else cached_spec
+            )
+            _session_spec_cache_put(
+                conv, cached_spec_entry,
                 generation=_bg_fill_generation,
                 agent_tag=_current_cache_agent_tag,
                 provenance=_sa_provenance,
@@ -6488,7 +6464,7 @@ def create_runner_app(
 
                     _tmgr = ToolManager(
                         cached_spec,
-                        workdir=cached_spec_workdir or runner_workspace,
+                        workdir=_resolved_workdir_for_spec(cached_spec_entry, runner_workspace),
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
                     _tools_resolved = True
@@ -8335,12 +8311,17 @@ def create_runner_app(
                 async def _claude_ensure_build(
                     ctx: NativeLaunchContext,
                 ) -> NativeLaunchContext:
-                    claude_agent_spec = await _resolve_session_agent_spec(
-                        session_id, agent_id_hint=_session_agent_ids.get(session_id)
-                    )
+                    # Resolve the entry, not just the spec: a sub-agent session
+                    # must launch against its own bundle dir so --plugin-dir
+                    # carries its skills rather than the parent's.
+                    claude_entry = await _resolve_session_spec_entry(session_id)
+                    claude_agent_spec = _unwrap_resolved_spec(claude_entry)
                     return dataclasses.replace(
                         ctx,
-                        agent_spec=claude_agent_spec,
+                        agent_spec=claude_entry,
+                        bundle_dir=_resolved_spec_workdir(claude_entry),
+                        agent_name=getattr(claude_agent_spec, "name", None),
+                        skills_filter=getattr(claude_agent_spec, "skills_filter", "all"),
                         auth_token_factory=auth_token_factory,
                         resolve_launch_config=lambda: _resolve_session_claude_launch_config(
                             session_id
@@ -8355,10 +8336,16 @@ def create_runner_app(
                 async def _codex_ensure_build(
                     ctx: NativeLaunchContext,
                 ) -> NativeLaunchContext:
-                    codex_agent_spec = await _resolve_session_agent_spec(
-                        session_id, agent_id_hint=_session_agent_ids.get(session_id)
+                    # Entry, not bare spec: a sub-agent session's CODEX_HOME
+                    # skills must come from its own bundle dir.
+                    codex_entry = await _resolve_session_spec_entry(session_id)
+                    codex_agent_spec = _unwrap_resolved_spec(codex_entry)
+                    return dataclasses.replace(
+                        ctx,
+                        agent_spec=codex_entry,
+                        bundle_dir=_resolved_spec_workdir(codex_entry),
+                        skills_filter=getattr(codex_agent_spec, "skills_filter", "all"),
                     )
-                    return dataclasses.replace(ctx, agent_spec=codex_agent_spec)
 
                 _ensure_build = _codex_ensure_build
                 _ensure_is_owned = _is_runner_owned_codex_terminal
@@ -9324,49 +9311,22 @@ def create_runner_app(
                     f"session {session_id!r} was not found",
                     code=ErrorCode.NOT_FOUND,
                 )
-            # UNDETERMINED until the block below decides. The unwrap can
-            # yield None, in which case no decision is made at all and the
-            # entry must not claim one.
             _entry_provenance: _SubAgentProvenanceValue = _SubAgentProvenance.RESOLVED
             if sub_agent_name:
                 _session_sub_agent_names[session_id] = sub_agent_name
-                from omnigent.runtime.workflow import _find_spec_by_name
-
-                parent_spec = _unwrap_resolved_spec(spec_entry)
-                if parent_spec is None:
-                    # Nothing to search, so nothing is decided. Saying
-                    # RESOLVED here would hand later readers a spec labelled
-                    # as this session's child on no evidence at all.
+                if _unwrap_resolved_spec(spec_entry) is None:
                     _entry_provenance = _SubAgentProvenance.UNDETERMINED
                 else:
-                    sub_spec = _find_spec_by_name(parent_spec, sub_agent_name)
-                    if sub_spec is None:
-                        # The PARENT entry is cached and returned unchanged, so
-                        # every downstream caller of this resolver (terminal
-                        # auto-create, resource listing, os_env checks, ...)
-                        # sees the parent's identity for a session bound to a
-                        # sub-agent that no longer resolves. This used to raise
-                        # NOT_FOUND, which the module-level OmnigentError
-                        # handler turned into a 404. Unlike the failure modes
-                        # above (bad snapshot, no agent_id, agent not found),
-                        # this one is recoverable and does not stop the
-                        # session — the warning is the sole record of it.
-                        # The entry is published carrying the name it failed
-                        # to resolve, so the two cache-hit returns above warn
-                        # for it as well instead of handing the parent out in
-                        # silence for the rest of the session.
+                    sub_entry = _native_runtime._resolve_sub_agent_spec_entry(
+                        spec_entry, sub_agent_name
+                    )
+                    if sub_entry is None:
                         _warn_unresolved_sub_agent(session_id, sub_agent_name)
                         _entry_provenance = sub_agent_name
                     else:
-                        workdir = _resolved_spec_workdir(spec_entry)
-                        spec_entry = (
-                            ResolvedSpec(spec=sub_spec, workdir=workdir)
-                            if workdir is not None
-                            else sub_spec
-                        )
+                        spec_entry = sub_entry
             _session_spec_cache_put(
-                session_id,
-                spec_entry,
+                session_id, spec_entry,
                 generation=_fill_generation,
                 agent_tag=agent_id,
                 provenance=_entry_provenance,
@@ -10181,22 +10141,26 @@ def create_runner_app(
                     )
             else:
                 _agent_id_local = _session_agent_ids.get(session_id)
-                spec_entry = _cache_get_for_agent(_session_spec_cache, session_id, _agent_id_local)
-                spec_workdir = _resolved_spec_workdir(spec_entry)
+                spec_entry = _cache_get_for_agent(
+                    _session_spec_cache, session_id, _agent_id_local
+                )
+                spec_workdir = _resolved_workdir_for_spec(spec_entry, runner_workspace)
                 spec = _unwrap_resolved_spec(spec_entry)
                 if spec is None and spec_resolver is not None:
                     _agent_id = _agent_id_local
                     if _agent_id:
                         try:
                             resolved = await spec_resolver(_agent_id, session_id)
-                            spec_workdir = _resolved_spec_workdir(resolved)
+                            spec_workdir = _resolved_workdir_for_spec(resolved, runner_workspace)
                             spec = _unwrap_resolved_spec(resolved)
                         except Exception:  # noqa: BLE001
                             pass
                 dispatch_workspace = (
+                    # A resolved entry with no bundle dir gets no workspace at
+                    # all: widening that to the runner workspace would hand a
+                    # sub-agent the tool tree its own bundle does not contain.
                     spec_workdir
-                    if spec_workdir is not None
-                    and _is_spec_local_native_python_tool(spec, tool_name)
+                    if _is_spec_local_native_python_tool(spec, tool_name)
                     else runner_workspace
                 )
                 try:
@@ -10676,9 +10640,10 @@ async def _resolve_effective_turn(
         resolves the parent's harness (``claude-sdk``) and the process
         manager respawns — tearing down the child's live ``claude-native``
         terminal ("Bridge closed: terminal resource not found"). When set,
-        the parent spec is swapped to the matching sub-spec via
-        :func:`_find_spec_by_name` before harness derivation. ``None`` for
-        top-level sessions.
+        the parent entry is swapped for the child's — spec AND bundle dir —
+        via :func:`_resolve_sub_agent_spec_entry` before harness derivation,
+        so the spawn-env advertises the child's bundle rather than the
+        parent's. ``None`` for top-level sessions.
     :param cwd: Runtime working directory for harnesses that need it.
     :returns: ``(harness, spawn_env, spec, workdir)``; ``spec``/``workdir``
         are ``None`` for unresolved specs (matches the harness/spawn_env
@@ -10694,19 +10659,18 @@ async def _resolve_effective_turn(
             # _run_turn_bg swaps; applied here so the harness-HTTP path is
             # sub-agent-aware too, even after a reconnect drops the
             # in-memory _session_sub_agent_names map.
+            # The child's bundle dir comes from the same resolution, so the
+            # spawn-env below advertises the child's bundle — not the
+            # parent's, whose skills and tools the child has no claim to.
             if sub_agent_name:
-                from omnigent.runtime.workflow import _find_spec_by_name
-
-                sub_spec = _find_spec_by_name(spec, sub_agent_name)
-                if sub_spec is None:
-                    # The swap is skipped, so harness and spawn_env below are
-                    # derived from the PARENT spec and returned as this turn's
-                    # effective result. This used to raise RuntimeError, which
-                    # the direct-stream no-harness path answered with a 503
-                    # spec_resolver_failed. The warning is the only trace.
+                sub_entry = _native_runtime._resolve_sub_agent_spec_entry(
+                    spec_entry, sub_agent_name
+                )
+                if sub_entry is None:
                     _warn_unresolved_sub_agent(session_id, sub_agent_name)
                 else:
-                    spec = sub_spec
+                    spec = _unwrap_resolved_spec(sub_entry)
+                    workdir = _resolved_spec_workdir(sub_entry)
             harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
             harness = canonicalize_harness(harness) or harness
             spawn_env = _build_spawn_env_from_spec(
