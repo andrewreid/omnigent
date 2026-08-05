@@ -454,18 +454,21 @@ your server config or an agent's YAML:
 policies:
   approve_shell:
     type: function
-    handler: omnigent.policies.builtins.safety.ask_on_os_tools   # ask before shell / file writes
+    function:
+      path: omnigent.policies.builtins.safety.ask_on_os_tools   # ask before shell / file writes
   cap_calls:
     type: function
-    handler: omnigent.policies.builtins.safety.max_tool_calls_per_session
-    factory_params:
-      limit: 50                    # cap how many tools one session can call
+    function:
+      path: omnigent.policies.builtins.safety.max_tool_calls_per_session
+      arguments:
+        limit: 50                  # cap how many tools one session can call
   budget:
     type: function
-    handler: omnigent.policies.builtins.cost.cost_budget
-    factory_params:
-      max_cost_usd: 5.00           # hard spend cap...
-      ask_thresholds_usd: [3.00]   # ...with a soft warning on the way
+    function:
+      path: omnigent.policies.builtins.cost.cost_budget
+      arguments:
+        max_cost_usd: 5.00         # hard spend cap...
+        ask_thresholds_usd: [3.00] # ...with a soft warning on the way
 ```
 
 Policies stack across three levels, **server-wide** (admin), **per-agent**
