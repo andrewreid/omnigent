@@ -6074,7 +6074,10 @@ def create_runner_app(
             # still hold that task. Only clear when it does — if a newer turn has
             # taken the slot, this is a stale finalizer and must not pop the newer
             # turn's state, response id, or publish a spurious idle over it.
-            if _active_turns.get(session_id) is asyncio.current_task():
+            # ``delete_session`` pops the slot before cancelling, so an empty
+            # slot still means "no newer turn took over" — publish for it too.
+            _slot = _active_turns.get(session_id)
+            if _slot is None or _slot is asyncio.current_task():
                 _active_turns.pop(session_id, None)
                 # Clear the live response AND the in-flight marker together (B1
                 # class fix): a bare pop would leak the process-manager marker and
