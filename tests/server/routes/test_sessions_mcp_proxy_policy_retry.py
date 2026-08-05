@@ -209,7 +209,7 @@ async def test_forged_retry_with_deny_policy_is_rejected(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: deny_engine,
+        lambda spec, session_id, conversation_store, conversation=None: deny_engine,
     )
 
     response = await _handle_mcp_tools_call(
@@ -266,7 +266,7 @@ async def test_forged_retry_with_ask_policy_rejects_unknown_elicitation(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: ask_engine,
+        lambda spec, session_id, conversation_store, conversation=None: ask_engine,
     )
 
     forged_eid = "elicit_FORGED_never_issued"
@@ -318,7 +318,7 @@ async def test_retry_with_allow_policy_falls_through(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: allow_engine,
+        lambda spec, session_id, conversation_store, conversation=None: allow_engine,
     )
 
     response = await _handle_mcp_tools_call(
@@ -374,7 +374,7 @@ async def test_retry_session_mismatch_still_rejected(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: deny_engine,
+        lambda spec, session_id, conversation_store, conversation=None: deny_engine,
     )
 
     params = _forged_retry_params()
@@ -432,7 +432,7 @@ async def test_legitimate_retry_with_pending_entry_proceeds(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: ask_engine,
+        lambda spec, session_id, conversation_store, conversation=None: ask_engine,
     )
 
     eid = "elicit_LEGITIMATE_server_issued"
@@ -533,7 +533,7 @@ async def test_non_mcp_entry_popped_by_events_handler_on_accept(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: _FixedPolicyEngine(
+        lambda spec, session_id, conversation_store, conversation=None: _FixedPolicyEngine(
             result=PolicyResult(action=PolicyAction.ALLOW, reason=None)
         ),
     )
@@ -612,7 +612,7 @@ async def test_mcp_proxy_runner_supplied_actor_reaches_policy_engine(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: engine,
+        lambda spec, session_id, conversation_store, conversation=None: engine,
     )
 
     params = {"name": "sys_os_shell", "arguments": {"command": "echo hi"}}
@@ -630,3 +630,52 @@ async def test_mcp_proxy_runner_supplied_actor_reaches_policy_engine(
     assert captured[0].actor == {"run_as": "alice@example.com"}, (
         f"expected actor from runner body, got: {captured[0].actor!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_tools_call_threads_conversation_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_handle_mcp_tools_call`` forwards its already-fetched ``conv`` into
+    ``_build_policy_engine_from_spec`` as ``conversation=``.
+
+    This is the 4th of the 4 safe wrapper call sites named in the C1
+    contract. Every other mock in this file accepts and discards the
+    ``conversation`` kwarg, so removing ``conversation=conv`` from the
+    call site (reintroducing a redundant re-fetch inside the builder)
+    would leave all of them passing — only a real capture-and-compare
+    assertion catches that regression.
+    """
+    captured_kwargs: dict[str, Any] = {}
+    conv = _make_conversation()
+    allow_engine = _FixedPolicyEngine(result=PolicyResult(action=PolicyAction.ALLOW, reason=None))
+
+    def _spy_build_from_spec(
+        spec: Any, session_id: str, conversation_store: Any, conversation: Any = None
+    ) -> Any:
+        captured_kwargs["conversation"] = conversation
+        return allow_engine
+
+    monkeypatch.setattr(
+        sessions_mod,
+        "_load_agent_spec_for_session",
+        lambda conv, agent_store: "fake_spec",
+    )
+    monkeypatch.setattr(
+        sessions_mod,
+        "_build_policy_engine_from_spec",
+        _spy_build_from_spec,
+    )
+
+    await _handle_mcp_tools_call(
+        rpc_id=5,
+        session_id=_SESSION_ID,
+        params={"name": "sys_os_shell", "arguments": {"command": "id -un"}},
+        conversation_store=_StubConversationStore(conv),  # type: ignore[arg-type]
+        agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+        runner_router=None,
+    )
+
+    assert "conversation" in captured_kwargs
+    assert captured_kwargs["conversation"] is conv

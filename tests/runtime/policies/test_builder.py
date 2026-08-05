@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.runtime.policies.builder import build_policy_engine
+from omnigent.runtime.policies.builder import build_policy_engine, load_session_usage
 from omnigent.spec.parser import parse
 from omnigent.spec.types import (
     AgentSpec,
@@ -368,6 +368,49 @@ guardrails:
     # write — a serious IFC safety bug (taint would silently
     # reset to clean on any workflow restart).
     assert second.labels == {"integrity": "0"}
+
+
+def test_seed_does_not_clobber_a_writer_racing_the_snapshot(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A value stored after the caller's snapshot survives the seed.
+
+    The pre-seed filter can only consult the snapshot, so a writer landing
+    between the snapshot and the seed is invisible to it. Whether the seed
+    lands must therefore be decided by the store's insert-if-absent write,
+    not by that filter. Seeding with ``set_labels`` (``ON CONFLICT DO
+    UPDATE``) instead replaces the stored value, losing the write and
+    reporting the initial value as though it had always been there.
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        name="seed-race",
+        guardrails=GuardrailsSpec(labels={"integrity": LabelDef(initial="initial")}),
+    )
+    conv = conversation_store.create_conversation()
+    snapshot = conversation_store.get_conversation(conv.id)
+    assert snapshot is not None
+    assert "integrity" not in snapshot.labels
+
+    # Another writer commits after the snapshot was captured.
+    conversation_store.set_labels(conv.id, {"integrity": "concurrent-writer"})
+
+    engine = build_policy_engine(
+        spec=spec,
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+        conversation=snapshot,
+    )
+
+    persisted = conversation_store.get_conversation(conv.id)
+    assert persisted is not None
+    assert persisted.labels["integrity"] == "concurrent-writer", (
+        "the initial-value seed overwrote a concurrently stored label — "
+        "silent data loss on a value a policy may already have acted on"
+    )
+    assert engine.labels["integrity"] == "concurrent-writer", (
+        "the engine reported the seed value rather than the value that actually won the write"
+    )
 
 
 def test_build_preserves_ask_timeout_override(
@@ -1001,3 +1044,38 @@ def test_normalize_usage_for_engine_drops_display_fields() -> None:
     assert "by_model" not in normalized3
     assert "policy_cost_usd" not in normalized3
     assert normalized3["input_tokens"] == 0
+
+
+@pytest.mark.parametrize("spelling", ["dashed", "prefixed"])
+def test_load_session_usage_accepts_alternate_id_spellings(
+    conversation_store: SqlAlchemyConversationStore,
+    spelling: str,
+) -> None:
+    """An accepted alternate route spelling must still sum the subtree.
+
+    The conversation fetch normalises through the column type, so the row is
+    found; the spawn tree is then matched in memory against bare hex. Passing
+    the caller's spelling into that match finds nothing and returns ``{}`` —
+    a silent empty sum, not an error, which surfaces as a client stuck on
+    stale cost display rather than as a failure.
+
+    :param conversation_store: Store fixture.
+    :param spelling: Which accepted non-canonical form to query with.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.set_session_usage(conv.id, {"total_tokens": 7.0, "total_cost_usd": 0.25})
+    bare = load_session_usage(conv.id, conversation_store)
+    assert bare["total_tokens"] == pytest.approx(7.0)
+
+    if spelling == "dashed":
+        spelled = str(uuid.UUID(hex=conv.id))
+    else:
+        spelled = f"conv_{conv.id}"
+    assert spelled != conv.id
+
+    usage = load_session_usage(spelled, conversation_store)
+
+    assert usage == bare, (
+        f"{spelling} id returned {usage!r} instead of the subtree sum — the "
+        "in-memory tree match used the caller's spelling"
+    )

@@ -853,10 +853,10 @@ class ConversationStore(ABC):
         validation lives in ``PolicyEngine.apply_label_writes``).
 
         Callers that need "insert only if missing" semantics
-        (initial-value seeding — POLICIES.md §10) should check
-        ``conversation.labels`` first and filter the updates
-        to keys not already present; this method always
-        overwrites.
+        (initial-value seeding — POLICIES.md §10) must use
+        :meth:`seed_labels`; this method always overwrites, and
+        pre-filtering against a snapshot does not make it safe —
+        another writer can land between the read and the write.
 
         :param conversation_id: The conversation to update,
             e.g. ``"conv_abc123"``. If the conversation does
@@ -875,6 +875,42 @@ class ConversationStore(ABC):
             audit trails aligned with the enforcement site
             rather than wall-clock drift between evaluate()
             and the actual DB write.
+        """
+        ...
+
+    @abstractmethod
+    def seed_labels(
+        self,
+        conversation_id: str,
+        seeds: dict[str, str],
+        updated_at: int | None = None,
+    ) -> None:
+        """
+        Insert guardrails labels only where the key is not already stored.
+
+        The initial-value seeding counterpart to :meth:`set_labels`
+        (POLICIES.md §10). A key that already has a row keeps its stored
+        value; the seed for it is discarded. This is decided by the
+        database, not by the caller, so a writer that stored a real value
+        after the caller's snapshot was taken still wins.
+
+        Reading labels first and filtering the seed set is not equivalent:
+        that leaves a window in which another writer's value is silently
+        replaced by the initial value.
+
+        Callers that need to know which value won must re-read after the
+        call — this method reports nothing about which seeds landed.
+
+        :param conversation_id: The conversation to seed, e.g.
+            ``"conv_abc123"``. If the conversation does not exist,
+            behavior is implementation-defined (typically raises via the
+            FK constraint).
+        :param seeds: Mapping from label key to the value to insert when
+            the key is absent. Example: ``{"integrity": "1"}``. Empty
+            dict is a no-op.
+        :param updated_at: Unix epoch seconds to stamp on rows this call
+            inserts. ``None`` (default) → the store records the current
+            time. Rows that already existed are not restamped.
         """
         ...
 

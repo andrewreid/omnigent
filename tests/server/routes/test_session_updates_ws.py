@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 
 import pytest
@@ -861,3 +862,61 @@ def test_daily_cost_attributed_via_root_for_sub_agent_without_owner_grant(
 
     # Sub-agent spend must appear in Alice's daily rollup via the root fallback.
     assert conversation_store.get_daily_cost(ALICE, today) == pytest.approx(0.75)
+
+
+@pytest.mark.parametrize("spelling", ["dashed", "prefixed"])
+def test_usage_broadcast_carries_subtree_cost_for_alternate_id_spellings(
+    app: FastAPI,
+    stores,
+    monkeypatch: pytest.MonkeyPatch,
+    spelling: str,
+) -> None:
+    """An accepted alternate route spelling must still broadcast subtree cost.
+
+    The event route forwards its raw path parameter into the subtree usage
+    aggregator. The conversation fetch normalises, so the write succeeds and
+    the request returns 202 — but the in-memory tree match is against bare
+    hex, so the sum comes back empty and ``total_cost_usd`` is dropped from
+    the broadcast by ``exclude_none``. The client keeps showing its previous
+    cost: a silent wrong answer with a success status.
+
+    :param app: Sessions app fixture.
+    :param stores: Store bundle fixture.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param spelling: Which accepted non-canonical form to post to.
+    """
+    from omnigent.runtime import session_stream
+
+    sid = _seed_session(stores, owner=ALICE, title="usage spelling session")
+    if spelling == "dashed":
+        spelled = str(uuid.UUID(hex=sid))
+    else:
+        spelled = f"conv_{sid}"
+    assert spelled != sid
+
+    published: list[dict] = []
+    real_publish = session_stream.publish
+
+    def _capture(conversation_id: str, payload: dict) -> None:
+        published.append(payload)
+        real_publish(conversation_id, payload)
+
+    # Patch the module the route layer's ``session_stream`` proxy resolves
+    # through, never the proxy itself: setattr on the proxy plants a real
+    # instance attribute that undo restores rather than removes, so every
+    # later facade-level patch of ``session_stream`` is bypassed process-wide.
+    monkeypatch.setattr(session_stream, "publish", _capture)
+
+    resp = TestClient(app).post(
+        f"/v1/sessions/{spelled}/events",
+        json={"type": "external_session_usage", "data": {"cumulative_cost_usd": 0.25}},
+        headers={"X-Forwarded-Email": ALICE},
+    )
+    assert resp.status_code == 202, resp.text
+
+    usage_events = [p for p in published if p.get("type") == "session.usage"]
+    assert usage_events, "no session.usage event was broadcast"
+    assert usage_events[0].get("total_cost_usd") == pytest.approx(0.25), (
+        f"{spelling} route id produced {usage_events[0]!r} — subtree cost was "
+        "dropped from the broadcast, leaving clients on stale display state"
+    )

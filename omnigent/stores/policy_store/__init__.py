@@ -96,6 +96,25 @@ class PolicyStore(ABC):
         """
         ...
 
+    def list_for_sessions(self, session_ids: list[str]) -> dict[str, list[Policy]]:
+        """
+        Bulk variant of :meth:`list_for_session`.
+
+        Default implementation loops :meth:`list_for_session` per id —
+        correct for any backend, just without a batching win. Backends
+        that can express this as a single query (e.g. SQL via an ``IN``
+        clause) should override it.
+
+        :param session_ids: Sessions to load policies for. Duplicates
+            are not an error; the result still has one entry per unique id.
+        :returns: ``{session_id: [Policy, ...]}``, ordered per-session the
+            same as :meth:`list_for_session` (``created_at ASC, id ASC``).
+            Every id in *session_ids* is a key, including ids with zero
+            policies (``[]``) — callers don't need existence checks.
+            Empty input returns ``{}``.
+        """
+        return {sid: self.list_for_session(sid) for sid in dict.fromkeys(session_ids)}
+
     @abstractmethod
     def update(
         self,

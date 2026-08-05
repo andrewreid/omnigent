@@ -983,3 +983,227 @@ def test_build_evaluation_context_request_dict_still_works() -> None:
     # ``content`` fallback also honored.
     ctx2 = _build_evaluation_context(Phase.REQUEST, {"content": "hi"}, {})
     assert ctx2.content == {"user_content": "hi", "attachments": []}
+
+
+# ── C1: conversation-snapshot threading spot-checks ─────────────────────────
+#
+# Each of the 4 wrapper call sites named in the C1 contract must forward the
+# ``conv`` the route layer already fetched into ``build_policy_engine`` as
+# ``conversation=``, rather than letting the builder re-fetch it. A future
+# edit to one of these wrappers that drops the ``conversation=conv`` forward
+# would silently reintroduce a redundant query per call — these tests catch
+# that by asserting the exact kwarg the (mocked) builder receives.
+
+
+@pytest.mark.asyncio
+async def test_tool_call_policy_threads_conversation_snapshot():
+    """``_evaluate_tool_call_policy`` forwards its ``conv`` as ``conversation=``."""
+    conv_store = _FakeConversationStore()
+    agent_store = _FakeAgentStore(agent=_make_agent())
+    conv = conv_store.get_conversation("sess_1")
+    body = _make_function_call_body()
+
+    spec = _make_spec_no_guardrails()
+    loaded = LoadedAgent(spec=spec, workdir="/tmp/fake")
+
+    async def _eval(_ctx: Any) -> PolicyResult:
+        return PolicyResult(action=PolicyAction.ALLOW)
+
+    with (
+        patch(_CACHE_PATCH) as mock_cache,
+        patch(_ENGINE_PATCH) as mock_build,
+    ):
+        mock_cache.return_value.load.return_value = loaded
+        mock_engine = mock_build.return_value
+        mock_engine.evaluate = _eval
+        mock_engine.apply_label_writes = lambda x: None
+
+        await _evaluate_tool_call_policy(
+            "sess_1",
+            conv,
+            body,
+            conv_store,
+            agent_store,
+            None,
+        )
+
+    assert mock_build.call_args.kwargs.get("conversation") is conv
+
+
+@pytest.mark.asyncio
+async def test_input_policy_threads_conversation_snapshot():
+    """``_evaluate_input_policy`` forwards its ``conv`` as ``conversation=``."""
+    conv_store = _FakeConversationStore()
+    agent_store = _FakeAgentStore(agent=_make_agent())
+    conv = conv_store.get_conversation("sess_1")
+    body = _make_user_message_body()
+
+    spec = _make_spec_with_guardrails()
+    loaded = LoadedAgent(spec=spec, workdir="/tmp/fake")
+
+    async def _eval(_ctx: Any) -> PolicyResult:
+        return PolicyResult(action=PolicyAction.ALLOW)
+
+    with (
+        patch(_CACHE_PATCH) as mock_cache,
+        patch(_ENGINE_PATCH) as mock_build,
+    ):
+        mock_cache.return_value.load.return_value = loaded
+        mock_engine = mock_build.return_value
+        mock_engine.evaluate = _eval
+        mock_engine.apply_label_writes = lambda x: None
+
+        await _evaluate_input_policy(
+            _FakeRequest(),
+            "sess_1",
+            conv,
+            body,
+            conv_store,
+            agent_store,
+            None,
+        )
+
+    assert mock_build.call_args.kwargs.get("conversation") is conv
+
+
+@pytest.mark.asyncio
+async def test_output_policy_threads_conversation_snapshot():
+    """``_evaluate_output_policy`` forwards its ``conv`` as ``conversation=``."""
+    from omnigent.server.routes.sessions import _evaluate_output_policy
+
+    conv_store = _FakeConversationStore()
+    agent_store = _FakeAgentStore(agent=_make_agent())
+    conv = conv_store.get_conversation("sess_1")
+    body = _make_assistant_message_body()
+
+    spec = _make_spec_with_guardrails()
+    loaded = LoadedAgent(spec=spec, workdir="/tmp/fake")
+
+    async def _eval(_ctx: Any) -> PolicyResult:
+        return PolicyResult(action=PolicyAction.ALLOW)
+
+    with (
+        patch(_CACHE_PATCH) as mock_cache,
+        patch(_ENGINE_PATCH) as mock_build,
+    ):
+        mock_cache.return_value.load.return_value = loaded
+        mock_engine = mock_build.return_value
+        mock_engine.evaluate = _eval
+        mock_engine.apply_label_writes = lambda x: None
+
+        await _evaluate_output_policy(
+            "sess_1",
+            conv,
+            body,
+            conv_store,
+            agent_store,
+            None,
+        )
+
+    assert mock_build.call_args.kwargs.get("conversation") is conv
+
+
+@pytest.mark.asyncio
+async def test_apply_pending_policy_ask_writes_always_builds_with_conversation_none(
+    db_uri: str,
+) -> None:
+    """
+    ``_apply_pending_policy_ask_writes`` always pins ``conversation=None``.
+
+    This site applies a deciding policy's stashed writes (e.g. an
+    INCREMENT cost-budget checkpoint) after an ASK is accepted. It must
+    force a fresh fetch rather than trust any caller-held snapshot — a
+    threaded stale snapshot here could silently double-apply or miss a
+    concurrently-recorded INCREMENT (``engine.py`` §INCREMENT hazard).
+
+    Proven two ways so the test can't pass vacuously: (1) the kwarg's
+    presence is checked explicitly, not just its value (a dropped kwarg
+    would also read as ``None`` via the parameter's own default), and (2)
+    a real, unmocked builder runs against a real store so the resulting
+    engine's state must reflect a DB mutation made AFTER the caller's
+    snapshot was taken — a mocked builder can't demonstrate this.
+
+    Spies on ``_build_policy_engine_from_spec`` — the ACTUAL call site
+    under test (``_apply_pending_policy_ask_writes`` in
+    ``_sessions/helpers.py``) — not ``build_policy_engine`` one layer
+    below. ``_build_policy_engine_from_spec`` always forwards an
+    explicit ``conversation=`` to ``build_policy_engine`` regardless of
+    what its own caller passes (its own parameter default is also
+    ``None``), so spying one layer too low can't distinguish "the pin was
+    explicitly passed" from "the pin was dropped and the wrapper's own
+    default kicked in" — both look identical at that lower layer. Spying
+    here is what actually catches a reverted pin.
+    """
+    from omnigent.server.routes import sessions as sessions_mod
+    from omnigent.server.routes.sessions import (
+        _apply_pending_policy_ask_writes,
+        _pending_policy_ask_writes,
+    )
+    from omnigent.server.routes.sessions import _PendingPolicyAskWrites as PendingWrites
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation(agent_id="4a3b8f1e6d2c47905b8e1f3a7c0d9e28")
+    conv_store.set_labels(conv.id, {"integrity": "1"})
+    # The caller's snapshot, taken BEFORE the DB mutation below. If this
+    # function threaded it through instead of forcing a fresh fetch, the
+    # resulting engine would wrongly observe "1", not the current "0".
+    stale_conv_view = conv_store.get_conversation(conv.id)
+    conv_store.set_labels(conv.id, {"integrity": "0"})
+
+    agent_store = _FakeAgentStore(agent=_make_agent())
+
+    eid = "elicit_test_fresh_build"
+    _pending_policy_ask_writes[eid] = PendingWrites(
+        state_updates=None,
+        set_labels=None,
+        from_mcp=False,
+    )
+
+    spec = _make_spec_no_guardrails()
+    loaded = LoadedAgent(spec=spec, workdir="/tmp/fake")
+
+    # Spy that delegates to the REAL (unmocked) _build_policy_engine_from_spec,
+    # so the test proves an actual fresh DB fetch happens — not just that a
+    # mock was called with a kwarg that happens to equal its own default.
+    real_build_from_spec = sessions_mod._build_policy_engine_from_spec
+    captured: dict[str, Any] = {}
+
+    def _spy_build_from_spec(*args: Any, **kwargs: Any) -> Any:
+        captured["kwargs"] = kwargs
+        engine = real_build_from_spec(*args, **kwargs)
+        captured["engine"] = engine
+        return engine
+
+    try:
+        with (
+            patch(_CACHE_PATCH) as mock_cache,
+            patch(
+                "omnigent.server.routes.sessions._build_policy_engine_from_spec",
+                new=_spy_build_from_spec,
+            ),
+        ):
+            mock_cache.return_value.load.return_value = loaded
+
+            await _apply_pending_policy_ask_writes(
+                session_id=conv.id,
+                conv=stale_conv_view,
+                conversation_store=conv_store,
+                agent_store=agent_store,
+                data={"elicitation_id": eid, "action": "accept"},
+            )
+    finally:
+        _pending_policy_ask_writes.pop(eid, None)
+
+    # 1. The kwarg must be passed EXPLICITLY — checking truthiness/equality
+    #    to None alone would also pass if the kwarg were dropped entirely
+    #    (the wrapper's own parameter default is also None), so assert its
+    #    presence at THIS call site, not just its downstream value.
+    assert "conversation" in captured["kwargs"]
+    assert captured["kwargs"]["conversation"] is None
+    # 2. The real builder actually ran and observed the CURRENT DB state
+    #    ("0"), not the caller's stale snapshot ("1") — proving a genuine
+    #    fresh fetch, not a vacuous kwarg check against a mocked builder.
+    assert captured["engine"].labels["integrity"] == "0"

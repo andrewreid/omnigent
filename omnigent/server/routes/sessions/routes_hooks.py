@@ -14,6 +14,7 @@ from fastapi import (
 from fastapi.responses import Response
 
 from omnigent.codex_native_elicitation import codex_elicitation_id
+from omnigent.entities import Conversation
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
@@ -709,6 +710,7 @@ def register_hooks_routes(
         if not any_policies_apply(
             spec=loaded.spec,
             conversation_id=session_id,
+            root_conversation_id=conv.root_conversation_id,
             default_policies=_caps.default_policies,
             policy_store=get_policy_store(),
             phase=phase,
@@ -723,29 +725,35 @@ def register_hooks_routes(
             _caps.policy_llm_connection_factory() if _caps.policy_llm_connection_factory else None
         )
 
-        def _build_engine() -> PolicyEngine:
+        def _build_engine(conversation: Conversation | None) -> PolicyEngine:
             """
             Build a policy engine for this session from the loaded spec.
 
-            Re-reads persisted ``session_state`` / usage from the store on
-            every call: the engine snapshots that state at construction and
-            does not re-query it during ``evaluate``, so a fresh build is the
-            only way to observe a concurrent sibling's just-recorded approval.
+            *conversation* is threaded explicitly by each caller rather than
+            captured from the enclosing scope, so the post-lock rebuild
+            cannot accidentally reuse the pre-lock snapshot — passing
+            ``None`` there is the only way to guarantee a fresh
+            ``get_conversation`` read of a concurrent sibling's just-recorded
+            approval (the engine snapshots state at construction and does
+            not re-query it during ``evaluate``).
 
-            :returns: A :class:`PolicyEngine` seeded with the latest
-                persisted state for ``session_id``.
+            :param conversation: Pre-fetched snapshot to seed from, or
+                ``None`` to force a fresh fetch inside the builder.
+            :returns: A :class:`PolicyEngine` seeded with either *conversation*
+                or the latest persisted state for ``session_id``.
             """
             return build_policy_engine(
                 spec=loaded.spec,
                 conversation_id=session_id,
                 conversation_store=conversation_store,
+                conversation=conversation,
                 default_policies=_caps.default_policies,
                 policy_store=get_policy_store(),
                 server_llm=_caps.llm,
                 host_connection=_host_conn,
             )
 
-        engine = _build_engine()
+        engine = _build_engine(conv)
         # Use the turn-initiating human's identity (persisted at forward time)
         # so per-user policies gate on the correct actor even when the HTTP
         # caller is the runner's service-account credential.  Falls back to
@@ -793,7 +801,7 @@ def register_hooks_routes(
                 deciding_policy = result.deciding_policy
                 assert deciding_policy is not None
                 async with _native_ask_gate_lock(session_id, deciding_policy):
-                    engine = _build_engine()
+                    engine = _build_engine(None)
                     result = await engine.evaluate(ctx, read_only=is_read_only)
                     if result.action == PolicyAction.ASK and phase in (
                         Phase.TOOL_CALL,

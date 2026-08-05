@@ -1359,3 +1359,62 @@ async def test_policy_evaluate_gates_every_first_party_tool_result_shape(
         assert resp.json()["result"] == "POLICY_ACTION_DENY", (
             f"{why}: the tool-scoped policy did not see a tool name — {resp.text[:160]}"
         )
+
+
+async def test_hook_route_threads_the_conversation_snapshot_it_already_fetched(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The hook route must pass its already-fetched ``conv`` to the builder.
+
+    The route fetches the conversation for its own auth/agent lookup, so
+    the builder must reuse that snapshot rather than re-reading the row.
+    Nothing else in this file pins it: swapping the call to
+    ``_build_engine(None)`` restores the redundant fetch and leaves every
+    other test here green, because the verdict is identical either way.
+    Only the argument is observable, so that is what this asserts.
+    """
+    deny_bash_policy = FunctionPolicySpec(
+        name="admin__deny_bash",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_bash_tool"),
+    )
+    original_caps = get_caps()
+    patched_caps = RuntimeCaps(
+        execution_timeout=original_caps.execution_timeout,
+        default_policies=[deny_bash_policy],
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: patched_caps,
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    from omnigent.server.routes.sessions import routes_hooks
+
+    real_build = routes_hooks.build_policy_engine
+    seen: list[Any] = []
+
+    def _spy(**kwargs: Any) -> Any:
+        seen.append(kwargs.get("conversation"))
+        return real_build(**kwargs)
+
+    monkeypatch.setattr(routes_hooks, "build_policy_engine", _spy)
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Bash"),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["result"] == "POLICY_ACTION_DENY"
+
+    assert seen, "route did not build a policy engine at all"
+    supplied = seen[0]
+    assert supplied is not None, (
+        "hook route built with conversation=None — the snapshot it already "
+        "fetched was discarded and the builder re-read the row"
+    )
+    assert supplied.id == session_id
