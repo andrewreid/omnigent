@@ -17,6 +17,7 @@ import asyncio
 import logging
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -250,6 +251,8 @@ class HostConnection:
         ``error_code``, and ``error``.
     :param pending_model_options: Per-``request_id`` futures for pre-launch
         model catalogs resolved by the selected host.
+    :param session_id: Per-connection ownership token used to fence
+        disconnect cleanup against newer replacement connections.
     """
 
     workspace_id: int
@@ -306,6 +309,7 @@ class HostConnection:
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 class HostRegistry:
@@ -330,6 +334,8 @@ class HostRegistry:
         hello: HostHelloFrame,
         owner: str | None,
         workspace_id: int | None = None,
+        *,
+        session_id: str | None = None,
     ) -> HostConnection:
         """Register a host connection (newest wins).
 
@@ -353,6 +359,8 @@ class HostRegistry:
             (``0`` in single-tenant deployments); captured into the
             connection so ``send_text`` need not read request context
             from the sender loop.
+        :param session_id: Optional preallocated ownership token. The
+            host tunnel passes the token already written to the DB row.
         :returns: The new :class:`HostConnection`. Its ``host_id`` is
             the canonical form (see :func:`_canonical_host_id`).
         """
@@ -368,6 +376,7 @@ class HostRegistry:
             outbound_queue=asyncio.Queue(),
             connected_at=now,
             last_frame_at=now,
+            session_id=session_id or uuid.uuid4().hex,
         )
         with self._lock:
             key = (ws_id, host_id)
@@ -385,49 +394,35 @@ class HostRegistry:
     def deregister(
         self,
         host_id: str,
-        workspace_id: int | None = None,
         conn: HostConnection | None = None,
+        workspace_id: int | None = None,
     ) -> bool:
-        """Remove a host connection and end its sender loop.
+        """Remove a host connection if it is still current.
 
-        No-op if ``(workspace_id, host_id)`` is not registered.
+        Passing *conn* makes this a compare-and-swap deregistration: a
+        stale connection cannot remove a newer replacement. Omitting it
+        preserves the explicit by-id removal used by administrative paths.
 
         :param host_id: Host identifier to remove, in any accepted
             spelling (see :func:`_canonical_host_id`).
         :param workspace_id: Tenant partition; defaults to
             :func:`current_workspace_id`.
-        :param conn: Optional generation guard, as on
-            :meth:`TunnelRegistry.deregister`. When given, the entry is
-            removed only if it is still this exact connection.
-        :returns: ``True`` when an entry was removed. ``False`` means
-            nothing was registered or the guard did not match, so the
-            caller is superseded and must not flip the host's durable
-            row offline — that row describes the live reconnect.
+        :param conn: Connection attempting cleanup, or ``None`` for an
+            unconditional by-id removal.
+        :returns: ``True`` if an entry was removed.
         """
-        ws_id = current_workspace_id() if workspace_id is None else workspace_id
+        key = (
+            (conn.workspace_id, conn.host_id)
+            if conn is not None
+            else (
+                current_workspace_id() if workspace_id is None else workspace_id,
+                _canonical_host_id(host_id),
+            )
+        )
         with self._lock:
-            key = (ws_id, _canonical_host_id(host_id))
-            current = self._hosts.get(key)
-            if current is None or (conn is not None and current is not conn):
+            if conn is not None and self._hosts.get(key) is not conn:
                 return False
-            removed = self._hosts.pop(key)
-        # Without this the route handler's loops keep running and its ping loop
-        # keeps the host row online, even though the host is now unreachable.
-        removed.outbound_queue.put_nowait(None)
-        return True
-
-    def mark_frame_seen(self, conn: HostConnection) -> bool:
-        """Record that a frame arrived for ``conn``.
-
-        :param conn: Connection that received the frame.
-        :returns: ``True`` if the connection is still current,
-            ``False`` if it has been replaced or deregistered.
-        """
-        with self._lock:
-            if self._hosts.get((conn.workspace_id, conn.host_id)) is not conn:
-                return False
-            conn.last_frame_at = time.time()
-            return True
+            return self._hosts.pop(key, None) is not None
 
     def get(self, host_id: str, workspace_id: int | None = None) -> HostConnection | None:
         """Look up a live host connection.

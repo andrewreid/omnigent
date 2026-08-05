@@ -232,6 +232,11 @@ def test_register_replaces_stale_connection() -> None:
     poison = old_conn.outbound_queue.get_nowait()
     assert poison is None
 
+    # Cleanup from the stale connection cannot remove its replacement.
+    assert old_conn.session_id != new_conn.session_id
+    assert registry.deregister("host_ddd", old_conn) is False
+    assert registry.get("host_ddd") is new_conn
+
 
 def test_send_text_enqueues_frame() -> None:
     """
@@ -316,9 +321,10 @@ def test_same_host_id_isolated_across_workspaces() -> None:
     assert conn_a.outbound_queue.get_nowait() == "a"
     assert conn_b.outbound_queue.get_nowait() == "b"
 
-    # Deregister is workspace-scoped: removing A leaves B live.
+    # CAS deregistration uses the connection's captured workspace and
+    # leaves the same host id in workspace B live.
+    assert registry.deregister(host_id, conn_a) is True
     with workspace_scope(111):
-        registry.deregister(host_id)
         assert registry.get(host_id) is None
     with workspace_scope(222):
         assert registry.get(host_id) is conn_b
