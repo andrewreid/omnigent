@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import gc
 import logging
 import os
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
 
     from omnigent.runner.native import ResolvedSpec
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
+    from omnigent.spec.types import AgentSpec
 
 _RUNNER_SERVER_URL_ENV_VAR = "RUNNER_SERVER_URL"
 _RUNNER_PREWARM_SPEC_PATH_ENV_VAR = "RUNNER_PREWARM_SPEC_PATH"
@@ -1034,6 +1036,7 @@ async def _resolve_agent_spec_from_server(
     spec_cache_root: Path,
     agent_id: str,
     session_id: str | None = None,
+    spec_parse_cache: dict[tuple[str, str, bool], AgentSpec] | None = None,
 ) -> ResolvedSpec | None:
     """
     Fetch, cache, and parse one agent spec bundle from the Omnigent server.
@@ -1048,6 +1051,13 @@ async def _resolve_agent_spec_from_server(
         via the session-scoped endpoint, e.g. ``"conv_abc123"``.
         ``None`` means the runner cannot resolve the session-scoped
         bundle and returns ``None``.
+    :param spec_parse_cache: Optional in-memory memo of parsed specs
+        keyed by ``(agent_id, version, expand_env)``. When provided, a
+        bundle already parsed for that key is reused instead of being
+        re-parsed, so sub-agent fan-out doesn't re-parse the shared
+        parent bundle. The caller gets a deepcopy each time so its
+        per-session in-place edits don't touch the cached spec.
+        ``None`` disables memoization.
     :returns: The parsed :class:`AgentSpec` plus its extracted bundle
         directory, or ``None`` when the server returns 404 for the
         requested agent.
@@ -1098,7 +1108,21 @@ async def _resolve_agent_spec_from_server(
     if not dest.exists():
         dest.mkdir(parents=True)
         load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
-    spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    # The bundle files under dest are already disk-cached by (agent_id, version),
+    # but the parse re-ran on every dispatch, so sub-agent fan-out re-parsed the
+    # same parent bundle. Memoize the parse and hand out a deepcopy: callers mutate
+    # the resolved spec in place per session (e.g. a builtin tool appends a
+    # sub-agent), so the cached master has to stay pristine. deepcopy is far
+    # cheaper than re-reading and re-parsing the bundle.
+    if spec_parse_cache is None:
+        spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    else:
+        cache_key = (agent_id, version, expand_env)
+        master = spec_parse_cache.get(cache_key)
+        if master is None:
+            master = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+            spec_parse_cache[cache_key] = master
+        spec = copy.deepcopy(master)
     return ResolvedSpec(spec=spec, workdir=dest)
 
 
@@ -1205,6 +1229,9 @@ def create_app(
     import tempfile
 
     _spec_cache_root = Path(tempfile.mkdtemp(prefix=f"runner-specs-{_runner_id}-"))
+    # Parsed-spec memo, same runner lifetime as _spec_cache_root. Keyed by
+    # (agent_id, version, expand_env); each resolve gets a deepcopy.
+    _spec_parse_cache: dict[tuple[str, str, bool], AgentSpec] = {}
 
     async def spec_resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec | None:
         """
@@ -1232,6 +1259,7 @@ def create_app(
             _spec_cache_root,
             agent_id,
             session_id=session_id,
+            spec_parse_cache=_spec_parse_cache,
         )
 
     # Out-of-process runner owns its own TerminalRegistry.
