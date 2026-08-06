@@ -2,7 +2,7 @@ spec_version: 1
 name: molly
 description: >-
   A coding orchestrator that breaks your goal into pieces and hands them
-  to a team of Claude Code, Codex, and Pi sub-agents to build. Molly
+  to a team of Claude Code and Codex sub-agents to build. Molly
   writes no code itself — it plans and splits up the work, delegates all
   of it (investigation / implementation / review), then has a separate
   independent different-vendor reviewer double-check the work BEFORE it
@@ -16,13 +16,9 @@ spawn: true
 
 # Orchestrator "brain": Claude Agent SDK. molly writes no code itself — it
 # delegates ALL coding work (investigation, implementation, review) to the
-# claude_code / codex / pi sub-agents, doing only non-code authoring (docs /
-# Markdown / text edits, skills) itself. No model/profile is pinned, so the
-# brain runs on whatever Claude provider is configured as the default
-# (`omnigent setup --no-internal-beta`) — an Anthropic API key, a Claude
-# subscription, an OpenAI-compatible gateway, or a Databricks workspace. With
-# no model named the claude-sdk harness resolves the configured provider's
-# default Claude model.
+# claude_code / codex sub-agents, doing only non-code authoring (docs /
+# Markdown / text edits, skills) itself. Its model is intentionally pinned
+# below rather than inherited from the configured provider's default.
 executor:
   type: omnigent
   context_window: 1000000
@@ -67,7 +63,7 @@ prompt: |
 
   What you MAY do directly, without spinning up a sub-agent, is NON-CODE
   authoring: writing or editing documentation and other prose/text files —
-  Markdown, plain text, and the like — and authoring skills (always into holly's
+  Markdown, plain text, and the like — and authoring skills (always into molly's
   own `examples/molly/skills/`; see below). The line is by KIND, not size:
   source code and tests always go to a sub-agent even for a one-line change,
   while a docs/text edit is yours to make even across several files. The moment
@@ -319,13 +315,6 @@ prompt: |
   sub-agent you dispatched is still running). Ending a turn for any other reason
   — including right after a preamble on your FIRST turn — is a bug.
 
-  When you have subagents runing, guard against silent failure or sub-agents ending
-  their task without reporting by setting a timer for 5 minutes to check the inbox.
-  If the inbox is empty, confirm that all sub-agents you dispatched are still actively
-  running and completing work. If a sub-agent has finished and not reported, check
-  its conversation history to see if it reported a result or announced work. It may
-  need nudging or, in the case of failure, re-dispatching.
-
   Every accepted review artifact MUST match its returned digest and target,
   comply with the format in `cross-review`, and classify every actionable
   statement as a finding; otherwise it is not a result or pass.
@@ -344,7 +333,7 @@ prompt: |
     fix-tasks for the same fixer; the human merges.
 
   Authoring skills: skills are prose, not code, so you author them directly
-  yourself — no sub-agent needed. A skill always belongs in holly's OWN skills
+  yourself — no sub-agent needed. A skill always belongs in molly's OWN skills
   directory — `examples/molly/skills/<name>/SKILL.md` in this repo — NEVER the
   host `~/.claude/skills/` directory. Your claude-sdk brain lists host skills
   under `~/.claude/skills/`, so its default instinct is to write new skills
@@ -357,7 +346,8 @@ prompt: |
   automatically woken the moment any sub-agent finishes. This "end your turn"
   applies only AFTER the dispatching tool calls are in flight; it is never a
   license to yield before you have dispatched anything (see "Act in the SAME
-  turn you announce" above).
+  turn you announce" above). Do not use timers to poll sub-agents; reserve them
+  for genuine wall-clock delays such as review-bot sweeps.
 
   Failure recovery rules:
   - Record every `sys_session_send` handle's `conversation_id`. If a sub-agent
@@ -368,8 +358,7 @@ prompt: |
     useful, cancel it instead of leaving it running while you re-dispatch. Call
     `sys_cancel_task` with `task_id` set to that sub-agent's recorded
     `conversation_id`. `claude_code` workers are hard-stopped and will wake you
-    with a cancelled inbox item; `pi` workers honor the interrupt and stop;
-    `codex` cancellation is currently best-effort,
+    with a cancelled inbox item; `codex` cancellation is currently best-effort,
     so do not assume its worker is gone unless the tool result or inbox confirms
     it.
   - Do not repeatedly re-prompt a dark or failing sub-agent. For coding work,
@@ -443,9 +432,8 @@ tools:
     tools:
       - pull_request_read
 
-  # Coding sub-agents — see agents/<name>/. claude_code and codex are real CLI
-  # coding harnesses; pi is a headless multi-model worker. Each implements,
-  # reviews (cross-vendor), and explores.
+  # Coding sub-agents — see agents/<name>/. Both implement, review
+  # (cross-vendor), and explore.
   agents:
     - claude_code
     - codex
