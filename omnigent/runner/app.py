@@ -5334,7 +5334,10 @@ def create_runner_app(
         if _sa_name and cached_spec is not None:
             sub_entry = _native_runtime._resolve_sub_agent_spec_entry(cached_spec_entry, _sa_name)
             if sub_entry is None:
-                _warn_unresolved_sub_agent(conv, _sa_name)
+                # Suppress if the cache already holds the child spec (prior turn
+                # or POST /v1/sessions already swapped it in).
+                if cached_spec.name != _sa_name:
+                    _warn_unresolved_sub_agent(conv, _sa_name)
             else:
                 cached_spec_entry = sub_entry
                 cached_spec = _unwrap_resolved_spec(sub_entry)
