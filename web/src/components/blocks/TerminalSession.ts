@@ -221,7 +221,6 @@ export function shouldEchoSynchronously(byteLength: number, msSinceLastInput: nu
  * synchronous ``writeSync`` method that the public types don't expose
  * (see {@link TerminalSession.writeOutput}).
  */
-// eslint-disable-next-line no-underscore-dangle
 interface TerminalCore {
   _core?: {
     writeSync?: (data: Uint8Array, maxSubsequentCalls?: number) => void;
@@ -665,6 +664,16 @@ export class TerminalSession {
    */
   setTheme(isDark: boolean): void {
     this.term.options.theme = terminalTheme(isDark);
+  }
+
+  /**
+   * Give the terminal keyboard focus. The WS-open handler focuses
+   * automatically, but that call is a browser no-op while the surface is
+   * hidden (a pre-warmed attach behind the chat view), so the view calls
+   * this when the surface is revealed.
+   */
+  focus(): void {
+    this.term.focus();
   }
 
   /**

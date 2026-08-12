@@ -3,6 +3,7 @@ import {
   CheckIcon,
   FileIcon,
   FilesIcon,
+  GitCompareIcon,
   GlobeIcon,
   ListTodoIcon,
   Loader2Icon,
@@ -33,6 +34,7 @@ import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
+import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
 import type { ChangedSort } from "./FlatFileList";
@@ -186,7 +188,7 @@ function NewTabMenu({
       )}
       <span className="whitespace-nowrap">{isReconnecting ? "Reconnecting…" : "Shell"}</span>
       {connectState === "offline" && (
-        <span className="ml-auto pl-4 text-xs text-muted-foreground">Offline</span>
+        <span className="ml-auto pl-4 text-sm text-muted-foreground">Offline</span>
       )}
     </>
   );
@@ -209,6 +211,9 @@ function NewTabMenu({
           ("Reconnecting…" + spinner, and the sub-trigger's chevron) — the
           default min-w-32 tracks the 32px "+" trigger and clips it. */}
       <DropdownMenuContent align="start" className="min-w-44">
+        {/* Hide the native browser view while this menu is open so it doesn't
+            paint over the dropdown (#3980). Only this rail menu needs it. */}
+        <SuppressBrowserView />
         <DropdownMenuLabel>Open new</DropdownMenuLabel>
         {multipleShells ? (
           <DropdownMenuSub>
@@ -324,7 +329,7 @@ function FileTabsStrip({
               // sets. `group/tab` drives the hover-revealed close overlay below.
               // `overflow-hidden` clips the hover-close gradient overlay to the
               // pill's rounded corners so its rectangular edges can't poke out.
-              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-[13px] font-medium leading-5 transition-colors",
+              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-ui font-medium leading-5 transition-colors",
               active
                 ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
                 : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
@@ -423,14 +428,14 @@ function TerminalTabsStrip({
             className={cn(
               // Match FileTabsStrip's pill metrics so shell and file tabs line
               // up in the same strip.
-              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-[13px] font-medium leading-5 transition-colors",
+              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-ui font-medium leading-5 transition-colors",
               active
                 ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
                 : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
             )}
           >
             <TerminalIcon className="size-4 shrink-0" />
-            <span className="min-w-0 truncate text-[11px]">{name}</span>
+            <span className="min-w-0 truncate text-sm">{name}</span>
             <span className="absolute inset-y-0 right-[2px] flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
               <button
                 type="button"
@@ -471,7 +476,7 @@ function RailTerminalView({
   const terminal = terminals.find((t) => terminalTabKey(t) === terminalKey) ?? null;
   if (!terminal) {
     return (
-      <div className="flex flex-1 items-center justify-center text-muted-foreground text-sm">
+      <div className="flex flex-1 items-center justify-center text-muted-foreground text-ui">
         Shell not available.
       </div>
     );
@@ -514,12 +519,12 @@ interface WorkspacePanelProps {
    * file + its comments + URL) so they can't drift from the tab state.
    */
   onRightRailTabChange: (next: RightRailTab) => void;
-  /** Whether the Files tab is available (agent spec exposes an os_env). */
+  /** Whether the Files/Changes tabs are available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
   /** Whether the Browser tab is available — Electron shell only (hidden in a
    *  plain web build, which has no embedded WebContentsView). */
   showBrowserTab: boolean;
-  /** Count of changed files, shown as the Files tab badge. */
+  /** Count of changed files, shown as the Changes tab badge. */
   changedCount: number;
   /**
    * Whether the Shells tab is available — AppShell's combined gate
@@ -582,10 +587,6 @@ interface WorkspacePanelProps {
   filesPanelSort: ChangedSort;
   /** Change the changed-files sort order. */
   onSortChange: (sort: ChangedSort) => void;
-  /** Files view scope: false = full tree, true = changed-only flat list. */
-  filesPanelFlatView: boolean;
-  /** Toggle the Files view scope (persisted by AppShell). */
-  onFlatViewChange: (flat: boolean) => void;
   /** Whether the Files panel shows dotfiles/hidden entries. */
   filesPanelShowHidden: boolean;
   /** Toggle hidden-file visibility in the Files panel. */
@@ -599,7 +600,7 @@ interface WorkspacePanelProps {
 /**
  * WorkspacePanel — the desktop right "Workspace" rail, rendered as a
  * floating card (bg-card, rounded, bordered, shadowed) sitting below the
- * full-width chat header band. Internally tabbed between Files,
+ * full-width chat header band. Internally tabbed between Files, Changes,
  * Terminals, Agents and Tasks so each can claim the full rail height
  * instead of competing for a vertically-split slot.
  *
@@ -644,8 +645,6 @@ export function WorkspacePanel({
   permissionLevel,
   filesPanelSort,
   onSortChange,
-  filesPanelFlatView,
-  onFlatViewChange,
   filesPanelShowHidden,
   onShowHiddenChange,
   liveness,
@@ -671,21 +670,23 @@ export function WorkspacePanel({
     <aside
       aria-label="Workspace"
       inert={inert}
-      // Floating desktop surface: 8px from every edge. AppShell reserves the
-      // panel width from ChatHeader, so the pane can extend to the top without
-      // sitting underneath the existing session action cluster.
+      // Full-height desktop surface flush to the window edge, separated from
+      // the main content by a left divider — no outer margin, rounding, or
+      // shadow (mirrors the left sidebar). AppShell reserves the panel width
+      // from ChatHeader, so the pane extends to the top without sitting under
+      // the existing session action cluster.
       // ``@container/rail`` makes the rail a named container-query context so
       // the tab strip can switch scroll behavior on the rail's own width
       // (see the strip below) without a JS width listener.
       //
       // Maximized: break out of the flex row and stretch across the content
-      // region (absolute inset-0) so the rail owns the full width. It keeps the
-      // same m-2 / rounded-lg / bordered card styling as when docked — only the
-      // width changes, the 8px inset (and thus the height) stays identical. The
-      // resize handle is suppressed in that state — there's no neighbor to
-      // resize against.
+      // region (absolute inset-0) so the rail owns the full width, keeping the
+      // same flush/bordered styling — only the width changes. The resize
+      // handle is suppressed in that state — there's no neighbor to resize
+      // against.
+      data-maximized={maximized || undefined}
       className={cn(
-        "@container/rail relative z-40 hidden md:m-2 md:flex md:min-h-0 md:flex-col md:overflow-hidden md:rounded-lg md:border md:border-border md:bg-card md:shadow-lg",
+        "@container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
         maximized ? "md:absolute md:inset-0" : "md:shrink-0",
       )}
       // Width is fixed by the resize handle normally; maximized ignores it and
@@ -699,9 +700,11 @@ export function WorkspacePanel({
           className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
         />
       )}
-      {/* Tab strip, in display order Files · Agents · Shells · Tasks.
-          Files and Agents are always present (the Agents panel lists at
-          least the main agent). Shells shows whenever AppShell's gate
+      {/* Tab strip, in display order Files · Changes · Agents · Shells · Tasks.
+          Files (full folder tree) and Changes (changed-files-only list) are
+          two peer tabs — same gate (an on-disk workspace), same FilesPanel,
+          each pinned to one scope. Agents is always present (the Agents panel
+          lists at least the main agent). Shells shows whenever AppShell's gate
           allows it (the agent declares shell access, or a shell already
           exists) — the empty state carries the "+ New shell"
           affordance, so an empty tab is an entry point, not a dead end.
@@ -727,16 +730,28 @@ export function WorkspacePanel({
           }
           onValueChange={(v) => onRightRailTabChange(v as RightRailTab)}
         >
-          <TabsList variant="pill" className="gap-0">
+          <TabsList variant="pill" className="gap-1">
             {showFilesPanel && (
               <WorkspaceTabTooltip label="Files">
                 <TabsTrigger
                   value="files"
-                  aria-label={changedCount > 0 ? `Files ${changedCount} changed` : "Files"}
+                  aria-label="Files"
                   className="size-8 shrink-0 rounded-md p-0 hover:bg-muted"
                 >
                   <FilesIcon className="size-4" />
                   <span className="sr-only">Files</span>
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
+            )}
+            {showFilesPanel && (
+              <WorkspaceTabTooltip label="Changes">
+                <TabsTrigger
+                  value="changes"
+                  aria-label={changedCount > 0 ? `Changes ${changedCount} changed` : "Changes"}
+                  className="size-8 shrink-0 rounded-md p-0 hover:bg-muted"
+                >
+                  <GitCompareIcon className="size-4" />
+                  <span className="sr-only">Changes</span>
                   {changedCount > 0 && <span className="sr-only">{changedCount}</span>}
                 </TabsTrigger>
               </WorkspaceTabTooltip>
@@ -881,7 +896,8 @@ export function WorkspacePanel({
         </WorkspaceTabTooltip>
       </div>
       {/* Tab content — single slot. An open shell tab holds its xterm; a
-          file tab holds FileViewer; the Files tab shows FilesPanel; the
+          file tab holds FileViewer; the Files/Changes tabs show FilesPanel
+          (tree vs changed-only list); the
           Shells tab holds the list-only inline section (clicking a row
           opens the shell as a tab above, surfacing its xterm here);
           Subagents lists the root's children + a "main" link back to the
@@ -922,8 +938,7 @@ export function WorkspacePanel({
             <FilesPanel
               frameless
               onFileSelect={openFileViewer}
-              flatView={filesPanelFlatView}
-              onFlatViewChange={onFlatViewChange}
+              flatView={rightRailTab === "changes"}
               showHidden={filesPanelShowHidden}
               onShowHiddenChange={onShowHiddenChange}
               sort={filesPanelSort}

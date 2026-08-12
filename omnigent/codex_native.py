@@ -22,6 +22,7 @@ from tempfile import TemporaryDirectory
 import click
 import httpx
 import yaml
+from omnigent_client._http import is_loopback_url
 
 from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
@@ -42,6 +43,7 @@ from omnigent.codex_native_app_server import (
     client_for_transport,
     codex_session_meta_model_provider,
     codex_terminal_env,
+    native_codex_launch_base_url,
     normalize_codex_permission_launch_args,
     preload_codex_thread_for_resume,
     resolve_native_codex_launch,
@@ -222,10 +224,12 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     fail-open the ``claude-sdk`` / ``openai-agents`` gateway harnesses already
     rely on: their gateway token is a runtime mint the daemon can't observe.
 
-    The check stays synchronous, side-effect free, and local: it resolves the
-    launch (local config reads) and, only on the defer-to-login path, inspects
-    the local auth source. It never runs ``codex login``, a status command, or a
-    network probe; any resolver failure fails safe onto the ``auth.json`` check.
+    The check stays synchronous and local: it resolves the launch (local config
+    reads) and, only on the defer-to-login path, inspects the local auth source.
+    It never runs ``codex login`` or a status command; the CLI ``--version``
+    probe it does run is bounded by ``READINESS_CLI_PROBE_TIMEOUT_S`` so a hung
+    CLI can't stall the readiness refresh, and any resolver failure fails safe
+    onto the ``auth.json`` check.
 
     :returns: ``"binary-missing"`` when the CLI is absent, ``"needs-auth"``
         when the launch would defer to Codex's own login but ``auth.json`` is
@@ -235,20 +239,23 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
         not judged locally — it surfaces at the first turn via the executor.
     """
     from omnigent.onboarding.harness_install import (
+        READINESS_CLI_PROBE_TIMEOUT_S,
         harness_cli_installed,
     )
     from omnigent.onboarding.provider_config import OPENAI_FAMILY
 
     if _find_codex_cli() is None:
         return HARNESS_BINARY_MISSING
-    if not harness_cli_installed(OPENAI_FAMILY):
+    if not harness_cli_installed(OPENAI_FAMILY, timeout=READINESS_CLI_PROBE_TIMEOUT_S):
         return HARNESS_VERSION_TOO_LOW
     # On a host with no configured provider this may run ambient detection.
     # configured_harness_map shares one probe across all Codex aliases.
     try:
         launch = resolve_native_codex_launch(model=None)
         routes_through_provider = (
-            launch.profile is not None or codex_session_meta_model_provider(launch) != "openai"
+            launch.profile is not None
+            or codex_session_meta_model_provider(launch) != "openai"
+            or native_codex_launch_base_url(launch) is not None
         )
     except Exception:  # noqa: BLE001 - readiness must never raise; fail onto auth.json.
         _logger.debug("codex readiness: launch resolve failed; using auth.json", exc_info=True)
@@ -660,9 +667,15 @@ def _run_with_local_server(
                 prompt=prompt,
             )
             if resolved_session_id is None:
+                # A native ``/new`` rotates ownership to a fresh session, so
+                # read the active id from bridge state instead of the id this
+                # process started with — otherwise the hint resumes a session
+                # the user already cleared away from.
                 echo_native_resume_hint(
                     native_command="codex",
-                    session_id=prepared.session_id,
+                    session_id=(
+                        _active_codex_session_id(prepared.bridge_dir) or prepared.session_id
+                    ),
                 )
 
         asyncio.run(_drive())
@@ -771,9 +784,13 @@ def _run_with_remote_server(
                 recover=_recover,
             )
             if resolved_session_id is None:
+                # See the local path: ``/new`` rotation means bridge state,
+                # not ``prepared``, holds the session worth resuming.
                 echo_native_resume_hint(
                     native_command="codex",
-                    session_id=prepared.session_id,
+                    session_id=(
+                        _active_codex_session_id(prepared.bridge_dir) or prepared.session_id
+                    ),
                     server=base_url,
                 )
 
@@ -826,8 +843,14 @@ async def _prepare_codex_terminal_via_daemon(
     """
     persist_args = list(codex_args)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         reattached = session_id is not None
+        fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Codex session requires a session bundle.")
@@ -896,6 +919,7 @@ async def _prepare_codex_terminal_via_daemon(
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _update_startup_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
@@ -999,6 +1023,7 @@ async def _post_initial_prompt(
     """
     async with httpx.AsyncClient(
         base_url=base_url,
+        trust_env=not is_loopback_url(base_url),
         headers=headers,
         auth=auth,
         timeout=httpx.Timeout(30.0),
@@ -1047,7 +1072,12 @@ async def _prepare_codex_terminal(
     :returns: Prepared terminal details.
     """
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         bridge_id: str
         thread_id: str | None = None
         if session_id is None:
@@ -1378,6 +1408,7 @@ async def _initialize_fresh_terminal_thread(
     thread_id = await _wait_for_thread_started(prepared.event_client)
     async with httpx.AsyncClient(
         base_url=base_url,
+        trust_env=not is_loopback_url(base_url),
         headers=headers,
         timeout=httpx.Timeout(30.0),
     ) as client:
@@ -2686,6 +2717,7 @@ async def _close_codex_terminal(
     with contextlib.suppress(Exception):
         async with httpx.AsyncClient(
             base_url=base_url,
+            trust_env=not is_loopback_url(base_url),
             headers=headers,
             timeout=httpx.Timeout(10.0),
         ) as client:

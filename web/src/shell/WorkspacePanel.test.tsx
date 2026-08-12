@@ -19,7 +19,11 @@ vi.mock("./FileViewer", () => ({
   FileViewer: ({ path }: { path: string }) => <div data-testid="file-viewer-stub">{path}</div>,
 }));
 vi.mock("./FilesPanel", () => ({
-  FilesPanel: () => <div data-testid="files-panel-stub" />,
+  // Echo the fixed scope so tests can prove the Files tab renders the tree
+  // (flatView=false) and the Changes tab the changed-only list (flatView=true).
+  FilesPanel: ({ flatView }: { flatView: boolean }) => (
+    <div data-testid="files-panel-stub" data-flat-view={String(flatView)} />
+  ),
 }));
 vi.mock("./InlineTerminalsSection", () => ({
   InlineTerminalsSection: () => <div data-testid="terminals-stub" />,
@@ -81,6 +85,7 @@ function renderWorkspace(
     rightRailTab?: RightRailTab;
     selectedFilePath?: string | null;
     openFiles?: string[];
+    changedCount?: number;
     showBrowserTab?: boolean;
     showShellsTab?: boolean;
     openTerminals?: string[];
@@ -105,7 +110,7 @@ function renderWorkspace(
         onRightRailTabChange={onRightRailTabChange}
         showFilesPanel
         showBrowserTab={overrides.showBrowserTab ?? false}
-        changedCount={0}
+        changedCount={overrides.changedCount ?? 0}
         showShellsTab={overrides.showShellsTab ?? false}
         terminalsLength={0}
         subagentsWorking={0}
@@ -129,8 +134,6 @@ function renderWorkspace(
         permissionLevel={null}
         filesPanelSort={"recent" as ChangedSort}
         onSortChange={vi.fn()}
-        filesPanelFlatView={false}
-        onFlatViewChange={vi.fn()}
         filesPanelShowHidden={false}
         onShowHiddenChange={vi.fn()}
         liveness={overrides.liveness}
@@ -148,27 +151,39 @@ function renderWorkspace(
 }
 
 describe("WorkspacePanel surface presentation", () => {
-  it("uses an evenly inset desktop surface instead of clearing the header", () => {
+  it("sits flush to the window edge with a left divider, no floating card frame", () => {
     renderWorkspace();
 
     const panel = screen.getByRole("complementary", { name: "Workspace" });
-    expect(panel).toHaveClass("md:m-2", "md:rounded-lg");
-    expect(panel).not.toHaveClass("md:mt-14", "md:mr-2", "md:mb-2");
+    expect(panel).toHaveClass("md:border-l", "md:border-border");
+    expect(panel).not.toHaveClass("md:m-2", "md:rounded-lg", "md:shadow-lg");
   });
 
   it("presents the fixed pane tabs as compact icon controls with accessible labels", () => {
     renderWorkspace();
 
     const filesTab = screen.getByRole("tab", { name: "Files" });
+    const changesTab = screen.getByRole("tab", { name: "Changes" });
     const agentsTab = screen.getByRole("tab", { name: "Agents 1" });
     expect(filesTab).toHaveClass("size-8", "p-0");
     expect(filesTab).not.toHaveAttribute("title");
+    expect(changesTab).toHaveClass("size-8", "p-0");
     expect(agentsTab).toHaveClass("size-8", "p-0");
     expect(agentsTab).not.toHaveAttribute("title");
   });
 
+  it("badges the Changes tab (not Files) with the changed-file count", () => {
+    renderWorkspace({ changedCount: 3 });
+
+    // The changed-file count moved from the old single Files tab to Changes;
+    // Files carries no count.
+    expect(screen.getByRole("tab", { name: "Changes 3 changed" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Files" })).toBeInTheDocument();
+  });
+
   it.each([
     { tabName: "Files", tooltip: "Files" },
+    { tabName: "Changes", tooltip: "Changes" },
     { tabName: "Agents 1", tooltip: "Agents" },
   ])("explains the $tabName pane icon with a hover tooltip", async ({ tabName, tooltip }) => {
     renderWorkspace();
@@ -268,12 +283,21 @@ describe("WorkspacePanel content area", () => {
     expect(screen.queryByTestId("files-panel-stub")).toBeNull();
   });
 
-  it("renders the FilesPanel scope view when no file is active on the Files tab", () => {
+  it("renders the FilesPanel tree scope when no file is active on the Files tab", () => {
     renderWorkspace({ rightRailTab: "files", selectedFilePath: null });
 
-    // No active file → the scope view (Changed/All list/tree) owns the content
-    // slot and the viewer is unmounted.
-    expect(screen.getByTestId("files-panel-stub")).toBeInTheDocument();
+    // No active file → the scope view owns the content slot and the viewer is
+    // unmounted. The Files tab pins the panel to the full folder tree.
+    const panel = screen.getByTestId("files-panel-stub");
+    expect(panel).toHaveAttribute("data-flat-view", "false");
+    expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+  });
+
+  it("renders the FilesPanel changed-only scope on the Changes tab", () => {
+    renderWorkspace({ rightRailTab: "changes", selectedFilePath: null });
+
+    // The Changes tab pins the same panel to the changed-files-only flat list.
+    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-flat-view", "true");
     expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
   });
 });
@@ -551,11 +575,11 @@ describe("WorkspacePanel maximize", () => {
     const toggle = screen.getByRole("button", { name: "Exit full screen" });
     expect(toggle).toHaveAttribute("aria-pressed", "true");
     // The rail breaks out of the docked flex sizing to cover the region, but
-    // keeps the same card styling (m-2 inset + rounded) so only the width
-    // changes — the height is unaffected.
+    // keeps the same flush/bordered styling so only the width changes — the
+    // height is unaffected.
     const panel = screen.getByRole("complementary", { name: "Workspace" });
-    expect(panel).toHaveClass("md:absolute", "md:inset-0", "md:m-2", "md:rounded-lg");
-    expect(panel).not.toHaveClass("md:shrink-0");
+    expect(panel).toHaveClass("md:absolute", "md:inset-0", "md:border-l");
+    expect(panel).not.toHaveClass("md:shrink-0", "md:m-2", "md:rounded-lg");
   });
 });
 

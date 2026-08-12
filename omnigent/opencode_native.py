@@ -30,6 +30,7 @@ from tempfile import TemporaryDirectory
 import click
 import httpx
 import yaml
+from omnigent_client._http import is_loopback_url
 
 from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
@@ -285,8 +286,14 @@ async def _prepare_opencode_terminal_via_daemon(  # pragma: no cover
     """Create or resume an opencode-native session through a daemon runner."""
     persist_args = list(opencode_args)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         reattached = session_id is not None
+        fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException(
@@ -338,7 +345,11 @@ async def _prepare_opencode_terminal_via_daemon(  # pragma: no cover
         await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
         _update_startup_progress(startup_progress, "Starting runner...")
         runner_id = await launch_or_reuse_daemon_runner(
-            client, host_id=host_id, session_id=session_id, workspace=workspace
+            client,
+            host_id=host_id,
+            session_id=session_id,
+            workspace=workspace,
+            fresh=fresh_session,
         )
         _update_startup_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)

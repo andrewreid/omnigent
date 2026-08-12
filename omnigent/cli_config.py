@@ -1351,13 +1351,13 @@ def _prompt_install_harness(family: str) -> bool:
     from omnigent.onboarding.configure_models import family_label
     from omnigent.onboarding.harness_install import (
         harness_cli_version,
-        harness_install_command,
+        harness_install_display,
         install_harness_cli,
     )
     from omnigent.onboarding.interactive import console, select
 
     label = family_label(family)
-    cmd = " ".join(harness_install_command(family))
+    cmd = harness_install_display(family)
     detected_version, range_str = harness_cli_version(family)
     if detected_version is None:
         prompt = f"{label}'s CLI is missing. Install it now?"
@@ -1375,7 +1375,7 @@ def _prompt_install_harness(family: str) -> bool:
             "I'll run it myself (show the command)",
         ],
         descriptions=[
-            f"Runs `{cmd}` (needs npm), then continues to credential setup.",
+            f"Runs `{cmd}`, then continues to credential setup.",
             "Return to the harness picker without installing.",
             "Print the command so you can install it yourself, then return.",
         ],
@@ -2549,29 +2549,30 @@ def _print_kimi_auth_help() -> None:
 def _manage_kimi_harness() -> None:
     """Run the level-2 loop for Kimi Code: install the CLI and drive ``kimi login``.
 
-    Unlike Qwen (which has no ``login`` subcommand), Kimi ships a real
-    ``kimi login`` (Moonshot OAuth or API key) and ``kimi logout``, so this
-    drill-in offers sign-in / sign-out directly. Kimi has no first-class
-    "am I logged in?" probe (its install spec sets ``status_args=None``), so
+    Kimi ships a real ``kimi login`` (Moonshot OAuth or API key), so this
+    drill-in offers sign-in directly. It has **no** ``kimi logout`` subcommand
+    (verified against kimi CLI v0.29.1), so there is no sign-out row — the user
+    clears credentials by removing kimi's own credential file. Kimi has no
+    first-class "am I logged in?" exit-code probe (its install spec sets
+    ``status_args=None``), so
     :func:`~omnigent.onboarding.harness_install.harness_cli_logged_in` always
     reports ``False`` for it — meaning ``harness_login`` runs ``kimi login``
     every time it is asked (the interactive flow lets the user cancel if
     already authenticated) and its boolean return is not a reliable success
-    signal. We therefore treat login / logout as best-effort side effects and
-    report that the flow finished rather than asserting an auth state.
+    signal. We therefore treat login as a best-effort side effect and report
+    that the flow finished rather than asserting an auth state.
 
     Like the other CLI-backed harnesses, a missing CLI gates the drill-in —
     there is nothing to configure for a harness you can't run.
 
     :returns: None. Side effects: may install the kimi CLI and run
-        ``kimi login`` / ``kimi logout`` in the foreground.
+        ``kimi login`` in the foreground.
     """
     from omnigent.onboarding.harness_install import (
         KIMI_KEY,
         harness_cli_installed,
         harness_install_spec,
         harness_login,
-        harness_logout,
     )
     from omnigent.onboarding.interactive import console, select
 
@@ -2594,7 +2595,6 @@ def _manage_kimi_harness() -> None:
     while True:
         rows: list[_HarnessMenuRow] = [
             _HarnessMenuRow("Sign in (kimi login)", action="login"),
-            _HarnessMenuRow("Sign out (kimi logout)", action="logout"),
             _HarnessMenuRow("Show auth options", action="help"),
             _HarnessMenuRow("← Back", action="back"),
         ]
@@ -2616,10 +2616,6 @@ def _manage_kimi_harness() -> None:
             console.print("  [dim]Signing in to Kimi (its login will open)…[/dim]")
             harness_login(KIMI_KEY)
             status = "kimi login flow finished — kimi stores its own credentials"
-        elif action == "logout":
-            console.print("  [dim]Signing out of Kimi…[/dim]")
-            harness_logout(KIMI_KEY)
-            status = "kimi logout flow finished"
         elif action == "help":
             _print_kimi_auth_help()
             status = None
@@ -2705,9 +2701,12 @@ def _manage_copilot_harness() -> None:
     from omnigent.onboarding.copilot_auth import (
         COPILOT_CONFIG_KEY,
         COPILOT_SECRET_NAME,
+        copilot_github_host,
         copilot_github_token_configured,
         copilot_github_token_ref,
         copilot_sdk_installed,
+        copilot_token_removal_settings,
+        gh_cli_github_token,
     )
     from omnigent.onboarding.interactive import select
 
@@ -2731,11 +2730,26 @@ def _manage_copilot_harness() -> None:
         ]
         if token_set:
             rows.append(_HarnessMenuRow("Remove GitHub token", action="remove_key"))
+        host = copilot_github_host(config)
+        rows.append(
+            _HarnessMenuRow(
+                f"Change GitHub Enterprise host ({host})"
+                if host
+                else "Set GitHub Enterprise host",
+                action="set_host",
+            )
+        )
+        if host:
+            rows.append(_HarnessMenuRow("Clear GitHub Enterprise host", action="clear_host"))
         rows.append(_HarnessMenuRow("← Back", action="back"))
 
-        header = (
-            "Copilot — GitHub token configured" if token_set else "Copilot — no GitHub token yet"
-        )
+        if token_set:
+            header = "Copilot — GitHub token configured"
+        elif gh_cli_github_token(host) is not None:
+            # No stored token, but a ``gh auth login`` session works as one.
+            header = "Copilot — using your GitHub CLI login"
+        else:
+            header = "Copilot — no GitHub token yet"
         idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
         if idx < 0:  # Esc / q
             return
@@ -2744,6 +2758,13 @@ def _manage_copilot_harness() -> None:
             return
         if action == "set_key":
             status = _set_copilot_github_token()
+        elif action == "set_host":
+            status = _set_copilot_github_host()
+        elif action == "clear_host":
+            from omnigent.onboarding.copilot_auth import copilot_github_host_settings
+
+            _save_global_config(copilot_github_host_settings(None))
+            status = "✓ Cleared Copilot GitHub Enterprise host"
         elif action == "remove_key":
             ref = copilot_github_token_ref(config)
             # Only the secret we own (``keychain:copilot``) is ours to delete: a
@@ -2752,8 +2773,35 @@ def _manage_copilot_harness() -> None:
             # those cases just drop the config block and leave the secret.
             if ref == f"keychain:{COPILOT_SECRET_NAME}":
                 secret_store.delete_secret(COPILOT_SECRET_NAME)
-            _save_global_config({}, unset_keys=(COPILOT_CONFIG_KEY,))
+            # Keep a configured GHE host: the saver replaces the whole block, so
+            # unsetting it wholesale would discard the host along with the token.
+            if (remaining := copilot_token_removal_settings()) is not None:
+                _save_global_config(remaining)
+            else:
+                _save_global_config({}, unset_keys=(COPILOT_CONFIG_KEY,))
             status = "✓ Removed Copilot GitHub token"
+
+
+def _set_copilot_github_host() -> str | None:
+    """Prompt for and store the Copilot GitHub Enterprise host; return a status line.
+
+    Organizations reaching Copilot through a GHE (data-residency) instance need
+    auth and API calls pointed at their own hostname. Stored as
+    ``copilot.github_host`` and forwarded to the Copilot CLI as
+    ``COPILOT_GH_HOST``.
+
+    :returns: A status string for the menu, or ``None`` if the user aborted.
+    """
+    from omnigent.onboarding.copilot_auth import copilot_github_host_settings
+    from omnigent.onboarding.interactive import prompt_text
+
+    entered = prompt_text("GitHub Enterprise hostname (e.g. acme.ghe.com)").strip()
+    if not entered:
+        return None
+    _save_global_config(copilot_github_host_settings(entered))
+    from omnigent.onboarding.copilot_auth import copilot_github_host
+
+    return f"✓ Copilot GitHub Enterprise host set ({copilot_github_host()})"
 
 
 def _set_copilot_github_token() -> str | None:
@@ -3359,6 +3407,7 @@ def _run_configure_harnesses_interactive() -> None:
         harness_cli_installed,
         harness_cli_logged_in,
         harness_install_command,
+        harness_install_display,
         harness_install_spec,
     )
     from omnigent.onboarding.interactive import select
@@ -3488,7 +3537,7 @@ def _run_configure_harnesses_interactive() -> None:
                 name,
                 _cli_absence_label(fam),
                 "missing",
-                _install_hint(" ".join(harness_install_command(fam))),
+                _install_hint(harness_install_display(fam)),
             )
         default = surface_default_provider(config, fam)
         if default is None:
@@ -3747,13 +3796,20 @@ def _run_configure_harnesses_interactive() -> None:
                 (_KIRO, "Kiro", _cli_absence_label(KIRO_KEY), "missing", _install_hint(kiro_hint))
             )
 
-        # Kimi Code — native CLI, own auth via `kimi login`; there is no local
-        # login status probe yet. Curl-installed (no npm package), so use its
-        # install_hint when absent and show "not configured" when present.
+        # Kimi Code — native CLI, own auth via `kimi login`. There is no CLI
+        # login-status probe, but `kimi login` writes a credential file, so a
+        # subprocess-free file check (`kimi_login_detected`) distinguishes
+        # "signed in" (green) from "installed but not configured" (yellow).
+        # Curl-installed (no npm package), so use its install_hint when absent.
         if harness_cli_installed(KIMI_KEY):
-            rows.append(
-                (_KIMI, "Kimi Code", "Not configured", "warn", "Sign in with `kimi login`.")
-            )
+            from omnigent.onboarding.kimi_auth import kimi_login_detected
+
+            if kimi_login_detected():
+                rows.append((_KIMI, "Kimi Code", "Signed in", "ready", ""))
+            else:
+                rows.append(
+                    (_KIMI, "Kimi Code", "Not configured", "warn", "Sign in with `kimi login`.")
+                )
         else:
             kimi_spec = harness_install_spec(KIMI_KEY)
             kimi_hint = (kimi_spec.install_hint if kimi_spec else None) or "see Kimi Code docs"

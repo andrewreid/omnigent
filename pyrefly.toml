@@ -1,9 +1,13 @@
 project-includes = [
     "omnigent/**/*.py",
     "omnigent/**/*.pyi",
+    "sdks/python-client/**/*.py",
 ]
 
 project-excludes = []
+
+# Editable workspace packages are project sources, not third-party site packages.
+disable-project-excludes-heuristics = true
 
 python-version = "3.12"
 
@@ -16,6 +20,8 @@ disable-search-path-heuristics = true
 ignore-missing-imports = [
     "boxlite",
     "boxlite.*",
+    "blaxel",
+    "blaxel.*",
     "copilot",
     "copilot.*",
     "cursor_sdk",
@@ -39,6 +45,12 @@ ignore-missing-imports = [
     "numpy",
     "numpy.*",
     "omnigent.onboarding.internal_beta",
+    "opentelemetry.exporter",
+    "opentelemetry.exporter.*",
+    "opentelemetry.instrumentation",
+    "opentelemetry.instrumentation.*",
+    "opentelemetry.sdk",
+    "opentelemetry.sdk.*",
     "openshell",
     "openshell.*",
 ]

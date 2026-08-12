@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
@@ -667,6 +667,7 @@ def test_append_error_item_round_trips_for_history(
         "response_id": "resp_failed",
         "type": "error",
         "status": "completed",
+        "created_at": read_back.created_at,
         "source": "execution",
         "code": "native_terminal_start_failed",
         "message": "Native Codex requires the 'codex' CLI on PATH.",
@@ -751,9 +752,9 @@ def test_position_not_enforced_by_db(
 
     # Neither a same-second nor a later-second duplicate is rejected now: the
     # index is not UNIQUE, and distinct ids keep the PK unique so both persist.
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.add(_duplicate_position_row(existing_created_at))
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.add(_duplicate_position_row(existing_created_at + 1))
 
 
@@ -1345,6 +1346,165 @@ def test_list_conversations_search_snippet_absent_without_query(
     )
     page = conversation_store.list_conversations()
     assert all(c.search_snippet is None for c in page.data)
+
+
+def _captured_sql(store: SqlAlchemyConversationStore, run) -> list[str]:
+    """
+    Capture every SQL statement the conversation engine executes during ``run``.
+
+    Attaches a ``before_cursor_execute`` listener to the store's conversation
+    engine, invokes ``run()``, then detaches. Used to assert which session-level
+    SET statements the search path emits.
+    """
+    statements: list[str] = []
+
+    def _before(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(store._conv_engine, "before_cursor_execute", _before)
+    try:
+        run()
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", _before)
+    return statements
+
+
+@pytest.mark.databricks
+def test_list_conversations_search_sets_statement_timeout(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A content search bounds itself with ``SET LOCAL statement_timeout`` on
+    Postgres, so an unindexed scan can't run unbounded (the query runs in a
+    worker thread a client disconnect wouldn't stop).
+
+    Postgres-only: SQLite has no ``statement_timeout``; the search path skips
+    the SET there, which the companion assertion below guards.
+    """
+    if conversation_store._conv_engine.dialect.name != "postgresql":
+        pytest.skip("statement_timeout is a Postgres feature")
+
+    conv = conversation_store.create_conversation()
+    conversation_store.update_conversation(conv.id, title="deployment runbook")
+
+    statements = _captured_sql(
+        conversation_store,
+        lambda: conversation_store.list_conversations(search_query="deployment"),
+    )
+    assert any("statement_timeout" in s.lower() for s in statements), statements
+
+
+def test_list_conversations_no_search_skips_statement_timeout(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A plain (non-search) listing never sets ``statement_timeout``.
+
+    Ordinary pagination is indexed and fast; bounding it could abort a
+    legitimately larger page. Holds on every dialect — the SET is gated on
+    ``search_query`` being set, not just on Postgres.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.update_conversation(conv.id, title="deployment runbook")
+
+    statements = _captured_sql(
+        conversation_store,
+        lambda: conversation_store.list_conversations(),
+    )
+    assert not any("statement_timeout" in s.lower() for s in statements), statements
+
+
+def test_list_conversations_search_content_match_is_correlated(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    The content-search predicate is a correlated ``EXISTS``, not an
+    uncorrelated ``id IN (SELECT DISTINCT ...)``.
+
+    The IN form materializes the match set for the entire workspace before the
+    outer query discards the rows the caller cannot see, so on a large
+    ``conversation_items`` table it scans everything regardless of how few
+    conversations the caller can actually access. Correlating on
+    ``conversation_id`` keeps each probe on the
+    ``(workspace_id, conversation_id)`` index. Asserted on the emitted SQL
+    because the difference is a query-plan property, not an observable result
+    difference — the two forms return identical rows.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_corr1",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "fix the deployment pipeline"}],
+                ),
+            ),
+        ],
+    )
+
+    statements = _captured_sql(
+        conversation_store,
+        lambda: conversation_store.list_conversations(search_query="deployment"),
+    )
+    select_sql = " ".join(s for s in statements if "conversation_items" in s).lower()
+    assert "exists" in select_sql, select_sql
+    assert "conversation_items.conversation_id = conversations.id" in select_sql, select_sql
+    # The uncorrelated form is what this guards against.
+    assert "distinct conversation_items.conversation_id" not in select_sql, select_sql
+
+
+def test_search_predicate_avoids_the_trigram_index_expression(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Content search matches with ``ILIKE`` on the raw column, never
+    ``lower(search_text) LIKE``.
+
+    ``lower(search_text)`` is exactly the expression the pg_trgm index
+    (migration ``d5e9f1a2b3c4``) is built on. Writing the predicate that way
+    makes the planner prefer that index, which scans every item in the
+    workspace out of a multi-GB index rather than probing the handful of
+    conversations the query is scoped to. ILIKE is the same case-insensitive
+    substring match but cannot match the index expression, so the scoped btree
+    probe wins. Covers both the list predicate and the snippet lookup, since
+    both run on a search request.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_ilike1",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "fix the DEPLOYMENT pipeline"}],
+                ),
+            ),
+        ],
+    )
+
+    # Case-insensitivity is the behavioural contract and holds on every dialect
+    # (row stored as "DEPLOYMENT", queried as "deployment").
+    page = conversation_store.list_conversations(search_query="deployment")
+    assert conv.id in {c.id for c in page.data}
+
+    # The SQL-shape guarantee is Postgres-specific: SQLAlchemy emits native
+    # ILIKE there, while SQLite (which has no trigram index to avoid) compiles
+    # ILIKE down to lower(...) LIKE lower(...).
+    if conversation_store._conv_engine.dialect.name != "postgresql":
+        return
+
+    statements = _captured_sql(
+        conversation_store,
+        lambda: conversation_store.list_conversations(search_query="deployment"),
+    )
+    item_sql = " ".join(s for s in statements if "conversation_items" in s).lower()
+    assert "ilike" in item_sql, item_sql
+    assert "lower(conversation_items.search_text)" not in item_sql, item_sql
 
 
 def test_list_conversations_search_snippet_uses_earliest_match(
@@ -4533,7 +4693,7 @@ def _stored_next_position(
     """Read the raw ``conversations.next_position`` counter for assertions."""
     from omnigent.db.db_models import SqlConversation
 
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         row = session.get(SqlConversation, (0, conversation_id))
         assert row is not None
         return row.next_position
@@ -4548,7 +4708,7 @@ def _stored_positions(
 
     from omnigent.db.db_models import SqlConversationItem
 
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         return sorted(
             session.execute(
                 select(SqlConversationItem.position).where(
@@ -4603,7 +4763,7 @@ def test_append_reads_counter_not_max_scan(
     conv = conversation_store.create_conversation()
     conversation_store.append(conv.id, [_user_message("a"), _user_message("b")])
     # Real max position is 1; jump the counter ahead to 100.
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.get(SqlConversation, (0, conv.id)).next_position = 100
 
     conversation_store.append(conv.id, [_user_message("c")])
@@ -4629,7 +4789,7 @@ def test_append_falls_back_to_scan_when_counter_null(
     if preexisting:
         conversation_store.append(conv.id, [_user_message(f"pre{i}") for i in range(preexisting)])
     # Simulate a pre-counter row: clear the maintained counter.
-    with conversation_store._session() as session:
+    with conversation_store._session("test_setup") as session:
         session.get(SqlConversation, (0, conv.id)).next_position = None
     assert _stored_next_position(conversation_store, conv.id) is None
 
@@ -5179,7 +5339,7 @@ def _stored_item_data(store: SqlAlchemyConversationStore, conversation_id: str) 
 
     from omnigent.db.db_models import SqlConversationItem
 
-    with store._conv_session() as session:
+    with store._conv_session("test_setup") as session:
         return list(
             session.execute(
                 select(SqlConversationItem.data)
@@ -5294,7 +5454,7 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
         ],
     )
 
-    with store._conv_session() as session:
+    with store._conv_session("test_setup") as session:
         stored = list(
             session.execute(
                 select(SqlConversationItem.search_text).where(

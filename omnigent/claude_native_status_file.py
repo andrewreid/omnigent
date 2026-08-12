@@ -4,8 +4,10 @@ Claude Code writes a per-process JSON file at
 ``<config_dir>/sessions/<pid>.json`` (its internal "concurrentSessions"
 registry, present since v2.1.139 — the file that also backs
 ``claude agents``). For an interactive session it carries a ``status``
-field that flips ``idle`` ⇄ ``busy`` ⇄ ``waiting`` as the agent works,
-which is a cleaner running/idle signal than diffing the tmux pane.
+field that flips ``idle`` ⇄ ``busy`` ⇄ ``waiting`` as the agent works. It
+reports what Claude is doing rather than inferring it from pane redraws, so
+it — not the tmux pane diff — is the session's running/idle status whenever
+it is readable.
 
 This module owns two pure pieces the claude-native status watcher builds
 on:
@@ -25,26 +27,39 @@ watcher that consumes this treats an unresolved / unreadable file as
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+_logger = logging.getLogger(__name__)
+
 # Runner-side status vocabulary the file maps onto. ``busy`` and
-# ``waiting`` both mean "the turn is not finished" from the session's
-# point of view, so both map to ``running`` (Option A — ``waiting`` is
-# not yet surfaced as a distinct "needs input" state).
+# ``waiting`` both mean "the turn is not finished" from the session's point
+# of view, so both map to ``running``; ``waiting`` is distinguished for the
+# UI by the ``waitingFor`` reason rather than by a separate status. (The
+# session vocabulary's own ``waiting`` means something else entirely —
+# "turn ended, background work remains" — and must not be reused here.)
 RUNNING = "running"
 IDLE = "idle"
 
-# Claude interactive-session status literals (writer ``b3f`` in the
-# bundle). ``running``/``completed``/``failed`` belong to background jobs
-# and are not expected here, but map defensively rather than crash.
+# Claude interactive-session status literals. The interactive writer emits
+# exactly ``busy`` / ``shell`` / ``idle`` / ``waiting``: ``busy`` while the
+# turn is loading or a delegate is active, and ``waiting`` while a dialog
+# owns the input.
 _STATUS_TO_RUNNER: dict[str, str] = {
     "busy": RUNNING,
     "waiting": RUNNING,
     "idle": IDLE,
+    # The turn ended but a background shell is still alive (Claude Code
+    # >= v2.1.197). The agent loop is idle, so this maps to ``idle``; the
+    # working indicator stays lit off the ``Stop`` hook's shell tally, which
+    # carries the count this boolean literal cannot. Mapping ``shell`` to
+    # ``running`` would strand the composer on the "(queued)" placeholder,
+    # since the session never reads idle while a background shell runs.
+    "shell": IDLE,
     # Background-job literals, mapped defensively for robustness.
     "running": RUNNING,
     "completed": IDLE,
@@ -71,11 +86,15 @@ class SessionStatus:
         "needs input" surfacing.
     :param status_updated_at: The file's ``statusUpdatedAt`` epoch-ms
         value, or ``None`` when absent.
+    :param blocked_on: The file's ``waitingFor`` reason when the raw status
+        is ``waiting`` — a short human phrase, e.g. ``"permission prompt"``,
+        ``"input needed"``, ``"dialog open"``. ``None`` otherwise.
     """
 
     runner_status: str
     raw_status: str
     status_updated_at: int | None
+    blocked_on: str | None = None
 
 
 def sessions_dir(config_dir: Path | None = None) -> Path:
@@ -222,10 +241,14 @@ def read_session_status(path: Path) -> SessionStatus | None:
         return None
     updated = record.get("statusUpdatedAt")
     status_updated_at = updated if isinstance(updated, int) else None
+    # Only meaningful alongside ``waiting`` — the writer merges updates into
+    # the existing record, so ignore any reason left over from an earlier one.
+    reason = record.get("waitingFor") if raw_status == "waiting" else None
     return SessionStatus(
         runner_status=runner_status,
         raw_status=raw_status,
         status_updated_at=status_updated_at,
+        blocked_on=reason if isinstance(reason, str) and reason else None,
     )
 
 
@@ -250,17 +273,23 @@ class SessionStatusPoller:
 
     - **Resolving:** each :meth:`tick` retries :func:`resolve_status_file`
       until it locks on or :data:`_MAX_RESOLVE_ATTEMPTS` is exhausted.
-      While resolving, :attr:`active` is ``False`` and the caller keeps
-      the PTY watcher authoritative for status.
-    - **Active:** once resolved, :attr:`active` is ``True`` (the caller
-      mutes PTY-derived status) and each tick reads the file and fires the
-      callback on a changed runner status.
+    - **Active:** once resolved, :attr:`active` is ``True`` and each tick
+      reads the file and fires the callback on a changed runner status.
     - **Exhausted:** if resolution never succeeds, :attr:`active` stays
-      ``False`` permanently and the PTY watcher remains the status source.
+      ``False`` permanently and the file contributes nothing.
 
-    :param on_status: Callback invoked with :data:`RUNNING` / :data:`IDLE`
-        on each status transition (and once on first read). Must not block
-        the watcher thread for long.
+    While :attr:`active` the poller *is* the session's status — it reports what
+    Claude is doing, where the pane diff only infers it from redraws — and the
+    PTY watcher publishes none. The watcher takes over when no file was ever
+    resolved (Claude older than v2.1.139) and always owns pane death, which the
+    file structurally cannot report: a killed Claude leaves its record behind
+    (see :meth:`retire`).
+
+    :param on_status: Callback invoked as ``(runner_status, blocked_on)``
+        on each transition (and once on first read). Fires when either part
+        changes, so ``busy`` → ``waiting`` still delivers its reason even
+        though both map to :data:`RUNNING`. Must not block the watcher
+        thread for long.
     :param pane_pid_getter: Returns the terminal's current pane pid, or
         ``None``. Called during resolution; on the omnigent launch path
         this pid names the status file.
@@ -273,7 +302,7 @@ class SessionStatusPoller:
     def __init__(
         self,
         *,
-        on_status: Callable[[str], None],
+        on_status: Callable[[str, str | None], None],
         pane_pid_getter: Callable[[], int | None],
         session_id_getter: Callable[[], str | None],
         config_dir: Path | None = None,
@@ -286,18 +315,17 @@ class SessionStatusPoller:
         self._attempts = 0
         self._exhausted = False
         self._last_mtime: float | None = None
-        self._last_runner_status: str | None = None
+        self._last_edge: tuple[str, str | None] | None = None
+        self._last_status: SessionStatus | None = None
 
     @property
     def active(self) -> bool:
-        """Whether the file is currently the authoritative status source.
+        """Whether a resolved file is still being read.
 
-        ``True`` only while a resolved file is still being read. The caller
-        reads this to decide whether to suppress the PTY-derived status
-        edges (file is authoritative) or keep them (still resolving, gave
-        up, or the file vanished). Goes back to ``False`` once the file
-        disappears — clean exit unlinks it — so the PTY watcher cleanly
-        reclaims status and exit detection.
+        ``False`` while resolving, once resolution gave up, or after the
+        file disappears (clean exit unlinks it). Status edges from the PTY
+        watcher are published regardless — this only reports whether the
+        file is contributing.
         """
         return self._path is not None and not self._exhausted
 
@@ -318,16 +346,72 @@ class SessionStatusPoller:
     def _try_resolve(self) -> None:
         """Attempt one resolution, retiring to the PTY watcher on timeout."""
         self._attempts += 1
+        pane_pid = self._pane_pid_getter()
         path = resolve_status_file(
-            pane_pid=self._pane_pid_getter(),
+            pane_pid=pane_pid,
             expected_session_id=self._session_id_getter(),
             config_dir=self._config_dir,
         )
         if path is not None:
+            # Log the hit: whether the file was found at all decides which
+            # source owns the session's status, and without this the answer is
+            # only reachable by re-deriving the resolution by hand.
+            _logger.info(
+                "claude status file resolved: path=%s attempts=%d pane_pid=%s",
+                path,
+                self._attempts,
+                pane_pid,
+            )
             self._path = path
             return
         if self._attempts >= _MAX_RESOLVE_ATTEMPTS:
+            _logger.warning(
+                "claude status file never resolved after %d attempts "
+                "(pane_pid=%s); session status falls back to the pane watcher",
+                self._attempts,
+                pane_pid,
+            )
             self._exhausted = True
+
+    def retire(self) -> None:
+        """Stop reading the file, permanently.
+
+        Called when the pane's process is gone: a killed Claude does not unlink
+        its file, so the record survives holding whatever it last said. Since
+        the file owns the session's status while it is readable, a dead pane
+        must retire it or that final value would pin the session forever.
+        """
+        _logger.info("claude status file retired: path=%s", self._path)
+        self._exhausted = True
+
+    def resync(self) -> None:
+        """Forget what was published so the next tick re-asserts the file.
+
+        The file is written only when its value *changes*, so a poller that
+        already published ``running`` has nothing more to say until Claude's
+        status moves. That is a problem when the *listener* restarts: a server
+        recycle wipes its status cache, and the session would sit on a stale
+        ``idle`` for the rest of the turn because every source believes it
+        already reported. Dropping the edge/mtime baselines makes the next tick
+        publish the file's current value verbatim.
+
+        Keeps the resolved path and the attempt count — this re-asserts a
+        working poller, it does not restart resolution.
+        """
+        _logger.info("claude status file resync: path=%s", self._path)
+        self._last_mtime = None
+        self._last_edge = None
+
+    @property
+    def blocked_on(self) -> str | None:
+        """Why Claude is parked, when it is parked on a dialog.
+
+        ``None`` unless the last read was ``waiting`` and carried a reason.
+        """
+        status = self._last_status
+        if status is None or status.raw_status != "waiting":
+            return None
+        return status.blocked_on
 
     def _read_and_publish(self) -> None:
         """Read the resolved file and fire the callback on a status change."""
@@ -344,8 +428,16 @@ class SessionStatusPoller:
         self._last_mtime = mtime
         status = read_session_status(self._path)
         if status is None:
+            # An unrecognized literal — the file is an undocumented internal
+            # detail whose vocabulary can grow. We are now blind to this
+            # transition, so drop the dedup baseline: the next readable
+            # status must publish rather than be swallowed as a duplicate.
+            self._last_status = None
+            self._last_edge = None
             return
-        if status.runner_status == self._last_runner_status:
+        self._last_status = status
+        edge = (status.runner_status, status.blocked_on)
+        if edge == self._last_edge:
             return
-        self._last_runner_status = status.runner_status
-        self._on_status(status.runner_status)
+        self._last_edge = edge
+        self._on_status(status.runner_status, status.blocked_on)

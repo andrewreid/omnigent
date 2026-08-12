@@ -15,6 +15,7 @@ from tempfile import TemporaryDirectory
 import click
 import httpx
 import yaml
+from omnigent_client._http import is_loopback_url
 
 from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._platform import resolve_cli_binary
@@ -369,8 +370,14 @@ async def _prepare_pi_terminal_via_daemon(
     """
     persist_args = list(pi_args)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         reattached = session_id is not None
+        fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Pi session requires a session bundle.")
@@ -426,6 +433,7 @@ async def _prepare_pi_terminal_via_daemon(
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _update_startup_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)

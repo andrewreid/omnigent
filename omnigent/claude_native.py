@@ -30,8 +30,8 @@ from omnigent.json_types import JsonObject as _JsonObject
 if sys.platform != "win32":
     import termios
     import tty
-from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 import click
 import httpx
 import yaml
+from omnigent_client._http import is_loopback_url
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSocketException
 from websockets.frames import Close
 
@@ -72,6 +73,10 @@ from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
 )
 from omnigent.claude_launcher import resolve_claude_launch
+from omnigent.claude_model_vocabulary import (
+    CUSTOM_MODEL_OPTION_ENV_VAR,
+    CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
+)
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     augment_claude_args,
@@ -181,12 +186,22 @@ _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV = "CLAUDE_CODE_API_KEY_HELPER_TTL_MS"
 _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV = "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"
 _CLAUDE_CODE_USE_GATEWAY_ENV = "CLAUDE_CODE_USE_GATEWAY"
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
+_CLAUDE_CODE_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
+# Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
+# request headers. The Databricks AI gateway only serves Claude requests
+# in coding-agent mode when this header is present.
+_DATABRICKS_CODING_AGENT_HEADER = "x-databricks-use-coding-agent-mode: true"
 # Claude Code's agent view (the session list opened by `claude agents`, the
 # left-arrow shortcut on an empty prompt, or /background) lets the user hop to
 # other sessions inside the TUI.  Omnigent owns session switching in its own
 # UI, so a wrapped terminal must stay pinned to the one session the UI thinks
 # it is showing.
 _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV = "CLAUDE_CODE_DISABLE_AGENT_VIEW"
+# Claude Code's in-TUI feedback surveys ("How is Claude doing this session?",
+# the memory-recollection rating, the transcript-sharing follow-up) render
+# only in the pane, so a web-driven session shows an unanswerable prompt —
+# often with nobody attached to the terminal at all.
+_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -208,8 +223,8 @@ _UCODE_CLAUDE_TIER_TO_ENV: dict[str, str] = {
 # workspace's existing default Sonnet (4.6). This keeps the default Sonnet
 # unchanged and adds the newer generation as a separate, explicit choice.
 # See https://code.claude.com/docs/en/model-config#custom-model-options
-_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV = "ANTHROPIC_CUSTOM_MODEL_OPTION"
-_ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV = "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"
+_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV = CUSTOM_MODEL_OPTION_ENV_VAR
+_ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV = CUSTOM_MODEL_OPTION_NAME_ENV_VAR
 _UCODE_CLAUDE_CUSTOM_TIER = "sonnet_5"
 _UCODE_CLAUDE_CUSTOM_TIER_LABEL = "Sonnet 5"
 _CLAUDE_NATIVE_STATIC_MODEL_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -354,11 +369,20 @@ class ClaudeNativeUcodeConfig:
         ``apiKeyHelper`` once ``CLAUDE_CODE_USE_BEDROCK=1``).
     :param model: Optional model id from ucode state, e.g.
         ``"databricks-claude-opus-4-7"``.
+    :param routable_models: Every Claude id this endpoint serves, newest
+        first, e.g. ``("databricks-claude-opus-5",
+        "databricks-claude-opus-4-8")``. A superset of the aliases in
+        ``env``, which only pin the newest of each family: an older
+        generation is still launchable (``--model`` takes an exact id),
+        so a router may pick it. Empty when the endpoint's catalog was
+        not enumerated (cached ucode state, managed settings, a
+        non-Databricks provider).
     """
 
     env: dict[str, str]
     api_key_helper: str | None = None
     model: str | None = None
+    routable_models: tuple[str, ...] = ()
 
 
 def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> bool:
@@ -441,6 +465,110 @@ def resolve_claude_native_model_selection(
     return family_match
 
 
+def claude_config_with_routed_arms_pinned(
+    claude_config: ClaudeNativeUcodeConfig | None,
+    routed_arms: Sequence[str],
+) -> ClaudeNativeUcodeConfig | None:
+    """Repoint Claude Code's family aliases at the router's frozen arms.
+
+    The terminal launches before the first turn decision, so ``/model`` can
+    only reach ids this env spells. Pinning each alias to its family's routed
+    arm makes turn one's ``/model opus`` land on the router's pick; arms with
+    no servable spelling keep the discovery-derived pin.
+
+    :param claude_config: Resolved provider config for the terminal, or
+        ``None`` (Claude's own login pins nothing).
+    :param routed_arms: Arm ids the router may select, in router or catalog
+        vocabulary, e.g. ``("claude-opus-4-8", "claude-sonnet-5")``.
+    :returns: ``claude_config`` itself when no pin changes, otherwise a copy
+        with the alias env repointed.
+    """
+    from omnigent.claude_model_vocabulary import normalized_model_id
+
+    if claude_config is None or not routed_arms:
+        return claude_config
+    servable = {normalized_model_id(m): m for m in reversed(claude_config.routable_models)}
+    env = dict(claude_config.env)
+    repinned: dict[str, str] = {}
+    for arm in routed_arms:
+        normalized = normalized_model_id(arm)
+        model_id = servable.get(normalized)
+        if model_id is None:
+            continue
+        tier = next(
+            (family for family in _UCODE_CLAUDE_TIER_TO_ENV if family in normalized.split("-")),
+            None,
+        )
+        if tier is None:
+            continue
+        env_var = _UCODE_CLAUDE_TIER_TO_ENV[tier]
+        if env.get(env_var) == model_id:
+            continue
+        env[env_var] = model_id
+        repinned[tier] = model_id
+    if not repinned:
+        return claude_config
+    _logger.info("native-claude: pinned routed arms onto family aliases: %s", repinned)
+    return replace(claude_config, env=env)
+
+
+def claude_config_with_launch_model_pinned(
+    claude_config: ClaudeNativeUcodeConfig | None,
+    launch_model: str | None,
+) -> ClaudeNativeUcodeConfig | None:
+    """Pin an exact launch model into Claude Code's custom picker slot.
+
+    The four family aliases are pinned to the NEWEST model each family
+    serves, so a session launched on an older generation of a family it
+    still serves (Smart Routing picking ``claude-opus-4-8`` while
+    ``opus`` resolves to ``claude-opus-5``) has no spelling of its own
+    model: ``/model`` would take the alias and silently move the pane to
+    the newer one. Claude Code's one extra picker slot takes an exact id,
+    so parking the launch model there gives the session a spelling for
+    the model it actually runs — and a picker row the user can return to.
+
+    :param claude_config: Resolved provider config for the terminal, or
+        ``None`` (Claude's own login pins nothing).
+    :param launch_model: The model this terminal launches with, e.g.
+        ``"databricks-claude-opus-4-8"``. Family aliases and ids already
+        covered by a pin need no slot.
+    :returns: The config to launch with — ``claude_config`` itself when
+        no slot change is needed, otherwise a copy with the custom-option
+        env set.
+    """
+    from omnigent.claude_model_vocabulary import (
+        claude_model_command_arg,
+        normalized_model_id,
+    )
+
+    if claude_config is None or not launch_model or not launch_model.strip():
+        return claude_config
+    model = launch_model.strip()
+    if model in _UCODE_CLAUDE_TIER_TO_ENV or model == _UCODE_CLAUDE_CUSTOM_TIER:
+        return claude_config
+    if claude_model_command_arg(model, claude_config.env) is not None:
+        # Already speakable: an alias pinned to exactly this id, or the
+        # custom slot already holding it.
+        return claude_config
+    normalized = normalized_model_id(model)
+    tier = next(
+        (family for family in _UCODE_CLAUDE_TIER_TO_ENV if family in normalized.split("-")),
+        None,
+    )
+    env = dict(claude_config.env)
+    displaced = env.get(_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV)
+    env[_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV] = model
+    env[_ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV] = (
+        _claude_model_display_name(tier, model) if tier is not None else model
+    )
+    _logger.info(
+        "native-claude: pinned launch model %s into the custom picker slot%s",
+        model,
+        f" (displacing {displaced})" if displaced else "",
+    )
+    return replace(claude_config, env=env)
+
+
 def _claude_model_display_name(tier: str, model_id: str) -> str:
     """Build a friendly family/version label from a routable model id."""
     normalized = model_id.lower().removesuffix("[1m]")
@@ -482,6 +610,40 @@ def _managed_claude_model_config() -> ClaudeNativeUcodeConfig | None:
             default_model = raw_default.strip() if isinstance(raw_default, str) else None
             return ClaudeNativeUcodeConfig(env=model_env, model=default_model or None)
     return None
+
+
+def managed_claude_gateway_signal() -> tuple[str | None, bool]:
+    """Read the AI-Gateway backing Claude Code applies from managed settings.
+
+    Managed settings win at Claude Code's actual launch, so an enterprise file
+    can pin all inference through an AI Gateway even when omnigent's own
+    provider config resolves nothing (a ``subscription`` login). This reports
+    that backing: the managed ``env.ANTHROPIC_BASE_URL`` and whether a
+    credential is delivered, either through a top-level ``apiKeyHelper`` or a
+    truthy ``env.CLAUDE_CODE_USE_GATEWAY``.
+
+    :returns: ``(base_url, has_credential)`` from the first readable managed
+        settings file, or ``(None, False)`` when none is present or parseable.
+    """
+    for path in _CLAUDE_CODE_MANAGED_SETTINGS_PATHS:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_env = payload.get("env")
+        env = raw_env if isinstance(raw_env, dict) else {}
+        raw_base_url = env.get("ANTHROPIC_BASE_URL")
+        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
+        has_helper = bool(payload.get("apiKeyHelper"))
+        use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
+            "",
+            "0",
+            "false",
+        )
+        return base_url or None, has_helper or use_gateway
+    return None, False
 
 
 def claude_native_model_options(
@@ -553,8 +715,11 @@ def build_native_claude_terminal_env(
     Build env overrides for a native Claude Code terminal process.
 
     Forces MCP Tool Search on so Claude defers MCP tool schemas and
-    loads them on demand, and disables Claude Code's agent view so the
-    terminal stays pinned to the session the Omnigent UI is showing.
+    loads them on demand, disables Claude Code's agent view so the
+    terminal stays pinned to the session the Omnigent UI is showing, and
+    disables the in-TUI feedback surveys, which a web-driven session
+    cannot see or answer (see
+    :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`).
 
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
@@ -565,11 +730,13 @@ def build_native_claude_terminal_env(
     terminal_env = {
         _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV: "true",
         _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV: "1",
+        _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV: "1",
     }
     if claude_config is not None:
         terminal_env.update(claude_config.env)
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
+        terminal_env[_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV] = "1"
     # On the apiKeyHelper path the credential reaches Claude Code via the
     # helper; a raw ANTHROPIC_API_KEY here re-triggers Claude Code's "Detected a
     # custom API key" menu, which hangs tmux delivery. Fail loud if one leaks.
@@ -616,6 +783,7 @@ def run_claude_native(
     extra_args: tuple[str, ...] | None = None,
     claude_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
+    prompt: str | None = None,
     command: str = _DEFAULT_CLAUDE_COMMAND,
     use_claude_config: bool = False,
     auto_open_conversation: bool = False,
@@ -635,6 +803,11 @@ def run_claude_native(
     :param resume_picker: ``True`` runs the claude-native picker
         once the server is reachable; ``False`` keeps the existing
         ``session_id``-or-fresh-session behavior.
+    :param prompt: Optional first prompt for the TUI, e.g.
+        ``"review the last commit"``. Delivered as Claude Code's
+        positional prompt argument, so a multi-line prompt survives
+        intact (one argv entry — never a tmux paste). ``None`` starts
+        the TUI empty.
     :param command: Executable to run in the terminal resource,
         e.g. ``"claude"``. Kept off the public CLI surface so v0
         always exposes Claude Code, while tests can supply a fake
@@ -664,6 +837,11 @@ def run_claude_native(
     _preflight_local_tools(resolved_command)
     startup_profiler.mark("local tools ready")
     sanitized_args = _strip_resume_from_claude_args(claude_args)
+    # Claude Code takes the initial prompt as a positional argument, so it
+    # rides along with the launch args (persisted for the runner on the remote
+    # path). One argv entry keeps newlines and quotes intact.
+    if prompt and prompt.strip():
+        sanitized_args = (*sanitized_args, prompt)
     startup_profiler.mark("claude args normalized")
     # Resolve the launch config across all offerings: a configured provider
     # (configure harnesses), the Databricks ucode profile, or Claude's own
@@ -1347,7 +1525,12 @@ def _fetch_external_session_id_for_redirect(
     if base_url is None:
         return None
     try:
-        with httpx.Client(base_url=base_url, headers=headers, timeout=10.0) as client:
+        with httpx.Client(
+            base_url=base_url,
+            headers=headers,
+            timeout=10.0,
+            trust_env=not is_loopback_url(base_url),
+        ) as client:
             resp = client.get(f"/v1/sessions/{url_component(session_id)}")
         if resp.status_code >= 400:
             return None
@@ -1719,18 +1902,21 @@ def _ucode_config_for_profile(
         agent_state.auth_refresh_interval_ms or _DEFAULT_UCODE_AUTH_REFRESH_INTERVAL_MS
     )
     claude_models = dict(workspace_state.claude_models)
+    routable_models: tuple[str, ...] = ()
     if refresh_models:
         live_models: dict[str, str] | None = None
         try:
             from omnigent.databricks_model_discovery import (
-                discover_databricks_claude_models,
+                discover_databricks_claude_catalog,
             )
             from omnigent.runtime.credentials.databricks import (
                 resolve_databricks_workspace,
             )
 
             creds = resolve_databricks_workspace(profile)
-            live_models = discover_databricks_claude_models(creds.host, creds.token)
+            live_catalog = discover_databricks_claude_catalog(creds.host, creds.token)
+            live_models = live_catalog.families
+            routable_models = live_catalog.model_ids
         except Exception:  # noqa: BLE001 — cached ucode state is the launch fallback
             _logger.warning(
                 "native-claude: live Databricks model discovery failed for profile %r; "
@@ -1741,6 +1927,9 @@ def _ucode_config_for_profile(
         if live_models is not None:
             if not workspace_state.fable_enabled:
                 live_models.pop("fable", None)
+                routable_models = tuple(
+                    model_id for model_id in routable_models if "fable" not in model_id.lower()
+                )
             if not live_models:
                 raise click.ClickException(
                     f"Databricks profile {profile!r} exposes no Claude model services. "
@@ -1752,7 +1941,18 @@ def _ucode_config_for_profile(
     env: dict[str, str] = {
         _UCODE_CLAUDE_BASE_URL_ENV: base_url,
         _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV: str(refresh_interval_ms),
+        # This path always launches in gateway mode (CLAUDE_CODE_USE_GATEWAY=1),
+        # in which Claude Code negotiates the anthropic-beta set with the gateway
+        # rather than sending every flag blindly — so we do NOT disable
+        # experimental betas here. Disabling them also turns off MCP tool search
+        # (it rides on ``advanced-tool-use``), which reloads every MCP tool
+        # schema eagerly and inflates the context window. The Databricks gateway
+        # now accepts the flags Claude Code sends under CLAUDE_CODE_USE_GATEWAY=1
+        # (advanced-tool-use / prompt-caching-scope / advisor-tool), so the
+        # earlier ``CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`` workaround for
+        # 400 "invalid beta flag" is no longer needed on this path.
         _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
+        _CLAUDE_CODE_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
     }
     # Pin each Claude Code model-tier alias to the corresponding Databricks
     # gateway model ID so that the /model picker natively shows gateway model
@@ -1802,11 +2002,60 @@ def _ucode_config_for_profile(
     # rejects.
     return ClaudeNativeUcodeConfig(
         env=env,
-        api_key_helper=agent_state.auth_command,
+        api_key_helper=_profile_pinned_auth_command(
+            agent_state.auth_command, workspace_url, profile
+        ),
         model=default_model
         or configured_default
         or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
+        routable_models=routable_models,
     )
+
+
+def _profile_pinned_auth_command(
+    auth_command: str,
+    workspace_url: str,
+    profile: str,
+) -> str:
+    """Pin a Databricks-CLI token helper to the profile the config named.
+
+    ucode writes its own token command into ``~/.ucode/state.json``, and it
+    selects the workspace however ucode was configured — often by host. The
+    server's router client instead authenticates as the ``kind: databricks``
+    provider's named profile. When two ``~/.databrickscfg`` profiles point at
+    one host, those are two different identities: re-authing one leaves the
+    other's token expired, and the pane and the router disagree about whether
+    the workspace is reachable. The named profile is the authority, so the
+    helper is regenerated against it.
+
+    Preference, not exclusion: the named profile may itself hold no usable
+    credential (the config names ``DEFAULT`` while the user authenticated under
+    another profile), so ucode's recorded command stays in the helper as the
+    last resort. Without it the pane 401s on the first turn.
+
+    Only the recognizable ``databricks auth token`` shape is rewritten — an
+    enterprise deployment can configure a wholly different token command, and
+    this has no business guessing at its selector.
+
+    :param auth_command: The token command ucode recorded for this agent.
+    :param workspace_url: The profile's workspace, e.g.
+        ``"https://example.databricks.com"``.
+    :param profile: The ``~/.databrickscfg`` profile the config named.
+    :returns: The command to install as ``apiKeyHelper``.
+    """
+    if "databricks auth token" not in auth_command:
+        return auth_command
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    pinned = databricks_bearer_token_command(workspace_url, profile)
+    if pinned == auth_command:
+        return auth_command
+    _logger.info(
+        "native-claude: pinning the token helper to Databricks profile %r "
+        "(ucode's recorded command selects the workspace its own way)",
+        profile,
+    )
+    return databricks_bearer_token_command(workspace_url, profile, fallback_command=auth_command)
 
 
 def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcodeConfig | None:
@@ -1964,7 +2213,13 @@ def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcode
             _ANTHROPIC_BEDROCK_BASE_URL_ENV: family.base_url,
             _AWS_BEARER_TOKEN_BEDROCK_ENV: token,
             _CLAUDE_CODE_USE_BEDROCK_ENV: "1",
-            _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1",
+            # Disable beta flags gateways reject (400 "invalid beta flag");
+            # skip when CLAUDE_CODE_USE_GATEWAY=1 to keep tool search enabled.
+            **(
+                {_CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1"}
+                if os.environ.get("CLAUDE_CODE_USE_GATEWAY") != "1"
+                else {}
+            ),
         },
         # No apiKeyHelper: Bedrock mode authenticates from the env token above.
         model=family.default_model,
@@ -1973,6 +2228,8 @@ def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcode
 
 def _native_claude_config_from_entry(
     entry: ProviderEntry,
+    *,
+    refresh_models: bool = True,
 ) -> ClaudeNativeUcodeConfig | None:
     """Map a resolved provider entry to a native Claude launch config.
 
@@ -1985,6 +2242,8 @@ def _native_claude_config_from_entry(
       Claude Enterprise seat) — intentional, not a fallback to ucode.
 
     :param entry: The resolved provider entry.
+    :param refresh_models: Forwarded to the ucode path's model discovery; pass
+        ``False`` for a network-free lookup.
     :returns: The launch config, or ``None`` to use Claude's own login.
     """
     from omnigent.onboarding.provider_config import (
@@ -2001,7 +2260,7 @@ def _native_claude_config_from_entry(
         return _bedrock_config_for_native_claude(entry)
     if entry.kind == DATABRICKS_KIND:
         _logger.info("native-claude routing: Databricks ucode profile %r", entry.profile)
-        return _ucode_config_for_profile(entry.profile)
+        return _ucode_config_for_profile(entry.profile, refresh_models=refresh_models)
     _logger.info("native-claude routing: Claude CLI login (subscription provider %r)", entry.name)
     return None
 
@@ -2009,6 +2268,7 @@ def _native_claude_config_from_entry(
 def resolve_native_claude_config(
     *,
     spec: AgentSpec | None,
+    refresh_models: bool = True,
 ) -> ClaudeNativeUcodeConfig | None:
     """Resolve the native Claude Code launch config across all offerings.
 
@@ -2032,6 +2292,9 @@ def resolve_native_claude_config(
 
     :param spec: The agent spec, or ``None`` for the bare ``omnigent
         claude`` launch.
+    :param refresh_models: Query Databricks for the workspace's current Claude
+        model services while resolving the ucode config. Capability checks that
+        only need the routing shape pass ``False`` to stay network-free.
     :returns: The launch config, or ``None`` to use Claude's own login.
     """
     from omnigent.onboarding.detected import effective_config_with_detected
@@ -2049,18 +2312,18 @@ def resolve_native_claude_config(
     if spec is not None:
         entry = _resolve_provider_for_build(spec, harness_type="claude-sdk")
         if entry is not None:
-            return _native_claude_config_from_entry(entry)
-        return _ucode_config_for_profile(spec.executor.profile)
+            return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
+        return _ucode_config_for_profile(spec.executor.profile, refresh_models=refresh_models)
 
     # 2. Spec-less (omnigent claude): explicit default wins first.
     explicit = load_config()
     entry = default_provider_for_harness(explicit, "claude-sdk")
     if entry is not None:
-        return _native_claude_config_from_entry(entry)
+        return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
     # A global databricks auth block → ucode.
     global_auth = _load_global_auth()
     if isinstance(global_auth, DatabricksAuth):
-        return _ucode_config_for_profile(global_auth.profile)
+        return _ucode_config_for_profile(global_auth.profile, refresh_models=refresh_models)
     if global_auth is not None:
         # A global api_key auth: let Claude's own login handle it (parity
         # with the subscription path); the in-process harness would inject
@@ -2069,7 +2332,7 @@ def resolve_native_claude_config(
     # 3. Ambient detection (first run without configure).
     entry = default_provider_for_harness(effective_config_with_detected(explicit), "claude-sdk")
     if entry is not None:
-        return _native_claude_config_from_entry(entry)
+        return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
     _logger.info(
         "native-claude routing: Claude CLI login (no provider configured for the Claude "
         "harness, no Databricks profile). Run `omnigent setup --no-internal-beta` to route "
@@ -2774,6 +3037,7 @@ async def _is_terminal_resource_gone(
     try:
         async with httpx.AsyncClient(
             base_url=base_url,
+            trust_env=not is_loopback_url(base_url),
             headers=headers,
             timeout=httpx.Timeout(timeout_s),
         ) as client:
@@ -2875,7 +3139,10 @@ async def _close_claude_terminal(
     )
     with contextlib.suppress(Exception):
         async with httpx.AsyncClient(
-            base_url=base_url, headers=headers, timeout=httpx.Timeout(10.0)
+            base_url=base_url,
+            headers=headers,
+            timeout=httpx.Timeout(10.0),
+            trust_env=not is_loopback_url(base_url),
         ) as client:
             await client.delete(path)
 
@@ -3013,29 +3280,42 @@ async def _prepare_claude_terminal_via_daemon(
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     persist_args = list(_strip_resume_from_claude_args(claude_args))
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         startup_profiler.mark("daemon prepare http client ready")
         # Resuming an existing session must not re-close its terminal on
         # exit; a fresh launch owns teardown.
         reattached = session_id is not None
+        fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Claude session requires a session bundle.")
+            # Session creation (POST /v1/sessions, ~2s), daemon tunnel
+            # start (~2s), and host-online polling (~0.2s) are mutually
+            # independent — run all three concurrently so they collapse to
+            # max(session_create, daemon_start) instead of their sum.
             _mark_startup_step(
                 startup_profiler,
-                "creating daemon claude session",
+                "creating daemon claude session and waiting for host online",
                 startup_progress=startup_progress,
                 progress_message="Creating Claude session...",
             )
-            session_id = await _create_claude_session(
-                client,
-                session_bundle,
-                bridge_id=None,
-                terminal_launch_args=persist_args or None,
+            session_id, _ = await asyncio.gather(
+                _create_claude_session(
+                    client,
+                    session_bundle,
+                    bridge_id=None,
+                    terminal_launch_args=persist_args or None,
+                ),
+                wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
             _mark_startup_step(
                 startup_profiler,
-                "daemon claude session created",
+                "daemon claude session created and host online",
                 startup_progress=startup_progress,
             )
         elif persist_args:
@@ -3057,17 +3337,30 @@ async def _prepare_claude_terminal_via_daemon(
                 "resume launch args persisted",
                 startup_progress=startup_progress,
             )
-        _mark_startup_step(
-            startup_profiler,
-            "waiting for host online",
-            startup_progress=startup_progress,
-        )
-        await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
-        _mark_startup_step(
-            startup_profiler,
-            "host online",
-            startup_progress=startup_progress,
-        )
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for host online",
+                startup_progress=startup_progress,
+            )
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+            _mark_startup_step(
+                startup_profiler,
+                "host online",
+                startup_progress=startup_progress,
+            )
+        else:
+            # Resume with no new flags: just wait for the host.
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for host online",
+                startup_progress=startup_progress,
+            )
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+            _mark_startup_step(
+                startup_profiler,
+                "host online",
+                startup_progress=startup_progress,
+            )
         _mark_startup_step(
             startup_profiler,
             "launching or reusing daemon runner",
@@ -3079,6 +3372,7 @@ async def _prepare_claude_terminal_via_daemon(
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _mark_startup_step(
             startup_profiler,
@@ -3086,27 +3380,30 @@ async def _prepare_claude_terminal_via_daemon(
             startup_progress=startup_progress,
             detail=f"runner={runner_id}",
         )
-        _mark_startup_step(
-            startup_profiler,
-            "waiting for runner online",
-            startup_progress=startup_progress,
-            progress_message="Waiting for runner...",
-        )
-        await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
-        _mark_startup_step(
-            startup_profiler,
-            "daemon runner online",
-            startup_progress=startup_progress,
-        )
         if reattached:
+            # Resume: runner must be online before we ask it to ensure the
+            # terminal (the POST goes to the runner via the server relay).
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for runner online",
+                startup_progress=startup_progress,
+                progress_message="Waiting for runner...",
+            )
+            await wait_for_runner_online(
+                client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S
+            )
+            _mark_startup_step(
+                startup_profiler,
+                "daemon runner online",
+                startup_progress=startup_progress,
+            )
             # Resume onto an already-online daemon runner reuses it without
             # re-running the session-start auto-create, so a runner whose
             # terminal was torn down (e.g. after a ``-p`` one-shot) comes
             # back terminal-less and the wait below would time out. Ask the
             # runner to ensure the claude terminal: idempotent (returns the
             # live one if present) and otherwise auto-creates it with cold
-            # resume so history is restored. A fresh launch already creates
-            # it on session-start, so this is only needed when reattaching.
+            # resume so history is restored.
             _mark_startup_step(
                 startup_profiler,
                 "ensuring resumed terminal on runner",
@@ -3119,15 +3416,37 @@ async def _prepare_claude_terminal_via_daemon(
                 "resumed terminal ensure requested",
                 startup_progress=startup_progress,
             )
-        _mark_startup_step(
-            startup_profiler,
-            "waiting for claude terminal ready",
-            startup_progress=startup_progress,
-            progress_message="Starting Claude terminal...",
-        )
-        terminal_id = await _wait_for_claude_terminal_ready(
-            client, session_id, timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S
-        )
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for claude terminal ready",
+                startup_progress=startup_progress,
+                progress_message="Starting Claude terminal...",
+            )
+            terminal_id = await _wait_for_claude_terminal_ready(
+                client, session_id, timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S
+            )
+        else:
+            # Fresh launch: the runner auto-creates the terminal on session-start,
+            # so runner-online and terminal-ready are sequential from the runner's
+            # side but independent from the CLI's perspective — the terminal poll
+            # returns None (404) until the runner creates it. Run both concurrently:
+            # wait_for_runner_online provides the fail-fast dead-runner signal;
+            # _wait_for_claude_terminal_ready drives to completion. The gather
+            # propagates any runner failure immediately, cancelling the terminal wait.
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for runner online and claude terminal ready",
+                startup_progress=startup_progress,
+                progress_message="Starting Claude terminal...",
+            )
+            _, terminal_id = await asyncio.gather(
+                wait_for_runner_online(
+                    client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S
+                ),
+                _wait_for_claude_terminal_ready(
+                    client, session_id, timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S
+                ),
+            )
         _mark_startup_step(
             startup_profiler,
             "claude terminal ready",
@@ -3190,7 +3509,6 @@ def _run_with_remote_server(
     :returns: None.
     """
     from omnigent.chat import _bundle_agent, _remote_headers, _server_auth
-    from omnigent.cli import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
@@ -3242,22 +3560,6 @@ def _run_with_remote_server(
                     startup_progress=progress,
                 )
 
-            # Ensure the connect daemon is up for this server, then route the
-            # runner launch through it. The runner the daemon spawns brings
-            # up the Claude terminal itself, so the CLI just waits and
-            # attaches.
-            _mark_startup_step(
-                startup_profiler,
-                "ensuring host daemon",
-                startup_progress=progress,
-                progress_message="Connecting to local daemon...",
-            )
-            _ensure_host_daemon(base_url)
-            _mark_startup_step(
-                startup_profiler,
-                "host daemon ready",
-                startup_progress=progress,
-            )
             host_id = load_or_create_host_identity().host_id
             _mark_startup_step(
                 startup_profiler,
@@ -3417,7 +3719,12 @@ async def _prepare_claude_terminal(
     """
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         startup_profiler.mark("prepare http client ready")
         cold_resume_args: tuple[str, ...] = ()
         # Cold resume = session existed but no live terminal. Even when
@@ -3523,6 +3830,7 @@ async def _prepare_claude_terminal(
             bridge_id=bridge_id,
             workspace=Path.cwd(),
             launch_model=claude_config.model if claude_config else None,
+            launch_env=claude_config.env if claude_config else None,
         )
         _mark_startup_step(
             startup_profiler,
@@ -3996,6 +4304,13 @@ def _claude_transcript_record_from_session_item(
     """
     Convert one Omnigent item into one Claude transcript record.
 
+    No ``message.model`` is emitted. An item's wire ``model`` is the
+    Omnigent *agent* name (``MessageData.agent`` serializes under that
+    alias), e.g. ``"claude-native-ui"`` — not a Claude model id. Copying
+    it through made ``--resume`` report "Session model … could not be
+    restored" and silently fall back to another model; omitting it lets
+    Claude keep its configured one.
+
     :param item: Flat Omnigent item dict, e.g.
         ``{"type": "function_call", "name": "Read", ...}``.
     :param session_id: Claude-native session id for the transcript,
@@ -4029,9 +4344,6 @@ def _claude_transcript_record_from_session_item(
                 return None
             record_type = "assistant"
             message = {"role": "assistant", "content": assistant_content}
-            model = item.get("model")
-            if isinstance(model, str) and model:
-                message["model"] = model
         else:
             return None
     elif item_type == "function_call":
@@ -4053,9 +4365,6 @@ def _claude_transcript_record_from_session_item(
                 }
             ],
         }
-        model = item.get("model")
-        if isinstance(model, str) and model:
-            message["model"] = model
     elif item_type == "function_call_output":
         call_id = item.get("call_id")
         if not isinstance(call_id, str) or not call_id:
