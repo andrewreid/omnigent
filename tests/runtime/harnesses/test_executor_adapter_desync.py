@@ -1,17 +1,4 @@
-"""Desync-recovery tests for :class:`ExecutorAdapter` (omnigent issue #1026).
-
-Covers the harness-subprocess half of the cross-process lifecycle-desync fix:
-
-- P0.1 compare-and-clear of the active turn slot (a stale ``run_turn`` finally
-  must not clobber a newer turn's ctx).
-- P0.2 detached, bounded abnormal-exit ``interrupt_session`` (an abandoned
-  inner generation is interrupted exactly once on a non-clean exit, and never
-  on a clean one).
-- P1.8 tiered orphan-callback watchdog (N consecutive orphans force exactly
-  one Tier-1 SDK reset; the counter resets at turn start).
-- P2.10 orphaned tool callbacks safe-fail with a structured desync error and
-  never dispatch.
-"""
+"""Turn-context recovery tests for :class:`ExecutorAdapter`."""
 
 from __future__ import annotations
 
@@ -106,7 +93,7 @@ def _request() -> CreateResponseRequest:
 
 
 async def test_stale_finally_does_not_clear_newer_ctx() -> None:
-    """P0.1: a stale turn's finally must not clobber a newer turn's slot."""
+    """Stale turn's finally must not clobber a newer turn's slot."""
     ctx_b = _ctx("resp_B")
     adapter: ExecutorAdapter | None = None
 
@@ -129,7 +116,7 @@ async def test_stale_finally_does_not_clear_newer_ctx() -> None:
 
 
 async def test_abnormal_exit_schedules_interrupt_once() -> None:
-    """P0.2: a cancelled turn schedules exactly one bounded interrupt."""
+    """Cancelled turn schedules exactly one bounded interrupt."""
     block = asyncio.Event()
     executor = _FakeExecutor(block_event=block)
     adapter = ExecutorAdapter(executor_factory=lambda: executor)
@@ -151,7 +138,7 @@ async def test_abnormal_exit_schedules_interrupt_once() -> None:
 
 
 async def test_clean_exit_schedules_no_interrupt() -> None:
-    """P0.2: a clean TurnComplete exit schedules no abnormal-exit interrupt."""
+    """Clean TurnComplete exit schedules no abnormal-exit interrupt."""
     executor = _FakeExecutor(events=[TurnComplete(response="done")])
     adapter = ExecutorAdapter(executor_factory=lambda: executor)
 
@@ -163,7 +150,7 @@ async def test_clean_exit_schedules_no_interrupt() -> None:
 
 
 async def test_orphan_tool_callback_safe_fails() -> None:
-    """P2.10: a stray tool callback after slot clear returns a structured error."""
+    """Stray tool callback after slot clear returns a structured error."""
     executor = _FakeExecutor()
     adapter = ExecutorAdapter(executor_factory=lambda: executor)
     # No active turn: _current_ctx / _current_agent are None.
@@ -176,7 +163,7 @@ async def test_orphan_tool_callback_safe_fails() -> None:
 
 
 async def test_watchdog_resync_is_idempotent() -> None:
-    """P1.8: a burst of orphans triggers exactly one Tier-1 reset."""
+    """Burst of orphan callbacks triggers exactly one Tier-1 reset."""
     executor = _FakeExecutor()
     adapter = ExecutorAdapter(executor_factory=lambda: executor)
     adapter._ensure_executor()
@@ -217,13 +204,7 @@ class _InterruptScriptExecutor(_FakeExecutor):
 
 
 async def test_failing_inline_interrupt_falls_back_to_detached(monkeypatch: Any) -> None:
-    """P0.2: a failing inline interrupt still triggers the detached fallback.
-
-    ``clean_exit`` is set only AFTER the inline ``interrupt_session`` succeeds,
-    so a raising inline interrupt leaves ``clean_exit`` False and the finally
-    schedules the bounded ``_safe_interrupt`` — the abandoned generation is
-    never left un-interrupted.
-    """
+    """Failing inline interrupt falls back to the detached bounded interrupt."""
     executor = _InterruptScriptExecutor(events=[TextChunk(text="x")])
     adapter = ExecutorAdapter(executor_factory=lambda: executor)
 
@@ -243,13 +224,7 @@ async def test_failing_inline_interrupt_falls_back_to_detached(monkeypatch: Any)
 
 
 async def test_policy_callback_orphan_counts_toward_watchdog() -> None:
-    """P1.8: missing-context policy callbacks count toward the orphan watchdog.
-
-    A ``None``-slot ``_stable_policy_evaluator`` fail-closes the individual
-    call (DENY on TOOL_CALL) AND increments the same consecutive-orphan
-    counter, so a generation flushing policy callbacks after its turn ended
-    triggers the same Tier-1 SDK reset as orphaned tool callbacks.
-    """
+    """Orphaned policy callbacks count toward the watchdog and fail-close TOOL_CALL."""
     executor = _FakeExecutor()
     adapter = ExecutorAdapter(executor_factory=lambda: executor)
     adapter._ensure_executor()
@@ -271,7 +246,7 @@ async def test_policy_callback_orphan_counts_toward_watchdog() -> None:
 
 
 async def test_policy_callback_orphan_advisory_phase_allows_and_counts() -> None:
-    """P1.8/P1.6: advisory-phase orphan policy callbacks ALLOW but still count."""
+    """Advisory-phase orphan policy callbacks ALLOW but still count toward watchdog."""
     executor = _FakeExecutor()
     adapter = ExecutorAdapter(executor_factory=lambda: executor)
     adapter._ensure_executor()
@@ -419,7 +394,7 @@ async def test_new_turn_registered_during_reset_survives() -> None:
     assert await asyncio.wait_for(fut, timeout=1.0) == "ok"
 
 
-# ── #1026 gap 2: out-of-turn host-tool (sys_os_*) self-heals on first orphan ──
+# ── gap 2: out-of-turn host-tool (sys_os_*) self-heals on first orphan ──
 
 
 async def test_orphan_host_tool_callback_forces_immediate_resync(
@@ -427,9 +402,9 @@ async def test_orphan_host_tool_callback_forces_immediate_resync(
 ) -> None:
     """Gap 2: ONE out-of-turn ``sys_os_*`` orphan drops the abandoned executor.
 
-    The #1026 storm was 88 orphaned ``sys_os_shell`` callbacks because the
+    Without this fix there would be many orphaned ``sys_os_shell`` callbacks because the
     Tier-1 self-heal only fired after ``_ORPHAN_RESYNC_THRESHOLD`` consecutive
-    orphans. A host-tool orphan is the deterministic respawn-desync signature,
+    orphans. A host-tool orphan is the deterministic respawn-wedge signature,
     so the watchdog now escalates on the FIRST one — interrupting the
     generation at its source so it stops flushing host-tool orphans.
 
@@ -499,16 +474,16 @@ async def test_out_of_turn_host_tool_dispatch_stays_bounded() -> None:
     """Gap 2: repeated out-of-turn host-tool dispatches stay BOUNDED (no 88x storm).
 
     Scope of this assertion (deliberately narrow): each call returns a structured
-    desync error (never raises, never hangs) and re-triggers the immediate
+    recovery error (never raises, never hangs) and re-triggers the immediate
     self-heal, so a freshly-rebuilt abandoned generation can never pile up the way
     the 88x ``sys_os_shell`` storm did. It proves the pile-up is BOUNDED — NOT
     that the call recovers to a SUCCESSFUL execution.
 
     A HEALTHY out-of-turn ``sys_call_async`` host-tool call is still classified as
-    a desync and fail-closed here (no bound TurnContext to gate against). Making
+    an orphan and fail-closed here (no bound TurnContext to gate against). Making
     such a call actually EXECUTE (carrying/synthesizing the originating policy
     context so ASK/DENY can be evaluated) is a background-dispatch feature tracked
-    as a follow-up, out of scope for the desync-recovery fix — so this test does
+    as a follow-up, out of scope for the turn-recovery fix — so this test does
     not (and must not) claim eventual successful execution.
     """
     adapter = ExecutorAdapter(executor_factory=lambda: _FakeExecutor())
@@ -533,7 +508,7 @@ async def test_host_tool_fast_resync_disabled_reproduces_pileup(
     :func:`_is_host_tool` forced to ``False`` (pre-fix: host tools were not
     special) — and the SAME ``sys_os_shell`` orphan falls back to the
     consecutive-threshold gate, so a single one does NOT self-heal and the
-    counter climbs unbounded: the exact 88x pile-up #1026 reported.
+    counter climbs unbounded without self-heal.
     """
     import omnigent.runtime.harnesses._executor_adapter as _adapter_mod
 
