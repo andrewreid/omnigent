@@ -601,30 +601,9 @@ class HarnessProcessManager:
         # first failure so we fall back to a direct exec for the process's life.
         self._harness_zygote = HarnessZygoteClient.from_env()
         self._harness_zygote_disabled = False
-        # Optional runner-side hook invoked when ``get_client`` RESPAWNS an
-        # already-registered entry that HAD AN IN-FLIGHT RESPONSE, because the
-        # requested model or harness changed (a mid-turn ``/model`` or agent
-        # switch). A respawn tears the old subprocess down out from under the
-        # turn still bound to it on the runner side — a DETERMINISTIC
-        # harness↔runner desync (#1026). The runner wires this to
-        # ``_resync_turn_state`` so that stale turn is cancelled and resynced AT
-        # RESPAWN TIME instead of waiting for the orphan-callback backstop.
-        #
-        # The hook fires ONLY when the replaced process was actually mid-response
-        # (``_in_flight_response_ids`` had an entry). A respawn during a NEW
-        # turn's own setup — the common between-turns ``/model`` case, where the
-        # prior turn already cleared in-flight and the new turn calls
-        # ``get_client`` before it marks in-flight — has no in-flight response to
-        # strand, so firing there would cancel the very turn being started. The
-        # replaced response id is carried into the callback so the runner can
-        # identity-match it against the turn currently bound and refuse to cancel
-        # a different (newer) turn. ``(conversation_id, reason, replaced_response_id)``.
-        #
-        # Mirrors the ``on_delivery_failure`` callback the verdict-delivery path
-        # uses — process_manager stays runner-agnostic and never imports
-        # ``runner.app``. Invoked OUTSIDE the per-conversation spawn lock so the
-        # callback's own ``get_client(conv, "any")`` interrupt forward cannot
-        # deadlock on the lock this respawn holds.
+        # Hook called when a mid-response entry is respawned (model/harness switch).
+        # Only fires when the replaced process had an in-flight response; invoked
+        # outside the spawn lock so the callback can re-enter get_client without deadlock.
         self._on_harness_respawn: Callable[[str, str, str], Awaitable[None]] | None = None
 
     def set_respawn_hook(self, hook: Callable[[str, str, str], Awaitable[None]] | None) -> None:
@@ -760,15 +739,8 @@ class HarnessProcessManager:
         # bumped generation and is allowed to respawn.
         async with self._registry_lock:
             start_generation = self._release_generations.get(conversation_id, 0)
-        # Set when an EXISTING entry is torn down and respawned for a model or
-        # harness switch (NOT a crash respawn, NOT a first spawn). Carries the
-        # desync reason to ``_on_harness_respawn``, which is invoked AFTER the
-        # spawn lock is released (the callback re-enters ``get_client(conv,
-        # "any")`` to forward an interrupt — running it under the lock would
-        # deadlock). The crash-respawn path is deliberately excluded: a dead
-        # subprocess is already covered by the orphan-callback backstop and the
-        # runner's own teardown, and the entry being gone means there is no
-        # in-flight harness turn to interrupt at respawn time.
+        # Non-None only for a model/harness-switch respawn of an in-flight entry
+        # (not crash respawns — those are already covered by the orphan watchdog).
         respawn_reason: str | None = None
         # The replaced entry's in-flight response id, captured at the respawn
         # decision (before ``_close_entry``). ``None`` means the replaced process
