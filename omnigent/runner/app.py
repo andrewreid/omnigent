@@ -366,14 +366,9 @@ _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
 _ASK_GATE_DELIVERY_READ_TIMEOUT_S: float = 86400.0
 _ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, connect=30.0)
 
-# Verdict-delivery transport errors that mean the harness channel itself is
-# dead (subprocess SIGKILL'd, connection reset, already gone before the POST
-# opens a socket, or unresponsive past the deadline) rather than a transient
-# blip. Nothing on a dead channel can resolve the harness's parked policy
-# future, so it would hang for ``_POLICY_EVAL_TIMEOUT_S`` (24h) instead of
-# self-healing. ``httpx.TimeoutException`` is the base for read/write/pool/
-# connect timeouts — a wedged harness that accepts the socket but never
-# acknowledges the POST is just as dead as one that reset the connection.
+# Transport errors that mean the harness channel is dead (subprocess killed,
+# connection reset, timeout). A dead channel can never resolve the harness's
+# parked policy future, so we signal recovery instead of log-and-swallow.
 _DEAD_HARNESS_CHANNEL_ERRORS: tuple[type[BaseException], ...] = (
     httpx.RemoteProtocolError,
     httpx.ReadError,
@@ -386,9 +381,7 @@ _DEAD_HARNESS_CHANNEL_ERRORS: tuple[type[BaseException], ...] = (
     httpcore.TimeoutException,
 )
 
-# Client-visible code for a turn-context desync. Deliberately absent from AP's
-# retryable-harness-error allowlist so the L2 classifier treats it as terminal
-# rather than retry-looping into the same wedge.
+# Not in the retryable-harness-error allowlist — desync is terminal, not transient.
 _RUNNER_TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
 # Bounded retry budget for the sub-agent wake POST. The wake is the sole
 # delivery signal for the last child of a fan-out, and Omnigent routinely
@@ -491,12 +484,8 @@ async def _evaluate_policy_via_omnigent(
     :param phase: Proto-style phase string, e.g.
         ``"PHASE_LLM_REQUEST"``.
     :param data: Event data dict for the policy engine.
-    :param on_delivery_failure: Optional async callback invoked with
-        *conversation_id* when the verdict cannot be delivered because the
-        harness channel is dead (a transport error surviving one retry on a
-        fresh connection). The parked policy future can never resolve on a
-        dead channel, so the caller wires this to tear the wedged turn down.
-        ``None`` preserves the legacy log-and-swallow behaviour.
+    :param on_delivery_failure: Called with *conversation_id* when the verdict
+        cannot be delivered after retry; wired by callers to cancel the wedged turn.
     """
     # Default verdict on error / non-200 / timeout. Phase-aware: TOOL_CALL
     # fails CLOSED (this round-trip is the authoritative gate for
@@ -570,17 +559,8 @@ async def _evaluate_policy_via_omnigent(
     if verdict_data is not None:
         verdict_body["data"] = verdict_data
 
-    # A verdict is ACKNOWLEDGED only on a 2xx — that is the sole outcome where
-    # the harness enqueued the event and its parked future will resolve. Every
-    # other outcome (a dead-channel transport error, a timeout, a 3xx/4xx/5xx
-    # response, OR an unexpected exception) leaves that future unresolvable, so
-    # the turn would hang for _POLICY_EVAL_TIMEOUT_S — each MUST eventually
-    # signal recovery. ``harness_client.post`` does not raise on non-2xx, so the
-    # status is checked explicitly. Retry policy stays selective: dead-channel /
-    # timeout / non-2xx retry once on a fresh connection; an unexpected
-    # (non-transport) error is a code bug, not a transient channel fault, so it
-    # is not retried — but it still signals, because the verdict is still
-    # unacknowledged and the future is still parked.
+    # Retry once on dead-channel / timeout / non-2xx; any unacknowledged verdict
+    # eventually calls on_delivery_failure to cancel the wedged turn.
     for _attempt in range(2):
         try:
             resp = await harness_client.post(
@@ -1979,8 +1959,6 @@ def create_runner_app(
     _spec_cache: dict[str, _SpecEntry] = {}  # agent_id → cached AgentSpec for terminal tools
     _resp_to_conv: dict[str, str] = {}  # harness response_id → conversation_id
     _live_response_id: dict[str, str] = {}
-    # Exposed on app.state so tests driving the respawn→resync adapter directly
-    # can seed the currently-bound turn's response id for the identity gate.
     app.state.live_response_id = _live_response_id
     _session_start_cache: dict[str, float] = {}  # session_id → registered start time
     _session_spec_cache: dict[str, _SpecEntry | None] = {}  # session_id → session AgentSpec
@@ -2066,26 +2044,16 @@ def create_runner_app(
     _ingest_cond: dict[str, asyncio.Condition] = {}
     _interrupted_sessions: set[str] = set()
     app.state.interrupted_sessions = _interrupted_sessions
-    # Conversations whose harness↔runner lifecycle desynced this turn. Marked by
-    # ``_resync_turn_state`` / ``_on_proxy_stream_end``, cleared when a fresh
-    # turn binds so a recovered conversation isn't left flagged.
+    # Desynced conversations; cleared when a fresh turn binds.
     _desynced_sessions: set[str] = set()
     app.state.desynced_sessions = _desynced_sessions
-    # Per-conversation turn-bind epoch: the value from a process-wide, strictly
-    # increasing, NON-REPEATING sequence stamped every time a turn binds the slot
-    # (including continuations that later complete). Recovery captures it to tell
-    # whether a REPLACEMENT turn started during a teardown await even if it already
-    # finished and popped its slot — a slot check alone cannot. The sequence is
-    # global (not a per-conversation counter reset on delete) so a same-id
-    # delete→recreate never returns to an epoch a stalled recovery still holds,
-    # which would let it clobber the new lifetime's turn.
+    # Global monotonic sequence stamped at each turn bind. Recovery holds its epoch
+    # to detect whether a newer turn started (and finished) during a teardown await.
     _turn_epoch_seq = itertools.count(1)
     _turn_bind_epoch: dict[str, int] = {}
     app.state.turn_bind_epoch = _turn_bind_epoch
-    # Publish-once token: maps a conversation to the bind epoch the desync recovery
-    # claimed the terminal ``failed`` for. A competing publish site suppresses its
-    # own ``idle`` only while the epoch still matches — a NEW turn (higher epoch)
-    # publishes its own terminal normally, so recovery can't swallow it.
+    # Epoch at which desync recovery published its terminal ``failed``. Competing
+    # publish sites skip their ``idle`` only if the epoch still matches.
     _desync_terminalized: dict[str, int] = {}
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
@@ -3222,7 +3190,7 @@ def create_runner_app(
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
-            if needs_turn and session_id not in _active_turns:
+            if needs_turn and not _suppress_recovery and session_id not in _active_turns:
                 _begin_turn_slot(session_id)
                 _publish_turn_status(session_id, "running")
                 msg_body = {
