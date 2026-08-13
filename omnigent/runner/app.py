@@ -2047,13 +2047,13 @@ def create_runner_app(
     # Desynced conversations; cleared when a fresh turn binds.
     _desynced_sessions: set[str] = set()
     app.state.desynced_sessions = _desynced_sessions
-    # Global monotonic sequence stamped at each turn bind. Recovery holds its epoch
-    # to detect whether a newer turn started (and finished) during a teardown await.
+    # Monotonic epoch stamped at each turn bind; lets recovery detect a replacement that ran
+    # and finished during a teardown await (slot empty, but epoch advanced).
     _turn_epoch_seq = itertools.count(1)
     _turn_bind_epoch: dict[str, int] = {}
     app.state.turn_bind_epoch = _turn_bind_epoch
-    # Epoch at which desync recovery published its terminal ``failed``. Competing
-    # publish sites skip their ``idle`` only if the epoch still matches.
+    # Epoch at which desync recovery claimed the terminal token; competing sites skip their
+    # ``idle`` only if the epoch still matches.
     _desync_terminalized: dict[str, int] = {}
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
@@ -3374,11 +3374,7 @@ def create_runner_app(
                 await turn_task
         _session_message_buffers.pop(session_id, None)
         _live_response_id.pop(session_id, None)
-        # Clear ALL paired desync/turn state on delete so a recreated same-id
-        # session starts clean: a leftover _desync_terminalized claim or a stale
-        # _desynced flag would otherwise carry into the new lifetime. (Epochs
-        # themselves come from a non-repeating sequence, so they never collide;
-        # this is state hygiene, not collision avoidance.)
+        # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
@@ -4911,47 +4907,27 @@ def create_runner_app(
         )
 
     def _begin_turn_slot(conv_id: str) -> None:
-        """Bind the ``None`` sentinel for a NEW turn and stamp a fresh bind epoch.
+        """Bind the ``None`` sentinel and stamp a fresh epoch for the new turn.
 
-        The epoch comes from a process-wide, non-repeating sequence, so recovery
-        can detect that a replacement turn ran during a teardown await even after
-        it finished and popped its own slot — and a same-id delete→recreate never
-        reuses an epoch a stalled recovery still holds. Use this at every
-        turn-start bind, not a bare ``_active_turns[conv] = None``.
-
-        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        Must be used instead of a bare ``_active_turns[conv] = None`` so recovery can detect
+        a replacement turn that ran and finished during a teardown await.
         """
         _active_turns[conv_id] = None
         _turn_bind_epoch[conv_id] = next(_turn_epoch_seq)
 
     def _release_live_turn_markers(conv_id: str) -> None:
-        """Drop ``_live_response_id`` and the process-manager in-flight marker together.
+        """Clear ``_live_response_id`` and the process-manager in-flight marker atomically.
 
-        They are one fact split across two stores. Popping the live response alone
-        severs the ownership link ``_on_proxy_stream_end`` keys on, so the marker is
-        left set and the idle reaper skips that harness forever. Any site that clears
-        the live response without terminating the process must call this, not a bare
-        pop.
-
-        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        The two stores represent one fact; clearing only one leaves the idle reaper stuck.
         """
         _live_response_id.pop(conv_id, None)
         if process_manager is not None:
             process_manager.clear_in_flight(conv_id)
 
     def _sweep_dead_turn_slot(conv_id: str, occupant: asyncio.Task[None] | None) -> bool:
-        """Remove a completed turn from ``_active_turns`` and clear all its per-turn
-        tokens together.
+        """Remove a completed turn and all its per-turn tokens together (identity-guarded).
 
-        A done Task in the slot is a corpse, not a live turn. Removing it is not
-        enough: its live-turn markers and its ``_interrupted_sessions`` token (which
-        is not cleared at the next turn's start) must go too, or they poison later
-        liveness checks and taint the next turn's terminal. Identity-guarded — if a
-        newer turn already took the slot, touch nothing.
-
-        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
-        :param occupant: The dead slot value; a no-op unless the slot still holds it.
-        :returns: ``True`` if swept, ``False`` if a newer turn owns the slot.
+        Returns ``True`` if swept, ``False`` if a newer turn already owns the slot.
         """
         if _active_turns.get(conv_id) is not occupant:
             return False
@@ -4966,19 +4942,8 @@ def create_runner_app(
         error: dict[str, Any] | None = None,
         owner_response_id: str | None = None,
     ) -> None:
-        # Generation-ownership guard: a stream's terminal callback must only
-        # finalize the conversation while THIS stream still owns it. Stream-mode
-        # desync recovery can pop the old sentinel and bind a continuation (a new
-        # response id + in-flight marker) BEFORE the old stream unwinds; the old
-        # stream's terminal must not then clear the newer turn's slot, response
-        # id, and in-flight marker. When ``owner_response_id`` is supplied (the
-        # proxy_stream terminal callers) and no longer matches the live response,
-        # a newer turn has taken over — this is a stale finalizer, so no-op every
-        # conversation-state mutation. Conversation-level callers that own no
-        # streamed response (setup-failure, the _run_turn_bg finally floor with
-        # its own identity guard, _cancel_active_turn with its expected_task
-        # guard, the desync recovery path) pass ``None`` and keep the
-        # unconditional behavior.
+        # Stale-finalizer guard: when owner_response_id no longer matches the live response,
+        # a newer turn has taken over — skip all conversation-state mutations.
         if owner_response_id is not None and _live_response_id.get(conv_id) != owner_response_id:
             _logger.debug(
                 "proxy stream end for %s ignored: response %s superseded by %s",
@@ -4990,17 +4955,12 @@ def create_runner_app(
 
         _active_turns.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
-        # A transport-loss ending leaves the harness lifecycle out of step with
-        # the runner's; flag it so the next turn binds clean. ``connection_error``
-        # is the code proxy_stream's transport handler stamps.
+        # Transport-loss ending desyncs harness from runner; flag for clean rebind.
         if error is not None and error.get("code") == "connection_error":
             _desynced_sessions.add(conv_id)
         has_buffered = bool(_session_message_buffers.get(conv_id))
         was_interrupted = conv_id in _interrupted_sessions
-        # Publish-once guard, epoch-scoped: suppress our own terminal only if the
-        # desync recovery claimed the token for the CURRENTLY-bound generation. A
-        # newer turn (higher bind epoch) is not the turn recovery meant to
-        # supersede, so it publishes normally instead of being swallowed.
+        # Suppress terminal only if desync recovery claimed the token for THIS generation's epoch.
         _suppress_status = _desync_terminalized.get(conv_id) == _turn_bind_epoch.get(conv_id, 0)
         if _suppress_status:
             _desync_terminalized.pop(conv_id, None)
@@ -5196,26 +5156,14 @@ def create_runner_app(
             return
         _logger.warning("resyncing turn state for %s: %s", conv_id, reason)
         _desynced_sessions.add(conv_id)
-        # Capture the wedged generation's bind epoch. Any turn that binds during the
-        # teardown await bumps it — so a REPLACEMENT that starts AND finishes during
-        # the await (invisible to a post-teardown slot check, which sees an empty
-        # slot) is still detectable as a continuation.
+        # Capture entry epoch; an advance during teardown means a replacement ran.
         _entry_epoch = _turn_bind_epoch.get(conv_id, 0)
-        # Clear the live response and the in-flight marker together, before any
-        # await, so a concurrent forward sees no live turn and the reaper isn't
-        # left a stale marker.
+        # Release markers before any await so concurrent callers see no live turn.
         _release_live_turn_markers(conv_id)
-        # Best-effort pre-claim of the terminal token, SCOPED to this generation's
-        # epoch: a competing terminal suppresses its own idle only while the epoch
-        # still matches, so a newer turn's terminal is never swallowed. The
-        # authoritative ownership decision is re-made after teardown.
+        # Pre-claim terminal token for this epoch; authoritative decision re-made after teardown.
         if not _session_message_buffers.get(conv_id):
             _desync_terminalized[conv_id] = _entry_epoch
-        # Tear the wedged generation out of the slot. A stream=true turn parks the
-        # None sentinel (no runner Task) — pop it synchronously so the active-turn
-        # gate can't stay stuck if the interrupt never ends the stream; a Task turn
-        # goes through _cancel_inprocess_turn. Both paths REMOVE the wedged
-        # generation (including a completed corpse).
+        # Stream-sentinel turns have no Task — pop synchronously so the gate doesn't stay stuck.
         stream_sentinel = conv_id in _active_turns and not isinstance(
             _active_turns.get(conv_id), asyncio.Task
         )
@@ -5224,15 +5172,10 @@ def create_runner_app(
             await _forward_harness_interrupt(conv_id)
         else:
             await _cancel_inprocess_turn(conv_id)
-        # Ownership decision, AFTER teardown. A continuation ran iff the bind epoch
-        # advanced — this catches a replacement that started AND finished during the
-        # await (empty slot, but a higher epoch), which a slot check alone misses.
-        # (A live slot is also covered: binding bumps the epoch.)
+        # Epoch advanced → a replacement ran (covers live-slot and empty-slot after teardown).
         _continuation_ran = _turn_bind_epoch.get(conv_id, 0) != _entry_epoch
         _has_buffer = bool(_session_message_buffers.get(conv_id))
         if not _continuation_ran and not _has_buffer:
-            # We own the terminal status; the competing OLD-generation terminal
-            # no-ops via the epoch-scoped token.
             _publish_turn_status(
                 conv_id,
                 "failed",
@@ -5245,18 +5188,11 @@ def create_runner_app(
                 },
             )
         else:
-            # A continuation owns the terminal status — release OUR claim so its
-            # own _on_proxy_stream_end publishes normally. Compare-and-pop: only
-            # remove the token if it still holds THIS recovery's epoch. A nested
-            # recovery for the replacement may have already re-claimed it under a
-            # different (higher) epoch; popping unconditionally would strip that
-            # and unsuppress the replacement's own competing terminal.
+            # A continuation owns the terminal status — release our claim (compare-and-pop
+            # so a nested recovery's higher-epoch claim isn't accidentally stripped).
             if _desync_terminalized.get(conv_id) == _entry_epoch:
                 _desync_terminalized.pop(conv_id, None)
-            # If a message is buffered but no continuation has run yet, kick one:
-            # a turn cancelled mid-drain pops its own slot without scheduling a
-            # continuation, so the buffered message would otherwise strand.
-            # Idempotent — _check_and_start_next_turn bails if a turn is active.
+            # Kick a continuation if none ran; a cancelled mid-drain turn doesn't schedule one.
             if _has_buffer and not _continuation_ran:
                 try:
                     loop = asyncio.get_running_loop()
@@ -5288,11 +5224,9 @@ def create_runner_app(
     ) -> None:
         """``HarnessProcessManager`` respawn-hook adapter for ``_resync_turn_state``.
 
-        A respawn landing while the turn that OWNED the replaced in-flight
-        response is still bound on the runner is the deterministic #1026 desync:
-        the inner generation dies with the subprocess and the active-turn slot
-        is never cleaned. Recovering here collapses the window instead of
-        waiting for the orphan backstop.
+        A respawn while the replaced response is still bound is the deterministic respawn-desync:
+        the inner generation dies with the subprocess and the slot is never cleaned.
+        Recovering here collapses the window instead of waiting for the orphan backstop.
 
         Two gates keep it from cancelling a HEALTHY turn:
 
