@@ -1,6 +1,6 @@
-"""Regression lock-in for the phase-aware policy-evaluation timeout (#1026).
+"""Regression for phase-aware policy-evaluation timeout.
 
-P1.9 is a NON-EDIT guard: the scaffold's ``TurnContext.evaluate_policy``
+NON-EDIT guard: the scaffold's ``TurnContext.evaluate_policy``
 timeout default must stay phase-aware — on expiry, ``PHASE_TOOL_CALL`` fails
 CLOSED (DENY) because it is the authoritative gate for connector-native MCP
 tools, while advisory LLM phases and ``PHASE_TOOL_RESULT`` (the tool already
