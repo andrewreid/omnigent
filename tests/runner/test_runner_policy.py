@@ -113,13 +113,7 @@ async def test_success_deny_verdict_passed_through() -> None:
     assert verdict["reason"] == "blocked"
 
 
-# ── P1.6: ExecutorAdapter._stable_policy_evaluator fail-closed ───────────────
-#
-# When the harness adapter's policy-evaluator callback fires with no active
-# turn context (the generation outlived its turn — a desync), the missing
-# verdict must be phase-aware: PHASE_TOOL_CALL is the authoritative gate for
-# connector-native MCP tools and fails CLOSED (DENY); advisory LLM phases and
-# PHASE_TOOL_RESULT (the tool already ran) fail OPEN (ALLOW).
+# ── ExecutorAdapter._stable_policy_evaluator fail-closed ──────────────────
 
 
 @pytest.mark.parametrize(
