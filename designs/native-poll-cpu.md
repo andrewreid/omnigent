@@ -931,6 +931,17 @@ streaming latency unchanged.
 - **#2702's own "amplifier" note** — terminals kept alive via
   `keep_alive_after_exit` inflate the watcher count. Unaddressed here (it is the
   #2421/#1349 teardown gap), but each such watcher now costs ~1 % of what it did.
+- **#5390** (tolerate transient tmux probe failures) — landed on `main` after
+  this branch was cut, and touches the same threaded loop. It added a failure
+  state machine: a `capture-pane` that raises is confirmed against `has-session`
+  and must fail `_IDLE_EXIT_FAILURE_THRESHOLD` times consecutively before the
+  watcher publishes exit. §3.2(b) folds the dead-pane probe *into* that capture,
+  so the two compose on one rule: **the folded probe returning `None` is the same
+  event #5390 counts.** `_capture_pane_state_or_none` therefore feeds
+  `consecutive_capture_failures` rather than exiting on the first failure, and
+  keeps #5390's probe-failure warning. A successful capture resets the counter and
+  supplies `pane_dead` directly, so the second tmux invocation this section exists
+  to remove stays removed.
 
 ## 6. Explicitly not covered
 
