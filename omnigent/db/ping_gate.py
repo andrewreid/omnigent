@@ -64,7 +64,9 @@ def _report_swallowed(message: str) -> None:
     :param message: Static description of the swallowed failure.
     """
     with contextlib.suppress(Exception):
-        _logger.debug(message, exc_info=True)
+        # LOG014 is lexical: every caller is inside an `except` block (see the
+        # docstring), so exc_info carries the live exception it is reporting.
+        _logger.debug(message, exc_info=True)  # noqa: LOG014
 
 
 def _fail_safe_listener(method: Callable[..., Any]) -> Callable[..., Any]:
