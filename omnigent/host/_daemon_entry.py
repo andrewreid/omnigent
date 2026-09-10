@@ -71,6 +71,7 @@ def main() -> None:
         )
         return
 
+    local_server_pid = None
     try:
         from omnigent.host.identity import CONFIG_PATH, load_or_create_host_identity
 
@@ -92,7 +93,10 @@ def main() -> None:
             # The daemon owns the local server: start/reuse it, then connect.
             from omnigent.host.local_server import ensure_local_omnigent_server
 
-            server_url = ensure_local_omnigent_server().url
+            startup = ensure_local_omnigent_server()
+            server_url = startup.url
+            # The daemon's own child, so the ownerless sweep must not condemn it.
+            local_server_pid = startup.pid
         else:
             server_url = args.server
 
@@ -100,6 +104,7 @@ def main() -> None:
 
         run_host_process(
             server_url=server_url,
+            local_server_pid=local_server_pid,
             daemon_target=daemon_target,
             lifecycle_lock=lifecycle_lock,
         )
