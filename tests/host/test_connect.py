@@ -1733,7 +1733,7 @@ async def test_sweep_ownerless_trees_once_runs_all_families(
     The pass must also hold the host-subprocess-op guard so the zombie
     reaper cannot steal the family sweeps' tmux/lsof children mid-wait.
     """
-    import omnigent.codex_native_process_registry as registry_mod
+    import omnigent.harnesses.codex_native.process_registry as registry_mod
     import omnigent.inner.terminal as terminal_mod
     import omnigent.runtime.harnesses.process_manager as pm_mod
 
@@ -2108,13 +2108,13 @@ async def test_dead_leader_attribution_uses_registry_and_spawn_records(
         "omnigent.host.connect._live_group_member_pids", lambda _pgid, exclude=None: []
     )
     monkeypatch.setattr(
-        "omnigent.codex_native_process_registry.ownerless_entry_matches_leader",
+        "omnigent.harnesses.codex_native.process_registry.ownerless_entry_matches_leader",
         lambda _pid, _ident: True,
     )
     assert host._dead_leader_group_is_ours(4242, pin) is True
 
     monkeypatch.setattr(
-        "omnigent.codex_native_process_registry.ownerless_entry_matches_leader",
+        "omnigent.harnesses.codex_native.process_registry.ownerless_entry_matches_leader",
         lambda _pid, _ident: False,
     )
     monkeypatch.setattr(
@@ -2280,7 +2280,7 @@ async def test_sweep_ownerless_trees_once_reaps_real_families(
     import os
     import sys
 
-    import omnigent.codex_native_process_registry as registry_mod
+    import omnigent.harnesses.codex_native.process_registry as registry_mod
     import omnigent.inner.terminal as terminal_mod
     from omnigent.runtime.harnesses.process_manager import (
         _AP_PID_FILE,

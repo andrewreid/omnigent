@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import sqlalchemy as sa
 from alembic import op
 
 revision: str = "za1b2c3d4e5f6"
@@ -26,13 +27,24 @@ depends_on: Sequence[str] | None = None
 _INDEX_NAME = "ix_conversations_archived_created"
 
 
+def _index_exists(table: str, index_name: str) -> bool:
+    """Return True if *index_name* exists on *table* in the current schema."""
+    return any(idx["name"] == index_name for idx in sa.inspect(op.get_bind()).get_indexes(table))
+
+
 def upgrade() -> None:
-    op.create_index(
-        _INDEX_NAME,
-        "conversations",
-        ["workspace_id", "archived", "created_at", "id"],
-    )
+    # Guarded: ``conversations`` lives on the AP metadata, so the index can
+    # already be present from a deployment that created it before this
+    # revision became pending — recreating it would abort the upgrade with
+    # DuplicateTable and strand the roll.
+    if not _index_exists("conversations", _INDEX_NAME):
+        op.create_index(
+            _INDEX_NAME,
+            "conversations",
+            ["workspace_id", "archived", "created_at", "id"],
+        )
 
 
 def downgrade() -> None:
-    op.drop_index(_INDEX_NAME, table_name="conversations")
+    if _index_exists("conversations", _INDEX_NAME):
+        op.drop_index(_INDEX_NAME, table_name="conversations")

@@ -44,8 +44,8 @@ from typing import Any
 
 import pytest
 
-from omnigent.claude_native_bridge import prepare_bridge_dir, record_hook_event
-from omnigent.claude_native_forwarder import supervise_forwarder
+from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir, record_hook_event
+from omnigent.harnesses.claude_native.forwarder import supervise_forwarder
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux",
@@ -78,8 +78,10 @@ _IN_OPEN = 0x00000020
 @pytest.fixture(autouse=True)
 def _bridge_root_in_tmp(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Relocate the bridge root under this test's temp dir (mirrors the unit suite)."""
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
     # The idle gate must be at its production default here: an ambient
     # kill-switch value on the host would measure the ungated loop instead.
     monkeypatch.delenv("OMNIGENT_CLAUDE_FORWARDER_IDLE_GATE", raising=False)
