@@ -29,12 +29,14 @@ concerns:
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import logging
 import os
 import re
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -483,6 +485,111 @@ def instrument_sqlalchemy_engine(engine: Any) -> None:
         _logger.debug("SQLAlchemy OpenTelemetry instrumentation not installed; skipping")
     except Exception:
         _logger.exception("failed to instrument SQLAlchemy engine")
+
+
+@dataclass(frozen=True)
+class _DbPoolPingGateInstruments:
+    checkout_age: Any
+    decisions: Any
+    disconnects: Any
+    recoveries: Any
+
+
+def _create_db_pool_ping_gate_instruments(meter: Any) -> _DbPoolPingGateInstruments:
+    """
+    Create the four ``omnigent.db.pool.*`` instruments for the pre-ping
+    skip gate (``omnigent.db.ping_gate``).
+
+    Split out from :func:`instrument_db_pool_ping_gate` so tests can inject
+    a fake meter and assert exact instrument names/attributes without going
+    through OpenTelemetry's global meter provider, mirroring
+    ``_create_request_otel_instruments`` in ``server/performance_metrics.py``.
+
+    :param meter: Meter used to create instruments.
+    :returns: The four grouped instruments.
+    """
+    return _DbPoolPingGateInstruments(
+        checkout_age=meter.create_histogram(
+            "omnigent.db.pool.checkout_age_seconds",
+            unit="s",
+            description=(
+                "Idle time since a pooled connection's last check-in or real ping, "
+                "sampled at checkout by the pre-ping skip gate. Not the physical "
+                "age of the connection."
+            ),
+        ),
+        decisions=meter.create_counter(
+            "omnigent.db.pool.pre_ping_decisions_total",
+            unit="{checkout}",
+            description="Pre-ping skip-gate decisions, labeled decision=skip|ping|fresh.",
+        ),
+        disconnects=meter.create_counter(
+            "omnigent.db.pool.disconnects_total",
+            unit="{disconnect}",
+            description=(
+                "Disconnects observed by the pre-ping skip gate, "
+                "labeled phase=post_skip|pre_ping|other."
+            ),
+        ),
+        recoveries=meter.create_counter(
+            "omnigent.db.pool.recoveries_total",
+            unit="{recovery}",
+            description=(
+                "Connection recoveries observed by the pre-ping skip gate, "
+                "labeled trigger=pre_ping|post_skip|other."
+            ),
+        ),
+    )
+
+
+def instrument_db_pool_ping_gate(engine: Any) -> None:
+    """
+    Wire the pre-ping skip gate's metric sinks on a single engine.
+
+    Best-effort and telemetry-gated like :func:`instrument_sqlalchemy_engine`:
+    a disabled or misconfigured telemetry setup must never block engine
+    creation or degrade the gate itself -- the gate keeps functioning with
+    its default null sinks. Called once per engine at creation time (see
+    ``omnigent.db.utils.get_or_create_engine``), beside the existing
+    ``instrument_sqlalchemy_engine(engine)`` call.
+
+    No-op if no gate was installed on ``engine`` (``OMNIGENT_DB_PING_SKIP_WINDOW_SECONDS``
+    unset/0, or a non-Postgres engine).
+
+    :param engine: The SQLAlchemy :class:`~sqlalchemy.engine.Engine` whose
+        installed ping gate (if any) should get real metric sinks.
+    """
+    gate = getattr(engine, "_omnigent_db_pool_ping_gate", None)
+    if gate is None:
+        return
+    if not telemetry_enabled():
+        return
+    try:
+        from opentelemetry import metrics as otel_metrics
+
+        meter = otel_metrics.get_meter("omnigent.db.pool")
+        instruments = _create_db_pool_ping_gate_instruments(meter)
+
+        class _Sinks:
+            def record_checkout_age(self, dialect_name: str, age_seconds: float) -> None:
+                instruments.checkout_age.record(age_seconds, {"dialect": dialect_name})
+
+            def inc_decision(self, dialect_name: str, decision: str) -> None:
+                instruments.decisions.add(1, {"dialect": dialect_name, "decision": decision})
+
+            def inc_disconnect(self, dialect_name: str, phase: str) -> None:
+                instruments.disconnects.add(1, {"dialect": dialect_name, "phase": phase})
+
+            def inc_recovery(self, dialect_name: str, trigger: str) -> None:
+                instruments.recoveries.add(1, {"dialect": dialect_name, "trigger": trigger})
+
+        gate.sinks = _Sinks()
+    except Exception:
+        # Reporting is inside the net too — a raising log handler here would
+        # propagate into engine creation, which this function promises never
+        # to block.
+        with contextlib.suppress(Exception):
+            _logger.exception("failed to instrument database ping gate")
 
 
 def parse_provider_name(model: str) -> tuple[str, str]:

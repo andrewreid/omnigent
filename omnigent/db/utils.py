@@ -23,6 +23,13 @@ if TYPE_CHECKING:
     from alembic.config import Config
 from sqlalchemy.orm import Session, sessionmaker
 
+from omnigent.db.ping_gate import (
+    PING_SKIP_WINDOW_ENV,
+    _install_db_pool_ping_gate,
+    _parse_db_ping_skip_window_seconds,
+    is_postgres_url,
+    warn_if_window_ge_recycle,
+)
 from omnigent.db.query_context import query_name_scope
 from omnigent.entities import NewConversationItem
 
@@ -227,7 +234,13 @@ def _create_engine(db_uri: str) -> Engine:
         ``"sqlite:///mydb.db"`` or
         ``"postgresql://<user>:<password>@host/dbname"``.
     :returns: A configured :class:`~sqlalchemy.engine.Engine`.
+    :raises ValueError: If ``OMNIGENT_DB_PING_SKIP_WINDOW_SECONDS`` is set to
+        a malformed value (negative, non-finite, or non-numeric), regardless
+        of which backend is being built.
     """
+    # Parsed unconditionally, ahead of the sqlite/non-sqlite branch, so a
+    # malformed value fails startup no matter which backend is being built.
+    ping_skip_window = _parse_db_ping_skip_window_seconds()
     is_sqlite = db_uri.startswith("sqlite")
     if is_sqlite:
         # ``check_same_thread=False`` lets SQLAlchemy's pool hand a
@@ -270,6 +283,14 @@ def _create_engine(db_uri: str) -> Engine:
             finally:
                 cur.close()
 
+        if ping_skip_window > 0:
+            # The gate is Postgres-only; a positive window here is a
+            # per-engine no-op, never a startup failure (the engine cache is
+            # keyed by URI, so a process can hold sqlite + Postgres engines).
+            _logger.debug(
+                "database ping gate disabled for dialect sqlite: %s applies only to PostgreSQL",
+                PING_SKIP_WINDOW_ENV,
+            )
         return engine
     # Lakebase (managed Postgres) authenticates with a short-lived OAuth token
     # re-minted per connection; everything else uses the static URI as-is. The
@@ -280,30 +301,42 @@ def _create_engine(db_uri: str) -> Engine:
     pool_recycle = (
         _LAKEBASE_POOL_RECYCLE_SECONDS if token_provider else _SERVER_POOL_RECYCLE_SECONDS
     )
-    try:
-        engine = create_engine(
-            db_uri,
-            # Verify connections are alive before checking them out
-            # from the pool. Prevents "server has gone away" errors
-            # after idle periods.
-            pool_pre_ping=True,
-            # Recycle connections older than this window. Prevents stale
-            # connections when the database server restarts or closes idle
-            # connections; in Lakebase token mode the shorter window also keeps
-            # each connection's OAuth token refreshed ahead of its ~1h expiry.
-            pool_recycle=pool_recycle,
-            # Aligned with the AnyIO thread limiter in
-            # ``server/app.py:_lifespan``. Every DB call runs via
-            # ``asyncio.to_thread``, so connections beyond the thread
-            # token count just sit idle. Overflow covers boot-time
-            # bursts (e.g. migrations). Lakebase per-instance cap: 1000.
-            pool_size=200,
-            max_overflow=20,
-            # Bound the wait when the pool is exhausted instead of
-            # blocking indefinitely; surfaces real saturation as an
-            # error rather than a hang.
-            pool_timeout=10,
+    # LIFO pool reuse only switches on together with the gate (see
+    # omnigent.db.ping_gate) -- with pool_size=200 the default FIFO
+    # round-robin would spread idle gaps past any sane window.
+    ping_gate_enabled = ping_skip_window > 0 and is_postgres_url(db_uri)
+    create_kwargs: dict[str, object] = {
+        # Verify connections are alive before checking them out
+        # from the pool. Prevents "server has gone away" errors
+        # after idle periods.
+        "pool_pre_ping": True,
+        # Recycle connections older than this window. Prevents stale
+        # connections when the database server restarts or closes idle
+        # connections; in Lakebase token mode the shorter window also keeps
+        # each connection's OAuth token refreshed ahead of its ~1h expiry.
+        "pool_recycle": pool_recycle,
+        # Aligned with the AnyIO thread limiter in
+        # ``server/app.py:_lifespan``. Every DB call runs via
+        # ``asyncio.to_thread``, so connections beyond the thread
+        # token count just sit idle. Overflow covers boot-time
+        # bursts (e.g. migrations). Lakebase per-instance cap: 1000.
+        "pool_size": 200,
+        "max_overflow": 20,
+        # Bound the wait when the pool is exhausted instead of
+        # blocking indefinitely; surfaces real saturation as an
+        # error rather than a hang.
+        "pool_timeout": 10,
+    }
+    if ping_gate_enabled:
+        create_kwargs["pool_use_lifo"] = True
+    elif ping_skip_window > 0:
+        _logger.debug(
+            "database ping gate disabled for dialect %s: %s applies only to PostgreSQL",
+            make_url(db_uri).get_backend_name(),
+            PING_SKIP_WINDOW_ENV,
         )
+    try:
+        engine = create_engine(db_uri, **create_kwargs)
     except ModuleNotFoundError as exc:
         # SQLAlchemy imports the DBAPI lazily in create_engine; a missing
         # Postgres driver surfaces as an opaque "No module named 'psycopg'".
@@ -325,6 +358,15 @@ def _create_engine(db_uri: str) -> Engine:
             f"(and install the driver via the 'omnigent[postgres]' extra "
             f"if needed)."
         ) from exc
+    if ping_gate_enabled:
+        if engine.dialect.name != "postgresql":
+            engine.dispose()
+            raise RuntimeError(
+                "database ping gate eligibility mismatch: URL backend was "
+                f"'postgresql' but engine dialect is {engine.dialect.name!r}"
+            )
+        _install_db_pool_ping_gate(engine, window_seconds=ping_skip_window)
+        warn_if_window_ge_recycle(ping_skip_window, pool_recycle)
     if token_provider:
         _install_lakebase_token_refresh(engine, token_provider)
     return engine
@@ -412,9 +454,13 @@ def get_or_create_engine(db_uri: str) -> Engine:
             if db_uri not in _engine_cache:
                 engine = _create_engine(db_uri)
                 _initialize_or_verify_schema(engine, db_uri)
-                from omnigent.runtime.telemetry import instrument_sqlalchemy_engine
+                from omnigent.runtime.telemetry import (
+                    instrument_db_pool_ping_gate,
+                    instrument_sqlalchemy_engine,
+                )
 
                 instrument_sqlalchemy_engine(engine)
+                instrument_db_pool_ping_gate(engine)
                 _engine_cache[db_uri] = engine
     return _engine_cache[db_uri]
 
@@ -437,9 +483,18 @@ def get_or_create_conversation_engine(conv_uri: str) -> Engine:
             if conv_uri not in _engine_cache:
                 engine = _create_engine(conv_uri)
                 _ensure_conversation_tables(engine)
-                from omnigent.runtime.telemetry import instrument_sqlalchemy_engine
+                # Same instrumentation pair as get_or_create_engine:
+                # _create_engine installs the pre-ping gate for an eligible
+                # PostgreSQL AP URI, so its metric sinks must be wired here
+                # too or that engine's gate runs on null sinks and emits
+                # nothing.
+                from omnigent.runtime.telemetry import (
+                    instrument_db_pool_ping_gate,
+                    instrument_sqlalchemy_engine,
+                )
 
                 instrument_sqlalchemy_engine(engine)
+                instrument_db_pool_ping_gate(engine)
                 _engine_cache[conv_uri] = engine
     return _engine_cache[conv_uri]
 
