@@ -1653,7 +1653,7 @@ class HostProcess:
 
         :returns: None.
         """
-        from omnigent.codex_native_process_registry import (
+        from omnigent.harnesses.codex_native.process_registry import (
             reconcile_codex_native_process_registry,
         )
         from omnigent.inner.terminal import reap_orphaned_terminals
@@ -1845,7 +1845,7 @@ class HostProcess:
             cmdline = _adopted_child_cmdline(member)
             if any(marker in cmdline for marker in _ADOPTED_CONDEMN_SIGNATURES):
                 return True
-        from omnigent.codex_native_process_registry import (
+        from omnigent.harnesses.codex_native.process_registry import (
             ownerless_entry_matches_leader,
         )
         from omnigent.runtime.harnesses.process_manager import (
