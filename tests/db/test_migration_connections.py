@@ -34,7 +34,12 @@ def _downgrade(uri: str, engine: sa.Engine, revision: str) -> None:
 def test_single_alembic_head() -> None:
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
     heads = script.get_heads()
-    assert heads == ["ge1b2c3d4e5f"], f"expected a single head, got {heads!r}"
+    # Not pinned to a literal head: the integration build linearises the forked
+    # migration DAG, which re-parents the fork's migration and moves the head.
+    assert len(heads) == 1, f"expected a single head, got {heads!r}"
+    # The connections migration must be part of the (single) mainline chain.
+    revisions = {rev.revision for rev in script.walk_revisions()}
+    assert "ga1b2c3d4e5f" in revisions, "connections migration missing from the chain"
 
 
 def test_upgrade_creates_table_downgrade_drops_it(tmp_path: Path) -> None:
