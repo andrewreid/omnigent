@@ -56,7 +56,7 @@ def test_session_row_uses_full_title_width_until_actions_are_revealed(
     row = _row(page, session_id)
     link = row.locator(f'a[href="/c/{session_id}"]')
     expect(link).to_be_visible(timeout=30_000)
-    expect(link).to_have_css("height", "32px")
+    expect(link).to_have_css("height", "28px")
     expect(link).to_contain_text(title)
 
     # Hidden desktop actions must not reserve width. The title surface starts
@@ -86,4 +86,4 @@ def test_session_row_uses_full_title_width_until_actions_are_revealed(
     expect(row.get_by_test_id("quick-pin-conversation")).to_be_visible()
     expect(row.get_by_test_id("conversation-actions")).to_be_visible()
     expect(page.get_by_test_id("session-tooltip-content")).to_be_visible()
-    assert _padding(link) == {"left": 8, "right": 56}
+    assert _padding(link) == {"left": 8, "right": 80}

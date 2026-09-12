@@ -15,6 +15,7 @@ import { ClockIcon, Loader2Icon, SearchIcon, TriangleAlertIcon } from "lucide-re
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
 import {
@@ -42,6 +43,7 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
 
 export function TasksPage() {
   const { data: tasks, isLoading, isError, refetch } = useScheduledTasks();
+  const { trackClick } = useOmnigentAnalytics();
   // A single shared, slowly-ticking clock for the whole list. Passing it down to
   // each row (rather than each row owning a timer) keeps the relative next-run
   // labels fresh with ONE interval regardless of how many rows are on screen.
@@ -155,7 +157,12 @@ export function TasksPage() {
             Run agent sessions on a recurring schedule. Tasks fire on a connected host.
           </p>
         </div>
-        <Button data-testid="new-task-button" className="shrink-0" onClick={openManual}>
+        <Button
+          data-testid="new-task-button"
+          className="shrink-0"
+          onClick={openManual}
+          componentId="tasks.new"
+        >
           New task
         </Button>
       </div>
@@ -183,7 +190,10 @@ export function TasksPage() {
                 type="button"
                 aria-pressed={filter === tab.value}
                 data-testid={`tasks-filter-${tab.value}`}
-                onClick={() => setFilter(tab.value)}
+                onClick={() => {
+                  trackClick(`tasks.filter_${tab.value}`, "button");
+                  setFilter(tab.value);
+                }}
                 className={cn(
                   "rounded-md px-3 py-1 text-ui font-medium transition-colors",
                   filter === tab.value
@@ -206,7 +216,12 @@ export function TasksPage() {
         >
           <TriangleAlertIcon className="size-4 shrink-0 text-destructive" />
           <span className="flex-1">Couldn’t load automations.</span>
-          <Button variant="outline" size="sm" onClick={() => void refetch()}>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void refetch()}
+            componentId="tasks.retry"
+          >
             Retry
           </Button>
         </div>
@@ -278,7 +293,7 @@ function EmptyState({
         <div className="flex flex-col items-center gap-2 py-12 text-center">
           <ClockIcon className="size-8 text-muted-foreground/50" />
           <p className="text-ui font-medium">No automations yet</p>
-          <p className="max-w-sm text-xs text-muted-foreground">
+          <p className="max-w-sm text-sm text-muted-foreground">
             Create a task to run an agent session automatically on a recurring schedule.
           </p>
           {showSuggestions && (

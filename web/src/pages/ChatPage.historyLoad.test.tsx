@@ -2,12 +2,21 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
 import { Profiler, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UserMessageBlock } from "@/lib/blocks";
-import { MAX_INITIAL_PAGES } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
-import { HistoryAutoLoader, JumpToTopButton, LatestTurnSpacer } from "./ChatPage";
+import {
+  HistoryAutoLoader,
+  JumpToTopButton,
+  KeepBottomOnViewportResize,
+  LatestTurnSpacer,
+} from "./ChatPage";
 
 const stickContext = vi.hoisted(() => ({
   scrollRef: { current: null as HTMLElement | null },
+  contentRef: { current: null as HTMLElement | null },
+  isAtBottom: false,
+  scrollToBottom: vi.fn(),
+  state: { isAtBottom: false, escapedFromLock: true },
+  stopScroll: undefined as (() => void) | undefined,
 }));
 
 vi.mock("use-stick-to-bottom", () => ({
@@ -60,6 +69,174 @@ function setScrollMetrics(
   });
 }
 
+describe("KeepBottomOnViewportResize", () => {
+  let resize: (() => void) | null;
+  let disconnectSpy = vi.fn<() => void>();
+  let nextFrameId: number;
+  let frames: Map<number, FrameRequestCallback>;
+
+  beforeEach(() => {
+    resize = null;
+    disconnectSpy.mockClear();
+    nextFrameId = 1;
+    frames = new Map();
+    stickContext.scrollRef.current = null;
+    stickContext.contentRef.current = null;
+    stickContext.isAtBottom = false;
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
+    stickContext.scrollToBottom.mockReset();
+
+    class StubResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resize = () => callback([], this as unknown as ResizeObserver);
+      }
+      observe() {}
+      disconnect() {
+        disconnectSpy();
+      }
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((callback: FrameRequestCallback) => {
+        const id = nextFrameId++;
+        frames.set(id, callback);
+        return id;
+      }),
+    );
+    vi.stubGlobal(
+      "cancelAnimationFrame",
+      vi.fn((id: number) => {
+        frames.delete(id);
+      }),
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    stickContext.scrollRef.current = null;
+    stickContext.contentRef.current = null;
+    stickContext.isAtBottom = false;
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
+  });
+
+  function flushFrames() {
+    act(() => {
+      const callbacks = [...frames.values()];
+      frames.clear();
+      for (const callback of callbacks) callback(performance.now());
+    });
+  }
+
+  function makeScrollRoot(scrollTop = 1300) {
+    const metrics = { scrollTop, scrollHeight: 2000, clientHeight: 700 };
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, metrics);
+    stickContext.scrollRef.current = scrollRoot;
+    return { metrics, scrollRoot };
+  }
+
+  it("keeps a bottom-locked transcript pinned after its viewport shrinks", () => {
+    const { metrics } = makeScrollRoot();
+    stickContext.isAtBottom = true;
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.clientHeight = 650;
+    act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).toHaveBeenCalledOnce();
+    expect(stickContext.scrollToBottom).toHaveBeenCalledWith("instant");
+    expect(frames.size).toBe(1);
+
+    flushFrames();
+    expect(stickContext.scrollToBottom).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves an escaped reader anchored by the browser", () => {
+    const { metrics } = makeScrollRoot(800);
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.clientHeight = 650;
+    act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+    expect(metrics.scrollTop).toBe(800);
+  });
+
+  it("ignores the public near-bottom alias when the live lock is escaped", () => {
+    const { metrics } = makeScrollRoot(1250);
+    stickContext.isAtBottom = true;
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.clientHeight = 650;
+    act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+    expect(metrics.scrollTop).toBe(1250);
+  });
+
+  it("keeps a user escape after a same-resize library reclassification", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    stickContext.isAtBottom = true;
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.scrollTop = 1250;
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
+    fireEvent.scroll(scrollRoot);
+
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    metrics.clientHeight = 650;
+    act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+    expect(metrics.scrollTop).toBe(1250);
+  });
+
+  it("ignores content-only resize notifications", () => {
+    const { metrics } = makeScrollRoot();
+    stickContext.isAtBottom = true;
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.scrollHeight = 2200;
+    act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+  });
+
+  it("disconnects the observer and cancels a queued follow-up frame", () => {
+    const { metrics } = makeScrollRoot();
+    stickContext.isAtBottom = true;
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    const { unmount } = render(<KeepBottomOnViewportResize />);
+
+    metrics.clientHeight = 650;
+    act(() => resize?.());
+    expect(frames.size).toBe(1);
+
+    unmount();
+
+    expect(disconnectSpy).toHaveBeenCalledOnce();
+    expect(cancelAnimationFrame).toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+  });
+});
+
 describe("HistoryAutoLoader", () => {
   beforeEach(() => {
     stickContext.scrollRef.current = null;
@@ -85,7 +262,11 @@ describe("HistoryAutoLoader", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("preserves the visible scroll offset after a scroll-up prepend", () => {
+  // Position across a prepend belongs to native scroll anchoring. These pin
+  // the loader to writing nothing: an imperative scrollTop write cancels
+  // in-flight momentum, so a page landing mid-flick used to yank the
+  // transcript out from under the reader.
+  it("leaves the scroll offset alone when a page prepends", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
     });
@@ -108,10 +289,10 @@ describe("HistoryAutoLoader", () => {
       });
     });
 
-    expect(metrics.scrollTop).toBe(104);
+    expect(metrics.scrollTop).toBe(24);
   });
 
-  it("preserves the offset after the user scrolls again during the request", () => {
+  it("leaves the offset alone when the user scrolls again during the request", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
     });
@@ -136,10 +317,10 @@ describe("HistoryAutoLoader", () => {
       });
     });
 
-    expect(metrics.scrollTop).toBe(800);
+    expect(metrics.scrollTop).toBe(0);
   });
 
-  it("anchors the latest user position across skeleton insertion and removal", () => {
+  it("leaves the offset alone across skeleton insertion and removal", () => {
     const scrollRoot = document.createElement("div");
     const metrics = { scrollTop: 500, scrollHeight: 1000 };
     setScrollMetrics(scrollRoot, metrics);
@@ -154,10 +335,10 @@ describe("HistoryAutoLoader", () => {
     render(<HistoryAutoLoader />);
     metrics.scrollTop = 499;
     fireEvent.scroll(scrollRoot);
-    expect(metrics.scrollTop).toBe(599);
+    expect(metrics.scrollTop).toBe(499);
 
-    // Preserve a scroll made while loading, then replace the 100px skeleton
-    // with a page that leaves the content 400px taller overall.
+    // Then replace the 100px skeleton with a page that leaves the content
+    // 400px taller overall — still not the loader's to compensate for.
     metrics.scrollTop = 20;
     fireEvent.scroll(scrollRoot);
     metrics.scrollHeight = 1500;
@@ -169,7 +350,7 @@ describe("HistoryAutoLoader", () => {
       });
     });
 
-    expect(metrics.scrollTop).toBe(420);
+    expect(metrics.scrollTop).toBe(20);
   });
 
   it("loads older history when the user scrolls near the top", () => {
@@ -184,6 +365,30 @@ describe("HistoryAutoLoader", () => {
     metrics.scrollTop = 499;
     fireEvent.scroll(scrollRoot);
 
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+  });
+
+  // The fetch fires viewports early so the page settles before the reader
+  // reaches offset 0, where the browser stops anchoring and a prepend would
+  // shift the transcript with nothing to absorb it.
+  it("scales the fetch threshold with the viewport", () => {
+    const loadMoreHistory = vi.fn(async () => {});
+    useChatStore.setState({ hasMoreHistory: true, loadMoreHistory, oldestItemId: "item_0" });
+    const scrollRoot = document.createElement("div");
+    const metrics = { scrollTop: 9000, scrollHeight: 20000, clientHeight: 2000 };
+    setScrollMetrics(scrollRoot, metrics);
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    // 2.5 viewports = 5000px. Still outside it on a tall pane.
+    metrics.scrollTop = 6000;
+    fireEvent.scroll(scrollRoot);
+    expect(loadMoreHistory).not.toHaveBeenCalled();
+
+    // Inside it — yet far enough from the top that a fixed 500px trigger
+    // would not have fired here at all.
+    metrics.scrollTop = 4000;
+    fireEvent.scroll(scrollRoot);
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
   });
 
@@ -210,7 +415,7 @@ describe("HistoryAutoLoader", () => {
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
   });
 
-  it("starts initial paging when the live scroll element becomes available after mount", () => {
+  it("does not page when the live scroll element arrives after mount", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
     });
@@ -233,7 +438,9 @@ describe("HistoryAutoLoader", () => {
 
     render(<DeferredScroller />);
 
-    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+    // The scroll element attaching is not a reader scrolling. Paging here
+    // made a freshly opened session keep fetching on its own.
+    expect(loadMoreHistory).not.toHaveBeenCalled();
   });
 
   it("keeps loading after reaching the top during an in-flight fetch", () => {
@@ -263,66 +470,125 @@ describe("HistoryAutoLoader", () => {
     expect(loadMoreHistory).toHaveBeenCalledTimes(2);
   });
 
-  it("loads to the second real user prompt even when the viewport already scrolls", () => {
+  it("never pages on load, even when the window holds a single prompt", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
     });
+    // One real prompt with older history behind it: the shape that used to
+    // make the open keep fetching until it found a second prompt, so the
+    // transcript grew and shifted seconds after the page had settled.
     useChatStore.setState({
       blocks: [userBlock("latest"), userBlock("system", "[System: task completed]")],
       hasMoreHistory: true,
+      oldestItemId: "item_9",
       loadMoreHistory,
     });
     const scrollRoot = document.createElement("div");
-    setScrollMetrics(scrollRoot, { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
+    // Parked well clear of the top threshold: nothing the reader did asks
+    // for older history.
+    setScrollMetrics(scrollRoot, { scrollTop: 2000, scrollHeight: 4000, clientHeight: 500 });
     stickContext.scrollRef.current = scrollRoot;
 
     render(<HistoryAutoLoader />);
-    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
-    expect(useChatStore.getState().loadingMoreHistory).toBe(true);
 
-    act(() => {
-      useChatStore.setState({
-        blocks: [userBlock("previous"), userBlock("latest")],
-        loadingMoreHistory: false,
-        oldestItemId: "item_1",
-      });
-    });
-
-    expect(useChatStore.getState().loadingMoreHistory).toBe(false);
-    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+    expect(loadMoreHistory).not.toHaveBeenCalled();
   });
 
-  it("caps the prompt search at the page cap", () => {
+  it("does not page when the open scrolls the pane to the bottom", () => {
     const loadMoreHistory = vi.fn(async () => {
       useChatStore.setState({ loadingMoreHistory: true });
     });
     useChatStore.setState({
       blocks: [userBlock("latest")],
       hasMoreHistory: true,
+      oldestItemId: "item_9",
       loadMoreHistory,
     });
-
     const scrollRoot = document.createElement("div");
-    setScrollMetrics(scrollRoot, { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
+    // A transcript barely taller than the pane: wherever it settles is inside
+    // the fetch threshold, so "near the top" is trivially true. Opening still
+    // must not fetch — the scroll below is the open's own scroll-to-bottom.
+    const metrics = { scrollTop: 0, scrollHeight: 900, clientHeight: 800 };
+    setScrollMetrics(scrollRoot, metrics);
     stickContext.scrollRef.current = scrollRoot;
 
     render(<HistoryAutoLoader />);
+    metrics.scrollTop = 100; // downward: stick-to-bottom settling the view
+    fireEvent.scroll(scrollRoot);
+
+    expect(loadMoreHistory).not.toHaveBeenCalled();
+
+    // The reader then scrolls up, which IS a request for older history.
+    metrics.scrollTop = 40;
+    fireEvent.scroll(scrollRoot);
+
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+  });
 
-    // The newest page counts as page one. Settle older pages without finding a
-    // second prompt; the semantic search must stop at the cap — reachability is
-    // no longer this loop's job (the spacer keeps the pane scrollable).
-    for (let page = 2; page <= MAX_INITIAL_PAGES; page++) {
-      act(() => {
-        useChatStore.setState({
-          loadingMoreHistory: false,
-          oldestItemId: `item_${page + 1}`,
-        });
-      });
-    }
+  it("pages on a wheel-up even when the pane has no scroll range", () => {
+    const loadMoreHistory = vi.fn(async () => {});
+    useChatStore.setState({
+      blocks: [userBlock("latest")],
+      hasMoreHistory: true,
+      oldestItemId: "item_9",
+      loadMoreHistory,
+    });
+    const scrollRoot = document.createElement("div");
+    // Transcript shorter than the window: scrollTop can never change, so a
+    // movement-only rule would strand older history behind a gesture the pane
+    // is physically unable to report.
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 900 });
+    stickContext.scrollRef.current = scrollRoot;
 
-    // MAX_INITIAL_PAGES total fetches: the initial page plus (cap − 1) more.
-    expect(loadMoreHistory).toHaveBeenCalledTimes(MAX_INITIAL_PAGES - 1);
+    render(<HistoryAutoLoader />);
+    expect(loadMoreHistory).not.toHaveBeenCalled();
+
+    fireEvent.wheel(scrollRoot, { deltaY: -120 });
+
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a wheel-down, which is not a request for older history", () => {
+    const loadMoreHistory = vi.fn(async () => {});
+    useChatStore.setState({
+      blocks: [userBlock("latest")],
+      hasMoreHistory: true,
+      oldestItemId: "item_9",
+      loadMoreHistory,
+    });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 900 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    fireEvent.wheel(scrollRoot, { deltaY: 120 });
+
+    expect(loadMoreHistory).not.toHaveBeenCalled();
+  });
+
+  it("does not cascade after a page settles while parked away from the top", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({
+      blocks: [userBlock("latest")],
+      hasMoreHistory: true,
+      oldestItemId: "item_9",
+      loadMoreHistory,
+    });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 2000, scrollHeight: 4000, clientHeight: 500 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+
+    // A prepend landing (new cursor) is not a reason to fetch again on its
+    // own — that self-feeding loop is what made one page turn into many.
+    act(() => {
+      useChatStore.setState({ loadingMoreHistory: false, oldestItemId: "item_1" });
+    });
+
+    expect(loadMoreHistory).not.toHaveBeenCalled();
   });
 
   it("does not page a short window for viewport fill (the spacer handles reachability)", () => {
@@ -354,6 +620,109 @@ describe("HistoryAutoLoader", () => {
 
     expect(loadMoreHistory).not.toHaveBeenCalled();
   });
+
+  it("bounds the prepend-fed chain from a single touch drag", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_50", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    // Folded tool-heavy transcript: one short screen, no scroll range, parked
+    // under the load threshold. Height-neutral prepends keep it that way.
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    expect(loadMoreHistory).not.toHaveBeenCalled();
+
+    // One small downward finger drag — "peek at what's above".
+    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
+    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 360 }] });
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+
+    // Each settled page moves the cursor without adding height. The chain may
+    // follow for a bounded number of pages, then must wait for a new gesture
+    // instead of paging in the entire transcript.
+    let settled = 49;
+    while (loadMoreHistory.mock.calls.length < 8 && settled > 0) {
+      const before = loadMoreHistory.mock.calls.length;
+      act(() => {
+        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${settled}` });
+      });
+      settled -= 1;
+      if (loadMoreHistory.mock.calls.length === before) break;
+    }
+
+    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+
+  it("holds the bound when pages settle mid-drag between touchmoves", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_50", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
+
+    // A sustained drag on a fast connection: pages settle while the finger is
+    // still moving, so every settle is followed by another touchmove from the
+    // SAME gesture. Those mid-drag touchmoves must not refill the budget.
+    let settled = 49;
+    let fingerY = 320;
+    let stalled = 0;
+    while (stalled < 2 && settled > 0) {
+      const before = loadMoreHistory.mock.calls.length;
+      fireEvent.touchMove(scrollRoot, { touches: [{ clientY: fingerY }] });
+      fingerY += 10;
+      act(() => {
+        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${settled}` });
+      });
+      settled -= 1;
+      if (loadMoreHistory.mock.calls.length === before) stalled += 1;
+      else stalled = 0;
+    }
+
+    expect(loadMoreHistory.mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(loadMoreHistory.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+
+  it("re-grants the chain budget on the reader's next gesture", () => {
+    const loadMoreHistory = vi.fn(async () => {
+      useChatStore.setState({ loadingMoreHistory: true });
+    });
+    useChatStore.setState({ hasMoreHistory: true, oldestItemId: "item_50", loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 400, clientHeight: 800 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader />);
+    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
+    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 360 }] });
+
+    // Exhaust the first gesture's budget with height-neutral prepends.
+    let settled = 49;
+    let stalled = 0;
+    while (stalled < 1 && settled > 0) {
+      const before = loadMoreHistory.mock.calls.length;
+      act(() => {
+        useChatStore.setState({ loadingMoreHistory: false, oldestItemId: `item_${settled}` });
+      });
+      settled -= 1;
+      if (loadMoreHistory.mock.calls.length === before) stalled += 1;
+    }
+    const afterFirstGesture = loadMoreHistory.mock.calls.length;
+
+    // The chain stopped, but older history is not stranded: the next drag
+    // asks again and pages resume.
+    fireEvent.touchStart(scrollRoot, { touches: [{ clientY: 300 }] });
+    fireEvent.touchMove(scrollRoot, { touches: [{ clientY: 360 }] });
+
+    expect(loadMoreHistory.mock.calls.length).toBe(afterFirstGesture + 1);
+  });
 });
 
 describe("LatestTurnSpacer", () => {
@@ -368,11 +737,11 @@ describe("LatestTurnSpacer", () => {
     vi.unstubAllGlobals();
   });
 
-  function rect(top: number): DOMRect {
+  function rect(top: number, bottom = top): DOMRect {
     return {
       top,
-      bottom: top,
-      height: 0,
+      bottom,
+      height: bottom - top,
       left: 0,
       right: 0,
       width: 0,
@@ -396,6 +765,8 @@ describe("LatestTurnSpacer", () => {
     anchorTop: number;
     spacerTop: number;
     anchor: "user" | "text" | "none";
+    /** Bottom edge of the content column, when its trailing padding matters. */
+    contentBottom?: number;
   }): number {
     const holder: { cb: (() => void) | null } = { cb: null };
     class StubResizeObserver {
@@ -416,22 +787,34 @@ describe("LatestTurnSpacer", () => {
     });
     stickContext.scrollRef.current = scrollRoot;
 
-    if (opts.anchor !== "none") {
+    if (opts.anchor === "user") {
       const anchor = document.createElement("div");
-      if (opts.anchor === "user") {
-        anchor.dataset.role = "user";
-        anchor.dataset.userMessageId = "initial-user";
-        useChatStore.setState({ blocks: [userBlock("initial-user")] });
-      } else {
-        anchor.dataset.testid = "assistant-text-section";
-      }
+      anchor.dataset.role = "user";
+      anchor.dataset.userMessageId = "initial-user";
+      useChatStore.setState({ blocks: [userBlock("initial-user")] });
       vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(rect(opts.anchorTop));
       scrollRoot.append(anchor);
+    } else if (opts.anchor === "text") {
+      // The assistant text section is nested inside its bubble, which carries
+      // the stable id the spacer captures and re-resolves by.
+      const bubble = document.createElement("div");
+      bubble.dataset.role = "assistant";
+      bubble.dataset.responseStableId = "resp-1";
+      const anchor = document.createElement("div");
+      anchor.dataset.testid = "assistant-text-section";
+      vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(rect(opts.anchorTop));
+      bubble.append(anchor);
+      scrollRoot.append(bubble);
     }
 
     const { container } = render(<LatestTurnSpacer />);
     const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
     vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(opts.spacerTop));
+    if (opts.contentBottom !== undefined) {
+      vi.spyOn(spacer.parentElement!, "getBoundingClientRect").mockReturnValue(
+        rect(0, opts.contentBottom),
+      );
+    }
     // Re-measure now that the rects are pinned (mount ran against jsdom's 0s).
     act(() => holder.cb?.());
 
@@ -446,7 +829,7 @@ describe("LatestTurnSpacer", () => {
     vi.stubGlobal("ResizeObserver", StubResizeObserver);
 
     const scrollRoot = document.createElement("div");
-    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 500 });
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
     stickContext.scrollRef.current = scrollRoot;
 
     const anchor = document.createElement("div");
@@ -458,7 +841,7 @@ describe("LatestTurnSpacer", () => {
     vi.spyOn(HTMLDivElement.prototype, "getBoundingClientRect").mockImplementation(function (
       this: HTMLDivElement,
     ) {
-      return this.getAttribute("aria-hidden") !== null ? rect(100) : rect(0);
+      return this.getAttribute("aria-hidden") !== null ? rect(400) : rect(0);
     });
 
     const onRender = vi.fn();
@@ -469,14 +852,54 @@ describe("LatestTurnSpacer", () => {
     );
 
     const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
-    expect(spacer.style.height).toBe("304px");
+    expect(spacer.style.height).toBe("104px");
     expect(onRender).toHaveBeenCalledTimes(1);
   });
 
-  it("pads a short reply so the anchor prompt pins to the top", () => {
-    // anchor→end = 100px content, viewport 500 → spacer = 500 − 100 − 96 = 304.
-    expect(measureSpacer({ clientHeight: 500, anchorTop: 0, spacerTop: 100, anchor: "user" })).toBe(
-      304,
+  it("pads a reply that falls short of the viewport so the anchor pins near the top", () => {
+    // anchor→end = 400px, viewport 600 → 600 − 400 − 96 = 104, under the
+    // 200px cap, so the pin-to-top formula is what this measures.
+    expect(measureSpacer({ clientHeight: 600, anchorTop: 0, spacerTop: 400, anchor: "user" })).toBe(
+      104,
+    );
+  });
+
+  it("leaves the column's trailing padding out of the reservation", () => {
+    // The padding below the spacer scrolls with the content: reserving it
+    // again would leave the document 24px taller than the viewport — a
+    // phantom scroll range that paints a scrollbar thumb over a transcript
+    // that fully fits. 600 − 400 − 96 − 24 = 80, not 104.
+    expect(
+      measureSpacer({
+        clientHeight: 600,
+        anchorTop: 0,
+        spacerTop: 400,
+        anchor: "user",
+        contentBottom: 424,
+      }),
+    ).toBe(80);
+  });
+
+  it("clamps to zero when the trailing padding alone would overdraw the viewport", () => {
+    // Reply nearly fills the viewport: 600 − 490 − 96 = 14 raw, minus 24px of
+    // trailing padding goes negative — the spacer must not go below 0.
+    expect(
+      measureSpacer({
+        clientHeight: 600,
+        anchorTop: 0,
+        spacerTop: 490,
+        anchor: "user",
+        contentBottom: 514,
+      }),
+    ).toBe(0);
+  });
+
+  it("caps the reserved space so a short turn does not blank most of the viewport", () => {
+    // anchor→end = 100px, viewport 600 → the raw pin formula wants
+    // 600 − 100 − 96 = 404px of blank (two thirds of the screen). The cap
+    // holds it to a third, so earlier turns stay on screen.
+    expect(measureSpacer({ clientHeight: 600, anchorTop: 0, spacerTop: 100, anchor: "user" })).toBe(
+      200,
     );
   });
 
@@ -489,9 +912,9 @@ describe("LatestTurnSpacer", () => {
   });
 
   it("anchors to the last assistant text when no user prompt is present", () => {
-    // 500 − 50 − 96 = 354.
-    expect(measureSpacer({ clientHeight: 500, anchorTop: 0, spacerTop: 50, anchor: "text" })).toBe(
-      354,
+    // 600 − 400 − 96 = 104 (under the cap, so anchor choice is what's measured).
+    expect(measureSpacer({ clientHeight: 600, anchorTop: 0, spacerTop: 400, anchor: "text" })).toBe(
+      104,
     );
   });
 
@@ -513,7 +936,7 @@ describe("LatestTurnSpacer", () => {
     vi.stubGlobal("ResizeObserver", StubResizeObserver);
 
     const scrollRoot = document.createElement("div");
-    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 500 });
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
     stickContext.scrollRef.current = scrollRoot;
 
     const initial = document.createElement("div");
@@ -531,9 +954,11 @@ describe("LatestTurnSpacer", () => {
     useChatStore.setState({ blocks: [userBlock("initial-user")] });
     const { container } = render(<LatestTurnSpacer />);
     const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
-    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(200));
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(400));
     act(() => holder.cb?.());
-    expect(spacer.style.height).toBe("204px");
+    // Measured from the initial prompt: 600 − 400 − 96 = 104. Retargeting to
+    // the promoted prompt would give 600 − 250 − 96 = 254 → capped to 200.
+    expect(spacer.style.height).toBe("104px");
 
     // The consumed event moves the pending prompt into committed blocks. The
     // spacer still measures from the initial prompt instead of retargeting.
@@ -541,7 +966,7 @@ describe("LatestTurnSpacer", () => {
       useChatStore.setState({ blocks: [userBlock("initial-user"), userBlock("pending-user")] });
       holder.cb?.();
     });
-    expect(spacer.style.height).toBe("204px");
+    expect(spacer.style.height).toBe("104px");
   });
 
   it("does not create an anchor after an initially empty conversation's first prompt commits", () => {
@@ -575,6 +1000,203 @@ describe("LatestTurnSpacer", () => {
     });
     expect(spacer.style.display).toBe("none");
     expect(spacer.style.height || "0px").toBe("0px");
+  });
+
+  it("holds its height while the anchor is windowed out, then re-resolves the remounted node", () => {
+    // WHY: the transcript is virtualized, so the anchor's DOM node is destroyed
+    // when it scrolls out of the window and a *fresh* node with the same id
+    // mounts when it returns. The spacer must resolve the anchor by id, not by a
+    // captured node reference — a held reference would stay detached forever and
+    // freeze the reservation.
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    const makeAnchor = (top: number) => {
+      const el = document.createElement("div");
+      el.dataset.role = "user";
+      el.dataset.userMessageId = "initial-user";
+      vi.spyOn(el, "getBoundingClientRect").mockReturnValue(rect(top));
+      return el;
+    };
+    const first = makeAnchor(0);
+    scrollRoot.append(first);
+    useChatStore.setState({ blocks: [userBlock("initial-user")] });
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(400));
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("104px"); // 600 − 400 − 96
+
+    // Windowed out: the row unmounts. The captured height must hold.
+    first.remove();
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("104px");
+
+    // Windowed back in as a *new* node with the same id, at a different offset
+    // (anchor at 50 → 600 − (400 − 50) − 96 = 154). A stale node reference would
+    // still read the removed node; id re-resolution picks up the fresh node.
+    const remounted = makeAnchor(50);
+    scrollRoot.append(remounted);
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("154px");
+  });
+
+  it("does not retarget the assistant-text anchor to a different mounted turn", () => {
+    // WHY: with no committed user anchor the spacer pins the LAST assistant
+    // response by its stable id. Once that response is windowed out while an
+    // EARLIER assistant text is still mounted, a "last mounted text" resolution
+    // would silently re-anchor to the wrong turn and change the reservation.
+    // Binding to the stable id holds the last good height instead.
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    const makeAssistant = (stableId: string, top: number) => {
+      const bubble = document.createElement("div");
+      bubble.dataset.role = "assistant";
+      bubble.dataset.responseStableId = stableId;
+      const text = document.createElement("div");
+      text.dataset.testid = "assistant-text-section";
+      vi.spyOn(text, "getBoundingClientRect").mockReturnValue(rect(top));
+      bubble.append(text);
+      return bubble;
+    };
+    // Two assistant turns mounted; the LAST (resp-2, at 150) is the anchor.
+    const earlier = makeAssistant("resp-1", 50);
+    const last = makeAssistant("resp-2", 150);
+    scrollRoot.append(earlier, last);
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(500));
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("154px"); // 600 − (500 − 150) − 96, anchored to resp-2
+
+    // resp-2 windows out; only the earlier turn (resp-1) stays mounted. A
+    // "last mounted text" resolution would retarget to resp-1 (→ 600 − (500 −
+    // 50) − 96 = 4); binding to the stable id holds the last good height.
+    last.remove();
+    act(() => holder.cb?.());
+    expect(spacer.style.height).toBe("154px");
+  });
+
+  it("retries capture across frames until the windowed anchor row mounts", () => {
+    // WHY: the anchor row can be absent for the first frame(s) on a cold load of
+    // a windowed transcript (the scroll element is published before the
+    // virtualizer fills its window). Capture must retry rather than depend on a
+    // resize that need not fire — the wrapper height is estimate-fixed.
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    // Drive requestAnimationFrame callbacks manually.
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      frames.push(cb);
+      return frames.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
+    stickContext.scrollRef.current = scrollRoot;
+    // Committed anchor exists in the store, but its row hasn't mounted yet.
+    useChatStore.setState({ blocks: [userBlock("initial-user")] });
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(400));
+    // Mount + manual measure both find no anchor node → a retry is scheduled and
+    // no height is set yet.
+    act(() => holder.cb?.());
+    expect(spacer.style.height || "0px").toBe("0px");
+    expect(frames.length).toBeGreaterThan(0);
+
+    // Synchronous layout/observer measurements can fire repeatedly before the
+    // browser advances a frame. They must not consume the frame retry budget.
+    for (let i = 0; i < 12; i += 1) {
+      act(() => holder.cb?.());
+    }
+
+    // The row mounts; the next scheduled frame fires and capture succeeds.
+    const anchor = document.createElement("div");
+    anchor.dataset.role = "user";
+    anchor.dataset.userMessageId = "initial-user";
+    vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(rect(0));
+    scrollRoot.append(anchor);
+    act(() => frames.shift()?.(0));
+    expect(spacer.style.height).toBe("104px"); // 600 − 400 − 96
+  });
+
+  it("settles a never-anchoring turn to display:none after the retry budget", () => {
+    // WHY: a tool-only trailing turn (committed non-user block, no user anchor
+    // and no assistant-text section) must not retry forever — capture settles to
+    // no-anchor (display:none) once the budget is spent, matching the pre-
+    // windowing behaviour.
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      frames.push(cb);
+      return frames.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 0, clientHeight: 600 });
+    stickContext.scrollRef.current = scrollRoot;
+    // A committed block that is NOT a user message and never renders an anchor.
+    useChatStore.setState({
+      blocks: [{ type: "reasoning", ctx: { itemId: "r1" }, text: "…" }] as never,
+    });
+
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(400));
+
+    // Drain the retry budget; the anchor never mounts. Bounded, so it stops.
+    act(() => holder.cb?.());
+    let guard = 0;
+    while (frames.length > 0 && guard < 50) {
+      guard += 1;
+      act(() => frames.shift()?.(0));
+    }
+    expect(guard).toBeLessThan(50); // did not retry forever
+    expect(spacer.style.display).toBe("none");
   });
 });
 
@@ -694,6 +1316,26 @@ describe("JumpToTopButton", () => {
     // Scrolling down (scrollTop increases) must not surface the pill.
     act(() => {
       metrics.scrollTop = 600;
+      fireEvent.scroll(scroll);
+    });
+    expect(pill().className).toContain("pointer-events-none");
+  });
+
+  it("does not mistake bottom re-anchoring for an upward scroll", () => {
+    const metrics = {
+      scrollTop: 600,
+      scrollHeight: 1000,
+      clientHeight: 400,
+    };
+    const { container, scroll, scroller } = makeScroller(metrics);
+
+    render(<JumpToTopButton containerEl={container} scroller={scroller} hasMoreHistory={true} />);
+
+    // Removing transient content can reduce both scrollHeight and scrollTop
+    // while the viewport remains pinned to the bottom.
+    act(() => {
+      metrics.scrollHeight = 800;
+      metrics.scrollTop = 400;
       fireEvent.scroll(scroll);
     });
     expect(pill().className).toContain("pointer-events-none");

@@ -9,6 +9,12 @@ which hosts are live *here*.
 Simpler than :class:`TunnelRegistry` because the host tunnel
 carries only control frames (launch/stop runner), not HTTP
 request/response traffic. No per-request reassembly queues needed.
+
+The registry also holds what connected hosts *report* about themselves and
+nothing persists — today the per-family gateway-inference map (see
+:mod:`omnigent.gateway_inference`) and interactive-shell inventory. They are
+delivered on the connect handshake, so a replica that has never seen a host
+simply knows nothing about them until the host reconnects and re-reports.
 """
 
 from __future__ import annotations
@@ -17,11 +23,13 @@ import asyncio
 import logging
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from cachetools import TTLCache
 
+from omnigent._platform import normalize_interactive_shells
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
 from omnigent.host.frames import HostHelloFrame
 
@@ -224,8 +232,8 @@ class HostConnection:
     :param pending_installs: Per-``request_id`` futures for in-flight
         ``host.install_harness`` requests. Resolved when the host sends
         ``host.install_harness_result``. Values carry the result fields
-        (``status``, ``configured_harnesses``, ``error``). Same ``Any``
-        typing rationale as ``pending_stats``.
+        (``status``, ``configured_harnesses``, ``gateway_inference``,
+        ``error``). Same ``Any`` typing rationale as ``pending_stats``.
     :param inflight_installs: Install tasks used to coalesce concurrent
         install requests for the same harness family (a double-click, or
         two spellings of one npm package) onto one in-flight install, so
@@ -235,8 +243,9 @@ class HostConnection:
     :param pending_secret_writes: Per-``request_id`` futures for in-flight
         ``host.store_secret`` requests (a UI-driven harness credential write).
         Resolved when the host sends ``host.store_secret_result``. Values carry
-        the result fields (``status``, ``configured_harnesses``, ``error``) —
-        never the secret. Same ``Any`` typing rationale as ``pending_stats``.
+        the result fields (``status``, ``configured_harnesses``,
+        ``gateway_inference``, ``error``) — never the secret. Same ``Any``
+        typing rationale as ``pending_stats``.
     :param credential_write_lock: Serializes credential writes to this host so
         two overlapping requests (a double-click, or key + gateway in quick
         succession) can't interleave the daemon's non-atomic
@@ -306,6 +315,12 @@ class HostConnection:
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    # Import streams one session per frame, so the tunnel pushes each onto a
+    # per-request queue the /imports/local handler drains (vs a single future).
+    # Each item is a ("session", dict) or ("done", dict) tuple.
+    pending_import_local: dict[str, asyncio.Queue[tuple[str, dict[str, Any]]]] = field(
+        default_factory=dict,
+    )
 
 
 class HostRegistry:
@@ -322,6 +337,14 @@ class HostRegistry:
         # Keyed by (workspace_id, host_id) to mirror the hosts-table PK:
         # one stable host_id can be live in more than one workspace.
         self._hosts: dict[tuple[int, str], HostConnection] = {}
+        # Last gateway-inference map each host reported, keyed by canonical
+        # host_id alone: the map describes the machine's local config, so the
+        # same machine connected to two workspaces reports the same answer.
+        # Kept across a host disconnect (a tunnel flap shouldn't blank a known
+        # answer) and lost with the process, which is the point — a restarted
+        # server re-learns it from the reconnect handshake.
+        self._gateway_inference: dict[str, dict[str, bool]] = {}
+        self._interactive_shells: dict[str, list[str]] = {}
 
     def register(
         self,
@@ -380,6 +403,12 @@ class HostRegistry:
                 )
                 old.outbound_queue.put_nowait(None)
             self._hosts[key] = conn
+            if hello.interactive_shells is not None:
+                self._interactive_shells[host_id] = normalize_interactive_shells(
+                    hello.interactive_shells
+                )
+            else:
+                self._interactive_shells.pop(host_id, None)
         return conn
 
     def deregister(
@@ -484,6 +513,48 @@ class HostRegistry:
         if conn is None:
             return None
         return conn.hello.installation_id
+
+    def record_gateway_inference(
+        self,
+        host_id: str,
+        gateway_inference: Mapping[str, bool] | None,
+    ) -> None:
+        """Store the gateway-inference map a host just reported.
+
+        Called for every frame that carries the map — the connect handshake and
+        each readiness refresh — so the server's view is delivered rather than
+        persisted. ``None`` (a host that cannot evaluate the map at all) clears
+        the entry back to unknown instead of recording "nothing is backed".
+
+        :param host_id: Host identifier, in any accepted spelling (see
+            :func:`_canonical_host_id`).
+        :param gateway_inference: Harness spelling → gateway-backed flag, e.g.
+            ``{"claude-native": True, "codex": False}``, or ``None``.
+        """
+        key = _canonical_host_id(host_id)
+        with self._lock:
+            if gateway_inference is None:
+                self._gateway_inference.pop(key, None)
+            else:
+                self._gateway_inference[key] = dict(gateway_inference)
+
+    def gateway_inference(self, host_id: str) -> dict[str, bool] | None:
+        """Return the gateway-inference map *host_id* last reported here.
+
+        :param host_id: Host identifier, in any accepted spelling.
+        :returns: A copy of the reported map, or ``None`` when this replica has
+            never had a report from the host — unknown, which readers treat as
+            gateway-backed rather than unavailable.
+        """
+        with self._lock:
+            reported = self._gateway_inference.get(_canonical_host_id(host_id))
+        return dict(reported) if reported is not None else None
+
+    def interactive_shells(self, host_id: str) -> list[str] | None:
+        """Return the ordered shell inventory last reported by *host_id*."""
+        with self._lock:
+            reported = self._interactive_shells.get(_canonical_host_id(host_id))
+        return list(reported) if reported is not None else None
 
     def send_text(self, conn: HostConnection, data: str) -> None:
         """Enqueue a text frame for sending to the host.
