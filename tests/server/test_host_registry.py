@@ -73,6 +73,29 @@ def test_register_and_get() -> None:
     assert fetched.hello.name == "test-host"
 
 
+def test_interactive_shells_survive_disconnect() -> None:
+    """A runner can outlive its host tunnel without losing the shell snapshot."""
+    registry = HostRegistry()
+    hello = _make_hello()
+    hello.interactive_shells = ["zsh", "invalid", "zsh", "bash"]
+    registry.register("host_shells", FakeWebSocket(), hello, owner="alice")
+    registry.deregister("host_shells")
+
+    assert registry.interactive_shells("host_shells") == ["zsh", "bash"]
+
+
+def test_reconnect_without_shell_inventory_clears_snapshot() -> None:
+    """An older reconnecting host cannot retain a newer host's inventory."""
+    registry = HostRegistry()
+    hello = _make_hello()
+    hello.interactive_shells = ["zsh", "bash"]
+    registry.register("host_shells", FakeWebSocket(), hello, owner="alice")
+
+    registry.register("host_shells", FakeWebSocket(), _make_hello(), owner="alice")
+
+    assert registry.interactive_shells("host_shells") is None
+
+
 def test_deregister() -> None:
     """
     Verify that deregister removes the host from the registry.
@@ -411,6 +434,53 @@ def test_exit_reports_get_is_unscoped() -> None:
     assert reports.get("runner_abc") == "runner process exited with code 1"
     # Missing runner still reads None (snapshot then leaves last_task_error unset).
     assert reports.get("runner_unknown") is None
+
+
+def test_gateway_inference_is_reported_not_persisted() -> None:
+    """The map a host reports is held per host id and survives a tunnel flap.
+
+    Nothing about gateway backing reaches the database, so the registry is the
+    only place a routing decision can read it. A host that disconnects keeps its
+    last report (a flap must not blank a known answer); a fresh registry — a
+    restarted server — knows nothing until the host reconnects and re-reports.
+    """
+    bare = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+    registry = HostRegistry()
+    assert registry.gateway_inference(bare) is None
+
+    registry.register(bare, FakeWebSocket(), _make_hello(), owner="alice")
+    registry.record_gateway_inference(bare, {"claude-native": True, "codex": False})
+    assert registry.gateway_inference(bare) == {"claude-native": True, "codex": False}
+    # Any accepted spelling of the id reads the same entry.
+    assert registry.gateway_inference(f"host_{bare}") == {
+        "claude-native": True,
+        "codex": False,
+    }
+
+    registry.deregister(bare)
+    assert registry.gateway_inference(bare) == {"claude-native": True, "codex": False}
+
+    # A host that cannot evaluate the map at all reports None, which is unknown
+    # — not "nothing is gateway-backed".
+    registry.record_gateway_inference(bare, None)
+    assert registry.gateway_inference(bare) is None
+
+    assert HostRegistry().gateway_inference(bare) is None
+
+
+def test_gateway_inference_returns_a_copy() -> None:
+    """A caller mutating the returned map cannot corrupt the registry's copy."""
+    bare = "11223344556677889900aabbccddeeff"
+    registry = HostRegistry()
+    reported = {"codex": True}
+    registry.record_gateway_inference(bare, reported)
+
+    reported["codex"] = False
+    read = registry.gateway_inference(bare)
+    assert read == {"codex": True}
+    assert read is not None
+    read["codex"] = False
+    assert registry.gateway_inference(bare) == {"codex": True}
 
 
 def test_legacy_prefixed_id_resolves_to_bare_registration() -> None:

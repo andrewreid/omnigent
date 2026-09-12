@@ -218,7 +218,7 @@ export function MembersPage() {
       {users !== null && users.length > 0 && (
         <div className="overflow-hidden rounded-md border border-border">
           <table className="w-full text-ui">
-            <thead className="bg-muted/40 text-left text-xs uppercase text-muted-foreground">
+            <thead className="bg-muted/40 text-left text-sm uppercase text-muted-foreground">
               <tr>
                 <th className="px-3 py-2 font-medium">Username</th>
                 <th className="px-3 py-2 font-medium">Role</th>
@@ -232,7 +232,7 @@ export function MembersPage() {
                   <td className="px-3 py-2 align-middle">
                     <span className="font-medium">{u.id}</span>
                     {u.id === meId && (
-                      <span className="ml-2 text-xs text-muted-foreground">(you)</span>
+                      <span className="ml-2 text-sm text-muted-foreground">(you)</span>
                     )}
                     {!u.has_password && (
                       <Badge variant="outline" className="ml-2">
@@ -329,8 +329,8 @@ export function MembersPage() {
             >
               Cancel
             </Button>
-            <Button onClick={() => void onCreateInvite()} disabled={pendingAction}>
-              {pendingAction ? "Creating…" : "Create invite"}
+            <Button onClick={() => void onCreateInvite()} loading={pendingAction}>
+              Create invite
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -419,9 +419,9 @@ export function MembersPage() {
             <Button
               variant="destructive"
               onClick={() => void onConfirmDelete()}
-              disabled={pendingAction}
+              loading={pendingAction}
             >
-              {pendingAction ? "Removing…" : "Remove"}
+              Remove
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -453,7 +453,7 @@ function CopyableValue({ value }: { value: string }) {
       <Input
         value={value}
         readOnly
-        className="font-mono text-xs"
+        className="font-mono text-sm"
         onFocus={(e) => e.currentTarget.select()}
       />
       <Button variant="outline" size="sm" onClick={() => void onCopy()} aria-label="Copy">
