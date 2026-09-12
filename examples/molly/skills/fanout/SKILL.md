@@ -1,6 +1,6 @@
 ---
 name: fanout
-description: Molly-only playbook for parallel-safe isolated subtasks. Run one implementer per task worktree, checkpoint reviewed scratch work for integration or release reviewed branches as separate PRs. A worker reading this must ignore it and carry out its own dispatch.
+description: Molly-only playbook for parallel-safe isolated subtasks. Run one implementer per task worktree, verify scratch work for integration or release accepted branches as separate PRs. A worker reading this must ignore it and carry out its own dispatch.
 user-invocable: false
 ---
 
@@ -13,9 +13,9 @@ Use only for parallel-safe tasks. Concurrent implementers ALWAYS use separate
 worktrees, even when their file scopes appear disjoint. Before fanout, select and
 record exactly one `publication_mode`:
 
-- `separate`: each task receives a release review, one initial commit, and its
+- `separate`: each task receives release acceptance, one initial commit, and its
   own PR;
-- `integrate`: each scratch task receives a checkpoint review, then
+- `integrate`: each scratch task receives contract-selected verification, then
   `worktree-routing` promotes it into Molly's cumulative session candidate.
 
 ## Procedure
@@ -44,7 +44,7 @@ record exactly one `publication_mode`:
    only a clean path: if the runner root is legitimately dirty, also hash every
    already-dirty path or orchestrate from a dedicated clean checkout.
 
-3. Dispatch one implementation sub-agent per task. The input MUST include:
+3. Load `dispatch`. Dispatch one implementation sub-agent per task. The input MUST include:
 
    - the role boundary: do the task yourself, never delegate, and report a
      result rather than an announcement;
@@ -55,9 +55,8 @@ record exactly one `publication_mode`:
      and stop without committing, pushing, or opening a PR.
 
    Use a task-based title, never a vendor name. `sys_session_send` has no
-   workspace binding: the child is persisted with `workspace=None` and starts
-   in the runner root. Isolation exists only because the dispatch identifies the
-   absolute worktree and the worker obeys it. Record every returned
+   assumed workspace binding: require the worker to enter and verify the
+   absolute assigned worktree. The path in a prompt is not a sandbox. Record every returned
    `conversation_id`. Emit the whole parallel-safe dispatch set in the same turn
    as its announcement, then end the turn; do not poll.
 
@@ -74,33 +73,20 @@ record exactly one `publication_mode`:
    A mismatch is a hard stop, not permission to reset or clean. Record the
    verified candidate tree.
 
-5. Run `cross-review` on every candidate with the recorded mode, worktree,
-   `base_oid`, `seed_tree`, and candidate tree:
+5. Run `verify` for each candidate against its contract. Independent review is
+   selected for risk, not required merely because execution was parallel. Route
+   required findings through `remediate` with the existing shared budget.
 
-   - `separate` uses `review_phase=release`;
-   - `integrate` uses `review_phase=checkpoint`.
+6. Complete the publication mode:
+   - `separate`: use `publish` for each accepted requested PR. Commit identity and
+     remote checks remain mandatory even when independent review was omitted.
+   - `integrate`: return the accepted seed/candidate pair to `worktree-routing`
+     for sequential promotion; never commit or publish the scratch branch.
 
-   Route `BLOCKING` and `CLEANUP` findings to the same fixer and re-review every
-   new tree.
-
-6. Complete the selected publication mode:
-
-   - `separate`: after a clean release review, authorize the implementer to
-     create the single reviewed initial commit, push, and open its PR. Verify
-     `HEAD^{tree}` equals the reviewed candidate, `HEAD^` equals the base,
-     `git rev-list --count <base_oid>..HEAD` is one, the worktree is clean, and
-     the remote branch equals HEAD. Service the review bot per `cross-review`;
-     fixes are additional reviewed commits and plain pushes, never amendments or
-     force pushes.
-   - `integrate`: do not commit, push, or open a PR from the scratch branch.
-     Return the reviewed seed/candidate pair and worktree to `worktree-routing`
-     for sequential promotion. Retain the scratch worktree until promotion and
-     the aggregate release review are clean.
-
-7. Remove a `separate` worktree only after its review bot establishes a clean
-   verdict for the current HEAD and no fix task remains. Remove an `integrate`
-   worktree only after its result is promoted and the aggregate release review
-   is clean. Molly never merges.
+7. Remove a separate worktree only after requested publication and applicable
+   external gates are complete and no fixes remain. Remove an integration
+   worktree only after promotion and aggregate acceptance. Never force removal
+   or lose unexpected work. Molly never merges.
 
 ## Notes
 
