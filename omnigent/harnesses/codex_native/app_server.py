@@ -1073,6 +1073,21 @@ class CodexAppServerClient:
             raise RuntimeError("Codex app-server client is not connected")
         await self._ws.send(json.dumps({"id": request_id, "result": result}))
 
+    async def respond_error(self, request_id: int | str, message: str, code: int = -32000) -> None:
+        """
+        Send one JSON-RPC error for an app-server request.
+
+        :param request_id: JSON-RPC id from the Codex request.
+        :param message: Error message, e.g. ``"ChatGPT is not connected"``.
+        :param code: JSON-RPC error code.
+        :raises RuntimeError: If the app-server client is not connected.
+        """
+        if self._ws is None:
+            raise RuntimeError("Codex app-server client is not connected")
+        await self._ws.send(
+            json.dumps({"id": request_id, "error": {"code": code, "message": message}})
+        )
+
     async def iter_events(self) -> AsyncIterator[CodexMessage]:
         """
         Yield app-server notifications until the connection closes.
@@ -1841,6 +1856,9 @@ class CodexNativeAppServer:
     session_id: str | None = None
     stderr_capture_error_type: str | None = field(default=None, init=False)
     _stderr_diagnostics: CodexStderrDiagnostics | None = field(default=None, init=False)
+    #: Async cleanups for helpers that live as long as the app-server (e.g. the
+    #: brokered ChatGPT auth client); run first on :meth:`close`.
+    close_callbacks: list[Callable[[], Awaitable[None]]] = field(default_factory=list, init=False)
 
     async def start(self) -> None:
         """
@@ -2205,6 +2223,10 @@ class CodexNativeAppServer:
 
         :returns: None.
         """
+        callbacks, self.close_callbacks = self.close_callbacks, []
+        for callback in callbacks:
+            with contextlib.suppress(Exception):
+                await callback()
         if self.proc is not None and self.proc.returncode is None:
             _terminate_process_tree(self.proc)
             try:

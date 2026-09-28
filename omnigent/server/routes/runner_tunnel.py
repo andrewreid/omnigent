@@ -22,7 +22,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from ipaddress import ip_address
 from typing import TypedDict
 
-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Request, Response, WebSocket, WebSocketDisconnect
 
 from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
@@ -369,6 +369,32 @@ def create_runner_tunnel_router(
             "token": bearer,
             "expires_at": int(time.time()) + _MANAGED_RUNNER_TOKEN_TTL_S,
         }
+
+    @router.get("/runners/{runner_id}/credentials/{provider}")
+    async def runner_credential(
+        request: Request, response: Response, runner_id: str, provider: str
+    ) -> dict[str, object]:
+        """Vend the managed runner owner's *provider* credential to the runner.
+
+        The runner-side twin of ``GET /hosts/{id}/credentials/{provider}``: the
+        codex harness runs in the runner, which holds its tunnel binding token
+        but not the host's launch token. Same gate as the owner-token mint
+        (binding token bound to *runner_id*, owner from the managed launch
+        record), so only a server-managed runner resolves an owner. ``401``
+        otherwise; ``{"connected": false}`` when the owner hasn't linked it.
+        """
+        from omnigent.server.routes.host_credentials import vend_provider_credential
+
+        response.headers["Cache-Control"] = "no-store"
+        token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+        if not token or token_bound_runner_id(token) != runner_id:
+            raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
+        owner: str | None = None
+        if resolve_managed_runner_owner is not None:
+            owner = await asyncio.to_thread(resolve_managed_runner_owner, runner_id)
+        if owner is None:
+            raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
+        return await vend_provider_credential(request.app, provider, owner)
 
     @router.websocket("/runners/{runner_id}/tunnel")
     async def tunnel(ws: WebSocket, runner_id: str) -> None:

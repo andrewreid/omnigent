@@ -5196,6 +5196,20 @@ async def _auto_create_codex_terminal(
     app_server.listen_url = codex_ws_url
     await app_server.start()
     _AUTO_CODEX_APP_SERVERS[session_id] = app_server
+    if _codex_launch.login_required:
+        # In a managed sandbox, sign codex in with the owner's brokered ChatGPT
+        # subscription instead of parking the TUI on its sign-in screen. The
+        # token stays in memory; the auth client answers refreshes until close.
+        from omnigent.runner.brokered_credentials import start_brokered_chatgpt_auth
+
+        _chatgpt_auth = await start_brokered_chatgpt_auth(codex_ws_url)
+        if _chatgpt_auth is not None:
+            app_server.close_callbacks.append(_chatgpt_auth.close)
+            _codex_launch = dataclasses.replace(
+                _codex_launch,
+                login_required=False,
+                summary="ChatGPT subscription (brokered by Omnigent)",
+            )
 
     event_client = CodexAppServerClient(
         ws_url=codex_ws_url,

@@ -281,6 +281,12 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
         return HARNESS_BINARY_MISSING
     if not harness_cli_installed(OPENAI_FAMILY, timeout=READINESS_CLI_PROBE_TIMEOUT_S):
         return HARNESS_VERSION_TOO_LOW
+    from omnigent.host.claude_credential import CHATGPT_BROKERED_ENV_VAR
+
+    if os.environ.get(CHATGPT_BROKERED_ENV_VAR) == "1":
+        # Managed sandbox whose owner connected ChatGPT: the runner signs codex in
+        # from the credential broker at launch, so no local login is needed.
+        return None
     # On a host with no configured provider this may run ambient detection.
     # configured_harness_map shares one probe across all Codex aliases.
     defers_to_codex_config = False
