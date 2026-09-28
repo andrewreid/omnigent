@@ -118,6 +118,14 @@ import {
   type DatabricksConnectionStatus,
 } from "@/lib/databricksIntegration";
 import {
+  type ChatgptConnectionStatus,
+  type ChatgptDeviceStart,
+  disconnectChatgpt,
+  fetchChatgptStatus,
+  pollChatgptConnect,
+  startChatgptConnect,
+} from "@/lib/chatgptIntegration";
+import {
   type ClaudeConnectionStatus,
   disconnectClaude,
   fetchClaudeStatus,
@@ -1118,6 +1126,7 @@ const CONNECTION_PANELS: Record<string, ComponentType> = {
   github: GithubIntegrationControl,
   databricks: DatabricksIntegrationControl,
   claude: ClaudeIntegrationControl,
+  chatgpt: ChatgptIntegrationControl,
 };
 
 /**
@@ -1547,6 +1556,170 @@ function ClaudeIntegrationControl() {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Connect / disconnect a ChatGPT subscription with a device code: show the
+ * one-time code and a link, then poll until the user approves on OpenAI's site.
+ * The server keeps the refresh chain; sandboxes get short-lived access tokens.
+ */
+function ChatgptIntegrationControl() {
+  const [status, setStatus] = useState<ChatgptConnectionStatus | null | "loading">("loading");
+  const [busy, setBusy] = useState(false);
+  const [device, setDevice] = useState<ChatgptDeviceStart | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await fetchChatgptStatus());
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  // Poll while a device code is showing; stop on any terminal state or unmount.
+  useEffect(() => {
+    if (device === null) return;
+    let cancelled = false;
+    const timer = window.setInterval(
+      async () => {
+        const result = await pollChatgptConnect(device.handle);
+        if (cancelled || result.status === "pending") return;
+        window.clearInterval(timer);
+        setDevice(null);
+        if (result.status === "complete") {
+          setMessage(null);
+          await refresh();
+        } else if (result.status === "expired") {
+          setMessage("That code expired before it was approved. Start again.");
+        } else {
+          setMessage(result.detail ?? "The ChatGPT sign-in failed. Start again.");
+        }
+      },
+      Math.max(device.interval, 2) * 1000,
+    );
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [device, refresh]);
+
+  const onConnect = useCallback(async () => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      setDevice(await startChatgptConnect());
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "Couldn't start the ChatGPT sign-in.");
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  const onDisconnect = useCallback(async () => {
+    setBusy(true);
+    try {
+      await disconnectChatgpt();
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  if (status !== "loading" && status !== null && !status.enabled) {
+    return null;
+  }
+  if (status === "loading") {
+    return <p className="text-sm text-muted-foreground">Checking…</p>;
+  }
+  if (status === null) {
+    return <p className="text-sm text-muted-foreground">ChatGPT status is unavailable.</p>;
+  }
+
+  const description = status.needs_reconnect
+    ? "ChatGPT no longer accepts the saved sign-in. Disconnect, then connect again."
+    : status.connected
+      ? `Connected${status.email ? ` as ${status.email}` : ""}${status.plan_type ? ` (${status.plan_type})` : ""}. New sandboxes run Codex on your subscription.`
+      : "Sign in with ChatGPT so new sandboxes run Codex on your subscription. Device code sign-in must be enabled in ChatGPT → Settings → Security.";
+
+  return (
+    <div className="flex flex-col gap-4">
+      {message !== null && (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          {message}
+        </div>
+      )}
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="text-sm font-medium">ChatGPT subscription</span>
+          <span className="text-sm text-muted-foreground">{description}</span>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {status.connected ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-9"
+              disabled={busy}
+              data-testid="chatgpt-disconnect"
+              onClick={() => void onDisconnect()}
+            >
+              Disconnect
+            </Button>
+          ) : device === null ? (
+            <Button
+              size="sm"
+              className="h-9"
+              disabled={busy}
+              data-testid="chatgpt-connect"
+              onClick={() => void onConnect()}
+            >
+              Connect ChatGPT
+            </Button>
+          ) : (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-9"
+              data-testid="chatgpt-cancel"
+              onClick={() => setDevice(null)}
+            >
+              Cancel
+            </Button>
+          )}
+        </div>
+      </div>
+      {device !== null && (
+        <div role="status" className="flex flex-col gap-2 rounded-md border px-3 py-3 text-sm">
+          <span>
+            Open{" "}
+            <a
+              href={device.verification_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline"
+            >
+              {device.verification_url}
+            </a>
+            , sign in, and enter this code:
+          </span>
+          <code data-testid="chatgpt-user-code" className="text-lg font-semibold tracking-widest">
+            {device.user_code}
+          </code>
+          <span className="text-muted-foreground">
+            Waiting for approval… Only enter this code if you started this sign-in here.
+          </span>
+        </div>
+      )}
     </div>
   );
 }

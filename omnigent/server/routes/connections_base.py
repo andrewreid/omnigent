@@ -238,9 +238,118 @@ def create_paste_connection_router(
     return router
 
 
+#: Device codes expire upstream after 15 minutes; the handle matches that.
+_DEVICE_HANDLE_TTL_S = 900
+
+
+@dataclass
+class DeviceStart:
+    """A started device-code login, as the provider reports it."""
+
+    user_code: str
+    verification_url: str
+    interval_s: int
+    #: Opaque provider state needed to poll (e.g. a device-auth id). Rides in
+    #: the signed, user-bound handle, never stored server-side.
+    poll_state: dict[str, str]
+
+
+class DeviceCodeHooks(Protocol):
+    """The provider-specific half of a device-code flow (RFC 8628 shaped): the
+    user approves on the provider's site from any device, and the browser polls.
+    Handle signing, user binding, status and disconnect are shared."""
+
+    provider: str
+    store: Any
+
+    def signing_key(self) -> bytes | str:
+        """The HMAC key the device-flow handle is signed with."""
+
+    def status_fields(self, connection: Any | None) -> dict[str, Any]:
+        """Non-secret, provider-specific ``status`` fields (never tokens)."""
+
+    async def device_start(self) -> DeviceStart:
+        """Start a login. Raise :class:`ConnectionError` with a user-safe message."""
+
+    async def device_poll(self, user_id: str, poll_state: dict[str, str]) -> bool:
+        """Poll once; persist and return ``True`` once approved, ``False`` while
+        pending. Raise :class:`ConnectionError` with a user-safe message on failure."""
+
+
+class _DeviceHandle(BaseModel):
+    handle: str
+
+
+def create_device_connection_router(
+    hooks: DeviceCodeHooks,
+    *,
+    auth_provider: AuthProvider | None = None,
+) -> APIRouter:
+    """Build ``/connections/{provider}/{status,device/start,device/poll,disconnect}``.
+
+    ``device/start`` returns ``{user_code, verification_url, interval, expires_in,
+    handle}``; the client shows the code and polls ``device/poll`` with the handle
+    every ``interval`` seconds until ``status`` is ``complete``, ``expired`` or
+    ``error``.
+    """
+    provider = hooks.provider
+    router = APIRouter()
+    key = hooks.signing_key()
+    _current_user = _mount_status_and_disconnect(router, hooks, auth_provider)
+
+    @router.post(f"/connections/{provider}/device/start")
+    async def device_start(request: Request) -> dict[str, object]:
+        """Start a device-code login for the caller."""
+        user_id = _current_user(request)
+        try:
+            start = await hooks.device_start()
+        except ConnectionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        handle = jwt.encode(
+            {
+                "sub": user_id,
+                "account_generation": account_generation(user_id),
+                "poll": start.poll_state,
+                "exp": int(time.time()) + _DEVICE_HANDLE_TTL_S,
+            },
+            key,
+            algorithm=_STATE_ALG,
+        )
+        return {
+            "user_code": start.user_code,
+            "verification_url": start.verification_url,
+            "interval": start.interval_s,
+            "expires_in": _DEVICE_HANDLE_TTL_S,
+            "handle": handle,
+        }
+
+    @router.post(f"/connections/{provider}/device/poll")
+    async def device_poll(request: Request, body: _DeviceHandle) -> dict[str, object]:
+        """Poll the caller's device-code login once."""
+        user_id = _current_user(request)
+        try:
+            claims = jwt.decode(body.handle, key, algorithms=[_STATE_ALG])
+        except jwt.ExpiredSignatureError:
+            return {"status": "expired"}
+        except jwt.PyJWTError as exc:
+            raise HTTPException(status_code=400, detail="invalid handle") from exc
+        if claims.get("sub") != user_id or claims.get("account_generation") != account_generation(
+            user_id
+        ):
+            raise HTTPException(status_code=403, detail="handle belongs to another user")
+        try:
+            done = await hooks.device_poll(user_id, dict(claims.get("poll") or {}))
+        except ConnectionError as exc:
+            _logger.warning("%s device login failed for %s: %s", provider, user_id, exc)
+            return {"status": "error", "detail": str(exc)}
+        return {"status": "complete" if done else "pending"}
+
+    return router
+
+
 def _mount_status_and_disconnect(
     router: APIRouter,
-    hooks: ConnectionHooks | PasteSecretHooks,
+    hooks: ConnectionHooks | PasteSecretHooks | DeviceCodeHooks,
     auth_provider: AuthProvider | None,
 ) -> Callable[[Request], str]:
     """Mount the shared ``status`` / ``disconnect`` endpoints on *router*.
@@ -274,8 +383,14 @@ def _mount_status_and_disconnect(
 
     @router.post(f"/connections/{provider}/disconnect")
     async def disconnect(request: Request) -> dict[str, bool]:
-        """Remove the caller's connection."""
+        """Remove the caller's connection, revoking it upstream when supported."""
         user_id = _current_user(request)
+        revoke = getattr(hooks, "revoke", None)
+        if revoke is not None:
+            try:
+                await revoke(user_id)
+            except Exception as exc:  # noqa: BLE001 - never block a disconnect on upstream
+                _logger.warning("%s upstream revoke failed for %s: %s", provider, user_id, exc)
         removed = await asyncio.to_thread(store.delete, user_id)
         return {"disconnected": removed}
 

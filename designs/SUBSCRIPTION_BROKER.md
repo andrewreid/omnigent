@@ -156,6 +156,30 @@ does not retry.
 
 ### 2. ChatGPT provider + device-code seam (PR 2)
 
+> **As built (M3).** The seam is `DeviceCodeHooks` plus
+> `create_device_connection_router`. It exposes `POST …/device/start`, which returns
+> `{user_code, verification_url, interval, expires_in, handle}`, and
+> `POST …/device/poll {handle}`, which returns `pending|complete|expired|error`.
+> The handle is an HS256 JWT holding `sub`, `account_generation` and the
+> provider's poll state, with a 15-minute expiry. The key is
+> `OMNIGENT_CHATGPT_STATE_KEY`, or a per-process fallback, which is fine for one
+> replica. Protocol, from codex `rust-v0.154.0`:
+> 1. `POST {issuer}/api/accounts/deviceauth/usercode {client_id}`.
+> 2. Poll `…/deviceauth/token {device_auth_id,user_code}`; it returns 403/404
+>    while pending.
+> 3. Form-POST `{issuer}/oauth/token` with `authorization_code`, the issued
+>    `code_verifier`, and `redirect_uri={issuer}/deviceauth/callback`.
+>
+> Refresh is a JSON POST to `/oauth/token` with `grant_type=refresh_token`.
+> A 401, a 400 `invalid_grant`, or `refresh_token_expired|reused|invalidated` is
+> treated as permanent (`RefreshRejected`, so `needs_reconnect`). Codex's source
+> confirms OpenAI does **refresh-token reuse detection** (`refresh_token_reused`),
+> so the M2 lease is required. Disconnect calls the hooks' `revoke` (JSON POST to
+> `/oauth/revoke` with `token_type_hint=refresh_token`) before deleting the row.
+> Requests send `User-Agent: omnigent`, not codex's `originator` header. Enable
+> the flow with `OMNIGENT_CHATGPT_SUBSCRIPTION_CONNECT=1`. `OMNIGENT_CHATGPT_ISSUER`
+> and `OMNIGENT_CHATGPT_CLIENT_ID` override the defaults.
+
 **Generic seam** in `omnigent/server/routes/connections_base.py`: a second,
 optional hooks protocol next to `ConnectionHooks.begin/complete`:
 
