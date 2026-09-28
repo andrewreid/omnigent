@@ -34,6 +34,8 @@ from dataclasses import dataclass
 
 import jwt
 
+from omnigent.connections.refresh import RefreshRejected
+
 _logger = logging.getLogger(__name__)
 
 _AUTHORIZE_ENDPOINT = "https://github.com/login/oauth/authorize"
@@ -264,3 +266,11 @@ def token_set_from_payload(payload: dict) -> GitHubTokenSet:
 
 class GitHubAppError(Exception):
     """Raised when a GitHub App API interaction fails."""
+
+
+#: Token-endpoint ``error`` codes meaning the refresh token itself is dead.
+REFRESH_REJECTED_ERRORS = frozenset({"bad_refresh_token", "invalid_grant"})
+
+
+class GitHubRefreshRejected(GitHubAppError, RefreshRejected):
+    """GitHub rejected the refresh token; the user must reconnect."""

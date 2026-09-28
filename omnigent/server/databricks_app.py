@@ -31,6 +31,8 @@ import os
 import time
 from dataclasses import dataclass
 
+from omnigent.connections.refresh import RefreshRejected
+
 _logger = logging.getLogger(__name__)
 
 # Workspace-relative OAuth endpoints (OIDC). Joined onto the per-connection
@@ -261,3 +263,11 @@ def token_set_from_payload(payload: dict) -> DatabricksTokenSet:
 
 class DatabricksAppError(Exception):
     """Raised when a Databricks OAuth interaction fails."""
+
+
+#: Token-endpoint ``error`` codes meaning the refresh token itself is dead.
+REFRESH_REJECTED_ERRORS = frozenset({"invalid_grant"})
+
+
+class DatabricksRefreshRejected(DatabricksAppError, RefreshRejected):
+    """Databricks rejected the refresh token; the user must reconnect."""

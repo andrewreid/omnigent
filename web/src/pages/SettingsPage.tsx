@@ -1217,9 +1217,11 @@ function GithubIntegrationControl() {
         <div className="flex min-w-0 flex-1 flex-col">
           <span className="text-sm font-medium">GitHub</span>
           <span className="text-sm text-muted-foreground">
-            {status.connected && status.login
-              ? `Connected as ${status.login}. New sandboxes authenticate gh and git as you, and your public SSH keys are added so you can SSH in.`
-              : "Connect your GitHub account so new sandboxes authenticate gh and git as you, and your public SSH keys are injected."}
+            {status.needs_reconnect
+              ? "GitHub no longer accepts the saved authorization. Disconnect, then connect again."
+              : status.connected && status.login
+                ? `Connected as ${status.login}. New sandboxes authenticate gh and git as you, and your public SSH keys are added so you can SSH in.`
+                : "Connect your GitHub account so new sandboxes authenticate gh and git as you, and your public SSH keys are injected."}
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-2">
@@ -1383,9 +1385,11 @@ function DatabricksIntegrationControl() {
         <div className="flex min-w-0 flex-1 flex-col">
           <span className="text-sm font-medium">Databricks</span>
           <span className="text-sm text-muted-foreground">
-            {status.connected && status.workspace_host
-              ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes reach the Databricks AI Gateway (MCP + model serving) as you.`
-              : "Connect your Databricks workspace so new sandboxes reach its AI Gateway (MCP + model serving) as you."}
+            {status.needs_reconnect
+              ? "Databricks no longer accepts the saved authorization. Disconnect, then connect again."
+              : status.connected && status.workspace_host
+                ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes reach the Databricks AI Gateway (MCP + model serving) as you.`
+                : "Connect your Databricks workspace so new sandboxes reach its AI Gateway (MCP + model serving) as you."}
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-2">

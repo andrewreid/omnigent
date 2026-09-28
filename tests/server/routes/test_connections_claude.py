@@ -78,7 +78,13 @@ def client(store: ClaudeConnectionStore) -> TestClient:
 
 def test_status_before_connect(client: TestClient) -> None:
     body = client.get("/v1/connections/claude/status").json()
-    assert body == {"enabled": True, "connected": False, "connected_at": None, "token_hint": None}
+    assert body == {
+        "enabled": True,
+        "connected": False,
+        "connected_at": None,
+        "needs_reconnect": False,
+        "token_hint": None,
+    }
 
 
 def test_paste_connects_and_status_never_returns_the_token(client: TestClient) -> None:

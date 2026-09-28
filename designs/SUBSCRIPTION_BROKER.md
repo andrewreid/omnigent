@@ -98,45 +98,50 @@ run. No token values were logged. The chain was revoked (`codex logout`) at the 
    on account/chatgptAuthTokens/refresh ─▶ re-fetch     refresh_token "", 0600, atomic
 ```
 
-### 1. Store: lease + CAS refresh (PR 1)
+### 1. Store: refresh lease (PR 1, built as M2)
 
-The concurrency primitive lives in `CredentialStore`
+**As built.** The primitive lives in `CredentialStore`
 (`omnigent/stores/credential_store/sqlalchemy_store.py`), so every provider gets
-it. Two new methods on the store, surfaced through `ConnectionStore`:
+it, and `ConnectionStore` passes it through. Lease state lives in the row's
+plaintext `metadata_json` (`refresh_lease_holder`, `refresh_lease_until`,
+`needs_reconnect`), so **no migration**. Every metadata change is one short
+write transaction that reads the row `FOR UPDATE` (Postgres, MySQL,
+CockroachDB). On SQLite the immediate write transaction serializes writers.
+No lock is held across the upstream call. This replaced the earlier
+text-compare CAS and `refresh_version` idea: a locked read-modify-write in a
+tiny transaction is simpler and portable.
 
-- `try_acquire_refresh_lease(user_id, provider, *, holder, ttl_s) -> Lease | None`:
-  a single short transaction that reads `metadata_json` and succeeds only when
-  there is no live lease (`refresh_lease_until < now`). It writes
-  `refresh_lease_holder`, `refresh_lease_until = now + ttl_s` and
-  `refresh_version += 1`, guarded by `UPDATE … WHERE refresh_version = :seen`. A
-  zero rowcount means someone else won.
-- `commit_refresh(user_id, provider, *, lease, secret, metadata) -> bool`: writes
-  the new secret and metadata and clears the lease, guarded by
-  `WHERE refresh_version = :lease.version`. A zero rowcount means the lease was
-  stolen after expiry. The caller then discards its result and re-reads.
+- `acquire_refresh_lease(user_id, provider, *, holder, ttl_s) -> bool`: claims the
+  lease unless another holder's lease is still live. An expired lease can be
+  taken over, so a crashed holder never wedges the row.
+- `update_secret(..., lease_holder=holder) -> bool`: commits only if *holder*
+  still owns the lease, and releases it in the same write. Fresh tokens also
+  clear `needs_reconnect`. A write without a lease leaves another holder's lease
+  in place.
+- `release_refresh_lease(...)` and `mark_needs_reconnect(...)`. A reconnect's
+  `upsert` rewrites the metadata, which clears the flag.
 
-`metadata_json` is plaintext JSON, so the version check compares against a JSON
-field. To keep it portable, the CAS reads the row, compares in Python, and
-writes with `WHERE metadata_json = :seen_metadata_json` (an exact text compare of
-what was read). This avoids dialect-specific JSON operators and needs no
-migration. *(Implementation note: if that proves fragile, a nullable
-`refresh_version` column is a small additive migration. Decide in PR 1.)*
+`omnigent/connections/refresh.py::refresh_coordinated` is the shared resolver
+core (lease TTL 60 s, above the clients' 15 s HTTP timeout):
 
-Resolver algorithm (generalizes `github_identity.resolve_access_token`):
+1. Read the row. If it needs a reconnect, return `None`. If it's fresh, return it.
+2. Try to acquire the lease.
+   - **Lost:** poll until the holder's refresh lands, then return the fresh row.
+     On timeout, return the current row; the caller decides from its expiry.
+   - **Won:** re-read under the lease, because another holder may have just
+     committed. Call upstream **outside any transaction**, then persist through
+     `update_secret(lease_holder=…)`.
+3. `RefreshRejected` (GitHub `bad_refresh_token`/`invalid_grant`, Databricks
+   `invalid_grant`) marks `needs_reconnect` and returns `None`, with no retries.
+   Any other error is transient: return the current row.
+4. It returns `Refreshed(connection, minted)`. Callers prefer `minted`, so a
+   failed persist never drops a token whose predecessor is already spent.
 
-1. Read the row. If the access token has more than `margin` remaining, return it.
-2. **Coalesce.** If `last_refresh` is within `coalesce_s` (60 s), return the
-   stored token.
-3. Try to acquire the lease (`ttl_s` ≈ 30 s, longer than the upstream timeout).
-   - **Lost:** poll-re-read up to the lease TTL. If a newer `last_refresh` appears,
-     return that token. On timeout, return the current token if it has not
-     expired, else `None`.
-   - **Won:** call upstream refresh **outside any transaction**, then
-     `commit_refresh`. On `invalid_grant`, set `needs_reconnect: true`, clear the
-     lease and return `None`. On a transient failure, clear the lease and return
-     the current token if still valid.
-4. Never raise. The broker degrades to `{"connected": false}`, per
-   `designs/CREDENTIAL_STORE.md`.
+GitHub and Databricks resolvers are retrofitted onto it. The shared `status`
+endpoint reports `needs_reconnect`, and the Settings panels say "reconnect".
+Tests: `tests/server/test_refresh_coordination.py`, which includes a 20-process
+race asserting exactly one upstream refresh, plus a control run without the lease
+showing the race is real.
 
 **Why this is mandatory, not hygiene:** OpenAI's auth server may do refresh-token
 *reuse detection* (Auth0-style). There, presenting a rotated-away refresh token

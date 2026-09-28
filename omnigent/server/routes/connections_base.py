@@ -259,10 +259,16 @@ def _mount_status_and_disconnect(
         """Return the caller's connection status. Never surfaces tokens."""
         user_id = _current_user(request)
         connection = await asyncio.to_thread(store.get, user_id)
+        # The provider rejected the stored refresh token: the connection row is
+        # still there but the user must connect again.
+        needs_reconnect = connection is not None and bool(
+            await asyncio.to_thread(getattr(store, "needs_reconnect", lambda _u: False), user_id)
+        )
         return {
             "enabled": True,
             "connected": connection is not None,
             "connected_at": connection.created_at if connection is not None else None,
+            "needs_reconnect": needs_reconnect,
             **hooks.status_fields(connection),
         }
 
