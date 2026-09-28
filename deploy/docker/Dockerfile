@@ -41,6 +41,10 @@
 #   docker build -t omnigent-host:latest --target host \
 #                -f deploy/docker/Dockerfile .
 #
+# To slim a host image for a deployment that never runs some of the default
+# harnesses, build with HOST_HARNESSES listing the ones to keep, e.g.
+# HOST_HARNESSES="claude codex pi" drops kiro-cli and agy (~1GB).
+#
 # To bake extra harness CLIs into a host image beyond the default set, build
 # with EXTRA_HARNESS_CLIS="goose jcode opencode" — harness names, optional
 # @version pins, or npm:<pkg-spec> entries (see deploy/docker/README.md and
@@ -61,6 +65,8 @@
 # Must satisfy pyproject requires-python (>=3.12); 3.11 fails dependency resolution.
 ARG PYTHON_VERSION=3.12
 ARG NODE_VERSION=22
+# Harness CLIs baked into the host image; any subset of the default.
+ARG HOST_HARNESSES="claude codex pi kiro agy"
 
 # ── Web UI builder ──────────────────────────────────────
 # Builds the web SPA so `docker build` works from a clean checkout —
@@ -172,8 +178,14 @@ RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
 # duplicates the npm `claude` the host stage installs, and the claude-sdk
 # executor always passes that system CLI as cli_path (_find_system_claude).
 # Trimmed here, not in the host stage, so the bytes never reach a host layer.
+# Kept when HOST_HARNESSES omits claude: the SDK then falls back to it.
 FROM builder AS host-builder
-RUN rm -rf /opt/venv/lib/python*/site-packages/claude_agent_sdk/_bundled
+ARG HOST_HARNESSES
+RUN for h in ${HOST_HARNESSES}; do \
+      case "$h" in \
+        claude) rm -rf /opt/venv/lib/python*/site-packages/claude_agent_sdk/_bundled ;; \
+      esac; \
+    done
 
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned
@@ -190,9 +202,10 @@ FROM node:${NODE_VERSION}-slim AS node-runtime
 # port" and breaks web-turn injection), bubblewrap to OS-sandbox the
 # native harness terminals (mandatory and fail-loud on Linux), curl + CA
 # certificates for outbound HTTPS and in-sandbox downloads, plus the
-# coding-harness CLIs (claude / codex / pi / kiro-cli) so claude-sdk,
-# claude-native, codex, pi, and kiro-native agents can run in managed
-# sandboxes without an in-sandbox install. No SPA, no psycopg, no server
+# coding-harness CLIs (claude / codex / pi / kiro-cli / agy, trimmable via
+# HOST_HARNESSES) so claude-sdk, claude-native, codex, pi, kiro-native and
+# antigravity-native agents can run in managed sandboxes without an
+# in-sandbox install. No SPA, no psycopg, no server
 # entrypoint.
 #
 # Also carries two additions required only by the NVIDIA OpenShell provider
@@ -263,11 +276,23 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 # (the binary/package map `omnigent setup` installs from) — keep the
 # two in sync. Unpinned on purpose: the official image is rebuilt by
 # CI, so it tracks the same "latest" a laptop install would get.
-RUN npm install -g --no-audit --no-fund \
-      @anthropic-ai/claude-code \
-      @openai/codex \
-      @earendil-works/pi-coding-agent \
- && npm cache clean --force
+# HOST_HARNESSES selects the subset; this step also rejects unknown names.
+ARG HOST_HARNESSES
+RUN set -eu; \
+    pkgs=""; \
+    for h in ${HOST_HARNESSES}; do \
+      case "$h" in \
+        claude) pkgs="$pkgs @anthropic-ai/claude-code" ;; \
+        codex)  pkgs="$pkgs @openai/codex" ;; \
+        pi)     pkgs="$pkgs @earendil-works/pi-coding-agent" ;; \
+        kiro | agy) ;; \
+        *) echo "ERROR: unknown HOST_HARNESSES entry '$h' (supported: claude codex pi kiro agy)" >&2; exit 1 ;; \
+      esac; \
+    done; \
+    if [ -n "$pkgs" ]; then \
+      npm install -g --no-audit --no-fund $pkgs; \
+      npm cache clean --force; \
+    fi
 
 # Kiro CLI is not published as an npm package, and its installer has NO version
 # flag — `curl …/install | bash` always fetches `latest`, so the image was
@@ -290,6 +315,8 @@ ARG KIRO_CLI_VERSION=2.10.0
 ARG KIRO_CLI_SHA256_AMD64=be9d8b6d7c44f93a83ca22466043d98ad058e6ed3c12fffd068f3fb8a60b3b70
 ARG KIRO_CLI_SHA256_ARM64=0afb37399b9e2847c2f2e3f5d9052c8bc52bbf1e30401ea284a602661bce34bc
 RUN set -eu; \
+    want=; for h in ${HOST_HARNESSES}; do case "$h" in kiro) want=1 ;; esac; done; \
+    [ -n "$want" ] || { echo "kiro-cli skipped (not in HOST_HARNESSES)"; exit 0; }; \
     case "$(uname -m)" in \
       x86_64)  asset="kirocli-x86_64-linux.zip";  sha="$KIRO_CLI_SHA256_AMD64" ;; \
       aarch64) asset="kirocli-aarch64-linux.zip"; sha="$KIRO_CLI_SHA256_ARM64" ;; \
@@ -339,6 +366,8 @@ ENV AGY_VERSION=${AGY_VERSION} \
     AGY_SHA256_AMD64=${AGY_SHA256_AMD64} \
     AGY_SHA256_ARM64=${AGY_SHA256_ARM64}
 RUN set -eu; \
+    want=; for h in ${HOST_HARNESSES}; do case "$h" in agy) want=1 ;; esac; done; \
+    [ -n "$want" ] || { echo "agy skipped (not in HOST_HARNESSES)"; exit 0; }; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \
       amd64) asset="agy_cli_linux_x64.tar.gz"; sha="$AGY_SHA256_AMD64" ;; \

@@ -55,16 +55,39 @@ def test_host_images_drop_sdk_bundled_claude(dockerfile: Path) -> None:
     """The host venv omits claude_agent_sdk's bundled CLI; the server venv keeps it.
 
     The host stage installs the npm ``claude`` the claude-sdk executor always
-    passes as ``cli_path``, so the bundled copy is dead weight there.
+    passes as ``cli_path``, so the bundled copy is dead weight there. The trim
+    is gated on ``claude`` being baked, so the SDK keeps a fallback otherwise.
     """
     text = dockerfile.read_text()
     host_builder = text.split("AS host-builder", 1)[1].split("\nFROM ", 1)[0]
     assert "claude_agent_sdk/_bundled" in host_builder
+    assert "claude) rm -rf" in host_builder
     host = text.split("AS host\n", 1)[1].split("\nFROM ", 1)[0]
     assert "COPY --from=host-builder /opt/venv /opt/venv" in host
     assert "@anthropic-ai/claude-code" in host
     runtime = text.split("AS runtime", 1)[1]
     assert "COPY --from=host-builder" not in runtime
+
+
+@pytest.mark.parametrize(
+    ("dockerfile", "default_set"),
+    [
+        (_ROOT / "deploy/docker/Dockerfile", "claude codex pi kiro agy"),
+        (_ROOT / "deploy/docker/Dockerfile.ubi", "claude codex pi kiro"),
+    ],
+)
+def test_host_harnesses_default_bakes_full_set(dockerfile: Path, default_set: str) -> None:
+    """``HOST_HARNESSES`` defaults to every baked CLI and gates each install.
+
+    Trimming is opt-in, so the published image keeps its CLI set; each
+    vendor-installer step must skip cleanly when its name is dropped.
+    """
+    text = dockerfile.read_text()
+    assert f'ARG HOST_HARNESSES="{default_set}"' in text
+    assert "kiro-cli skipped (not in HOST_HARNESSES)" in text
+    if "agy" in default_set.split():
+        assert "agy skipped (not in HOST_HARNESSES)" in text
+    assert "unknown HOST_HARNESSES entry" in text
 
 
 @pytest.mark.parametrize(
