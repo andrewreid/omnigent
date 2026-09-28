@@ -487,6 +487,10 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
             databricks_store = DatabricksConnectionStore(database_url, dbx_cipher)
 
+    from omnigent.server.claude_subscription import build_claude_connection
+
+    claude_config, claude_store = build_claude_connection(database_url)
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -512,6 +516,8 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         github_store=github_store,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
+        claude_config=claude_config,
+        claude_store=claude_store,
     )
 
     log_capabilities(sandbox_config, github_config, github_store)
