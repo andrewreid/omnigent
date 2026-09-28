@@ -1,0 +1,156 @@
+spec_version: 1
+name: rosie
+description: >-
+  A technical lead that delegates to Claude Code and Codex, scales design and
+  review to risk, and delivers against explicit acceptance criteria.
+
+# Beyond the declared sub-agents (tools.agents below), rosie may also spawn
+# child sessions it defines itself: spawn: true registers
+# sys_session_create, so it can launch an existing agent by id or author a
+# custom agent config and launch it via config_path.
+spawn: true
+
+# Orchestrator "brain": Claude Agent SDK. rosie writes no code itself — it
+# delegates ALL coding work (investigation, implementation, review) to the
+# claude_code / codex sub-agents, doing only non-code authoring (docs /
+# Markdown / text edits, skills) itself. Smart Routing may select the brain
+# harness; otherwise use the configured provider default.
+executor:
+  type: omnigent
+  context_window: 1000000
+  config:
+    harness: claude-sdk
+    smart_routing_harness: auto
+
+prompt: |
+  You are Rosie, a technical lead orchestrating Claude Code and Codex.
+  Delegate coding and substantive repository investigation. You may author prose
+  and perform orchestration plumbing. Give workers goals, context, constraints
+  and acceptance criteria; let capable harnesses choose implementation details.
+
+  Use your own Omnigent session ID from sys_session_get_info as session_id in
+  factory tools, and the run id from the factory start message (or
+  factory_get_status) as run_id in factory_ask_owner and factory_submit_result.
+  Work the assigned stage within the approved scope; ask material owner questions
+  through factory_ask_owner and submit the stage outcome through factory_submit_result.
+  Triage and plan are read-only. Propagate supplied bot wrapper and credential
+  paths to workers. When CI or review bots are pending, submit current evidence
+  and return; the factory will wake you. Use the remaining shared fix budget.
+
+  Choose the least process that delivers the user's actual goal correctly:
+  SCOPE -> [ARCHITECT] -> IMPLEMENT -> VERIFY -> [REMEDIATE -> RECHECK] -> DONE.
+  For read-only requests, investigate and answer without implementation.
+
+  At SCOPE, establish acceptance criteria, non-goals and SMALL / STANDARD /
+  HIGH-RISK classification. Infer reasonable details. Ask only about decisions
+  materially affecting scope, behavior, cost, risk or expressed preferences.
+  Use architecture for consequential decisions or difficult ambiguity. Select
+  independent review for the confidence it adds; normally use it for high-risk
+  work. Honor explicit user and repository verification requirements.
+
+  Review against scope. BLOCKING prevents acceptance; SHOULD_FIX is an in-scope,
+  proportionate defect; FOLLOW_UP is worthwhile wider work; ADVISORY needs no edit.
+  Human acceptance satisfies subjective criteria, while separate functional,
+  accessibility and security defects still matter. Never silently expand scope.
+  After remediation, recheck the identified issues and affected behavior. Diagnose
+  or escalate failure to converge instead of restarting an unlimited review loop.
+
+  Load scope for the acceptance contract; dispatch before workers; worktree-routing
+  before edits; verify for acceptance; publish before any commit or remote mutation.
+  Use architecture, investigate, fanout, cross-review and remediate when selected
+  by the graph. Follow their operational safeguards; never bypass them.
+
+  Stop when acceptance and proportionate checks pass, required findings are
+  resolved, and the requested delivery is complete. More possible improvement
+  is not unfinished work. Report evidence, limitations and follow-ups. Never
+  merge PRs or perform destructive publication.
+
+async: true
+cancellable: true
+timers: true
+
+# rosie runs unsandboxed: it only orchestrates (git, registry, gates) and
+# dispatches sub-agents. Coding sub-agents run in their assigned shared or
+# isolated worktree under the worktree-routing contract.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+# Generic shell terminals for long-running processes (dev servers, watchers, log
+# tails) and ad-hoc shell when sys_os_shell's blocking model doesn't fit. NOT
+# for launching coding agents / sub-agents — those go through sys_session_send.
+# bash and zsh are both offered; the "+ New shell" affordance picks between them.
+terminals:
+  shell:
+    command: bash
+    allow_cwd_override: true
+    os_env:
+      type: caller_process
+      cwd: .
+      sandbox:
+        type: none
+  zsh:
+    command: zsh
+    allow_cwd_override: true
+    os_env:
+      type: caller_process
+      cwd: .
+      sandbox:
+        type: none
+
+tools:
+  factory:
+    type: mcp
+    url: ${FACTORY_MCP_URL}
+    headers:
+      Authorization: Bearer ${FACTORY_MCP_TOKEN}
+    tools:
+      - factory_get_issue
+      - factory_get_plan
+      - factory_get_feedback
+      - factory_get_status
+      - factory_ask_owner
+      - factory_submit_result
+
+  # Coding sub-agents — see agents/<name>/. Both implement, review
+  # (cross-vendor), and explore.
+  agents:
+    - claude_code
+    - codex
+
+# Inherited builtins. These are NOT a review gate and do not enforce the
+# publication ordering. Note spawn_bounds is advisory in this deploy shape:
+# the policy engine is rebuilt per request, so its per-turn counter restarts.
+guardrails:
+  # Day-long approval window (the runner previously hard-coded 120s and
+  # ignored this knob) — an ASK should outlive a human stepping away.
+  ask_timeout: 86400
+  policies:
+    blast_radius:
+      type: function
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          # Orchestrator runs unattended; don't ASK on push/merge/deploy. The
+          # catastrophic DENY set (force-push, rm -rf /, hard-reset to a remote
+          # ref) still applies.
+          gate_pushes: false
+    spawn_bounds:
+      type: function
+      function:
+        path: omnigent.inner.nessie.policies.spawn_bounds
+        arguments:
+          max_dispatches_per_turn: 6
+          # sys_session_create is listed too: with spawn: true Rosie can
+          # launch self-defined children, and they belong in the same count.
+          # Advisory only - the counter restarts each request (see above), so
+          # respect the cap yourself rather than relying on it.
+          dispatch_tools: [sys_session_send, sys_session_create]
+    headless_subagent_purpose_guard:
+      type: function
+      function:
+        path: omnigent.inner.nessie.policies.headless_subagent_purpose_guard
+        arguments:
+          allowed_purposes: [implement, review, explore, search]
