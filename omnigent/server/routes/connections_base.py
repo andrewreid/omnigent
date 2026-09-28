@@ -17,12 +17,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import urlencode
 
 import jwt
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
 from starlette.responses import RedirectResponse
 
 from omnigent.db.account_authority import account_generation
@@ -119,28 +121,12 @@ def create_connection_router(
     :returns: A FastAPI router with status / connect / callback / disconnect.
     """
     provider = hooks.provider
-    store = hooks.store
     router = APIRouter()
     key = hooks.signing_key()
-
-    def _current_user(request: Request) -> str:
-        user_id = require_user(request, auth_provider)
-        return user_id if user_id is not None else RESERVED_USER_LOCAL
+    _current_user = _mount_status_and_disconnect(router, hooks, auth_provider)
 
     def _verify_state(state: str) -> dict:
         return jwt.decode(state, key, algorithms=[_STATE_ALG])
-
-    @router.get(f"/connections/{provider}/status")
-    async def status(request: Request) -> dict[str, object]:
-        """Return the caller's connection status. Never surfaces tokens."""
-        user_id = _current_user(request)
-        connection = await asyncio.to_thread(store.get, user_id)
-        return {
-            "enabled": True,
-            "connected": connection is not None,
-            "connected_at": connection.created_at if connection is not None else None,
-            **hooks.status_fields(connection),
-        }
 
     @router.get(f"/connections/{provider}/connect")
     async def connect(request: Request, return_to: str | None = None) -> RedirectResponse:
@@ -201,6 +187,85 @@ def create_connection_router(
             return redirect_with_status(provider, return_to, "error")
         return redirect_with_status(provider, return_to, "connected")
 
+    if extra_routes is not None:
+        extra_routes(router)
+    return router
+
+
+class PasteSecretHooks(Protocol):
+    """The provider-specific half of a paste flow: the user pastes a secret
+    their own tool minted (e.g. ``claude setup-token``) instead of an OAuth
+    redirect. Status and disconnect are shared with the redirect flow."""
+
+    provider: str
+    store: Any
+
+    def status_fields(self, connection: Any | None) -> dict[str, Any]:
+        """Non-secret, provider-specific ``status`` fields (never tokens)."""
+
+    async def accept(self, user_id: str, secret: str) -> None:
+        """Validate and persist *secret* for *user_id*. Raise
+        :class:`ConnectionError` with a user-safe message on rejection."""
+
+
+class _PastedSecret(BaseModel):
+    secret: str
+
+
+def create_paste_connection_router(
+    hooks: PasteSecretHooks,
+    *,
+    auth_provider: AuthProvider | None = None,
+) -> APIRouter:
+    """Build ``/connections/{provider}/{status,secret,disconnect}`` for *hooks*.
+
+    ``POST …/secret`` takes ``{"secret": "…"}``; ``400`` with the hook's message
+    on rejection. The secret is never echoed back or logged.
+    """
+    router = APIRouter()
+    _current_user = _mount_status_and_disconnect(router, hooks, auth_provider)
+
+    @router.post(f"/connections/{hooks.provider}/secret")
+    async def submit(request: Request, body: _PastedSecret) -> dict[str, object]:
+        """Store the caller's pasted secret, replacing any existing one."""
+        user_id = _current_user(request)
+        try:
+            await hooks.accept(user_id, body.secret)
+        except ConnectionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"connected": True}
+
+    return router
+
+
+def _mount_status_and_disconnect(
+    router: APIRouter,
+    hooks: ConnectionHooks | PasteSecretHooks,
+    auth_provider: AuthProvider | None,
+) -> Callable[[Request], str]:
+    """Mount the shared ``status`` / ``disconnect`` endpoints on *router*.
+
+    :returns: The caller-identity resolver the flow's own endpoints reuse.
+    """
+    provider = hooks.provider
+    store = hooks.store
+
+    def _current_user(request: Request) -> str:
+        user_id = require_user(request, auth_provider)
+        return user_id if user_id is not None else RESERVED_USER_LOCAL
+
+    @router.get(f"/connections/{provider}/status")
+    async def status(request: Request) -> dict[str, object]:
+        """Return the caller's connection status. Never surfaces tokens."""
+        user_id = _current_user(request)
+        connection = await asyncio.to_thread(store.get, user_id)
+        return {
+            "enabled": True,
+            "connected": connection is not None,
+            "connected_at": connection.created_at if connection is not None else None,
+            **hooks.status_fields(connection),
+        }
+
     @router.post(f"/connections/{provider}/disconnect")
     async def disconnect(request: Request) -> dict[str, bool]:
         """Remove the caller's connection."""
@@ -208,6 +273,4 @@ def create_connection_router(
         removed = await asyncio.to_thread(store.delete, user_id)
         return {"disconnected": removed}
 
-    if extra_routes is not None:
-        extra_routes(router)
-    return router
+    return _current_user
