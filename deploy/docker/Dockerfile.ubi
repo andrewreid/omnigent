@@ -147,7 +147,8 @@ RUN set -eu; \
 # install.sh and moving the binaries onto the global PATH. The `--version` check
 # asserts the binary is the pinned version (a sanity guard atop the sha256). See
 # the fuller rationale in deploy/docker/Dockerfile — keep KIRO_CLI_VERSION + both
-# SHA256s in sync.
+# SHA256s in sync. HOME=/root because the UBI base sets HOME=/opt/app-root/src
+# and install.sh writes to $HOME/.local/bin.
 ARG KIRO_CLI_VERSION=2.10.0
 ARG KIRO_CLI_SHA256_AMD64=be9d8b6d7c44f93a83ca22466043d98ad058e6ed3c12fffd068f3fb8a60b3b70
 ARG KIRO_CLI_SHA256_ARM64=0afb37399b9e2847c2f2e3f5d9052c8bc52bbf1e30401ea284a602661bce34bc
@@ -162,7 +163,7 @@ RUN set -eu; \
     curl -fsSL -o /tmp/kiro.zip "https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/${asset}"; \
     echo "${sha}  /tmp/kiro.zip" | sha256sum -c -; \
     unzip -q /tmp/kiro.zip -d /tmp/kiro; \
-    KIRO_CLI_SKIP_SETUP=1 sh /tmp/kiro/kirocli/install.sh; \
+    HOME=/root KIRO_CLI_SKIP_SETUP=1 sh /tmp/kiro/kirocli/install.sh; \
     install -m 0755 /root/.local/bin/kiro-cli /usr/local/bin/kiro-cli; \
     if [ -f /root/.local/bin/kiro-cli-chat ]; then \
       install -m 0755 /root/.local/bin/kiro-cli-chat /usr/local/bin/kiro-cli-chat; \
