@@ -491,6 +491,10 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
     claude_config, claude_store = build_claude_connection(database_url)
 
+    from omnigent.server.chatgpt_identity import build_chatgpt_connection
+
+    chatgpt_config, chatgpt_store = build_chatgpt_connection(database_url)
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -518,6 +522,8 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         databricks_store=databricks_store,
         claude_config=claude_config,
         claude_store=claude_store,
+        chatgpt_config=chatgpt_config,
+        chatgpt_store=chatgpt_store,
     )
 
     log_capabilities(sandbox_config, github_config, github_store)
