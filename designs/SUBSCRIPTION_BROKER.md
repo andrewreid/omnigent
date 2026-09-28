@@ -247,6 +247,41 @@ Payload (never includes `refresh_token` or `id_token`):
 
 ### 4. Delivery in the sandbox (PR 3b)
 
+> **As built (M4), codex-native.**
+> - **Spike (codex 0.154.0, 2026-09-28):**
+>   - A `--remote` TUI attached to an app-server logged in with
+>     `chatgptAuthTokens` skips the sign-in screen, and nothing is written to
+>     `auth.json`.
+>   - `account/chatgptAuthTokens/refresh` is **broadcast to every connected
+>     client**, so it doesn't matter which client logged in, and the real TUI
+>     doesn't answer it with an error.
+>   - An error answer fails the turn immediately.
+> - **Runner route:** `GET /v1/runners/{id}/credentials/{provider}`
+>   (`runner_tunnel.py`) uses the binding token plus
+>   `resolve_managed_runner_owner`, the same gate as the owner-token mint. It
+>   vends through `host_credentials.vend_provider_credential`, shared with the
+>   host route.
+> - **Runner side:** `omnigent/runner/brokered_credentials.py`.
+>   - When the resolved launch has `login_required` in a managed sandbox,
+>     `_auto_create_codex_terminal` calls `start_brokered_chatgpt_auth(ws_url)`
+>     right after the app-server starts.
+>   - That opens an `omnigent-chatgpt-auth` client and logs in. The client
+>     stays connected (closed through `CodexNativeAppServer.close_callbacks`)
+>     and answers refresh requests from the broker.
+>   - "Not connected", or the broker returning the token codex just rejected,
+>     is answered with an error and cached for 60 s, so codex's ~14-retry burst
+>     costs one broker call.
+>   - It then clears `login_required`, so the headless sign-in fail-fast
+>     doesn't trigger.
+> - **Readiness:** at startup, `configure_host_chatgpt` asks the host route
+>   whether ChatGPT is connected, without taking the token, and sets
+>   `OMNIGENT_CHATGPT_SUBSCRIPTION_BROKERED=1`. `_codex_auth_unavailable_reason`
+>   treats that as available.
+> - **Not yet built:**
+>   - The in-process `codex` harness (stdio app-server in `codex_executor`).
+>   - The opt-in `auth.json` materializer (Path A) for running bare `codex` in
+>     the Pod terminal.
+
 **Path B (default)**, inside the runner:
 
 - `codex` harness: `omnigent/inner/codex_executor.py`. After the `initialize`

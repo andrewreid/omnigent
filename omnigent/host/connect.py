@@ -4872,9 +4872,10 @@ def run_host_process(
     # Claude subscription: export the owner's brokered `claude setup-token`
     # token as CLAUDE_CODE_OAUTH_TOKEN, which runner spawns forward to every
     # Claude harness. Sandbox-only and best-effort, like the two above.
-    from omnigent.host.claude_credential import configure_host_claude
+    from omnigent.host.claude_credential import configure_host_chatgpt, configure_host_claude
 
     configure_host_claude(server_url, identity.host_id)
+    configure_host_chatgpt(server_url, identity.host_id)
     _generate_ucode_configs()
 
     if lifecycle_lock is None and daemon_target is not None:
