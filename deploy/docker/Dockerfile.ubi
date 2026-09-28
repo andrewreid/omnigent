@@ -76,6 +76,11 @@ RUN test -f ./omnigent/server/static/web-ui/index.html \
 
 RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
 
+# ── Host builder ────────────────────────────────────────
+# Drops the SDK's bundled Claude CLI from the host venv; see deploy/docker/Dockerfile.
+FROM builder AS host-builder
+RUN rm -rf /opt/venv/lib/python*/site-packages/claude_agent_sdk/_bundled
+
 # ── Node alias stage ─────────────────────────────────────
 FROM registry.access.redhat.com/ubi9/nodejs-${NODE_VERSION} AS node-runtime
 
@@ -115,7 +120,7 @@ RUN npm install -g --no-audit --no-fund \
 # Kiro CLI is not published as an npm package and its installer has no version
 # flag (always fetches `latest`). Pin it by fetching the immutable per-arch zip
 # from the versioned CDN path + verifying sha256, then running the package's own
-# install.sh and copying the binaries onto the global PATH. The `--version` check
+# install.sh and moving the binaries onto the global PATH. The `--version` check
 # asserts the binary is the pinned version (a sanity guard atop the sha256). See
 # the fuller rationale in deploy/docker/Dockerfile — keep KIRO_CLI_VERSION + both
 # SHA256s in sync.
@@ -136,7 +141,7 @@ RUN set -eu; \
     if [ -f /root/.local/bin/kiro-cli-chat ]; then \
       install -m 0755 /root/.local/bin/kiro-cli-chat /usr/local/bin/kiro-cli-chat; \
     fi; \
-    rm -rf /tmp/kiro /tmp/kiro.zip; \
+    rm -rf /tmp/kiro /tmp/kiro.zip /root/.local/bin/kiro-cli*; \
     installed="$(/usr/local/bin/kiro-cli --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; \
     [ "$installed" = "$KIRO_CLI_VERSION" ] || { \
       echo "ERROR: kiro-cli reports '${installed:-<none>}', expected '$KIRO_CLI_VERSION'." >&2; exit 1; }; \
@@ -178,7 +183,7 @@ RUN set -eu; \
       echo "ERROR: gh reports '${installed:-<none>}', expected '$GH_VERSION'." >&2; exit 1; }; \
     echo "gh ${GH_VERSION} pinned (sha256 verified)"
 
-COPY --from=builder /opt/venv /opt/venv
+COPY --from=host-builder /opt/venv /opt/venv
 COPY --from=builder /build /build
 
 RUN echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
