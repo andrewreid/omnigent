@@ -15,8 +15,10 @@ from __future__ import annotations
 import httpx
 
 from omnigent.server.github_app import (
+    REFRESH_REJECTED_ERRORS,
     GitHubAppConfig,
     GitHubAppError,
+    GitHubRefreshRejected,
     GitHubTokenSet,
     token_set_from_payload,
 )
@@ -73,9 +75,13 @@ class GitHubAppClient:
 
         :param refresh_token: The stored ``ghr_…`` refresh token.
         :returns: The refreshed token set.
-        :raises GitHubAppError: When GitHub rejects the refresh.
+        :raises GitHubRefreshRejected: When the refresh token itself is dead.
+        :raises GitHubAppError: When GitHub rejects the refresh otherwise.
         """
-        return await self._token_request(self._config.token_refresh_fields(refresh_token))
+        return await self._token_request(
+            self._config.token_refresh_fields(refresh_token),
+            rejected=REFRESH_REJECTED_ERRORS,
+        )
 
     async def fetch_login(self, access_token: str) -> tuple[str, int]:
         """Fetch the authenticated user's ``(login, id)``.
@@ -192,14 +198,33 @@ class GitHubAppClient:
                     break
         return branches
 
-    async def _token_request(self, fields: dict[str, str]) -> GitHubTokenSet:
-        """POST the given form fields to the token endpoint and parse the reply."""
+    async def _token_request(
+        self, fields: dict[str, str], *, rejected: frozenset[str] = frozenset()
+    ) -> GitHubTokenSet:
+        """POST the given form fields to the token endpoint and parse the reply.
+
+        :param rejected: ``error`` codes to raise as :class:`GitHubRefreshRejected`.
+        """
         async with self._http_client() as client:
             resp = await client.post(
                 _TOKEN_ENDPOINT,
                 data=fields,
                 headers={"Accept": "application/json"},
             )
+        _raise_if_rejected(resp, rejected)
         if resp.status_code != 200:
             raise GitHubAppError(f"GitHub token endpoint returned {resp.status_code}")
         return token_set_from_payload(resp.json())
+
+
+def _raise_if_rejected(resp: httpx.Response, rejected: frozenset[str]) -> None:
+    """Raise :class:`GitHubRefreshRejected` when the reply's ``error`` is in *rejected*."""
+    if not rejected:
+        return
+    try:
+        payload = resp.json()
+    except ValueError:
+        return
+    if isinstance(payload, dict) and payload.get("error") in rejected:
+        detail = payload.get("error_description") or payload["error"]
+        raise GitHubRefreshRejected(f"GitHub refused the refresh token: {detail}")

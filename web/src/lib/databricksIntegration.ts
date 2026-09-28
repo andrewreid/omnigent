@@ -24,6 +24,9 @@ export interface DatabricksConnectionStatus {
   databricks_user: string | null;
   /** Unix epoch seconds the workspace was connected, or null. */
   connected_at: number | null;
+  /** The provider rejected the stored refresh token; the user must reconnect.
+   *  Absent on older servers. */
+  needs_reconnect?: boolean;
 }
 
 /** Fetch the current user's Databricks connection status. */

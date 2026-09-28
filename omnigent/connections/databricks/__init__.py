@@ -89,11 +89,13 @@ class DatabricksConnectionStore(ConnectionStore[DatabricksConnection]):
         )
         return self._to_entity(conn)
 
-    def update_tokens(self, user_id: str, tokens: DatabricksTokenSet) -> bool:
+    def update_tokens(
+        self, user_id: str, tokens: DatabricksTokenSet, *, lease_holder: str | None = None
+    ) -> bool:
         """Persist a refreshed token set, preserving the connected workspace/user.
 
         Returns ``True`` if a row was present to update, ``False`` if it was
-        removed between read and refresh.
+        removed between read and refresh (or *lease_holder* lost its lease).
         """
         # with_secret=True: we may need the stored refresh token to preserve it
         # when the provider's refresh response omits a rotated one.
@@ -111,4 +113,6 @@ class DatabricksConnectionStore(ConnectionStore[DatabricksConnection]):
             # An OAuth refresh may omit a rotated refresh token; keep the stored
             # one (and its expiry) so the next refresh doesn't wedge the user.
             secret["refresh_token"] = (existing.secret or {}).get("refresh_token")
-        return self._store.update_secret(user_id, self._PROVIDER, secret=secret, metadata=meta)
+        return self._store.update_secret(
+            user_id, self._PROVIDER, secret=secret, metadata=meta, lease_holder=lease_holder
+        )

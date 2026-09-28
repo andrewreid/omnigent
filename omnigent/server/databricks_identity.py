@@ -12,8 +12,10 @@ from __future__ import annotations
 import logging
 
 from omnigent.connections.databricks import DatabricksConnectionStore
+from omnigent.connections.refresh import refresh_coordinated
 from omnigent.db.utils import now_epoch
-from omnigent.server.databricks_app import DatabricksAppError
+from omnigent.entities import DatabricksConnection
+from omnigent.server.databricks_app import DatabricksAppError, DatabricksTokenSet
 from omnigent.server.databricks_app_client import DatabricksAppClient
 
 _logger = logging.getLogger(__name__)
@@ -32,26 +34,43 @@ async def resolve_databricks_token(
     """Resolve a valid ``(access_token, workspace_host)`` for *user_id*, or ``None``.
 
     Reads the stored connection and transparently refreshes a token at/near
-    expiry (persisting the refresh, workspace-scoped). Best-effort: any failure
-    (no connection, no refresh token, refresh rejected) returns ``None``.
+    expiry (persisting the refresh, workspace-scoped). Concurrent callers
+    coordinate through the store's refresh lease so exactly one refreshes.
+    Best-effort: any failure (no connection, no refresh token, refresh
+    rejected) returns ``None``; a rejected refresh token also marks the
+    connection as needing a reconnect.
     """
-    connection = await _run_sync(store.get, user_id, with_tokens=True)
-    if connection is None or not connection.access_token or not connection.workspace_host:
+
+    def is_fresh(conn: DatabricksConnection) -> bool:
+        expires_at = conn.token_expires_at
+        return expires_at is None or expires_at > now_epoch() + _REFRESH_MARGIN_S
+
+    async def refresh(conn: DatabricksConnection) -> DatabricksTokenSet:
+        if not conn.refresh_token:
+            raise DatabricksAppError("no refresh token stored")
+        return await client.refresh_token(conn.workspace_host, conn.refresh_token)
+
+    def persist(tokens: DatabricksTokenSet, holder: str) -> bool:
+        return store.update_tokens(user_id, tokens, lease_holder=holder)
+
+    resolved = await refresh_coordinated(
+        store,
+        user_id,
+        is_fresh=is_fresh,
+        refresh=refresh,
+        persist=persist,
+        provider="Databricks",
+    )
+    if resolved is None:
         return None
-    access_token = connection.access_token
-    workspace_host = connection.workspace_host
-    expires_at = connection.token_expires_at
-    if expires_at is not None and expires_at <= now_epoch() + _REFRESH_MARGIN_S:
-        if not connection.refresh_token:
-            return None
-        try:
-            refreshed = await client.refresh_token(workspace_host, connection.refresh_token)
-        except DatabricksAppError as exc:
-            _logger.warning("Databricks token refresh failed for %s: %s", user_id, exc)
-            return None
-        await _run_sync(store.update_tokens, user_id, refreshed)
-        access_token = refreshed.access_token
-    return access_token, workspace_host
+    connection = resolved.connection
+    if not connection.workspace_host:
+        return None
+    if resolved.minted is not None:
+        return resolved.minted.access_token, connection.workspace_host
+    if connection.access_token and is_fresh(connection):
+        return connection.access_token, connection.workspace_host
+    return None
 
 
 async def resolve_databricks_credential(
@@ -74,10 +93,3 @@ async def resolve_databricks_credential(
         return None
     access_token, workspace_host = resolved
     return {"token": access_token, "workspace_host": workspace_host}
-
-
-async def _run_sync(func, /, *args, **kwargs):
-    """Run a synchronous store call off the event loop."""
-    import asyncio
-
-    return await asyncio.to_thread(lambda: func(*args, **kwargs))
