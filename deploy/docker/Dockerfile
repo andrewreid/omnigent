@@ -167,6 +167,14 @@ RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
         uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e ".[${OMNIGENT_EXTRAS}]"; \
     fi
 
+# ── Host builder ────────────────────────────────────────
+# Host-only trim of the shared venv. The SDK's bundled Claude CLI (~230MB)
+# duplicates the npm `claude` the host stage installs, and the claude-sdk
+# executor always passes that system CLI as cli_path (_find_system_claude).
+# Trimmed here, not in the host stage, so the bytes never reach a host layer.
+FROM builder AS host-builder
+RUN rm -rf /opt/venv/lib/python*/site-packages/claude_agent_sdk/_bundled
+
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned
 # image; contributes no layers of its own.
@@ -268,8 +276,10 @@ RUN npm install -g --no-audit --no-fund \
 # bracketed-paste multi-line path, the session-JSONL layout — all verified
 # against 2.10.0; grep `kiro-cli 2.10.0`). So pin it the same way as `agy` below:
 # fetch the immutable per-arch zip from the versioned CDN path and verify its
-# sha256, run the package's own (network-free) install.sh, then copy the binaries
-# onto a system PATH dir every sandbox user shares. A trailing `kiro-cli
+# sha256, run the package's own (network-free) install.sh, then move the binaries
+# onto a system PATH dir every sandbox user shares. kiro-cli-term (the
+# shell-integration PTY) is dropped: KIRO_CLI_SKIP_SETUP never wires it up, and
+# the harness only runs `kiro-cli chat`. A trailing `kiro-cli
 # --version` check asserts the unpacked binary really is the pinned version — a
 # cheap sanity guard atop the sha256. To adopt a new kiro-cli: re-verify the
 # coupled behavior, then bump KIRO_CLI_VERSION + both
@@ -293,7 +303,7 @@ RUN set -eu; \
     if [ -f /root/.local/bin/kiro-cli-chat ]; then \
       install -m 0755 /root/.local/bin/kiro-cli-chat /usr/local/bin/kiro-cli-chat; \
     fi; \
-    rm -rf /tmp/kiro /tmp/kiro.zip; \
+    rm -rf /tmp/kiro /tmp/kiro.zip /root/.local/bin/kiro-cli*; \
     installed="$(/usr/local/bin/kiro-cli --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; \
     [ "$installed" = "$KIRO_CLI_VERSION" ] || { \
       echo "ERROR: kiro-cli reports '${installed:-<none>}', expected '$KIRO_CLI_VERSION'." >&2; exit 1; }; \
@@ -385,7 +395,7 @@ RUN set -eu; \
 # /build/omnigent and /build/sdks/* -- both denied by the k8s Landlock LSM
 # policy. Re-install without -e so the package bytes land in the venv's
 # site-packages and imports no longer require /build at runtime.
-COPY --from=builder /opt/venv /opt/venv
+COPY --from=host-builder /opt/venv /opt/venv
 COPY --from=builder /build /build
 RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
  && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /opt/venv/lib/python*/site-packages

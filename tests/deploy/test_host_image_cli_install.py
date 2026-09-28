@@ -37,8 +37,34 @@ def test_host_images_install_pinned_kiro_cli(dockerfile: Path) -> None:
     # Integrity-checked, then copied onto the global PATH for all sandbox users.
     assert "sha256sum -c" in text
     assert "install -m 0755 /root/.local/bin/kiro-cli /usr/local/bin/kiro-cli" in text
+    # The installer's per-user copies are removed in the same layer; leaving
+    # them doubled the image by ~850MB.
+    assert "/root/.local/bin/kiro-cli*" in text
     # kiro-cli is not an npm package, so it must not appear in the npm install list.
     assert "      kiro-cli \\" not in text
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        _ROOT / "deploy/docker/Dockerfile",
+        _ROOT / "deploy/docker/Dockerfile.ubi",
+    ],
+)
+def test_host_images_drop_sdk_bundled_claude(dockerfile: Path) -> None:
+    """The host venv omits claude_agent_sdk's bundled CLI; the server venv keeps it.
+
+    The host stage installs the npm ``claude`` the claude-sdk executor always
+    passes as ``cli_path``, so the bundled copy is dead weight there.
+    """
+    text = dockerfile.read_text()
+    host_builder = text.split("AS host-builder", 1)[1].split("\nFROM ", 1)[0]
+    assert "claude_agent_sdk/_bundled" in host_builder
+    host = text.split("AS host\n", 1)[1].split("\nFROM ", 1)[0]
+    assert "COPY --from=host-builder /opt/venv /opt/venv" in host
+    assert "@anthropic-ai/claude-code" in host
+    runtime = text.split("AS runtime", 1)[1]
+    assert "COPY --from=host-builder" not in runtime
 
 
 @pytest.mark.parametrize(
