@@ -379,6 +379,23 @@ docker build -t omnigent-host:latest --target host \
              -f deploy/docker/Dockerfile .
 ```
 
+### Trimming the baked harness CLIs
+
+The default host image bakes `claude`, `codex`, `pi`, `kiro-cli`, and `agy`.
+A deployment that never runs some of those harnesses can drop them with
+`HOST_HARNESSES`, the space-separated list of harnesses to keep:
+
+```bash
+docker build -t omnigent-host:latest --target host \
+             -f deploy/docker/Dockerfile \
+             --build-arg HOST_HARNESSES="claude codex pi" .
+```
+
+Supported names are `claude`, `codex`, `pi`, `kiro`, and `agy` (UBI: all but
+`agy`); an unknown name fails the build. Dropping `kiro` and `agy` saves about
+1GB uncompressed. A dropped harness fails closed with
+`harness_not_configured`, like any other CLI missing from the image.
+
 ### Baking in extra harness CLIs
 
 A harness whose CLI isn't in the image fails closed with
