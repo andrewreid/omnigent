@@ -25,17 +25,19 @@ threads, check runs and required check/status results. Apply in order:
    unless a recorded repo configuration or human decision establishes no checks
    are expected. Newly appearing checks retire that exemption. Read legacy
    statuses too where configured; don't confuse their absence with check success.
-5. Checks pass and the current head has a clean bot verdict with no outstanding
-   required finding or unresolved required gate: external readiness established.
+5. Checks pass and every bot finding on the current head has an outcome (fixed,
+   follow-up issue, or advisory) with no unresolved required gate: external
+   readiness established. A clean bot verdict is not required.
 6. Otherwise submit the current evidence and return.
 
 Report exactly what is pending. Never call silence approval.
-A valid FOLLOW_UP/ADVISORY need not cause edits, but an outstanding bot objection
-is not a clean bot verdict: if clean bot approval is required, ask the human to
-adjudicate the disposition instead of silently waiving it or endlessly fixing.
+A valid FOLLOW_UP needs no edit: open a follow-up issue, reply on the thread with
+the disposition and link, then resolve it. ADVISORY: reply with the rationale,
+then resolve. Resolve only threads you replied to. Ask the human only when a
+required defect cannot be fixed within scope.
 
 Use remediate's shared budget and targeted recheck for fixes. After accepted
-fixes, publish an additional commit with a plain push. When authorized to comment,
-reply in-thread with dispositions and request review on the PR root. Otherwise
-report the required communication to the human. Refresh the bot verdict for the
-new head. Report unresolved thread counts; a reply is not thread resolution.
+fixes, publish an additional commit with a plain push. Reply in-thread with each
+disposition (the factory authorizes this, issue creation and thread resolution
+through the bot wrapper), then resolve that thread, and request review on the PR
+root. Refresh the bot verdict for the new head. Report unresolved thread counts.
