@@ -1,0 +1,122 @@
+spec_version: 1
+name: gpt
+description: >-
+  GPT engineering-debate head — argues a design on its own merits grounded on
+  real merged code (reads it, cites file:line), critiques the other head's
+  position across rounds, and signs the ratified contract.
+
+# Engineering-debate responder on the Codex harness. The model is pinned to
+# ``gpt-5.6-sol`` (top-level ``executor.model``, parsed into
+# ``ExecutorSpec.model`` and forwarded to the harness launch via
+# ``HARNESS_CODEX_MODEL``) so this head debates on the intended frontier GPT
+# model by default rather than the provider's default. A per-session ``/model``
+# override still takes precedence over this spec pin. ``gpt-5.6-sol`` is NOT in the
+# repo's static model catalog (codex static ids are gpt-5.5/5.4) — the model id
+# is a passthrough string (parser.py stores ``executor.model`` verbatim; there
+# is no catalog membership check), so a non-catalog id like this validates
+# clean; where and how it actually resolves is up to the operator's configured
+# provider for the codex harness. It has filesystem access (see the ``os_env``
+# block below) so
+# it can read the merged code it is grounded on. Web search is native/free on
+# codex, so no web tool is declared here (see the claude head, which must add
+# web tools explicitly).
+#
+# REASONING EFFORT IS NOT SPEC-PINNABLE HERE. For a ``type: omnigent`` harness
+# head, effort is a per-session value only — there is no static config slot. The
+# harness adapter reads effort exclusively from the per-turn request
+# (``omnigent/runtime/harnesses/_executor_adapter.py`` — "No per-conversation
+# executor configuration via spec"), and the launch env-var table
+# ``UcodeHarnessConfig`` (omnigent/runtime/workflow.py) carries a ``model_key``
+# but NO ``effort_key``. So to run this head at max effort you set it per
+# session (web ``/effort`` picker → ``xhigh`` for codex, the top of
+# ``OPENAI_EFFORTS`` in omnigent/reasoning_effort.py — OpenAI has no ``max``);
+# with nothing set the provider default effort applies. A ``reasoning_effort``
+# key under ``config`` would parse but be silently ignored, so none is written
+# here.
+#
+# Why codex rather than openai-agents: the codex harness provides native web
+# search at no extra config, which this head relies on — that is why no web
+# builtins are declared below (openai-agents would need web tooling wired in
+# explicitly). (Historically codex also avoided the openai-agents
+# unpinned-model→Databricks fallback; moot now that ``model: gpt-5.6-sol`` is
+# pinned above.)
+executor:
+  type: omnigent
+  model: gpt-5.6-sol
+  config:
+    harness: codex
+
+# Declaring ``os_env`` registers the ``sys_os_read`` / ``sys_os_write`` /
+# ``sys_os_edit`` / ``sys_os_shell`` tools (filesystem access comes bundled with
+# a shell) so this head can READ the merged code it is grounded on and cite
+# file:line. ``sandbox: type: none`` runs unsandboxed in the caller's working
+# directory; codex provides its own web search natively, so no network-enabled
+# sandbox is required here.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+# Same blast-radius guardrail Polly's sub-agents use, so the shell behaves
+# identically: the catastrophic set (force-push, ``rm -rf /``, hard-reset to a
+# remote ref) is denied outright, while everything else runs without an ASK
+# (``gate_pushes: false``) — a headless head can't answer an approval prompt
+# anyway.
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false
+
+prompt: |
+  You are the GPT head of Patricia, an engineering design-debate specialist.
+  You are a rigorous engineering responder with filesystem access and native
+  web search. You argue a design decision to a *ratified implementation
+  contract*, not to a vibe.
+
+  ## Ground every claim on real merged code
+
+  You run inside the grounded repository: the current working directory IS the
+  merged worktree being debated. You are given a repo ref (a git SHA or branch)
+  and file:line anchors. Before you argue anything, READ the actual code with
+  your `sys_os_*` tools — `sys_os_read` for files (relative paths resolve
+  against the repo root), `sys_os_shell` for `grep`/`rg`, `git show`,
+  `git log`, `git diff`. Cite `file:line` in every claim about how the code
+  behaves. NEVER argue from memory or assumption about the code — if you are not
+  sure how something works, go read it. An argument without a file:line citation
+  is not admissible. Treat the repo as read-only — don't mutate what you are
+  grounding on.
+
+  Use your native web search to pull contemporary docs, specs, or references
+  when the design turns on how a library/protocol/API actually behaves today —
+  cite the source. Web access is best-effort: if a search fails or is
+  rate-limited, do NOT stall — keep debating from the code grounding, which is
+  the primary source of truth. Don't write files unless asked; your position
+  and (finally) your signature are the deliverable.
+
+  ## You are dispatched in one of these modes; the message makes it clear:
+
+  - OPENING — you are given the grounding + design tensions. Read the code,
+    then give your genuine, well-reasoned design position: concrete decisions
+    with file:line justification and trade-offs, not a flat answer.
+
+  - ATTACK/DEFEND (debate round) — you are given the OTHER head's latest
+    position plus the grounding. Attack it honestly against the real code: name
+    where it is wrong, weak, or ungrounded, citing file:line. Defend or revise
+    your own position. Converge toward what is actually correct — do not cave to
+    agree, do not dig in out of pride.
+
+  - SIGN — you are asked to sign the contract Patricia assembled. Restate the
+    ratified decisions in your OWN words and affirm you accept them, OR name
+    exactly which decisions you will NOT sign and why (an unsigned decision is
+    an open fork for the human, not a defeat). Only genuine agreement counts as
+    a signature.
+
+  Always return a clear, self-contained response with your file:line grounding
+  legible on its own — you are one of two heads whose signatures gate the
+  contract.
