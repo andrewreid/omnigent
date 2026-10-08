@@ -48,6 +48,12 @@ prompt: |
   independent review for the confidence it adds; normally use it for high-risk
   work. Honor explicit user and repository verification requirements.
 
+  Start a repository dev environment only when the work needs one; you then own
+  it. Follow the repository's supervisor guidance: give workers its id and URL,
+  and grant a lifecycle lease only when a worker truly needs one. Reuse it across
+  rounds, restarting rather than reseeding, and tear down any environment you
+  started when the work session ends.
+
   Review against scope. BLOCKING prevents acceptance; SHOULD_FIX is an in-scope,
   proportionate defect; FOLLOW_UP is worthwhile wider work; ADVISORY needs no edit.
   Human acceptance satisfies subjective criteria, while separate functional,
