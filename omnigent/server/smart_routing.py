@@ -608,7 +608,15 @@ class LLMRoutingClient:
                 ),
                 timeout=ROUTING_REQUEST_TIMEOUT_S,
             )
-            text = response.output[0].content[0].text
+            # Reasoning models emit a reasoning item before the message when the
+            # task makes them think, so take the message rather than item 0.
+            message = next(
+                (item for item in response.output if getattr(item, "type", None) == "message"),
+                None,
+            )
+            if message is None or not message.content:
+                raise ValueError("routing judge response carried no message")
+            text = message.content[0].text
             # The verdict can echo prompt text in its rationale, so keep it off
             # INFO; the chosen model is logged by the caller either way.
             _logger.debug("LLMRoutingClient: raw response: %s", text[:500])
