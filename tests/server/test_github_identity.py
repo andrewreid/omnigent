@@ -14,7 +14,7 @@ import httpx
 
 from omnigent.db.utils import now_epoch
 from omnigent.server import github_identity as gi
-from omnigent.server.github_app import GitHubAppError, GitHubTokenSet
+from omnigent.server.github_app import GitHubAppError, GitHubRefreshRejected, GitHubTokenSet
 
 
 class _Conn:
@@ -26,18 +26,44 @@ class _Conn:
 
 
 class _Store:
+    """In-memory stand-in for GithubConnectionStore, including the refresh lease."""
+
     def __init__(self, conn: _Conn | None) -> None:
         self._conn = conn
         self.updated: list[GitHubTokenSet] = []
         self.raise_on_update = False
+        self.reconnect = False
+        self.lease: str | None = None
 
     def get(self, user_id: str, with_tokens: bool = False) -> _Conn | None:
         return self._conn
 
-    def update_tokens(self, user_id: str, tokens: GitHubTokenSet) -> None:
+    def needs_reconnect(self, user_id: str) -> bool:
+        return self.reconnect
+
+    def acquire_refresh_lease(self, user_id: str, *, holder: str, ttl_s: int) -> bool:
+        if self.lease not in (None, holder):
+            return False
+        self.lease = holder
+        return True
+
+    def release_refresh_lease(self, user_id: str, *, holder: str) -> bool:
+        if self.lease != holder:
+            return False
+        self.lease = None
+        return True
+
+    def mark_needs_reconnect(self, user_id: str) -> bool:
+        self.reconnect, self.lease = True, None
+        return True
+
+    def update_tokens(
+        self, user_id: str, tokens: GitHubTokenSet, *, lease_holder: str | None = None
+    ) -> bool:
         if self.raise_on_update:
             raise RuntimeError("db down")
         self.updated.append(tokens)
+        return True
 
 
 class _Client:
@@ -122,3 +148,41 @@ def test_persist_failure_still_returns_refreshed_token() -> None:
     store = _Store(_Conn("ghu_old", "ghr", now_epoch() + 60))
     store.raise_on_update = True
     assert _resolve(store, _Client(result=_fresh("ghu_new"))) == "ghu_new"
+
+
+def test_rejected_refresh_token_marks_reconnect_and_stops_refreshing() -> None:
+    # invalid_grant/bad_refresh_token: the chain is dead. Vend nothing, flag the
+    # connection, and don't hit GitHub again on the next resolve.
+    store = _Store(_Conn("ghu_old", "ghr", now_epoch() + 60))
+    client = _Client(exc=GitHubRefreshRejected("bad_refresh_token"))
+    assert _resolve(store, client) is None
+    assert store.reconnect is True
+    assert store.lease is None  # released with the flag
+    assert _resolve(store, client) is None
+    assert client.calls == 1
+
+
+def test_lease_held_elsewhere_does_not_refresh() -> None:
+    # Another process holds the lease: wait for its result rather than refresh.
+    store = _Store(_Conn("ghu_old", "ghr", now_epoch() + 120))
+    store.lease = "other-process"
+    client = _Client(result=_fresh("ghu_new"))
+    token = asyncio.run(
+        gi.refresh_coordinated(  # type: ignore[attr-defined]
+            store,
+            "u@example.com",
+            is_fresh=lambda c: False,
+            refresh=client.refresh_token,
+            persist=lambda tokens, holder: True,
+            provider="GitHub",
+            wait_s=0.3,
+        )
+    )
+    assert client.calls == 0
+    assert token is not None and token.minted is None
+
+
+def test_lease_released_after_successful_refresh() -> None:
+    store = _Store(_Conn("ghu_old", "ghr", now_epoch() + 60))
+    assert _resolve(store, _Client(result=_fresh("ghu_new"))) == "ghu_new"
+    assert store.lease is None

@@ -4593,6 +4593,14 @@ def server(
 
             databricks_store = DatabricksConnectionStore(db_uri, dbx_cipher)
 
+    from omnigent.server.claude_subscription import build_claude_connection
+
+    claude_config, claude_store = build_claude_connection(db_uri)
+
+    from omnigent.server.chatgpt_identity import build_chatgpt_connection
+
+    chatgpt_config, chatgpt_store = build_chatgpt_connection(db_uri)
+
     # Accounts mode ergonomics: when accounts mode is selected
     # (OMNIGENT_AUTH_ENABLED=1 without OIDC config, or an explicit
     # OMNIGENT_AUTH_PROVIDER=accounts), supply sensible defaults
@@ -4664,6 +4672,10 @@ def server(
         github_store=github_store,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
+        claude_config=claude_config,
+        claude_store=claude_store,
+        chatgpt_config=chatgpt_config,
+        chatgpt_store=chatgpt_store,
         server_config=title_server_config,
     )
 

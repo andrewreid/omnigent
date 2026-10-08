@@ -13,8 +13,10 @@ from __future__ import annotations
 import httpx
 
 from omnigent.server.databricks_app import (
+    REFRESH_REJECTED_ERRORS,
     DatabricksAppError,
     DatabricksConfig,
+    DatabricksRefreshRejected,
     DatabricksTokenSet,
     token_set_from_payload,
     token_url,
@@ -54,7 +56,9 @@ class DatabricksAppClient:
     async def refresh_token(self, workspace_host: str, refresh_token: str) -> DatabricksTokenSet:
         """Exchange a refresh token for a fresh access token."""
         return await self._token_request(
-            workspace_host, self._config.token_refresh_fields(refresh_token)
+            workspace_host,
+            self._config.token_refresh_fields(refresh_token),
+            rejected=REFRESH_REJECTED_ERRORS,
         )
 
     async def fetch_user(self, workspace_host: str, access_token: str) -> tuple[str, str]:
@@ -74,7 +78,11 @@ class DatabricksAppClient:
         return str(user_name), str(user_id)
 
     async def _token_request(
-        self, workspace_host: str, fields: dict[str, str]
+        self,
+        workspace_host: str,
+        fields: dict[str, str],
+        *,
+        rejected: frozenset[str] = frozenset(),
     ) -> DatabricksTokenSet:
         async with self._http_client() as client:
             resp = await client.post(
@@ -82,6 +90,16 @@ class DatabricksAppClient:
                 data=fields,
                 headers={"Accept": "application/json"},
             )
+        if rejected:
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict) and payload.get("error") in rejected:
+                raise DatabricksRefreshRejected(
+                    "Databricks refused the refresh token: "
+                    f"{payload.get('error_description') or payload['error']}"
+                )
         if resp.status_code != 200:
             raise DatabricksAppError(f"Databricks token endpoint returned {resp.status_code}")
         return token_set_from_payload(resp.json())

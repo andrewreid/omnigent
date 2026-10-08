@@ -11,9 +11,14 @@
 #
 #   docker build -t omnigent-host:ubi --target host \
 #                -f deploy/docker/Dockerfile.ubi .
+#
+# HOST_HARNESSES trims the baked harness CLIs, as in deploy/docker/Dockerfile.
 
 ARG PYTHON_VERSION=3.12
 ARG NODE_VERSION=22
+# Harness CLIs baked into the host image; any subset of the default. UBI bakes
+# no agy (use EXTRA_HARNESS_CLIS=agy).
+ARG HOST_HARNESSES="claude codex pi kiro"
 
 # ── Web UI builder ──────────────────────────────────────
 FROM registry.access.redhat.com/ubi9/nodejs-${NODE_VERSION} AS web-builder
@@ -76,6 +81,17 @@ RUN test -f ./omnigent/server/static/web-ui/index.html \
 
 RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
 
+# ── Host builder ────────────────────────────────────────
+# Drops the SDK's bundled Claude CLI from the host venv when the npm claude is
+# baked; see deploy/docker/Dockerfile.
+FROM builder AS host-builder
+ARG HOST_HARNESSES
+RUN for h in ${HOST_HARNESSES}; do \
+      case "$h" in \
+        claude) rm -rf /opt/venv/lib/python*/site-packages/claude_agent_sdk/_bundled ;; \
+      esac; \
+    done
+
 # ── Node alias stage ─────────────────────────────────────
 FROM registry.access.redhat.com/ubi9/nodejs-${NODE_VERSION} AS node-runtime
 
@@ -106,23 +122,39 @@ COPY --from=node-runtime /usr/lib/node_modules /usr/local/lib/node_modules
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
-RUN npm install -g --no-audit --no-fund \
-      @anthropic-ai/claude-code \
-      @openai/codex \
-      @earendil-works/pi-coding-agent \
- && npm cache clean --force
+# HOST_HARNESSES selects the subset; this step also rejects unknown names.
+ARG HOST_HARNESSES
+RUN set -eu; \
+    pkgs=""; \
+    for h in ${HOST_HARNESSES}; do \
+      case "$h" in \
+        claude) pkgs="$pkgs @anthropic-ai/claude-code" ;; \
+        codex)  pkgs="$pkgs @openai/codex" ;; \
+        pi)     pkgs="$pkgs @earendil-works/pi-coding-agent" ;; \
+        kiro) ;; \
+        agy) echo "ERROR: UBI bakes no agy; use EXTRA_HARNESS_CLIS=agy" >&2; exit 1 ;; \
+        *) echo "ERROR: unknown HOST_HARNESSES entry '$h' (supported: claude codex pi kiro)" >&2; exit 1 ;; \
+      esac; \
+    done; \
+    if [ -n "$pkgs" ]; then \
+      npm install -g --no-audit --no-fund $pkgs; \
+      npm cache clean --force; \
+    fi
 
 # Kiro CLI is not published as an npm package and its installer has no version
 # flag (always fetches `latest`). Pin it by fetching the immutable per-arch zip
 # from the versioned CDN path + verifying sha256, then running the package's own
-# install.sh and copying the binaries onto the global PATH. The `--version` check
+# install.sh and moving the binaries onto the global PATH. The `--version` check
 # asserts the binary is the pinned version (a sanity guard atop the sha256). See
 # the fuller rationale in deploy/docker/Dockerfile — keep KIRO_CLI_VERSION + both
-# SHA256s in sync.
+# SHA256s in sync. HOME=/root because the UBI base sets HOME=/opt/app-root/src
+# and install.sh writes to $HOME/.local/bin.
 ARG KIRO_CLI_VERSION=2.10.0
 ARG KIRO_CLI_SHA256_AMD64=be9d8b6d7c44f93a83ca22466043d98ad058e6ed3c12fffd068f3fb8a60b3b70
 ARG KIRO_CLI_SHA256_ARM64=0afb37399b9e2847c2f2e3f5d9052c8bc52bbf1e30401ea284a602661bce34bc
 RUN set -eu; \
+    want=; for h in ${HOST_HARNESSES}; do case "$h" in kiro) want=1 ;; esac; done; \
+    [ -n "$want" ] || { echo "kiro-cli skipped (not in HOST_HARNESSES)"; exit 0; }; \
     case "$(uname -m)" in \
       x86_64)  asset="kirocli-x86_64-linux.zip";  sha="$KIRO_CLI_SHA256_AMD64" ;; \
       aarch64) asset="kirocli-aarch64-linux.zip"; sha="$KIRO_CLI_SHA256_ARM64" ;; \
@@ -131,12 +163,12 @@ RUN set -eu; \
     curl -fsSL -o /tmp/kiro.zip "https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/${asset}"; \
     echo "${sha}  /tmp/kiro.zip" | sha256sum -c -; \
     unzip -q /tmp/kiro.zip -d /tmp/kiro; \
-    KIRO_CLI_SKIP_SETUP=1 sh /tmp/kiro/kirocli/install.sh; \
+    HOME=/root KIRO_CLI_SKIP_SETUP=1 sh /tmp/kiro/kirocli/install.sh; \
     install -m 0755 /root/.local/bin/kiro-cli /usr/local/bin/kiro-cli; \
     if [ -f /root/.local/bin/kiro-cli-chat ]; then \
       install -m 0755 /root/.local/bin/kiro-cli-chat /usr/local/bin/kiro-cli-chat; \
     fi; \
-    rm -rf /tmp/kiro /tmp/kiro.zip; \
+    rm -rf /tmp/kiro /tmp/kiro.zip /root/.local/bin/kiro-cli*; \
     installed="$(/usr/local/bin/kiro-cli --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; \
     [ "$installed" = "$KIRO_CLI_VERSION" ] || { \
       echo "ERROR: kiro-cli reports '${installed:-<none>}', expected '$KIRO_CLI_VERSION'." >&2; exit 1; }; \
@@ -178,7 +210,7 @@ RUN set -eu; \
       echo "ERROR: gh reports '${installed:-<none>}', expected '$GH_VERSION'." >&2; exit 1; }; \
     echo "gh ${GH_VERSION} pinned (sha256 verified)"
 
-COPY --from=builder /opt/venv /opt/venv
+COPY --from=host-builder /opt/venv /opt/venv
 COPY --from=builder /build /build
 
 RUN echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
