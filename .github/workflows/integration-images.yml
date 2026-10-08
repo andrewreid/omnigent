@@ -300,7 +300,12 @@ jobs:
             # its ref in the subject and carries that ref's tip as parent 2. No
             # dependence on ~/omnigent-integration being present here.
             if [ -n "$BASE" ]; then
-              git log --merges --format='%P%x09%s' "$BASE..HEAD" | while IFS=$'\t' read -r parents subject; do
+              # --first-parent is load-bearing: compose merges each ingredient
+              # onto this branch, so its merges are exactly the ones on HEAD's
+              # first-parent chain. Without it the walk also reports merges from
+              # INSIDE the ingredients' own histories ("Merge branch 'main'"
+              # commits they carry), which are not ingredients.
+              git log --merges --first-parent --format='%P%x09%s' "$BASE..HEAD" | while IFS=$'\t' read -r parents subject; do
                 ref=$(echo "$subject" | sed -nE "s/^Merge (remote-tracking )?branch '([^']+)'.*/\2/p")
                 [ -n "$ref" ] && printf "  %-46s %s\n" "$ref" "$(echo "$parents" | awk '{print $2}')"
               done
