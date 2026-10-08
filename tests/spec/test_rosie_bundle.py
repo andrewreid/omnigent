@@ -18,6 +18,8 @@ FACTORY_TOOLS = [
     "factory_get_status",
     "factory_ask_owner",
     "factory_submit_result",
+    "factory_list_issues",
+    "factory_submit_ranking",
 ]
 FACTORY_TOOL_PATTERN = "^(factory__|mcp__omnigent__factory__|mcp__factory__)?factory_.*$"
 
