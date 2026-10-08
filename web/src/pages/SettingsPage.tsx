@@ -1582,14 +1582,16 @@ function ClaudeIntegrationControl() {
         </div>
       )}
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-        <div className="flex min-w-0 flex-1 flex-col">
-          <span className="text-sm font-medium">Claude subscription</span>
-          <span className="text-sm text-muted-foreground">
-            {status.connected
+        <SettingsLabel
+          label="Claude subscription"
+          labelClassName="text-sm"
+          className="flex-1"
+          description={
+            status.connected
               ? `Connected (${status.token_hint ?? "token stored"}). New sandboxes run Claude Code on your subscription.`
-              : "Run `claude setup-token` on your machine and paste the token so new sandboxes run Claude Code on your subscription."}
-          </span>
-        </div>
+              : "Run `claude setup-token` on your machine and paste the token so new sandboxes run Claude Code on your subscription."
+          }
+        />
         <div className="flex shrink-0 items-center gap-2">
           {status.connected ? (
             <Button
@@ -1729,10 +1731,12 @@ function ChatgptIntegrationControl() {
         </div>
       )}
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-        <div className="flex min-w-0 flex-1 flex-col">
-          <span className="text-sm font-medium">ChatGPT subscription</span>
-          <span className="text-sm text-muted-foreground">{description}</span>
-        </div>
+        <SettingsLabel
+          label="ChatGPT subscription"
+          labelClassName="text-sm"
+          className="flex-1"
+          description={description}
+        />
         <div className="flex shrink-0 items-center gap-2">
           {status.connected ? (
             <Button
