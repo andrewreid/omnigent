@@ -1,0 +1,360 @@
+# Build, smoke, boot-check and publish the fork's integration images on a
+# GitHub-hosted runner, so `coder` no longer thrashes doing it.
+#
+# This is the CI half of ~/omnigent-integration (lib/build-images.sh). Compose
+# stays local: resolving merge conflicts needs rerere and judgement, and it is
+# cheap anyway. This workflow takes an ALREADY-COMPOSED commit and does the
+# expensive part — two image builds, the smoke checks, the boot check against a
+# throwaway Postgres, the push, and the manifest.
+#
+# It lives on a long-lived branch of the fork (not `main`, which is a stale
+# mirror that gets fast-forwarded to upstream and would lose this file), and is
+# always started with `workflow_dispatch`, which runs the workflow definition
+# from the branch you dispatch while checking out whatever `ref` you pass:
+#
+#   gh workflow run integration-images.yml --repo andrewreid/omnigent \
+#      --ref ci/integration -f ref=<integration-sha>
+#
+# Runner cost is zero: andrewreid/omnigent is public, so GitHub-hosted minutes
+# are free and unlimited. The constraint is the 14 GB runner disk, which is why
+# the server image is built, checked, pushed and then DELETED before the host
+# image is built — only one image is ever resident.
+name: integration images
+
+on:
+  # `integration ship` just pushes the composed branch; this fires on that.
+  # The workflow file has to exist ON the pushed branch for a push event to
+  # trigger it, which is why compose re-installs it as a glue step every run
+  # (build-integration.sh "glue 5") — the branch is reset to upstream/main each
+  # time and would otherwise lose it.
+  push:
+    branches: [integration]
+  # Manual re-run of an arbitrary commit, e.g. to rebuild without recomposing.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Composed commit or branch to build (sha preferred — a branch is resolved at checkout).'
+        type: string
+        required: true
+        default: integration
+      push:
+        description: 'Push both images to GHCR. Off = build + check only.'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  # Two builds at once would race the GHA layer cache cold and double the time.
+  group: integration-images
+  cancel-in-progress: false
+
+env:
+  SERVER_REPO: ghcr.io/andrewreid/omnigent-server
+  HOST_REPO: ghcr.io/andrewreid/omnigent-host
+  # Keep in step with integration.env.
+  EXTRAS: tracing,kms,kubernetes
+  HOST_HARNESSES: claude codex
+  AGENT_BUNDLES: patricia scribe sentinel remy design-sync aws_analyst holly molly rosie
+  # The cluster is amd64 on every node; the arm64 leg upstream builds would
+  # double the time under QEMU for an image nothing here runs.
+  PLATFORM: linux/amd64
+  UPSTREAM: https://github.com/omnigent-ai/omnigent.git
+
+jobs:
+  images:
+    if: github.repository == 'andrewreid/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write # push to GHCR via GITHUB_TOKEN
+    steps:
+      - name: Reclaim runner disk
+        # ubuntu-latest ships ~25 GB of preinstalled toolchains this build never
+        # uses. The host image (claude + codex CLIs, kiro, agy) plus a pnpm web
+        # build does not comfortably fit in the stock 14 GB free.
+        run: |
+          set -x
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/share/boost /usr/local/lib/node_modules \
+                      /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Checkout composed commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          # Full history: the manifest reports the upstream merge-base and walks
+          # the branch's own merge commits to recover the ingredient SHAs.
+          fetch-depth: 0
+
+      - name: Fetch upstream refs
+        # Only needed so the manifest can name the upstream merge-base the way
+        # the local build does. Blobless: we want refs, not trees.
+        run: |
+          git remote add upstream "$UPSTREAM" 2>/dev/null || true
+          git fetch --quiet --filter=blob:none upstream 'refs/heads/main:refs/remotes/upstream/main'
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          SHA=$(git rev-parse HEAD)
+          {
+            echo "sha=$SHA"
+            echo "tag=integration-${SHA:0:8}"
+            echo "server=$SERVER_REPO:integration-${SHA:0:8}"
+            echo "host=$HOST_REPO:integration-${SHA:0:8}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── server ────────────────────────────────────────────────────────────
+      - name: Build server image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: runtime
+          build-args: OMNIGENT_EXTRAS=${{ env.EXTRAS }}
+          tags: ${{ steps.tag.outputs.server }}
+          platforms: ${{ env.PLATFORM }}
+          # Loaded, not pushed: the smoke and boot checks below run the image,
+          # and nothing is published until every check has passed.
+          load: true
+          push: false
+          cache-from: type=gha,scope=server
+          cache-to: type=gha,mode=max,scope=server
+
+      - name: Smoke server imports
+        run: |
+          out=$(docker run --rm --entrypoint python "${{ steps.tag.outputs.server }}" -c \
+            "import omnigent.server.app, opentelemetry.sdk, psycopg, boto3, botocore, kubernetes, omnigent.onboarding.sandboxes.kubernetes; print('imports ok, kubernetes', kubernetes.__version__)" 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "imports ok" || { echo "::error::SERVER_SMOKE_FAILED"; exit 1; }
+          echo "server smoke: $(echo "$out" | tail -1)" >> status.txt
+
+      - name: Smoke KMS credential cipher
+        run: |
+          out=$(docker run --rm --entrypoint python \
+            -e OMNIGENT_CREDENTIAL_CIPHER=kms -e OMNIGENT_CREDENTIAL_KMS_KEY_ID=alias/smoke-test \
+            "${{ steps.tag.outputs.server }}" -c \
+            "from omnigent.stores.credential_store import build_secret_cipher; print('kms cipher:', type(build_secret_cipher()).__name__)" 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "kms cipher: KmsSecretCipher" || { echo "::error::KMS_SMOKE_FAILED"; exit 1; }
+          echo "server $(echo "$out" | tail -1)" >> status.txt
+
+      - name: Check agent bundles
+        id: bundles
+        run: |
+          out=$(docker run --rm --entrypoint sh "${{ steps.tag.outputs.server }}" -c \
+            "for b in $AGENT_BUNDLES; do test -f /build/examples/\$b/config.yaml || echo MISSING \$b; done; echo bundles checked" 2>&1)
+          echo "$out"
+          if echo "$out" | grep -q MISSING; then echo "::error::AGENT_BUNDLES_MISSING"; exit 1; fi
+          dirs=$(for b in $AGENT_BUNDLES; do printf '/build/examples/%s:' "$b"; done)
+          echo "dirs=${dirs%:}" >> "$GITHUB_OUTPUT"
+          echo "server bundles: $(echo "$out" | tr '\n' ' ')" >> status.txt
+
+      - name: Boot server against throwaway Postgres
+        id: boot
+        env:
+          SERVER_IMG: ${{ steps.tag.outputs.server }}
+          AGENT_DIRS: ${{ steps.bundles.outputs.dirs }}
+        run: |
+          PG_IMG=postgres:17-alpine; NET=boot-net; PG=boot-pg; BOOT=boot; PORT=18766
+          docker network create "$NET" >/dev/null
+          docker run -d --name "$PG" --network "$NET" \
+            -e POSTGRES_PASSWORD=smoke -e POSTGRES_DB=omnigent "$PG_IMG" >/dev/null
+          for _ in $(seq 1 30); do
+            docker exec "$PG" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1
+          done
+          docker run -d --name "$BOOT" --network "$NET" -p 127.0.0.1:$PORT:8000 \
+            -e HOST=0.0.0.0 -e PORT=8000 -e ARTIFACT_DIR=/tmp/artifacts \
+            -e DATABASE_URL="postgresql+psycopg://postgres:smoke@$PG:5432/omnigent" \
+            -e OMNIGENT_BUILTIN_AGENT_DIRS="$AGENT_DIRS" \
+            -e OMNIGENT_TELEMETRY_ENABLED=true \
+            -e OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
+            "$SERVER_IMG" >/dev/null
+          ok=0
+          for _ in $(seq 1 90); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORT/healthz)" = 200 ] && { ok=1; break; }
+            [ "$(docker inspect -f '{{.State.Running}}' "$BOOT")" = true ] || break
+            sleep 2
+          done
+          sleep 3
+          docker logs "$BOOT" > boot.log 2>&1
+          tb=$(grep -c Traceback boot.log || true)
+          reg=$(grep -c "Registered extra built-in agent" boot.log || true)
+          want=$(echo $AGENT_BUNDLES | wc -w)
+          stamp=$(docker exec "$PG" psql -U postgres -d omnigent -tAc \
+            "select version_num from alembic_version" 2>/dev/null || true)
+          docker rm -fv "$BOOT" "$PG" >/dev/null 2>&1 || true
+          docker network rm "$NET" >/dev/null 2>&1 || true
+          line="boot: healthz=$ok, agents registered=$reg/$want, tracebacks=$tb, db stamp=${stamp:-none}"
+          echo "$line"; echo "$line" >> status.txt
+          echo "stamp=${stamp:-unknown}" >> "$GITHUB_OUTPUT"
+          [ "$ok" = 1 ] && [ "$tb" = 0 ] && [ -n "$stamp" ] && [ "$reg" = "$want" ] || {
+            echo "::error::BOOT_FAILED"; tail -60 boot.log; exit 1; }
+
+      - name: Push server image
+        id: push_server
+        if: ${{ github.event_name == 'push' || inputs.push }}
+        run: |
+          IMG=${{ steps.tag.outputs.server }}
+          for a in 1 2 3; do docker push "$IMG" && break; [ "$a" = 3 ] && exit 1; sleep 20; done
+          d=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMG" | grep "^$SERVER_REPO@")
+          echo "digest=$d" >> "$GITHUB_OUTPUT"
+          echo "PUSHED $d" >> status.txt
+
+      - name: Free the server image
+        # The host image will not fit alongside it on a 14 GB runner disk.
+        run: |
+          docker image rm -f "${{ steps.tag.outputs.server }}" postgres:17-alpine || true
+          docker image prune -af || true
+          df -h /
+
+      # ── sandbox host ──────────────────────────────────────────────────────
+      - name: Build host image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: host
+          build-args: HOST_HARNESSES=${{ env.HOST_HARNESSES }}
+          tags: ${{ steps.tag.outputs.host }}
+          platforms: ${{ env.PLATFORM }}
+          load: true
+          push: false
+          cache-from: type=gha,scope=host
+          cache-to: type=gha,mode=max,scope=host
+
+      - name: Smoke host image
+        run: |
+          # `bash -lc` like the sandbox launchers, so the profile.d venv PATH fix
+          # is exercised rather than assumed.
+          SB_CLIS=$(echo "$HOST_HARNESSES" | sed 's/\bkiro\b/kiro-cli/')
+          out=$(docker run --rm -e SB_CLIS="$SB_CLIS" "${{ steps.tag.outputs.host }}" bash -lc '
+            echo "IS_SANDBOX=${IS_SANDBOX:-unset}"
+            echo "omnigent=$(command -v omnigent) $(omnigent --version 2>&1 | tail -1)"
+            python -c "import omnigent.host.connect, omnigent.runner.app; print(\"host imports ok\")"
+            for b in $SB_CLIS gh git tmux bwrap lsof; do command -v $b >/dev/null || echo "MISSING $b"; done
+            for b in $SB_CLIS gh; do echo "$b: $($b --version 2>&1 | head -1)"; done
+            id sandbox >/dev/null 2>&1 || echo "MISSING sandbox user"' 2>&1)
+          echo "$out"
+          echo "$out" | sed 's/^/  host smoke: /' >> status.txt
+          echo "$out" | grep -q "host imports ok" \
+            && echo "$out" | grep -q "IS_SANDBOX=1" \
+            && echo "$out" | grep -q "omnigent=/opt/venv/bin/omnigent" \
+            && ! echo "$out" | grep -q MISSING \
+            || { echo "::error::HOST_SMOKE_FAILED"; exit 1; }
+
+      - name: Push host image
+        id: push_host
+        if: ${{ github.event_name == 'push' || inputs.push }}
+        run: |
+          IMG=${{ steps.tag.outputs.host }}
+          for a in 1 2 3; do docker push "$IMG" && break; [ "$a" = 3 ] && exit 1; sleep 20; done
+          d=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMG" | grep "^$HOST_REPO@")
+          echo "digest=$d" >> "$GITHUB_OUTPUT"
+          echo "PUSHED $d" >> status.txt
+
+      # ── manifest ──────────────────────────────────────────────────────────
+      - name: Write manifest
+        if: always()
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          SHA: ${{ steps.tag.outputs.sha }}
+          SERVER_IMG: ${{ steps.tag.outputs.server }}
+          HOST_IMG: ${{ steps.tag.outputs.host }}
+          SERVER_DIGEST: ${{ steps.push_server.outputs.digest }}
+          HOST_DIGEST: ${{ steps.push_host.outputs.digest }}
+          STAMP: ${{ steps.boot.outputs.stamp }}
+          RESULT: ${{ job.status == 'success' && 'OK' || 'FAILED' }}
+        run: |
+          M=$TAG.txt
+          BASE=$(git merge-base HEAD upstream/main 2>/dev/null || true)
+          {
+            echo "result:   $RESULT"
+            echo "server:   $SERVER_IMG"; echo "  digest: ${SERVER_DIGEST:-not pushed}"
+            echo "host:     $HOST_IMG";   echo "  digest: ${HOST_DIGEST:-not pushed}"
+            echo "built:    $(date -Iseconds)"
+            echo "worktree: github-actions/${{ github.run_id }}"
+            echo "branch:   ${{ inputs.ref || github.ref_name }} @ $SHA"
+            echo "base:     ${BASE:-unknown} ($( [ -n "$BASE" ] && git log -1 --format=%cs "$BASE"))"
+            echo "migration head: ${STAMP:-unknown}"
+            echo; echo "build:"
+            echo "  docker build -f deploy/docker/Dockerfile --target runtime --build-arg OMNIGENT_EXTRAS=$EXTRAS -t $SERVER_IMG ."
+            echo "  docker build -f deploy/docker/Dockerfile --target host --build-arg HOST_HARNESSES=\"$HOST_HARNESSES\" -t $HOST_IMG ."
+            echo; echo "ingredients:"
+            # Recovered from the branch itself: each compose merge commit names
+            # its ref in the subject and carries that ref's tip as parent 2. No
+            # dependence on ~/omnigent-integration being present here.
+            if [ -n "$BASE" ]; then
+              git log --merges --format='%P%x09%s' "$BASE..HEAD" | while IFS=$'\t' read -r parents subject; do
+                ref=$(echo "$subject" | sed -nE "s/^Merge (remote-tracking )?branch '([^']+)'.*/\2/p")
+                [ -n "$ref" ] && printf "  %-46s %s\n" "$ref" "$(echo "$parents" | awk '{print $2}')"
+              done
+            else
+              echo "  unknown (no upstream merge-base)"
+            fi
+            echo; echo "repairs:  recorded locally (see ~/omnigent-integration/repairs)"
+            echo "focus tests: run locally via \`integration test\`"
+            echo; echo "status:"; sed 's/^/  /' status.txt 2>/dev/null || echo "  none"
+          } > "$M"
+          cat "$M"
+
+      - name: Upload manifest and boot log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: manifest-${{ steps.tag.outputs.tag }}
+          path: |
+            ${{ steps.tag.outputs.tag }}.txt
+            boot.log
+          if-no-files-found: warn
+
+  wheels:
+    # Independent of the images: this is what `integration install-host` would
+    # otherwise build on coder. Download the artifact into
+    # ~/omnigent-integration/wheels/<tag>/ and install-host skips its own build.
+    if: github.repository == 'andrewreid/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout composed commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Resolve tag
+        id: tag
+        run: echo "tag=integration-$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+
+      - name: Build wheels
+        # Same three wheels, same flags as cmd_install_host.
+        env:
+          OMNIGENT_SKIP_WEB_UI: 'true'
+        run: |
+          uv build --wheel --out-dir dist .
+          uv build --wheel --out-dir dist sdks/python-client
+          uv build --wheel --out-dir dist sdks/ui
+          ls -la dist
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: wheels-${{ steps.tag.outputs.tag }}
+          path: dist/*.whl
