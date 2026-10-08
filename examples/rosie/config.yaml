@@ -119,6 +119,8 @@ tools:
       - factory_get_status
       - factory_ask_owner
       - factory_submit_result
+      - factory_list_issues
+      - factory_submit_ranking
 
   # Coding sub-agents — see agents/<name>/. Both implement, review
   # (cross-vendor), and explore.
