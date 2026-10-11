@@ -1,7 +1,11 @@
 # Subscription broker (ChatGPT / Codex first)
 
-> **Status:** design, not implemented. Fork-only (`andrewreid/omnigent`) until
-> proven; upstreaming is a later decision.
+> **Status:** implemented on the fork (`andrewreid/omnigent`, branch
+> `feat/subscription-broker`) for M1–M4; see the "As built" notes in each
+> section, which take precedence over the original design text. Not built: the
+> in-process `codex` harness and the opt-in `auth.json` materializer (Path A).
+> Upstreaming needs maintainer agreement on the open questions below. Operator
+> setup: `docs/SUBSCRIPTION_CONNECTIONS.md`.
 > **Basis:** `designs/CODEX_SUBSCRIPTION_BROKER.md` (the handoff brief). This doc
 > supersedes the brief where they disagree. Every such point is called out under
 > "Corrections to the brief".
@@ -200,7 +204,7 @@ class DeviceCodeHooks(Protocol):
 `POST /connections/{provider}/device/{start,poll}` when the hooks implement it.
 `handle` is the signed, user-bound state JWT already used for redirects: it
 carries the upstream `device_auth_id` (non-secret), `sub` and
-`account_generation`, and has a 600 s TTL. So there is no server-side pending
+`account_generation`, and has a 900 s TTL (as built). So there is no server-side pending
 store and the CSRF/replay binding carries over. `status` and `disconnect` are
 unchanged.
 
@@ -226,14 +230,17 @@ unchanged.
   map. Copy notes that device-code login must be enabled in ChatGPT → Settings →
   Security.
 
-Row: `provider="chatgpt"`, `account_id=""`. Secret (encrypted):
-`{access_token, refresh_token, id_token, account_id}`. Metadata (plaintext, no
-tokens): `{access_expires_at, plan_type, chatgpt_account_id, email,
-last_refresh, needs_reconnect, refresh_lease_holder, refresh_lease_until,
-refresh_version}`.
+Row: `provider="chatgpt"`, `account_id=""`. As built, the secret (encrypted) is
+`{access_token, refresh_token}`; the id token isn't stored. Metadata (plaintext,
+no tokens): `{account_id, access_expires_at, plan_type, email,
+device_auth_digest}` plus the shared `needs_reconnect`, `refresh_lease_holder`
+and `refresh_lease_until`. A token set over KMS `Encrypt`'s 4096-byte limit is
+sealed with an envelope (`kmsenv1:`, needs `kms:GenerateDataKey`).
 
-Disconnect deletes the row **and** calls `/oauth/revoke`. Per t7, that
-invalidates every vended access token immediately. This is the real kill switch.
+Disconnect calls `/oauth/revoke`, then deletes the row. Per t7, a successful
+revoke invalidates every vended access token. If the revoke fails, the
+connection is flagged `needs_reconnect` (nothing more is vended) and kept so a
+retried disconnect can still revoke it; the route returns `502`.
 
 ### 3. Broker routes (PR 3a)
 
@@ -248,7 +255,13 @@ invalidates every vended access token immediately. This is the real kill switch.
   route, it does not need an auth provider.
 
 Payload (never includes `refresh_token` or `id_token`):
-`{connected, owner, access_token, account_id, plan_type, expires_at}`.
+`{connected, owner, token, account_id, plan_type, expires_at}`.
+
+> **As built.** The runner route resolves the owner through
+> `resolve_runner_credential_owner`, which also requires the runner's session to
+> sit on a live, server-managed host owned by that user, so a binding token left
+> over after teardown stops working. An optional `?rejected=<sha256 hex>` names
+> an access token OpenAI refused; the resolver refreshes it if it is current.
 
 ### 4. Delivery in the sandbox (PR 3b)
 
@@ -279,9 +292,10 @@ Payload (never includes `refresh_token` or `id_token`):
 >   - It then clears `login_required`, so the headless sign-in fail-fast
 >     doesn't trigger.
 > - **Readiness:** at startup, `configure_host_chatgpt` asks the host route
->   whether ChatGPT is connected, without taking the token, and sets
->   `OMNIGENT_CHATGPT_SUBSCRIPTION_BROKERED=1`. `_codex_auth_unavailable_reason`
->   treats that as available.
+>   whether ChatGPT is connected (it receives the payload but keeps only the
+>   yes/no) and sets `OMNIGENT_CHATGPT_SUBSCRIPTION_BROKERED=1`. Harness
+>   readiness then treats `codex-native` / `native-codex` as available; the
+>   in-process `codex` harness still needs a local login.
 > - **Not yet built:**
 >   - The in-process `codex` harness (stdio app-server in `codex_executor`).
 >   - The opt-in `auth.json` materializer (Path A) for running bare `codex` in
