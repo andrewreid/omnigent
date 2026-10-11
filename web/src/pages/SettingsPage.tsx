@@ -1663,30 +1663,45 @@ function ChatgptIntegrationControl() {
     void refresh();
   }, [refresh]);
 
-  // Poll while a device code is showing; stop on any terminal state or unmount.
+  // Poll one request at a time while a device code is showing: overlapping polls
+  // would race to redeem the one-time code. Stop on a terminal state or unmount.
   useEffect(() => {
     if (device === null) return;
     let cancelled = false;
-    const timer = window.setInterval(
-      async () => {
-        const result = await pollChatgptConnect(device.handle);
-        if (cancelled || result.status === "pending") return;
-        window.clearInterval(timer);
-        setDevice(null);
-        if (result.status === "complete") {
-          setMessage(null);
-          await refresh();
-        } else if (result.status === "expired") {
-          setMessage("That code expired before it was approved. Start again.");
-        } else {
-          setMessage(result.detail ?? "The ChatGPT sign-in failed. Start again.");
-        }
-      },
-      Math.max(device.interval, 2) * 1000,
-    );
+    let timer: number | undefined;
+    const delayMs = Math.max(device.interval, 2) * 1000;
+    const expiresAt = Date.now() + device.expires_in * 1000;
+
+    const tick = async () => {
+      let result = await pollChatgptConnect(device.handle);
+      if (cancelled) return;
+      if (result.status === "unreachable") {
+        // A proxy can time out a poll the server still completes, so trust the
+        // stored connection over the lost answer.
+        const current = await fetchChatgptStatus().catch(() => null);
+        if (cancelled) return;
+        if (current?.connected) result = { status: "complete" };
+        else result = Date.now() < expiresAt ? { status: "pending" } : { status: "expired" };
+      }
+      if (result.status === "pending") {
+        timer = window.setTimeout(() => void tick(), delayMs);
+        return;
+      }
+      setDevice(null);
+      if (result.status === "complete") {
+        setMessage(null);
+        await refresh();
+      } else if (result.status === "expired") {
+        setMessage("That code expired before it was approved. Start again.");
+      } else {
+        setMessage(result.detail ?? "The ChatGPT sign-in failed. Start again.");
+      }
+    };
+
+    timer = window.setTimeout(() => void tick(), delayMs);
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      window.clearTimeout(timer);
     };
   }, [device, refresh]);
 
