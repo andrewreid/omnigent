@@ -208,8 +208,17 @@ class PasteSecretHooks(Protocol):
         :class:`ConnectionError` with a user-safe message on rejection."""
 
 
-class _PastedSecret(BaseModel):
-    secret: str
+async def _pasted_secret(request: Request) -> str:
+    """Read ``{"secret": "…"}`` without echoing it: FastAPI's validation error
+    would repeat the submitted value in its 422 body."""
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    secret = body.get("secret") if isinstance(body, dict) else None
+    if not isinstance(secret, str):
+        raise HTTPException(status_code=400, detail='Expected a JSON body {"secret": "…"}.')
+    return secret
 
 
 def create_paste_connection_router(
@@ -226,11 +235,12 @@ def create_paste_connection_router(
     _current_user = _mount_status_and_disconnect(router, hooks, auth_provider)
 
     @router.post(f"/connections/{hooks.provider}/secret")
-    async def submit(request: Request, body: _PastedSecret) -> dict[str, object]:
+    async def submit(request: Request) -> dict[str, object]:
         """Store the caller's pasted secret, replacing any existing one."""
         user_id = _current_user(request)
+        secret = await _pasted_secret(request)
         try:
-            await hooks.accept(user_id, body.secret)
+            await hooks.accept(user_id, secret)
         except ConnectionError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"connected": True}

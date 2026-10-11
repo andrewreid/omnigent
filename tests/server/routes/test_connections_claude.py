@@ -118,6 +118,16 @@ def test_paste_rejects_non_setup_tokens(client: TestClient, store, bad: str) -> 
     assert store.get(RESERVED_USER_LOCAL) is None
 
 
+@pytest.mark.parametrize(
+    "body",
+    [{"secret": ["SECRET-SENTINEL"]}, {"token": "SECRET-SENTINEL"}, "SECRET-SENTINEL"],
+)
+def test_malformed_paste_never_echoes_the_input(client: TestClient, body) -> None:
+    resp = client.post("/v1/connections/claude/secret", json=body)
+    assert resp.status_code == 400
+    assert "SECRET-SENTINEL" not in resp.text
+
+
 def test_disconnect_removes_the_connection(client: TestClient) -> None:
     client.post("/v1/connections/claude/secret", json={"secret": _TOKEN})
     assert client.post("/v1/connections/claude/disconnect").json() == {"disconnected": True}
