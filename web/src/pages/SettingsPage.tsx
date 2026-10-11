@@ -1562,10 +1562,13 @@ function ClaudeIntegrationControl() {
 
   const onDisconnect = useCallback(async () => {
     setBusy(true);
+    setError(null);
     try {
       await disconnectClaude();
-      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't disconnect Claude.");
     } finally {
+      await refresh();
       setBusy(false);
     }
   }, [refresh]);
@@ -1719,10 +1722,13 @@ function ChatgptIntegrationControl() {
 
   const onDisconnect = useCallback(async () => {
     setBusy(true);
+    setMessage(null);
     try {
       await disconnectChatgpt();
-      await refresh();
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "Couldn't disconnect ChatGPT.");
     } finally {
+      await refresh();
       setBusy(false);
     }
   }, [refresh]);

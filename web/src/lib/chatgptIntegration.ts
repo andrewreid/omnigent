@@ -105,6 +105,6 @@ export async function pollChatgptConnect(handle: string): Promise<ChatgptPollSta
 export async function disconnectChatgpt(): Promise<void> {
   const res = await authenticatedFetch("/v1/connections/chatgpt/disconnect", { method: "POST" });
   if (!res.ok) {
-    throw new Error(`ChatGPT disconnect failed: ${res.status}`);
+    throw new Error(await detailOf(res, "Couldn't disconnect ChatGPT"));
   }
 }

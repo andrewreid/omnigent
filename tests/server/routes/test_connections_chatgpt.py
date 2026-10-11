@@ -58,6 +58,7 @@ class FakeAuthService:
         self.refresh_error: tuple[int, dict] | None = None
         self.refreshes: list[str] = []
         self.revoked: list[str] = []
+        self.revoke_status = 200
         self.exchanges: list[dict] = []
         self.user_agents: set[str] = set()
         self.token_polls = 0
@@ -107,6 +108,8 @@ class FakeAuthService:
             n = int(body["refresh_token"].split("-")[1]) + 1
             return httpx.Response(200, json=_tokens(n))
         if path == "/oauth/revoke":
+            if self.revoke_status != 200:
+                return httpx.Response(self.revoke_status)
             self.revoked.append(json.loads(request.content)["token"])
             return httpx.Response(200)
         return httpx.Response(404)
@@ -302,6 +305,28 @@ def test_disconnect_revokes_upstream_then_deletes(client: TestClient, auth) -> N
     assert client.post("/v1/connections/chatgpt/disconnect").json() == {"disconnected": True}
     assert auth.revoked == ["rt-1"]
     assert client.get("/v1/connections/chatgpt/status").json()["connected"] is False
+
+
+def test_failed_revoke_stops_vending_but_keeps_the_chain_to_revoke_on_retry(
+    client: TestClient, auth: FakeAuthService
+) -> None:
+    _connect(client)
+    auth.revoke_status = 503
+
+    failed = client.post("/v1/connections/chatgpt/disconnect")
+
+    assert failed.status_code == 502
+    assert "disconnect again" in failed.json()["detail"]
+    status = client.get("/v1/connections/chatgpt/status").json()
+    assert status["connected"] is True and status["needs_reconnect"] is True
+    vend = client.get(
+        "/v1/hosts/host1/credentials/chatgpt", headers={MANAGED_HOST_TOKEN_HEADER: "launch-tok"}
+    )
+    assert vend.json() == {"connected": False}
+
+    auth.revoke_status = 200
+    assert client.post("/v1/connections/chatgpt/disconnect").json() == {"disconnected": True}
+    assert auth.revoked == ["rt-1"]
 
 
 # --- resolver refresh -------------------------------------------------------
