@@ -51,7 +51,7 @@ def _route_app() -> FastAPI:
     app.include_router(
         create_runner_tunnel_router(
             app.state.tunnel_registry,
-            resolve_managed_runner_owner=lambda rid: (
+            resolve_runner_credential_owner=lambda rid: (
                 "owner@example.com" if rid == runner_id else None
             ),
         ),
