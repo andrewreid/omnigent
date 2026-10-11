@@ -12,6 +12,7 @@ the upstream call outside any transaction, one write to commit. See
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
 import time
@@ -27,6 +28,9 @@ TokensT = TypeVar("TokensT")
 #: Longer than any provider's token-endpoint timeout, so a live holder keeps it.
 LEASE_TTL_S = 60
 _POLL_S = 0.25
+#: Backoff between attempts to store freshly minted tokens (the old refresh
+#: token is already spent, so losing them means a reconnect).
+_PERSIST_RETRY_S = (0.2, 0.5, 1.0)
 
 
 class RefreshRejected(Exception):
@@ -41,7 +45,8 @@ class Refreshed(Generic[EntityT, TokensT]):
     :param connection: The stored connection (with tokens) as last read.
     :param minted: Tokens this call just obtained from the provider, or ``None``.
         Prefer them over *connection*: they are valid even when persisting them
-        failed, and the refresh token they replaced is already spent.
+        failed (the connection is then flagged for reconnect, because the
+        refresh token they replaced is spent).
     """
 
     connection: EntityT
@@ -53,7 +58,7 @@ class _LeasedStore(Protocol[EntityT]):
     def needs_reconnect(self, user_id: str) -> bool: ...
     def acquire_refresh_lease(self, user_id: str, *, holder: str, ttl_s: int) -> bool: ...
     def release_refresh_lease(self, user_id: str, *, holder: str) -> bool: ...
-    def mark_needs_reconnect(self, user_id: str) -> bool: ...
+    def mark_needs_reconnect(self, user_id: str, *, holder: str | None = None) -> bool: ...
 
 
 async def refresh_coordinated(
@@ -79,6 +84,11 @@ async def refresh_coordinated(
         the current connection (the caller decides from its expiry whether it is
         still usable). ``None`` when there is no connection or it needs a
         reconnect.
+
+    A transient failure after the request reached the provider (e.g. a read
+    timeout) leaves it unknown whether the chain rotated; the current token is
+    kept, and if it did rotate the next refresh is rejected as reused, which
+    degrades to "reconnect".
     """
     conn = await asyncio.to_thread(store.get, user_id, with_tokens=True)
     if conn is None or await asyncio.to_thread(store.needs_reconnect, user_id):
@@ -106,22 +116,43 @@ async def refresh_coordinated(
             _logger.warning(
                 "%s refresh rejected for %s; needs reconnect: %s", provider, user_id, exc
             )
-            await asyncio.to_thread(store.mark_needs_reconnect, user_id)
+            await asyncio.to_thread(store.mark_needs_reconnect, user_id, holder=holder)
             return None
         except Exception as exc:  # noqa: BLE001 - transient: keep the current token
             _logger.warning("%s token refresh failed for %s: %s", provider, user_id, exc)
             return Refreshed(conn)
-        try:
-            persisted = await asyncio.to_thread(persist, tokens, holder)
-        except Exception as exc:  # noqa: BLE001 - a persist error must not drop minted tokens
-            _logger.warning("%s refreshed token for %s not persisted: %s", provider, user_id, exc)
-            persisted = False
-        if not persisted:
-            # Lease lost (the refresh outlived it) or the row went away.
-            _logger.warning("%s refreshed token for %s was not stored", provider, user_id)
+        if not await _persist_minted(persist, tokens, holder, provider, user_id):
+            # The stored refresh token is spent; never let a later refresh replay it.
+            _logger.error(
+                "%s refreshed token for %s could not be stored; needs reconnect", provider, user_id
+            )
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(store.mark_needs_reconnect, user_id, holder=holder)
         return Refreshed(conn, minted=tokens)
     finally:
-        await asyncio.to_thread(store.release_refresh_lease, user_id, holder=holder)
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(store.release_refresh_lease, user_id, holder=holder)
+
+
+async def _persist_minted(
+    persist: Callable[[TokensT, str], bool],
+    tokens: TokensT,
+    holder: str,
+    provider: str,
+    user_id: str,
+) -> bool:
+    """Store minted tokens, retrying a failing write while the lease is still ours.
+
+    :returns: ``False`` when every attempt raised or the lease was lost.
+    """
+    for delay in (0.0, *_PERSIST_RETRY_S):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            return await asyncio.to_thread(persist, tokens, holder)
+        except Exception as exc:  # noqa: BLE001 - retried, then fails closed
+            _logger.warning("%s refreshed token for %s not stored: %s", provider, user_id, exc)
+    return False
 
 
 async def _await_other_holder(

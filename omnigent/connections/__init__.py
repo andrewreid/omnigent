@@ -68,9 +68,9 @@ class ConnectionStore(ABC, Generic[EntityT]):
         """Drop *holder*'s lease without writing tokens."""
         return self._store.release_refresh_lease(user_id, self._PROVIDER, holder=holder)
 
-    def mark_needs_reconnect(self, user_id: str) -> bool:
-        """Stop refreshing until the user reconnects."""
-        return self._store.mark_needs_reconnect(user_id, self._PROVIDER)
+    def mark_needs_reconnect(self, user_id: str, *, holder: str | None = None) -> bool:
+        """Stop refreshing until the user reconnects (see the store method)."""
+        return self._store.mark_needs_reconnect(user_id, self._PROVIDER, holder=holder)
 
     def list_all(self) -> list[EntityT]:
         """All connections for this provider (metadata only) — tests/admin."""

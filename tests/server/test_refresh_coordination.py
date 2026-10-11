@@ -116,6 +116,23 @@ def test_needs_reconnect_is_set_and_cleared_by_reconnect(db_uri: str) -> None:
     assert not store.needs_reconnect(_USER)
 
 
+def test_needs_reconnect_refuses_the_lease(db_uri: str) -> None:
+    store = _seed(db_uri)
+    assert store.mark_needs_reconnect(_USER)
+    assert not store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)
+
+
+def test_stale_rejection_cannot_flag_a_reconnected_login(db_uri: str) -> None:
+    # A refresh that outlives a reconnect gets rejected for the OLD chain; the
+    # reconnect's upsert dropped its lease, so its flag must not land.
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="old-refresh", ttl_s=60)
+    store.upsert(_USER, github_login="alice", github_user_id=7, tokens=_tokens("fresh", 3600))
+
+    assert not store.mark_needs_reconnect(_USER, holder="old-refresh")
+    assert not store.needs_reconnect(_USER)
+
+
 # --- resolver against the real store ----------------------------------------
 
 
@@ -188,33 +205,42 @@ def _race(db_uri: str, workdir: Path, *, bypass_lease: bool = False) -> tuple[li
         "import sys; from tests.server.test_refresh_coordination import race_worker_main; "
         "race_worker_main(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4] == '1')"
     )
-    procs = [
-        subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                code,
-                db_uri,
-                str(workdir),
-                str(i),
-                "1" if bypass_lease else "0",
-            ],
-            cwd=_REPO_ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        for i in range(_PROCS)
-    ]
+    procs: list[subprocess.Popen[str]] = []
     tokens = []
-    for proc in procs:
-        out, err = proc.communicate(timeout=120)
-        lines = out.strip().splitlines()
-        tokens.append(
-            json.loads(lines[-1])["token"]
-            if proc.returncode == 0 and lines
-            else f"ERROR: {err[-300:]}"
-        )
+    try:
+        for i in range(_PROCS):
+            procs.append(
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        code,
+                        db_uri,
+                        str(workdir),
+                        str(i),
+                        "1" if bypass_lease else "0",
+                    ],
+                    cwd=_REPO_ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            )
+        deadline = time.monotonic() + 120
+        for proc in procs:
+            out, err = proc.communicate(timeout=max(1.0, deadline - time.monotonic()))
+            lines = out.strip().splitlines()
+            tokens.append(
+                json.loads(lines[-1])["token"]
+                if proc.returncode == 0 and lines
+                else f"ERROR: {err[-300:]}"
+            )
+    finally:
+        # A timeout or failed launch must not leave workers running.
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
     return (workdir / "refresh-calls.log").read_text().splitlines(), tokens
 
 

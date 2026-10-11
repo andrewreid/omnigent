@@ -32,6 +32,7 @@ class _Store:
         self._conn = conn
         self.updated: list[GitHubTokenSet] = []
         self.raise_on_update = False
+        self.update_attempts = 0
         self.reconnect = False
         self.lease: str | None = None
 
@@ -42,7 +43,7 @@ class _Store:
         return self.reconnect
 
     def acquire_refresh_lease(self, user_id: str, *, holder: str, ttl_s: int) -> bool:
-        if self.lease not in (None, holder):
+        if self.reconnect or self.lease not in (None, holder):
             return False
         self.lease = holder
         return True
@@ -53,13 +54,16 @@ class _Store:
         self.lease = None
         return True
 
-    def mark_needs_reconnect(self, user_id: str) -> bool:
+    def mark_needs_reconnect(self, user_id: str, *, holder: str | None = None) -> bool:
+        if holder is not None and self.lease != holder:
+            return False
         self.reconnect, self.lease = True, None
         return True
 
     def update_tokens(
         self, user_id: str, tokens: GitHubTokenSet, *, lease_holder: str | None = None
     ) -> bool:
+        self.update_attempts += 1
         if self.raise_on_update:
             raise RuntimeError("db down")
         self.updated.append(tokens)
@@ -143,11 +147,19 @@ def test_no_refresh_token_expired_returns_none() -> None:
     assert _resolve(store, _Client()) is None
 
 
-def test_persist_failure_still_returns_refreshed_token() -> None:
-    # A DB write error after a successful refresh must not drop the new token.
+def test_persist_failure_returns_the_new_token_then_fails_closed() -> None:
+    # The new token is valid for this call, but the stored refresh token is now
+    # spent: after retrying the write, flag a reconnect so nothing replays it.
     store = _Store(_Conn("ghu_old", "ghr", now_epoch() + 60))
     store.raise_on_update = True
-    assert _resolve(store, _Client(result=_fresh("ghu_new"))) == "ghu_new"
+    client = _Client(result=_fresh("ghu_new"))
+
+    assert _resolve(store, client) == "ghu_new"
+
+    assert store.update_attempts == 4
+    assert store.reconnect is True
+    assert _resolve(store, client) is None
+    assert client.calls == 1
 
 
 def test_rejected_refresh_token_marks_reconnect_and_stops_refreshing() -> None:
