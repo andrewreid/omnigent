@@ -96,11 +96,20 @@ class ChatgptConnectionStore(ConnectionStore[ChatgptConnection]):
     def update_tokens(
         self, user_id: str, tokens: ChatgptTokenSet, *, lease_holder: str | None = None
     ) -> bool:
-        """Persist refreshed tokens. ``False`` if the row went or the lease was lost."""
+        """Persist refreshed tokens. ``False`` if the row went or the lease was lost.
+
+        Keeps the device-login marker, so a sign-in poll retried after a
+        refresh still finds its completion.
+        """
+        metadata = self._metadata(tokens)
+        current = self._store.get(user_id, self._PROVIDER)
+        digest = current.metadata.get("device_auth_digest") if current is not None else None
+        if digest:
+            metadata["device_auth_digest"] = digest
         return self._store.update_secret(
             user_id,
             self._PROVIDER,
             secret=self._secret(tokens),
-            metadata=self._metadata(tokens),
+            metadata=metadata,
             lease_holder=lease_holder,
         )
