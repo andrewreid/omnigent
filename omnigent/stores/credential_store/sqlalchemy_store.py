@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -40,6 +41,13 @@ _logger = logging.getLogger(__name__)
 _LEASE_HOLDER = "refresh_lease_holder"
 _LEASE_UNTIL = "refresh_lease_until"
 _NEEDS_RECONNECT = "needs_reconnect"
+#: Set by the lease holder just before it calls the provider; cleared only once
+#: the outcome is known. Found on a lease that expired, it means the refresh
+#: token may already be spent.
+_REFRESH_INFLIGHT = "refresh_inflight"
+#: Fresh per connect/reconnect, so a slow operation can tell the row it read
+#: from a replacement (``upsert`` keeps ``created_at``).
+_GENERATION = "connection_generation"
 
 
 def _enc_context(
@@ -146,7 +154,7 @@ class CredentialStore:
         pk = (workspace_id, user_id, provider, account_id)
         context = _enc_context(workspace_id, user_id, provider, account_id)
         secret_enc = self._cipher.encrypt(json.dumps(secret), context=context)
-        metadata_json = json.dumps(metadata)
+        metadata_json = json.dumps({**metadata, _GENERATION: uuid.uuid4().hex})
 
         def _apply(session: Session, row: SqlConnection | None) -> SqlConnection:
             if row is None:
@@ -223,10 +231,12 @@ class CredentialStore:
             if lease_holder is not None and current.get(_LEASE_HOLDER) != lease_holder:
                 return False
             new_meta = dict(metadata) if metadata is not None else current
+            if _GENERATION in current:
+                new_meta[_GENERATION] = current[_GENERATION]
             # Fresh tokens clear the reconnect flag. Only the holder's own
             # commit releases the lease; an unleased write keeps someone else's.
             new_meta.pop(_NEEDS_RECONNECT, None)
-            for key in (_LEASE_HOLDER, _LEASE_UNTIL):
+            for key in (_LEASE_HOLDER, _LEASE_UNTIL, _REFRESH_INFLIGHT):
                 new_meta.pop(key, None)
                 if lease_holder is None and key in current:
                     new_meta[key] = current[key]
@@ -308,21 +318,86 @@ class CredentialStore:
         :meth:`update_secret` with ``lease_holder``. A lease past its expiry can
         be taken over, so a crashed holder never wedges the connection.
 
+        A lease that expired with a refresh still in flight (the holder died, or
+        lost the provider's answer) fails closed: the refresh token may already
+        be spent, so the connection is flagged for reconnect instead.
+
         :returns: ``True`` when *holder* now owns the lease; ``False`` when another
             holder does or the connection needs a reconnect.
         """
         now = now_epoch()
+        acquired = False
 
         def claim(meta: dict[str, Any]) -> bool:
+            nonlocal acquired
             if meta.get(_NEEDS_RECONNECT):
                 return False
             if int(meta.get(_LEASE_UNTIL) or 0) > now and meta.get(_LEASE_HOLDER) != holder:
                 return False
+            if meta.get(_REFRESH_INFLIGHT) not in (None, holder):
+                meta[_NEEDS_RECONNECT] = True
+                for key in (_LEASE_HOLDER, _LEASE_UNTIL, _REFRESH_INFLIGHT):
+                    meta.pop(key, None)
+                return True
             meta[_LEASE_HOLDER] = holder
             meta[_LEASE_UNTIL] = now + ttl_s
+            acquired = True
             return True
 
-        return self._update_metadata("acquire_refresh_lease", user_id, provider, account_id, claim)
+        self._update_metadata("acquire_refresh_lease", user_id, provider, account_id, claim)
+        if not acquired and self.needs_reconnect_flagged(user_id, provider, account_id=account_id):
+            _logger.warning(
+                "credential_store: %s refresh was abandoned mid-flight; needs reconnect", provider
+            )
+        return acquired
+
+    def needs_reconnect_flagged(
+        self, user_id: str, provider: str, *, account_id: str = ""
+    ) -> bool:
+        """Whether the connection is flagged for reconnect."""
+        conn = self.get(user_id, provider, account_id=account_id)
+        return bool(conn is not None and conn.metadata.get(_NEEDS_RECONNECT))
+
+    def get_under_lease(
+        self, user_id: str, provider: str, *, holder: str, account_id: str = ""
+    ) -> ProviderConnection | None:
+        """The connection with its secret, only while *holder* owns its refresh lease.
+
+        ``None`` when the lease was lost (taken over, or cleared by a reconnect)
+        or the connection was flagged for reconnect since it was acquired.
+        """
+        conn = self.get(user_id, provider, account_id=account_id, with_secret=True)
+        if conn is None:
+            return None
+        meta = conn.metadata
+        if meta.get(_NEEDS_RECONNECT) or meta.get(_LEASE_HOLDER) != holder:
+            return None
+        return conn
+
+    def mark_refresh_inflight(
+        self, user_id: str, provider: str, *, holder: str, account_id: str = ""
+    ) -> bool:
+        """Record that *holder* is about to call the provider. ``False`` if the
+        lease is no longer held, so the caller must not refresh."""
+        now = now_epoch()
+
+        def mark(meta: dict[str, Any]) -> bool:
+            if meta.get(_NEEDS_RECONNECT) or meta.get(_LEASE_HOLDER) != holder:
+                return False
+            if int(meta.get(_LEASE_UNTIL) or 0) <= now:
+                return False
+            meta[_REFRESH_INFLIGHT] = holder
+            return True
+
+        return self._update_metadata("mark_refresh_inflight", user_id, provider, account_id, mark)
+
+    def generation(self, user_id: str, provider: str, *, account_id: str = "") -> str | None:
+        """The connection's current generation (see :data:`_GENERATION`), or ``None``."""
+        conn = self.get(user_id, provider, account_id=account_id)
+        if conn is None:
+            return None
+        value = conn.metadata.get(_GENERATION)
+        return value if isinstance(value, str) else ""
 
     def release_refresh_lease(
         self, user_id: str, provider: str, *, holder: str, account_id: str = ""
@@ -332,8 +407,8 @@ class CredentialStore:
         def release(meta: dict[str, Any]) -> bool:
             if meta.get(_LEASE_HOLDER) != holder:
                 return False
-            meta.pop(_LEASE_HOLDER, None)
-            meta.pop(_LEASE_UNTIL, None)
+            for key in (_LEASE_HOLDER, _LEASE_UNTIL, _REFRESH_INFLIGHT):
+                meta.pop(key, None)
             return True
 
         return self._update_metadata(
@@ -346,6 +421,7 @@ class CredentialStore:
         provider: str,
         *,
         holder: str | None = None,
+        generation: str | None = None,
         account_id: str = "",
     ) -> bool:
         """Flag that the stored chain is unusable; clears any lease.
@@ -356,14 +432,18 @@ class CredentialStore:
 
         :param holder: Only flag while *holder* still owns the refresh lease, so
             a refresh that outlived a reconnect can't mark the new login broken.
+        :param generation: Only flag that generation of the connection (see
+            :meth:`generation`), not a replacement made since it was read.
         """
 
         def flag(meta: dict[str, Any]) -> bool:
             if holder is not None and meta.get(_LEASE_HOLDER) != holder:
                 return False
+            if generation is not None and meta.get(_GENERATION, "") != generation:
+                return False
             meta[_NEEDS_RECONNECT] = True
-            meta.pop(_LEASE_HOLDER, None)
-            meta.pop(_LEASE_UNTIL, None)
+            for key in (_LEASE_HOLDER, _LEASE_UNTIL, _REFRESH_INFLIGHT):
+                meta.pop(key, None)
             return True
 
         return self._update_metadata("mark_needs_reconnect", user_id, provider, account_id, flag)
@@ -393,8 +473,34 @@ class CredentialStore:
             )
             return self._to_entity(row, with_secret=with_secret) if row is not None else None
 
-    def delete(self, user_id: str, provider: str, *, account_id: str = "") -> bool:
-        """Remove a user's connection for *provider*. Returns ``True`` if a row went."""
+    def delete(
+        self,
+        user_id: str,
+        provider: str,
+        *,
+        account_id: str = "",
+        generation: str | None = None,
+    ) -> bool:
+        """Remove a user's connection for *provider*. Returns ``True`` if a row went.
+
+        :param generation: Only remove that generation (see :meth:`generation`),
+            leaving a replacement made since it was read.
+        """
+        workspace_id = current_workspace_id()
+
+        if generation is not None:
+
+            def fenced(session: Session) -> bool:
+                row = self._locked_row(session, workspace_id, user_id, provider, account_id)
+                if row is None:
+                    return False
+                meta = _safe_json_obj(row.metadata_json) or {}
+                if meta.get(_GENERATION, "") != generation:
+                    return False
+                session.delete(row)
+                return True
+
+            return run_write_transaction(self._session_immediate, "delete_generation", fenced)
 
         def write(session: Session) -> bool:
             result = cast(

@@ -19,6 +19,8 @@ import sys
 import time
 from pathlib import Path
 
+import httpx
+
 from omnigent.connections.github import GithubConnectionStore
 from omnigent.db.utils import now_epoch
 from omnigent.server import github_identity
@@ -133,6 +135,90 @@ def test_stale_rejection_cannot_flag_a_reconnected_login(db_uri: str) -> None:
     assert not store.needs_reconnect(_USER)
 
 
+def _expire_lease(store: GithubConnectionStore) -> None:
+    store._store._update_metadata(
+        "test_expire_lease",
+        _USER,
+        _PROVIDER,
+        "",
+        lambda m: m.update(refresh_lease_until=0) or True,
+    )
+
+
+def test_abandoned_inflight_refresh_fails_closed_on_next_acquire(db_uri: str) -> None:
+    # The holder marked the refresh in flight, then died: the refresh token may
+    # already be spent, so the next acquirer flags a reconnect instead.
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="crashed", ttl_s=60)
+    assert store.mark_refresh_inflight(_USER, holder="crashed")
+    _expire_lease(store)
+
+    assert not store.acquire_refresh_lease(_USER, holder="next", ttl_s=60)
+    assert store.needs_reconnect(_USER)
+
+
+def test_released_lease_clears_the_inflight_marker(db_uri: str) -> None:
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)
+    assert store.mark_refresh_inflight(_USER, holder="a")
+    assert store.release_refresh_lease(_USER, holder="a")
+    assert store.acquire_refresh_lease(_USER, holder="b", ttl_s=60)
+    assert not store.needs_reconnect(_USER)
+
+
+def test_snapshot_under_lease_is_fenced(db_uri: str) -> None:
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)
+    assert store.get_under_lease(_USER, holder="a") is not None
+    assert store.get_under_lease(_USER, holder="b") is None
+    store.upsert(_USER, github_login="alice", github_user_id=7, tokens=_tokens("re", 3600))
+    assert store.get_under_lease(_USER, holder="a") is None  # reconnect dropped the lease
+    assert not store.mark_refresh_inflight(_USER, holder="a")
+
+
+def test_lost_answer_never_replays_the_refresh_token(db_uri: str) -> None:
+    store = _seed(db_uri)
+    client = _Client(exc=httpx.ReadTimeout("answer lost"))
+    assert _resolve(store, client) == "old"  # still valid for this call
+    assert _resolve(store, client) is None
+    assert client.calls == 1
+    assert store.needs_reconnect(_USER)
+
+
+def test_flag_landing_after_acquire_stops_the_refresh(db_uri: str) -> None:
+    store = _seed(db_uri)
+    client = _Client(result=_tokens("new", 3600))
+    acquire = store.acquire_refresh_lease
+
+    def acquire_then_flag(user_id: str, **kwargs) -> bool:
+        ok = acquire(user_id, **kwargs)
+        store.mark_needs_reconnect(user_id)  # e.g. a disconnect in between
+        return ok
+
+    store.acquire_refresh_lease = acquire_then_flag  # type: ignore[method-assign]
+    assert _resolve(store, client) is None
+    assert client.calls == 0
+
+
+def test_generation_fences_delete_and_flag(db_uri: str) -> None:
+    store = _seed(db_uri)
+    old = store.generation(_USER)
+    store.upsert(_USER, github_login="alice", github_user_id=7, tokens=_tokens("re", 3600))
+    assert store.generation(_USER) != old
+    assert not store.mark_needs_reconnect(_USER, generation=old)
+    assert not store.delete(_USER, generation=old)
+    assert store.get(_USER) is not None
+    assert store.delete(_USER, generation=store.generation(_USER))
+
+
+def test_refresh_keeps_the_generation(db_uri: str) -> None:
+    store = _seed(db_uri)
+    gen = store.generation(_USER)
+    assert store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)
+    assert store.update_tokens(_USER, _tokens("new", 3600), lease_holder="a")
+    assert store.generation(_USER) == gen
+
+
 # --- resolver against the real store ----------------------------------------
 
 
@@ -188,6 +274,8 @@ def race_worker_main(db_uri: str, workdir: str, index: int, bypass_lease: bool) 
     store = _store(db_uri)
     if bypass_lease:  # control: every process believes it won the lease
         store.acquire_refresh_lease = lambda *a, **k: True  # type: ignore[method-assign]
+        store.get_under_lease = lambda user_id, **k: store.get(user_id, with_tokens=True)  # type: ignore[method-assign]
+        store.mark_refresh_inflight = lambda *a, **k: True  # type: ignore[method-assign]
     (Path(workdir) / f"ready-{index}").touch()
     deadline = time.monotonic() + 60
     while len(list(Path(workdir).glob("ready-*"))) < _PROCS and time.monotonic() < deadline:
