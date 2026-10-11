@@ -34,6 +34,29 @@ describe("chatgptIntegration", () => {
     });
   });
 
+  it("reports a bare 5xx from a proxy as unreachable, not a failed sign-in", async () => {
+    fetchMock.mockResolvedValue(new Response("upstream request timeout", { status: 503 }));
+
+    await expect(pollChatgptConnect("h1")).resolves.toEqual({ status: "unreachable" });
+  });
+
+  it("reports a network failure as unreachable", async () => {
+    fetchMock.mockRejectedValue(new TypeError("Failed to fetch"));
+
+    await expect(pollChatgptConnect("h1")).resolves.toEqual({ status: "unreachable" });
+  });
+
+  it("keeps a server 5xx that carries a detail as an error", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ detail: "ChatGPT sign-in is unavailable." }), { status: 503 }),
+    );
+
+    await expect(pollChatgptConnect("h1")).resolves.toEqual({
+      status: "error",
+      detail: "ChatGPT sign-in is unavailable.",
+    });
+  });
+
   it("surfaces why a sign-in couldn't start", async () => {
     fetchMock.mockResolvedValue(
       new Response(JSON.stringify({ detail: "Enable it in ChatGPT → Settings → Security." }), {

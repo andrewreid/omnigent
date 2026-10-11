@@ -37,16 +37,22 @@ export type ChatgptPollStatus =
   | { status: "pending" }
   | { status: "complete" }
   | { status: "expired" }
-  | { status: "error"; detail?: string };
+  | { status: "error"; detail?: string }
+  /** No answer from the server, e.g. a proxy timed out a poll the server may still finish. */
+  | { status: "unreachable" };
 
-async function detailOf(res: Response, fallback: string): Promise<string> {
+async function jsonDetail(res: Response): Promise<string | undefined> {
   try {
     const body = (await res.json()) as { detail?: unknown };
     if (typeof body.detail === "string") return body.detail;
   } catch {
     // fall through
   }
-  return `${fallback} (${res.status}).`;
+  return undefined;
+}
+
+async function detailOf(res: Response, fallback: string): Promise<string> {
+  return (await jsonDetail(res)) ?? `${fallback} (${res.status}).`;
 }
 
 /** Fetch the current user's ChatGPT connection status. */
@@ -71,13 +77,21 @@ export async function startChatgptConnect(): Promise<ChatgptDeviceStart> {
 
 /** Poll a device-code login once. */
 export async function pollChatgptConnect(handle: string): Promise<ChatgptPollStatus> {
-  const res = await authenticatedFetch("/v1/connections/chatgpt/device/poll", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ handle }),
-  });
+  let res: Response;
+  try {
+    res = await authenticatedFetch("/v1/connections/chatgpt/device/poll", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ handle }),
+    });
+  } catch {
+    return { status: "unreachable" };
+  }
   if (!res.ok) {
-    return { status: "error", detail: await detailOf(res, "Sign-in check failed") };
+    const detail = await jsonDetail(res);
+    // The server always answers with a JSON detail; a bare 5xx came from a proxy.
+    if (detail === undefined && res.status >= 500) return { status: "unreachable" };
+    return { status: "error", detail: detail ?? `Sign-in check failed (${res.status}).` };
   }
   return (await res.json()) as ChatgptPollStatus;
 }

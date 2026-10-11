@@ -19,6 +19,11 @@ import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nat
 
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
+  // Server `enabled_connections`: which Sandbox Integrations panels render.
+  enabledConnections: [] as string[],
+  chatgptStatus: vi.fn(),
+  chatgptStart: vi.fn(),
+  chatgptPoll: vi.fn(),
   theme: "system" as string,
   isEmbedded: false,
   archiveMutate: vi.fn(),
@@ -57,7 +62,14 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
+    enabled_connections: mocks.enabledConnections,
   }),
+}));
+vi.mock("@/lib/chatgptIntegration", () => ({
+  fetchChatgptStatus: mocks.chatgptStatus,
+  startChatgptConnect: mocks.chatgptStart,
+  pollChatgptConnect: mocks.chatgptPoll,
+  disconnectChatgpt: vi.fn(),
 }));
 vi.mock("@/shell/ImportSessionsPanel", () => ({
   ImportSessionsPanel: mocks.importSessionsPanel,
@@ -221,6 +233,10 @@ function renderPage(path = "/settings") {
 
 beforeEach(() => {
   mocks.setTheme.mockReset();
+  mocks.enabledConnections = [];
+  mocks.chatgptStatus.mockReset();
+  mocks.chatgptStart.mockReset();
+  mocks.chatgptPoll.mockReset();
   mocks.archiveMutate.mockReset();
   mocks.deleteMutate.mockReset();
   mocks.bulkArchiveMutate.mockReset();
@@ -304,6 +320,85 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
     unsubscribe,
   };
 }
+
+describe("ChatGPT subscription sign-in", () => {
+  const disconnected = {
+    enabled: true,
+    connected: false,
+    connected_at: null,
+    plan_type: null,
+    email: null,
+  };
+  const connected = { ...disconnected, connected: true, plan_type: "pro", email: "a@b.c" };
+  const device = {
+    user_code: "ABCD-1234",
+    verification_url: "https://auth.openai.com/codex/device",
+    interval: 2,
+    expires_in: 900,
+    handle: "h1",
+  };
+
+  beforeEach(() => {
+    mocks.enabledConnections = ["chatgpt"];
+    mocks.chatgptStart.mockResolvedValue(device);
+  });
+
+  async function startSignIn() {
+    renderPage("/settings/integrations");
+    fireEvent.click(await screen.findByRole("button", { name: "Connect ChatGPT" }));
+    await screen.findByTestId("chatgpt-user-code");
+  }
+
+  it("completes when a proxy cuts off the poll but the connection was saved", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mocks.chatgptStatus.mockResolvedValueOnce(disconnected).mockResolvedValue(connected);
+      mocks.chatgptPoll.mockResolvedValue({ status: "unreachable" });
+      await startSignIn();
+
+      await act(() => vi.advanceTimersByTimeAsync(2000));
+
+      expect(await screen.findByText(/Connected as a@b\.c \(pro\)/)).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps polling when a poll goes unanswered and nothing was saved", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mocks.chatgptStatus.mockResolvedValue(disconnected);
+      mocks.chatgptPoll
+        .mockResolvedValueOnce({ status: "unreachable" })
+        .mockResolvedValue({ status: "pending" });
+      await startSignIn();
+
+      await act(() => vi.advanceTimersByTimeAsync(4000));
+
+      expect(mocks.chatgptPoll).toHaveBeenCalledTimes(2);
+      expect(screen.getByTestId("chatgpt-user-code")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never overlaps polls while one is still in flight", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mocks.chatgptStatus.mockResolvedValue(disconnected);
+      mocks.chatgptPoll.mockReturnValue(new Promise(() => {}));
+      await startSignIn();
+
+      await act(() => vi.advanceTimersByTimeAsync(10_000));
+
+      expect(mocks.chatgptPoll).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("SettingsPage", () => {
   beforeEach(() => {
