@@ -118,6 +118,7 @@ import {
 import {
   type ChatgptConnectionStatus,
   type ChatgptDeviceStart,
+  type ChatgptPollStatus,
   disconnectChatgpt,
   fetchChatgptStatus,
   pollChatgptConnect,
@@ -1664,7 +1665,8 @@ function ChatgptIntegrationControl() {
   }, [refresh]);
 
   // Poll one request at a time while a device code is showing: overlapping polls
-  // would race to redeem the one-time code. Stop on a terminal state or unmount.
+  // would race to redeem the one-time code. Every round either schedules the
+  // next poll or ends the flow; the code's expiry bounds the whole loop.
   useEffect(() => {
     if (device === null) return;
     let cancelled = false;
@@ -1672,30 +1674,28 @@ function ChatgptIntegrationControl() {
     const delayMs = Math.max(device.interval, 2) * 1000;
     const expiresAt = Date.now() + device.expires_in * 1000;
 
-    const tick = async () => {
-      let result = await pollChatgptConnect(device.handle);
-      if (cancelled) return;
-      if (result.status === "unreachable") {
-        // A proxy can time out a poll the server still completes, so trust the
-        // stored connection over the lost answer.
-        const current = await fetchChatgptStatus().catch(() => null);
-        if (cancelled) return;
-        if (current?.connected) result = { status: "complete" };
-        else result = Date.now() < expiresAt ? { status: "pending" } : { status: "expired" };
-      }
-      if (result.status === "pending") {
-        timer = window.setTimeout(() => void tick(), delayMs);
-        return;
-      }
+    const finish = (result: Exclude<ChatgptPollStatus, { status: "pending" | "unreachable" }>) => {
       setDevice(null);
       if (result.status === "complete") {
         setMessage(null);
-        await refresh();
+        void refresh();
       } else if (result.status === "expired") {
         setMessage("That code expired before it was approved. Start again.");
       } else {
         setMessage(result.detail ?? "The ChatGPT sign-in failed. Start again.");
       }
+    };
+
+    const tick = async () => {
+      const result = await pollChatgptConnect(device.handle);
+      if (cancelled) return;
+      // A lost answer is retried: the server reports a saved login as complete.
+      if (result.status === "pending" || result.status === "unreachable") {
+        if (Date.now() >= expiresAt) finish({ status: "expired" });
+        else timer = window.setTimeout(() => void tick(), delayMs);
+        return;
+      }
+      finish(result);
     };
 
     timer = window.setTimeout(() => void tick(), delayMs);

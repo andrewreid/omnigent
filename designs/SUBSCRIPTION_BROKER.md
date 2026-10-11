@@ -163,7 +163,12 @@ does not retry.
 > The handle is an HS256 JWT holding `sub`, `account_generation` and the
 > provider's poll state, with a 15-minute expiry. The key is
 > `OMNIGENT_CHATGPT_STATE_KEY`, or a per-process fallback, which is fine for one
-> replica. Protocol, from codex `rust-v0.154.0`:
+> replica. Polls are idempotent: the save records a digest of the redeemed
+> `device_auth_id` in the connection metadata, and `device_completed` answers a
+> repeat poll for that login from storage. OpenAI redeems a device code once and
+> can take ~13s to answer after approval, so a proxy may drop the completing
+> poll's response; the browser retries uncertain outcomes until the code expires.
+> Protocol, from codex `rust-v0.154.0`:
 > 1. `POST {issuer}/api/accounts/deviceauth/usercode {client_id}`.
 > 2. Poll `…/deviceauth/token {device_auth_id,user_code}`; it returns 403/404
 >    while pending.

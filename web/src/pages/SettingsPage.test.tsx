@@ -349,14 +349,16 @@ describe("ChatGPT subscription sign-in", () => {
     await screen.findByTestId("chatgpt-user-code");
   }
 
-  it("completes when a proxy cuts off the poll but the connection was saved", async () => {
+  it("completes when the poll after a lost answer reports the saved login", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
       mocks.chatgptStatus.mockResolvedValueOnce(disconnected).mockResolvedValue(connected);
-      mocks.chatgptPoll.mockResolvedValue({ status: "unreachable" });
+      mocks.chatgptPoll
+        .mockResolvedValueOnce({ status: "unreachable" })
+        .mockResolvedValue({ status: "complete" });
       await startSignIn();
 
-      await act(() => vi.advanceTimersByTimeAsync(2000));
+      await act(() => vi.advanceTimersByTimeAsync(4000));
 
       expect(await screen.findByText(/Connected as a@b\.c \(pro\)/)).toBeInTheDocument();
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -379,6 +381,26 @@ describe("ChatGPT subscription sign-in", () => {
       expect(mocks.chatgptPoll).toHaveBeenCalledTimes(2);
       expect(screen.getByTestId("chatgpt-user-code")).toBeInTheDocument();
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ends with an expiry message when polls never get an answer", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mocks.chatgptStatus.mockResolvedValue(disconnected);
+      mocks.chatgptStart.mockResolvedValue({ ...device, expires_in: 5 });
+      mocks.chatgptPoll.mockResolvedValue({ status: "unreachable" });
+      await startSignIn();
+
+      await act(() => vi.advanceTimersByTimeAsync(8000));
+
+      expect(await screen.findByRole("alert")).toHaveTextContent("That code expired");
+      expect(screen.queryByTestId("chatgpt-user-code")).not.toBeInTheDocument();
+      const polls = mocks.chatgptPoll.mock.calls.length;
+      await act(() => vi.advanceTimersByTimeAsync(10_000));
+      expect(mocks.chatgptPoll).toHaveBeenCalledTimes(polls);
     } finally {
       vi.useRealTimers();
     }
