@@ -3892,8 +3892,9 @@ def create_app(
 
         Host deletion clears ``host_id`` but not ``runner_id``, so the binding
         token alone would keep resolving after teardown; require the bound
-        session's managed host to exist, belong to the owner, and not be
-        terminating before vending that owner's provider credentials.
+        session's managed host to exist, belong to the owner, not be
+        terminating, and still hold an unexpired, unrevoked launch credential
+        before vending that owner's provider credentials.
         """
         owner = _resolve_managed_runner_owner(runner_id)
         if owner is None or host_store is None:
@@ -3907,6 +3908,7 @@ def create_app(
                 and host.user_id == owner
                 and host.sandbox_provider is not None
                 and host.terminating_sandbox_id is None
+                and host_store.has_live_launch_credential(host.host_id)
             ):
                 return owner
         return None

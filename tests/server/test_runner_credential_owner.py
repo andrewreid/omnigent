@@ -54,7 +54,9 @@ def _app(db_uri: str, tmp_path: Path, hosts: HostStore, convs: SqlAlchemyConvers
     return app
 
 
-def _bind_managed_runner(db_uri: str, hosts: HostStore, convs) -> tuple[str, str]:
+def _bind_managed_runner(
+    db_uri: str, hosts: HostStore, convs, *, expires_in: int = 3600
+) -> tuple[str, str]:
     host = hosts.register_managed_host(
         host_id=uuid.uuid4().hex,
         name="managed-1",
@@ -62,7 +64,7 @@ def _bind_managed_runner(db_uri: str, hosts: HostStore, convs) -> tuple[str, str
         token="launch-token",
         provider="kubernetes",
         sandbox_id="sbx-1",
-        token_expires_at=int(time.time()) + 3600,
+        token_expires_at=int(time.time()) + expires_in,
     )
     runner_id = token_bound_runner_id(_BINDING)
     conv = convs.create_conversation(host_id=host.host_id, runner_id=runner_id, workspace="/work")
@@ -97,6 +99,33 @@ async def test_vends_while_the_managed_host_is_live_and_stops_after_deletion(
 
     gone = await _vend(app, runner_id)
     assert gone.status_code == 401
+
+
+async def test_stops_once_the_launch_credential_is_revoked(
+    db_uri: str, tmp_path: Path, broker: None
+) -> None:
+    # A failed relaunch revokes the launch credential but keeps the host row
+    # and its session binding.
+    hosts = HostStore(db_uri)
+    convs = SqlAlchemyConversationStore(db_uri)
+    app = _app(db_uri, tmp_path, hosts, convs)
+    runner_id, host_id = _bind_managed_runner(db_uri, hosts, convs)
+    assert (await _vend(app, runner_id)).status_code == 200
+
+    hosts.revoke_launch_token(host_id)
+
+    assert (await _vend(app, runner_id)).status_code == 401
+
+
+async def test_expired_launch_credential_gets_nothing(
+    db_uri: str, tmp_path: Path, broker: None
+) -> None:
+    hosts = HostStore(db_uri)
+    convs = SqlAlchemyConversationStore(db_uri)
+    app = _app(db_uri, tmp_path, hosts, convs)
+    runner_id, _ = _bind_managed_runner(db_uri, hosts, convs, expires_in=-60)
+
+    assert (await _vend(app, runner_id)).status_code == 401
 
 
 async def test_runner_on_an_unmanaged_host_gets_nothing(
