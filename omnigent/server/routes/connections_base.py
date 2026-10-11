@@ -240,6 +240,10 @@ def create_paste_connection_router(
 
 #: Device codes expire upstream after 15 minutes; the handle matches that.
 _DEVICE_HANDLE_TTL_S = 900
+#: How long a poll whose redemption was refused waits for another poll (or
+#: replica) that redeemed the same code to finish saving it.
+_REDEMPTION_GRACE_S = 10.0
+_REDEMPTION_RECHECK_S = 0.5
 
 
 @dataclass
@@ -285,6 +289,19 @@ class DeviceCodeHooks(Protocol):
 
 class _DeviceHandle(BaseModel):
     handle: str
+
+
+async def _completed_within(
+    hooks: DeviceCodeHooks, user_id: str, poll_state: dict[str, str], grace_s: float
+) -> bool:
+    """Whether the login identified by *poll_state* is saved within *grace_s*."""
+    deadline = time.monotonic() + grace_s
+    while True:
+        if await hooks.device_completed(user_id, poll_state):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(_REDEMPTION_RECHECK_S)
 
 
 def create_device_connection_router(
@@ -350,8 +367,8 @@ def create_device_connection_router(
         try:
             done = await hooks.device_poll(user_id, poll_state)
         except ConnectionError as exc:
-            # Another poll (or replica) may have redeemed the code first.
-            if await hooks.device_completed(user_id, poll_state):
+            # Another poll (or replica) may have redeemed the code and still be saving.
+            if await _completed_within(hooks, user_id, poll_state, _REDEMPTION_GRACE_S):
                 return {"status": "complete"}
             _logger.warning("%s device login failed for %s: %s", provider, user_id, exc)
             return {"status": "error", "detail": str(exc)}

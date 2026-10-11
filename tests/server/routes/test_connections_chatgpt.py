@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import threading
 import time
 from dataclasses import dataclass
 
@@ -254,6 +255,45 @@ def test_poll_that_loses_a_redemption_race_reports_complete(
     resp = client.post("/v1/connections/chatgpt/device/poll", json={"handle": start["handle"]})
 
     assert resp.json() == {"status": "complete"}
+
+
+def test_poll_refused_while_the_winner_is_still_saving_reports_complete(
+    client: TestClient, auth: FakeAuthService, store: ChatgptConnectionStore
+) -> None:
+    # The winning poll has redeemed the code but its save lands a moment after
+    # this poll is refused upstream.
+    start = client.post("/v1/connections/chatgpt/device/start").json()
+    auth.pending_polls = 0
+    auth.redeemed = True
+
+    def save_shortly() -> None:
+        threading.Timer(
+            0.6,
+            lambda: store.upsert(
+                _USER, token_set_from_payload(_tokens(1)), device_auth_id="dai-1"
+            ),
+        ).start()
+
+    auth.on_already_used = save_shortly
+
+    resp = client.post("/v1/connections/chatgpt/device/poll", json={"handle": start["handle"]})
+
+    assert resp.json() == {"status": "complete"}
+
+
+def test_refused_poll_with_no_save_still_reports_the_error(
+    client: TestClient, auth: FakeAuthService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import omnigent.server.routes.connections_base as cb
+
+    monkeypatch.setattr(cb, "_REDEMPTION_GRACE_S", 0.2)
+    start = client.post("/v1/connections/chatgpt/device/start").json()
+    auth.pending_polls = 0
+    auth.redeemed = True
+
+    resp = client.post("/v1/connections/chatgpt/device/poll", json={"handle": start["handle"]})
+
+    assert resp.json()["status"] == "error"
 
 
 def test_another_logins_connection_does_not_complete_this_one(
