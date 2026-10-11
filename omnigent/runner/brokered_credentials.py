@@ -36,6 +36,12 @@ _REFRESH_METHOD = "account/chatgptAuthTokens/refresh"
 # Codex retries a failed refresh ~14 times in quick succession; answer those
 # from cache rather than re-asking the server each time.
 _NEGATIVE_CACHE_S = 60.0
+#: Oldest codex verified with the app-server's chatgptAuthTokens login (an
+#: interface codex marks unstable); older versions keep their own login.
+MIN_BROKERED_CODEX_VERSION = (0, 154, 0)
+#: Bound on connecting and logging in, so an unresponsive app-server can't
+#: stall the session's startup.
+_LOGIN_TIMEOUT_S = 30.0
 
 
 def _in_managed_sandbox() -> bool:
@@ -147,12 +153,23 @@ class BrokeredChatgptAuth:
             await self._client.close()
 
 
-async def start_brokered_chatgpt_auth(ws_url: str) -> BrokeredChatgptAuth | None:
+async def start_brokered_chatgpt_auth(
+    ws_url: str, *, codex_version: tuple[int, int, int] | None = None
+) -> BrokeredChatgptAuth | None:
     """Log the codex app-server at *ws_url* in with the owner's ChatGPT subscription.
 
-    A no-op (``None``) outside a managed sandbox or when the owner hasn't
-    connected ChatGPT; the caller keeps codex's own login path. Never raises.
+    A no-op (``None``) outside a managed sandbox, when the owner hasn't
+    connected ChatGPT, or when *codex_version* predates
+    :data:`MIN_BROKERED_CODEX_VERSION`; the caller keeps codex's own login path.
+    Never raises.
     """
+    if codex_version is not None and codex_version < MIN_BROKERED_CODEX_VERSION:
+        _logger.warning(
+            "codex %s predates brokered ChatGPT sign-in (needs %s+); using codex's own login",
+            ".".join(map(str, codex_version)),
+            ".".join(map(str, MIN_BROKERED_CODEX_VERSION)),
+        )
+        return None
     payload = await fetch_runner_credential("chatgpt")
     if payload is None:
         return None
@@ -161,8 +178,9 @@ async def start_brokered_chatgpt_auth(ws_url: str) -> BrokeredChatgptAuth | None
     client = CodexAppServerClient(ws_url=ws_url, client_name="omnigent-chatgpt-auth")
     auth = BrokeredChatgptAuth(client)
     try:
-        await client.connect()
-        await auth.login(payload)
+        async with asyncio.timeout(_LOGIN_TIMEOUT_S):
+            await client.connect()
+            await auth.login(payload)
     except Exception:  # noqa: BLE001 - fall back to codex's own login
         _logger.warning("codex: brokered ChatGPT login failed", exc_info=True)
         await auth.close()
