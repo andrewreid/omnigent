@@ -241,6 +241,32 @@ def test_repeat_poll_after_completion_answers_from_storage(
     assert auth.token_polls == polls
 
 
+def test_repeat_poll_still_completes_after_a_refresh(
+    client: TestClient,
+    auth: FakeAuthService,
+    store: ChatgptConnectionStore,
+    api: ChatgptOAuthClient,
+) -> None:
+    # A refresh lands between the lost completing poll and its retry.
+    start = _connect(client)
+    stored = store.get(_USER, with_tokens=True).access_token
+    asyncio.run(
+        resolve_chatgpt_credential(
+            _USER,
+            store=store,
+            client=api,
+            rejected_digest=hashlib.sha256(stored.encode()).hexdigest(),
+        )
+    )
+    assert auth.refreshes == ["rt-1"]
+    polls = auth.token_polls
+
+    again = client.post("/v1/connections/chatgpt/device/poll", json={"handle": start["handle"]})
+
+    assert again.json() == {"status": "complete"}
+    assert auth.token_polls == polls
+
+
 def test_poll_that_loses_a_redemption_race_reports_complete(
     client: TestClient, auth: FakeAuthService, store: ChatgptConnectionStore
 ) -> None:

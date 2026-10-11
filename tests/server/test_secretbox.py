@@ -181,3 +181,6 @@ def test_tampered_envelope_reads_as_unreadable() -> None:
 
     assert box.decrypt(tampered, context=CTX_ALICE) is None
     assert box.decrypt("kmsenv1:not-base64!", context=CTX_ALICE) is None
+    body["nonce"] = ""
+    bad_nonce = "kmsenv1:" + base64.b64encode(json.dumps(body).encode()).decode()
+    assert box.decrypt(bad_nonce, context=CTX_ALICE) is None

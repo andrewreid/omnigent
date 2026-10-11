@@ -51,6 +51,7 @@ _SOFT_FAIL_KMS_CODES = frozenset({"InvalidCiphertextException", "IncorrectKeyExc
 _KMS_DIRECT_MAX_BYTES = 4096
 #: Marks an envelope ciphertext (a KMS data key wrapping AES-256-GCM).
 _ENVELOPE_PREFIX = "kmsenv1:"
+_ENVELOPE_NONCE_BYTES = 12
 
 
 @runtime_checkable
@@ -203,7 +204,7 @@ class KmsSecretCipher:
         key = self._kms.generate_data_key(
             KeyId=self._key_id, KeySpec="AES_256", EncryptionContext=kms_context
         )
-        nonce = os.urandom(12)
+        nonce = os.urandom(_ENVELOPE_NONCE_BYTES)
         sealed = AESGCM(key["Plaintext"]).encrypt(nonce, data, _envelope_aad(kms_context))
         body = {
             "key": base64.b64encode(key["CiphertextBlob"]).decode("ascii"),
@@ -263,6 +264,8 @@ class KmsSecretCipher:
             wrapped_key = base64.b64decode(body["key"], validate=True)
             nonce = base64.b64decode(body["nonce"], validate=True)
             sealed = base64.b64decode(body["data"], validate=True)
+            if len(nonce) != _ENVELOPE_NONCE_BYTES:
+                raise ValueError("bad nonce length")
         except (ValueError, KeyError, TypeError):
             _logger.warning(
                 "secretbox: stored envelope ciphertext is corrupt — the affected "
@@ -285,7 +288,7 @@ class KmsSecretCipher:
             raise
         try:
             data = AESGCM(key["Plaintext"]).decrypt(nonce, sealed, _envelope_aad(kms_context))
-        except InvalidTag:
+        except (InvalidTag, ValueError):
             _logger.warning(
                 "secretbox: envelope ciphertext failed authentication (wrong context or "
                 "corrupt) — the affected integration will read as disconnected until reconnected"
