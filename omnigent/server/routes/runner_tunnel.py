@@ -191,6 +191,7 @@ def create_runner_tunnel_router(
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
     mint_managed_runner_token: Callable[[str, int], str | None] | None = None,
+    resolve_runner_credential_owner: Callable[[str], str | None] | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/runners/{id}/tunnel`` WS endpoint.
 
@@ -229,6 +230,10 @@ def create_runner_tunnel_router(
         runner-side analog of the host tunnel's ``resolve_launch_token``.
         ``None`` disables the lookup (an unauthenticated non-loopback
         peer is then rejected, the prior behavior).
+    :param resolve_runner_credential_owner: ``runner_id -> owner`` for vending
+        provider credentials: like *resolve_managed_runner_owner*, but only while
+        the runner's managed host is still live, so a leftover binding token
+        stops working at teardown. ``None`` disables the credential route.
     :param mint_managed_runner_token: Accounts-mode issuer that validates the
         saved runner authority and mints under the account lock.
     :returns: A FastAPI router with the tunnel endpoint.
@@ -388,8 +393,9 @@ def create_runner_tunnel_router(
         codex harness runs in the runner, which holds its tunnel binding token
         but not the host's launch token. Same gate as the owner-token mint
         (binding token bound to *runner_id*, owner from the managed launch
-        record), so only a server-managed runner resolves an owner. ``401``
-        otherwise; ``{"connected": false}`` when the owner hasn't linked it.
+        record), and only while that managed host is live, so a binding token
+        left over after teardown resolves nothing. ``401`` otherwise;
+        ``{"connected": false}`` when the owner hasn't linked it.
         """
         from omnigent.server.routes.host_credentials import vend_provider_credential
 
@@ -398,8 +404,8 @@ def create_runner_tunnel_router(
         if not token or token_bound_runner_id(token) != runner_id:
             raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
         owner: str | None = None
-        if resolve_managed_runner_owner is not None:
-            owner = await asyncio.to_thread(resolve_managed_runner_owner, runner_id)
+        if resolve_runner_credential_owner is not None:
+            owner = await asyncio.to_thread(resolve_runner_credential_owner, runner_id)
         if owner is None:
             raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
         return await vend_provider_credential(request.app, provider, owner)
