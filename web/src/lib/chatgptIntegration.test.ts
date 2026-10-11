@@ -57,6 +57,38 @@ describe("chatgptIntegration", () => {
     });
   });
 
+  it("reports a response body that breaks mid-read as unreachable", async () => {
+    fetchMock.mockResolvedValue(new Response("{not json", { status: 200 }));
+
+    await expect(pollChatgptConnect("h1")).resolves.toEqual({ status: "unreachable" });
+  });
+
+  it("keeps the app's error envelope as an error, not a proxy failure", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: { code: "internal_error", message: "An internal error occurred." },
+        }),
+        { status: 500 },
+      ),
+    );
+
+    await expect(pollChatgptConnect("h1")).resolves.toEqual({
+      status: "error",
+      detail: "An internal error occurred.",
+    });
+  });
+
+  it("bounds each poll with a timeout so a hung request is retried", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ status: "pending" }), { status: 200 }),
+    );
+
+    await pollChatgptConnect("h1");
+
+    expect(fetchMock.mock.calls[0][1]?.signal).toBeInstanceOf(AbortSignal);
+  });
+
   it("surfaces why a sign-in couldn't start", async () => {
     fetchMock.mockResolvedValue(
       new Response(JSON.stringify({ detail: "Enable it in ChatGPT → Settings → Security." }), {

@@ -26,6 +26,8 @@ class ChatgptConnection:
     :param email: The ChatGPT account's email.
     :param created_at: Unix epoch seconds the connection was first made.
     :param updated_at: Unix epoch seconds of the last refresh / reconnect.
+    :param device_auth_digest: Digest of the device-code login that saved this
+        connection, so a repeated poll can confirm it; cleared by a refresh.
     """
 
     user_id: str
@@ -38,3 +40,4 @@ class ChatgptConnection:
     email: str | None
     created_at: int
     updated_at: int
+    device_auth_digest: str | None = None

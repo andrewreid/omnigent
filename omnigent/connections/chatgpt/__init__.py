@@ -8,6 +8,7 @@ new schema. See ``designs/SUBSCRIPTION_BROKER.md``.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, ClassVar
 
 from omnigent.connections import ConnectionStore
@@ -36,6 +37,7 @@ class ChatgptConnectionStore(ConnectionStore[ChatgptConnection]):
             email=meta.get("email"),
             created_at=conn.created_at,
             updated_at=conn.updated_at,
+            device_auth_digest=meta.get("device_auth_digest"),
         )
 
     @staticmethod
@@ -69,10 +71,24 @@ class ChatgptConnectionStore(ConnectionStore[ChatgptConnection]):
             email=conn.email,
         )
 
-    def upsert(self, user_id: str, tokens: ChatgptTokenSet) -> ChatgptConnection:
-        """Create or replace a user's ChatGPT connection (idempotent on ``user_id``)."""
+    @staticmethod
+    def device_auth_digest(device_auth_id: str) -> str:
+        """Non-reversible marker for the device-code login that saved a connection."""
+        return hashlib.sha256(device_auth_id.encode()).hexdigest()
+
+    def upsert(
+        self, user_id: str, tokens: ChatgptTokenSet, *, device_auth_id: str | None = None
+    ) -> ChatgptConnection:
+        """Create or replace a user's ChatGPT connection (idempotent on ``user_id``).
+
+        :param device_auth_id: The device-code login that minted *tokens*,
+            recorded as a digest so a repeated poll for it reports completion.
+        """
+        metadata = self._metadata(tokens)
+        if device_auth_id:
+            metadata["device_auth_digest"] = self.device_auth_digest(device_auth_id)
         conn = self._store.upsert(
-            user_id, self._PROVIDER, secret=self._secret(tokens), metadata=self._metadata(tokens)
+            user_id, self._PROVIDER, secret=self._secret(tokens), metadata=metadata
         )
         return self._to_entity(conn)
 

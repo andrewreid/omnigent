@@ -275,6 +275,13 @@ class DeviceCodeHooks(Protocol):
         """Poll once; persist and return ``True`` once approved, ``False`` while
         pending. Raise :class:`ConnectionError` with a user-safe message on failure."""
 
+    async def device_completed(self, user_id: str, poll_state: dict[str, str]) -> bool:
+        """Whether *this* login (identified by *poll_state*) was already saved.
+
+        A proxy can drop the response of the poll that completed a login, and the
+        provider rejects a second redemption, so polls must answer from storage.
+        """
+
 
 class _DeviceHandle(BaseModel):
     handle: str
@@ -337,9 +344,15 @@ def create_device_connection_router(
             user_id
         ):
             raise HTTPException(status_code=403, detail="handle belongs to another user")
+        poll_state = dict(claims.get("poll") or {})
+        if await hooks.device_completed(user_id, poll_state):
+            return {"status": "complete"}
         try:
-            done = await hooks.device_poll(user_id, dict(claims.get("poll") or {}))
+            done = await hooks.device_poll(user_id, poll_state)
         except ConnectionError as exc:
+            # Another poll (or replica) may have redeemed the code first.
+            if await hooks.device_completed(user_id, poll_state):
+                return {"status": "complete"}
             _logger.warning("%s device login failed for %s: %s", provider, user_id, exc)
             return {"status": "error", "detail": str(exc)}
         return {"status": "complete" if done else "pending"}

@@ -60,6 +60,10 @@ class FakeAuthService:
         self.revoked: list[str] = []
         self.exchanges: list[dict] = []
         self.user_agents: set[str] = set()
+        self.token_polls = 0
+        self.redeemed = False
+        # Runs as a second redemption is refused (e.g. another replica's save landing).
+        self.on_already_used = lambda: None
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.user_agents.add(request.headers.get("user-agent", ""))
@@ -76,9 +80,14 @@ class FakeAuthService:
                 "device_auth_id": "dai-1",
                 "user_code": "ABCD-1234",
             }
+            self.token_polls += 1
             if self.pending_polls > 0:
                 self.pending_polls -= 1
                 return httpx.Response(403)
+            if self.redeemed:  # a device code redeems once
+                self.on_already_used()
+                return httpx.Response(400, json={"error": "device_auth_already_used"})
+            self.redeemed = True
             return httpx.Response(
                 200,
                 json={"authorization_code": "ac", "code_verifier": "cv", "code_challenge": "cc"},
@@ -208,6 +217,48 @@ def test_broker_vends_access_token_but_never_the_refresh_chain(client: TestClien
     assert set(body) == {"connected", "owner", "token", "account_id", "plan_type", "expires_at"}
     assert body["account_id"] == "acct-1" and body["plan_type"] == "pro"
     assert "rt-1" not in resp.text
+
+
+def test_repeat_poll_after_completion_answers_from_storage(
+    client: TestClient, auth: FakeAuthService
+) -> None:
+    # The completing poll's response was lost (e.g. a proxy timed it out), so the
+    # browser polls again; OpenAI would reject a second redemption of the code.
+    start = _connect(client)
+    polls = auth.token_polls
+
+    again = client.post("/v1/connections/chatgpt/device/poll", json={"handle": start["handle"]})
+
+    assert again.json() == {"status": "complete"}
+    assert auth.token_polls == polls
+
+
+def test_poll_that_loses_a_redemption_race_reports_complete(
+    client: TestClient, auth: FakeAuthService, store: ChatgptConnectionStore
+) -> None:
+    start = client.post("/v1/connections/chatgpt/device/start").json()
+    # Another poll (or replica) already redeemed the code and its save lands
+    # while this poll is asking OpenAI, which refuses the second redemption.
+    auth.pending_polls = 0
+    auth.redeemed = True
+    auth.on_already_used = lambda: store.upsert(
+        _USER, token_set_from_payload(_tokens(1)), device_auth_id="dai-1"
+    )
+
+    resp = client.post("/v1/connections/chatgpt/device/poll", json={"handle": start["handle"]})
+
+    assert resp.json() == {"status": "complete"}
+
+
+def test_another_logins_connection_does_not_complete_this_one(
+    client: TestClient, store: ChatgptConnectionStore
+) -> None:
+    store.upsert(_USER, token_set_from_payload(_tokens(1)), device_auth_id="dai-other")
+    start = client.post("/v1/connections/chatgpt/device/start").json()
+
+    resp = client.post("/v1/connections/chatgpt/device/poll", json={"handle": start["handle"]})
+
+    assert resp.json() == {"status": "pending"}
 
 
 def test_device_code_disabled_upstream_is_a_clear_400(client: TestClient, auth) -> None:

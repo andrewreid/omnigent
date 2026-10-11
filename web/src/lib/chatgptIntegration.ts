@@ -38,13 +38,19 @@ export type ChatgptPollStatus =
   | { status: "complete" }
   | { status: "expired" }
   | { status: "error"; detail?: string }
-  /** No answer from the server, e.g. a proxy timed out a poll the server may still finish. */
+  /** No usable answer (network failure, proxy error, timeout): poll again. The
+   * server answers a completed login from storage, so retrying is safe. */
   | { status: "unreachable" };
 
+/** A poll that hangs longer than this is abandoned and retried. */
+const POLL_TIMEOUT_MS = 30_000;
+
+/** The server's error message: FastAPI ``{detail}`` or the app ``{error: {message}}``. */
 async function jsonDetail(res: Response): Promise<string | undefined> {
   try {
-    const body = (await res.json()) as { detail?: unknown };
+    const body = (await res.json()) as { detail?: unknown; error?: { message?: unknown } };
     if (typeof body.detail === "string") return body.detail;
+    if (typeof body.error?.message === "string") return body.error.message;
   } catch {
     // fall through
   }
@@ -75,25 +81,24 @@ export async function startChatgptConnect(): Promise<ChatgptDeviceStart> {
   return (await res.json()) as ChatgptDeviceStart;
 }
 
-/** Poll a device-code login once. */
+/** Poll a device-code login once. Never throws. */
 export async function pollChatgptConnect(handle: string): Promise<ChatgptPollStatus> {
-  let res: Response;
   try {
-    res = await authenticatedFetch("/v1/connections/chatgpt/device/poll", {
+    const res = await authenticatedFetch("/v1/connections/chatgpt/device/poll", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ handle }),
+      signal: AbortSignal.timeout(POLL_TIMEOUT_MS),
     });
-  } catch {
-    return { status: "unreachable" };
-  }
-  if (!res.ok) {
+    if (res.ok) return (await res.json()) as ChatgptPollStatus;
     const detail = await jsonDetail(res);
-    // The server always answers with a JSON detail; a bare 5xx came from a proxy.
+    // Server errors carry a message; a bare 5xx came from a proxy in between.
     if (detail === undefined && res.status >= 500) return { status: "unreachable" };
     return { status: "error", detail: detail ?? `Sign-in check failed (${res.status}).` };
+  } catch {
+    // Network failure, timeout, or a response body that broke mid-read.
+    return { status: "unreachable" };
   }
-  return (await res.json()) as ChatgptPollStatus;
 }
 
 /** Disconnect: the server revokes the chain at OpenAI, then forgets it. */

@@ -77,9 +77,18 @@ class ChatgptConnectionHooks:
             return False  # transient; the client polls again
         if tokens is None:
             return False
-        await asyncio.to_thread(self.store.upsert, user_id, tokens)
+        await asyncio.to_thread(self.store.upsert, user_id, tokens, device_auth_id=device_auth_id)
         _logger.info("ChatGPT subscription connected for %s (plan %s)", user_id, tokens.plan_type)
         return True
+
+    async def device_completed(self, user_id: str, poll_state: dict[str, str]) -> bool:
+        device_auth_id = poll_state.get("device_auth_id", "")
+        if not device_auth_id:
+            return False
+        conn = await asyncio.to_thread(self.store.get, user_id)
+        return conn is not None and conn.device_auth_digest == self.store.device_auth_digest(
+            device_auth_id
+        )
 
     async def revoke(self, user_id: str) -> None:
         """Revoke the refresh chain upstream; every vended access token dies with it."""
