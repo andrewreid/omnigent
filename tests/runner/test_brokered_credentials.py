@@ -315,6 +315,34 @@ async def test_rejected_token_handed_back_again_stops_the_retry_storm(monkeypatc
     await auth.close()
 
 
+async def test_start_skips_codex_too_old_for_brokered_sign_in(monkeypatch) -> None:
+    fetched: list[str] = []
+
+    async def fake_fetch(provider: str, **kwargs):
+        fetched.append(provider)
+        return _PAYLOAD
+
+    monkeypatch.setattr(bc, "fetch_runner_credential", fake_fetch)
+    assert await bc.start_brokered_chatgpt_auth("ws://x", codex_version=(0, 153, 9)) is None
+    assert fetched == []
+
+
+async def test_start_gives_up_on_an_app_server_that_never_answers(monkeypatch) -> None:
+    async def fake_fetch(provider: str, **kwargs):
+        return _PAYLOAD
+
+    class _Hung(_FakeClient):
+        async def connect(self) -> None:
+            await asyncio.sleep(3600)
+
+    import omnigent.harnesses.codex_native.app_server as app_server_mod
+
+    monkeypatch.setattr(bc, "fetch_runner_credential", fake_fetch)
+    monkeypatch.setattr(bc, "_LOGIN_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(app_server_mod, "CodexAppServerClient", lambda **kw: _Hung())
+    assert await bc.start_brokered_chatgpt_auth("ws://x", codex_version=(0, 158, 0)) is None
+
+
 async def test_start_is_a_noop_when_not_connected(monkeypatch) -> None:
     async def fake_fetch(provider: str, **kwargs):
         return None

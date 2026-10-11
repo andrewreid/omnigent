@@ -5365,7 +5365,9 @@ async def _auto_create_codex_terminal(
         # token stays in memory; the auth client answers refreshes until close.
         from omnigent.runner.brokered_credentials import start_brokered_chatgpt_auth
 
-        _chatgpt_auth = await start_brokered_chatgpt_auth(codex_ws_url)
+        _chatgpt_auth = await start_brokered_chatgpt_auth(
+            codex_ws_url, codex_version=app_server.codex_cli_version
+        )
         if _chatgpt_auth is not None:
             app_server.close_callbacks.append(_chatgpt_auth.close)
             _codex_launch = dataclasses.replace(
