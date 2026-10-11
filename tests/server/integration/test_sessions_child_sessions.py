@@ -1078,6 +1078,270 @@ async def test_child_sessions_scoped_to_requested_parent(
     assert ids_b == [child_b.id]
 
 
+# ── descendants — whole subtree in one call ───────────────
+
+
+async def test_descendants_returns_subtree_breadth_first_with_depth(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    The root's listing holds every level, parents first, with real parents.
+
+    A mid-tree request returns only that node's subtree, with depth relative
+    to it — no siblings or ancestors. Leaves return an empty page.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    a = _seed_child(conv_store=conv_store, parent_id=session["id"], title="researcher:a")
+    b = _seed_child(conv_store=conv_store, parent_id=session["id"], title="researcher:b")
+    a1 = _seed_child(conv_store=conv_store, parent_id=a.id, title="coder:a1")
+    a1x = _seed_child(conv_store=conv_store, parent_id=a1.id, title="coder:a1x")
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/descendants")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["has_more"] is False
+    rows = [(r["id"], r["parent_session_id"], r["depth"]) for r in body["data"]]
+    assert set(rows[:2]) == {(a.id, session["id"], 1), (b.id, session["id"], 1)}
+    assert rows[2:] == [(a1.id, a.id, 2), (a1x.id, a1.id, 3)]
+    assert body["data"][0]["object"] == "descendant_session"
+    assert body["data"][0]["archived"] is False
+
+    mid = await client.get(f"/v1/sessions/{a.id}/descendants")
+    assert [(r["id"], r["depth"]) for r in mid.json()["data"]] == [(a1.id, 1), (a1x.id, 2)]
+
+    leaf = await client.get(f"/v1/sessions/{a1x.id}/descendants")
+    assert leaf.status_code == 200
+    assert leaf.json()["data"] == []
+
+
+async def test_descendants_traverses_archived_intermediate(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    An archived mid-tree node no longer hides its live descendants.
+
+    By default the archived row itself is omitted; ``include_archived``
+    returns it flagged.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    mid = _seed_child(conv_store=conv_store, parent_id=session["id"], title="researcher:mid")
+    live = _seed_child(conv_store=conv_store, parent_id=mid.id, title="coder:live")
+    conv_store.update_conversation(mid.id, archived=True)
+
+    default = await client.get(f"/v1/sessions/{session['id']}/descendants")
+    assert [(r["id"], r["parent_session_id"]) for r in default.json()["data"]] == [
+        (live.id, mid.id)
+    ]
+
+    included = await client.get(
+        f"/v1/sessions/{session['id']}/descendants", params={"include_archived": "true"}
+    )
+    assert [(r["id"], r["archived"]) for r in included.json()["data"]] == [
+        (mid.id, True),
+        (live.id, False),
+    ]
+
+
+async def test_descendants_max_depth(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``max_depth=1`` returns direct children only.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(conv_store=conv_store, parent_id=session["id"], title="researcher:c")
+    _seed_child(conv_store=conv_store, parent_id=child.id, title="coder:g")
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/descendants", params={"max_depth": 1})
+    assert [r["id"] for r in resp.json()["data"]] == [child.id]
+
+
+async def test_descendants_previews_are_optional(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Previews are read by default; ``include_previews=false`` skips the read.
+
+    The CLI navigator polls every 2 s and never renders previews, so the
+    opt-out must avoid the ``conversation_items`` query entirely, not just
+    blank the field.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(conv_store=conv_store, parent_id=session["id"], title="researcher:p")
+    conv_store.append(
+        child.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="seed",
+                data=MessageData(
+                    role="assistant",
+                    agent="researcher",
+                    content=[{"type": "output_text", "text": "still digging"}],
+                ),
+            )
+        ],
+    )
+    url = f"/v1/sessions/{session['id']}/descendants"
+
+    default = await client.get(url)
+    assert default.json()["data"][0]["last_message_preview"] == "still digging"
+
+    item_reads: list[str] = []
+
+    def _record(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+        if "conversation_items" in statement:
+            item_reads.append(statement)
+
+    event.listen(Engine, "before_cursor_execute", _record)
+    try:
+        skipped = await client.get(url, params={"include_previews": "false"})
+    finally:
+        event.remove(Engine, "before_cursor_execute", _record)
+    row = skipped.json()["data"][0]
+    assert row["id"] == child.id
+    assert row["last_message_preview"] is None
+    assert item_reads == []
+
+
+async def test_descendants_preview_opt_out_covers_label_derived_previews(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    ``include_previews=false`` also omits the preview Codex children derive from labels.
+
+    The summary builder falls back to the Codex prompt label when no message
+    preview is passed, which would leak through the opt-out.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
+    from omnigent.server.routes._sessions.common import (
+        _CODEX_NATIVE_SUBAGENT_PROMPT_LABEL_KEY,
+        _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+    )
+
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(conv_store=conv_store, parent_id=session["id"], title="codex:worker")
+    conv_store.set_labels(
+        child.id,
+        {
+            WRAPPER_LABEL_KEY: _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+            _CODEX_NATIVE_SUBAGENT_PROMPT_LABEL_KEY: "refactor the parser",
+        },
+    )
+    url = f"/v1/sessions/{session['id']}/descendants"
+
+    default = await client.get(url)
+    assert default.json()["data"][0]["last_message_preview"] == "refactor the parser"
+
+    skipped = await client.get(url, params={"include_previews": "false"})
+    assert skipped.json()["data"][0]["last_message_preview"] is None
+
+
+async def test_descendants_paginates_and_rejects_stale_cursor(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Pages chain via ``last_id`` past one parent's fan-out without loss.
+
+    A cursor that left the filtered set (archived here) is a 400
+    ``stale_cursor``, not a silently empty page.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    seeded = {
+        _seed_child(conv_store=conv_store, parent_id=session["id"], title=f"r:{i}").id
+        for i in range(5)
+    }
+
+    seen: list[str] = []
+    after: str | None = None
+    while True:
+        params: dict[str, str | int] = {"limit": 2}
+        if after is not None:
+            params["after"] = after
+        body = (
+            await client.get(f"/v1/sessions/{session['id']}/descendants", params=params)
+        ).json()
+        seen.extend(r["id"] for r in body["data"])
+        if not body["has_more"]:
+            break
+        after = body["last_id"]
+    assert sorted(seen) == sorted(seeded)
+    assert len(seen) == len(seeded)
+
+    conv_store.update_conversation(seen[0], archived=True)
+    stale = await client.get(
+        f"/v1/sessions/{session['id']}/descendants", params={"after": seen[0]}
+    )
+    assert stale.status_code == 400
+    assert stale.json()["error"]["code"] == "stale_cursor"
+
+
+async def test_descendants_returns_fan_out_past_one_loader_page(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A parent with more children than one store page loses none of them.
+
+    The per-node walk read a single 100-row page per parent; the subtree
+    loader must page the spawn tree to completion.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    seeded = {
+        _seed_child(conv_store=conv_store, parent_id=session["id"], title=f"r:{i}").id
+        for i in range(120)
+    }
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/descendants", params={"limit": 1000})
+    body = resp.json()
+    assert body["has_more"] is False
+    assert {r["id"] for r in body["data"]} == seeded
+
+
+async def test_descendants_404_for_nonexistent_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """Route returns 404 when the session does not exist."""
+    resp = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/descendants")
+    assert resp.status_code == 404
+
+
 async def test_closed_child_session_display_is_sanitized_and_read_only(
     client: httpx.AsyncClient,
     db_uri: str,

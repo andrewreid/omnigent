@@ -12320,6 +12320,32 @@ def _create_session_from_bundle(
     )
 
 
+def _latest_message_previews(
+    conversations: list[Conversation],
+    conv_store: ConversationStore,
+) -> dict[str, str | None]:
+    """
+    Read each conversation's latest message preview in one batched query.
+
+    Blocking; call from a worker thread.
+
+    :param conversations: Rows to preview, e.g. a page of sub-agents.
+    :param conv_store: Conversation store used for the batched message read.
+    :returns: ``{conversation_id: preview}``; ids with no visible message
+        are absent or map to ``None``.
+    """
+    if not conversations:
+        return {}
+    message_items_by_conv = conv_store.list_latest_message_items_for_conversations(
+        [conv.id for conv in conversations],
+        10,
+    )
+    return {
+        conv_id: _latest_message_preview(message_items)
+        for conv_id, message_items in message_items_by_conv.items()
+    }
+
+
 async def _child_session_summaries_from_conversations(
     children: list[Conversation],
     parent_session_id: str,
@@ -12344,16 +12370,7 @@ async def _child_session_summaries_from_conversations(
     """
     if not children:
         return []
-    child_ids = [child.id for child in children]
-    message_items_by_child = await asyncio.to_thread(
-        conv_store.list_latest_message_items_for_conversations,
-        child_ids,
-        10,
-    )
-    previews = {
-        child_id: _latest_message_preview(message_items)
-        for child_id, message_items in message_items_by_child.items()
-    }
+    previews = await asyncio.to_thread(_latest_message_previews, children, conv_store)
     return [
         _child_session_summary_from_conversation(
             child,
