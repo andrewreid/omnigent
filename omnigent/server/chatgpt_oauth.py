@@ -32,6 +32,8 @@ DEFAULT_ISSUER = "https://auth.openai.com"
 #: codex's first-party OAuth client (``CLIENT_ID`` in codex-rs/login).
 DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 _HTTP_TIMEOUT_S = 15.0
+#: An HS256 key should carry at least 256 bits; 32 characters is the floor.
+_MIN_STATE_KEY_LEN = 32
 _USER_AGENT = "omnigent"
 _AUTH_CLAIMS = "https://api.openai.com/auth"
 # Refresh failures that mean the chain is dead (codex classifies these as permanent).
@@ -68,10 +70,17 @@ class ChatgptConfig:
         if raw not in ("1", "true", "yes", "on"):
             return None
         state_key = (os.environ.get(CHATGPT_STATE_KEY_ENV_VAR) or "").strip()
+        if state_key and len(state_key) < _MIN_STATE_KEY_LEN:
+            raise ValueError(
+                f"{CHATGPT_STATE_KEY_ENV_VAR} must be at least {_MIN_STATE_KEY_LEN} "
+                "characters; generate one with `openssl rand -base64 32`"
+            )
         if not state_key:
-            # In-flight connects (≤15 min) won't survive a restart or another replica.
+            # In-flight connects (≤15 min) won't survive a restart, and a handle
+            # minted by one worker or replica can't be verified by another.
             _logger.warning(
-                "%s is unset; using a per-process key for ChatGPT connect handles",
+                "%s is unset; using a per-process key for ChatGPT connect handles. "
+                "Set it to a shared secret when running more than one worker.",
                 CHATGPT_STATE_KEY_ENV_VAR,
             )
             state_key = base64.urlsafe_b64encode(os.urandom(32)).decode()

@@ -1555,6 +1555,8 @@ function ClaudeIntegrationControl() {
       } else {
         setError(rejection);
       }
+    } catch {
+      setError("Couldn't reach the server to save the token. Try again.");
     } finally {
       setBusy(false);
     }
@@ -1600,7 +1602,7 @@ function ClaudeIntegrationControl() {
           className="flex-1"
           description={
             status.connected
-              ? `Connected (${status.token_hint ?? "token stored"}). New sandboxes run Claude Code on your subscription.`
+              ? `Connected (${status.token_hint ?? "token stored"}). New sandboxes run Claude Code on your subscription; disconnecting doesn't remove it from sandboxes already running.`
               : "Run `claude setup-token` on your machine and paste the token so new sandboxes run Claude Code on your subscription."
           }
         />
@@ -1621,6 +1623,7 @@ function ClaudeIntegrationControl() {
               <Input
                 type="password"
                 autoComplete="off"
+                aria-label="Claude setup token"
                 placeholder="sk-ant-oat01-…"
                 className="h-9 w-64"
                 value={token}

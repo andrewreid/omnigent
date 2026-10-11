@@ -390,6 +390,15 @@ def test_failed_revoke_stops_vending_but_keeps_the_chain_to_revoke_on_retry(
     assert auth.revoked == ["rt-1"]
 
 
+def test_short_configured_state_key_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMNIGENT_CHATGPT_SUBSCRIPTION_CONNECT", "1")
+    monkeypatch.setenv("OMNIGENT_CHATGPT_STATE_KEY", "too-short")
+    with pytest.raises(ValueError, match="at least 32"):
+        ChatgptConfig.from_env()
+    monkeypatch.setenv("OMNIGENT_CHATGPT_STATE_KEY", "k" * 32)
+    assert ChatgptConfig.from_env().state_key == "k" * 32
+
+
 # --- resolver refresh -------------------------------------------------------
 
 
