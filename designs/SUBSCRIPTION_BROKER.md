@@ -124,6 +124,13 @@ tiny transaction is simpler and portable.
   in place.
 - `release_refresh_lease(...)` and `mark_needs_reconnect(...)`. A reconnect's
   `upsert` rewrites the metadata, which clears the flag.
+- As built, also: `get_under_lease` (a snapshot only while the holder still
+  owns the lease and the row isn't flagged), `mark_refresh_inflight` (set just
+  before calling the provider, cleared once the outcome is known), and a
+  `connection_generation` stamped on every connect so slower operations
+  (disconnect) can fence on the row they read. `acquire_refresh_lease` refuses
+  a flagged row, and an expired lease that still carries the in-flight marker
+  fails closed (flags reconnect) instead of being taken over.
 
 `omnigent/connections/refresh.py::refresh_coordinated` is the shared resolver
 core (lease TTL 60 s, above the clients' 15 s HTTP timeout):
@@ -132,14 +139,18 @@ core (lease TTL 60 s, above the clients' 15 s HTTP timeout):
 2. Try to acquire the lease.
    - **Lost:** poll until the holder's refresh lands, then return the fresh row.
      On timeout, return the current row; the caller decides from its expiry.
-   - **Won:** re-read under the lease, because another holder may have just
-     committed. Call upstream **outside any transaction**, then persist through
-     `update_secret(lease_holder=…)`.
+   - **Won:** take a fenced snapshot under the lease (another holder may have
+     just committed), mark the refresh in flight, call upstream **outside any
+     transaction**, then persist through `update_secret(lease_holder=…)`.
 3. `RefreshRejected` (GitHub `bad_refresh_token`/`invalid_grant`, Databricks
    `invalid_grant`) marks `needs_reconnect` and returns `None`, with no retries.
-   Any other error is transient: return the current row.
-4. It returns `Refreshed(connection, minted)`. Callers prefer `minted`, so a
-   failed persist never drops a token whose predecessor is already spent.
+   A connect failure or a provider error response left the chain unrotated:
+   return the current row. Any other failure (a lost answer, a failed save
+   after retries, a crash or cancellation) fails closed: flag `needs_reconnect`,
+   or leave the in-flight marker for the next acquirer to flag. A possibly
+   spent refresh token is never sent again.
+4. It returns `Refreshed(connection, minted)`. Callers prefer `minted`: newly
+   minted tokens are valid for that call even when they couldn't be stored.
 
 GitHub and Databricks resolvers are retrofitted onto it. The shared `status`
 endpoint reports `needs_reconnect`, and the Settings panels say "reconnect".
