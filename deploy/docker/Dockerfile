@@ -80,7 +80,9 @@ ARG HOST_HARNESSES="claude codex pi kiro agy"
 #   --build-arg NPM_CONFIG_REGISTRY=https://npm-proxy.example.com
 FROM node:${NODE_VERSION}-slim AS web-builder
 ARG NPM_CONFIG_REGISTRY=
-ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
+ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org}
+# pnpm 11 uses PNPM_CONFIG_ settings; npm uses NPM_CONFIG_.
+ENV PNPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 WORKDIR /web
 
 # Workspace manifests + lockfile first so the install layer caches across pure
@@ -94,6 +96,7 @@ RUN npm install -g pnpm@11.15.1
 RUN pnpm install --frozen-lockfile --filter web
 
 COPY web/ ./web/
+ARG VITE_OMNIGENT_HOST_ROUTING=false
 RUN pnpm --filter web run build
 
 # ── Python builder (shared: server + host) ──────────────
