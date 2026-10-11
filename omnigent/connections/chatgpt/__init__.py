@@ -42,10 +42,11 @@ class ChatgptConnectionStore(ConnectionStore[ChatgptConnection]):
 
     @staticmethod
     def _secret(tokens: ChatgptTokenSet) -> dict[str, Any]:
+        # The id token isn't stored: its identity claims are kept as metadata,
+        # and nothing downstream needs the token itself.
         return {
             "access_token": tokens.access_token,
             "refresh_token": tokens.refresh_token,
-            "id_token": tokens.id_token,
         }
 
     @staticmethod

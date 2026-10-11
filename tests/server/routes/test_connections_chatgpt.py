@@ -205,6 +205,9 @@ def test_full_connect_stores_tokens_and_status_shows_identity_only(
     assert "rt-1" not in status.text and "access_token" not in status.text
     assert store.get(_USER, with_tokens=True).refresh_token == "rt-1"
     assert auth.user_agents == {"omnigent"}
+    # Only what a refresh and the broker need is kept at rest.
+    stored = store._store.get(_USER, "chatgpt", with_secret=True)
+    assert set(stored.secret) == {"access_token", "refresh_token"}
 
 
 def test_broker_vends_access_token_but_never_the_refresh_chain(client: TestClient) -> None:
