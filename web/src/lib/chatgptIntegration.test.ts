@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "./identity";
-import { pollChatgptConnect, startChatgptConnect } from "./chatgptIntegration";
+import { disconnectChatgpt, pollChatgptConnect, startChatgptConnect } from "./chatgptIntegration";
 
 vi.mock("./identity", () => ({ authenticatedFetch: vi.fn() }));
 
@@ -87,6 +87,16 @@ describe("chatgptIntegration", () => {
     await pollChatgptConnect("h1");
 
     expect(fetchMock.mock.calls[0][1]?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("surfaces why a disconnect didn't finish", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ detail: "disconnect again to finish revoking it." }), {
+        status: 502,
+      }),
+    );
+
+    await expect(disconnectChatgpt()).rejects.toThrow("disconnect again");
   });
 
   it("surfaces why a sign-in couldn't start", async () => {
