@@ -1727,7 +1727,11 @@ function ChatgptIntegrationControl() {
     setBusy(true);
     setMessage(null);
     try {
-      await disconnectChatgpt();
+      if (!(await disconnectChatgpt())) {
+        setMessage(
+          "Disconnected, but the stored sign-in couldn't be read, so it wasn't revoked at OpenAI.",
+        );
+      }
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "Couldn't disconnect ChatGPT.");
     } finally {

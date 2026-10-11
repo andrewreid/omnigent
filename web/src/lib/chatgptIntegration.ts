@@ -102,9 +102,13 @@ export async function pollChatgptConnect(handle: string): Promise<ChatgptPollSta
 }
 
 /** Disconnect: the server revokes the chain at OpenAI, then forgets it. */
-export async function disconnectChatgpt(): Promise<void> {
+/** Disconnect. Resolves ``false`` when the stored sign-in was unreadable and so
+ * couldn't be revoked at OpenAI (it is disconnected either way). */
+export async function disconnectChatgpt(): Promise<boolean> {
   const res = await authenticatedFetch("/v1/connections/chatgpt/disconnect", { method: "POST" });
   if (!res.ok) {
     throw new Error(await detailOf(res, "Couldn't disconnect ChatGPT"));
   }
+  const body = (await res.json().catch(() => ({}))) as { revoked?: unknown };
+  return body.revoked !== false;
 }

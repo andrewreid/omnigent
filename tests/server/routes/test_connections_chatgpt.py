@@ -343,7 +343,10 @@ def test_expired_and_tampered_handles(client: TestClient) -> None:
 
 def test_disconnect_revokes_upstream_then_deletes(client: TestClient, auth) -> None:
     _connect(client)
-    assert client.post("/v1/connections/chatgpt/disconnect").json() == {"disconnected": True}
+    assert client.post("/v1/connections/chatgpt/disconnect").json() == {
+        "disconnected": True,
+        "revoked": True,
+    }
     assert auth.revoked == ["rt-1"]
     assert client.get("/v1/connections/chatgpt/status").json()["connected"] is False
 
@@ -368,6 +371,41 @@ def test_a_token_refused_before_expiry_is_refreshed_not_handed_back(
     assert store.get(_USER, with_tokens=True).refresh_token == "rt-2"
 
 
+def test_reconnect_during_disconnect_survives(
+    client: TestClient, auth: FakeAuthService, store: ChatgptConnectionStore
+) -> None:
+    # The user reconnects while the old chain's revoke is still in flight: the
+    # disconnect only removes the generation it started with.
+    _connect(client)
+    revoke = auth.__call__
+
+    def revoke_then_reconnect(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oauth/revoke":
+            store.upsert(_USER, token_set_from_payload(_tokens(9)))
+        return revoke(request)
+
+    client.app.state.chatgpt_client._transport = httpx.MockTransport(revoke_then_reconnect)  # type: ignore[attr-defined]
+
+    resp = client.post("/v1/connections/chatgpt/disconnect").json()
+
+    assert resp == {"disconnected": False, "revoked": True}
+    status = client.get("/v1/connections/chatgpt/status").json()
+    assert status["connected"] is True and status["needs_reconnect"] is False
+    assert store.get(_USER, with_tokens=True).refresh_token == "rt-9"
+
+
+def test_unreadable_sign_in_is_disconnected_but_reported_unrevoked(
+    client: TestClient, auth: FakeAuthService, store: ChatgptConnectionStore
+) -> None:
+    _connect(client)
+    store._store._cipher = SecretBox("other-key")  # can no longer decrypt the row
+
+    resp = client.post("/v1/connections/chatgpt/disconnect").json()
+
+    assert resp == {"disconnected": True, "revoked": False}
+    assert auth.revoked == []
+
+
 def test_failed_revoke_stops_vending_but_keeps_the_chain_to_revoke_on_retry(
     client: TestClient, auth: FakeAuthService
 ) -> None:
@@ -386,7 +424,10 @@ def test_failed_revoke_stops_vending_but_keeps_the_chain_to_revoke_on_retry(
     assert vend.json() == {"connected": False}
 
     auth.revoke_status = 200
-    assert client.post("/v1/connections/chatgpt/disconnect").json() == {"disconnected": True}
+    assert client.post("/v1/connections/chatgpt/disconnect").json() == {
+        "disconnected": True,
+        "revoked": True,
+    }
     assert auth.revoked == ["rt-1"]
 
 
