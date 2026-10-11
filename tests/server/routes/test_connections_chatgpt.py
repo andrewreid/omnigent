@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import threading
 import time
@@ -345,6 +346,26 @@ def test_disconnect_revokes_upstream_then_deletes(client: TestClient, auth) -> N
     assert client.post("/v1/connections/chatgpt/disconnect").json() == {"disconnected": True}
     assert auth.revoked == ["rt-1"]
     assert client.get("/v1/connections/chatgpt/status").json()["connected"] is False
+
+
+def test_a_token_refused_before_expiry_is_refreshed_not_handed_back(
+    store: ChatgptConnectionStore, api: ChatgptOAuthClient, auth: FakeAuthService
+) -> None:
+    _seed(store, ttl=864000)  # well inside its life, so normally vended as-is
+    stored = store.get(_USER, with_tokens=True).access_token
+    digest = hashlib.sha256(stored.encode()).hexdigest()
+
+    other = asyncio.run(
+        resolve_chatgpt_credential(_USER, store=store, client=api, rejected_digest="0" * 64)
+    )
+    assert other["token"] == stored and auth.refreshes == []
+
+    fresh = asyncio.run(
+        resolve_chatgpt_credential(_USER, store=store, client=api, rejected_digest=digest)
+    )
+    assert auth.refreshes == ["rt-1"]
+    assert fresh is not None
+    assert store.get(_USER, with_tokens=True).refresh_token == "rt-2"
 
 
 def test_failed_revoke_stops_vending_but_keeps_the_chain_to_revoke_on_retry(

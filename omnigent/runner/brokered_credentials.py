@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import os
 import time
@@ -41,9 +42,13 @@ def _in_managed_sandbox() -> bool:
     return (os.environ.get("IS_SANDBOX") or "").strip() == "1"
 
 
-async def fetch_runner_credential(provider: str) -> dict[str, Any] | None:
+async def fetch_runner_credential(
+    provider: str, *, rejected_token: str | None = None
+) -> dict[str, Any] | None:
     """Fetch the owner's *provider* credential for this managed runner.
 
+    :param rejected_token: A token the provider just refused (a 401 before its
+        expiry). Only its SHA-256 digest is sent, so the broker can refresh it.
     :returns: The broker payload when connected, else ``None`` (not in a managed
         sandbox, no binding token, server unreachable, or not connected).
     """
@@ -54,9 +59,12 @@ async def fetch_runner_credential(provider: str) -> dict[str, Any] | None:
     if not server or not token:
         return None
     url = f"{server}/v1/runners/{token_bound_runner_id(token)}/credentials/{provider}"
+    params = {}
+    if rejected_token:
+        params["rejected"] = hashlib.sha256(rejected_token.encode()).hexdigest()
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT_S) as http:
-            resp = await http.get(url, headers={RUNNER_TUNNEL_TOKEN_HEADER: token})
+            resp = await http.get(url, headers={RUNNER_TUNNEL_TOKEN_HEADER: token}, params=params)
     except httpx.HTTPError as exc:
         _logger.info("brokered %s credential unavailable: %s", provider, exc)
         return None
@@ -113,10 +121,10 @@ class BrokeredChatgptAuth:
     async def _answer(self, request_id: int | str) -> None:
         payload = None
         if time.monotonic() >= self._declined_until:
-            payload = await fetch_runner_credential("chatgpt")
-            # The broker handing back the token codex just rejected means it is
-            # dead upstream (e.g. revoked); answering with it again only feeds
-            # codex's retry loop.
+            payload = await fetch_runner_credential("chatgpt", rejected_token=self._current_token)
+            # The broker refreshes a rejected token; handing the same one back
+            # means it couldn't (e.g. the chain was revoked), and answering with
+            # it again only feeds codex's retry loop.
             if payload is not None and payload["token"] == self._current_token:
                 payload = None
             if payload is None:

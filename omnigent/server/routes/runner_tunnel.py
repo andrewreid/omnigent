@@ -385,7 +385,11 @@ def create_runner_tunnel_router(
 
     @router.get("/runners/{runner_id}/credentials/{provider}")
     async def runner_credential(
-        request: Request, response: Response, runner_id: str, provider: str
+        request: Request,
+        response: Response,
+        runner_id: str,
+        provider: str,
+        rejected: str | None = None,
     ) -> dict[str, object]:
         """Vend the managed runner owner's *provider* credential to the runner.
 
@@ -395,7 +399,9 @@ def create_runner_tunnel_router(
         (binding token bound to *runner_id*, owner from the managed launch
         record), and only while that managed host is live, so a binding token
         left over after teardown resolves nothing. ``401`` otherwise;
-        ``{"connected": false}`` when the owner hasn't linked it.
+        ``{"connected": false}`` when the owner hasn't linked it. ``rejected``
+        is the SHA-256 digest of a token the provider refused, which the broker
+        refreshes rather than handing back.
         """
         from omnigent.server.routes.host_credentials import vend_provider_credential
 
@@ -408,7 +414,9 @@ def create_runner_tunnel_router(
             owner = await asyncio.to_thread(resolve_runner_credential_owner, runner_id)
         if owner is None:
             raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
-        return await vend_provider_credential(request.app, provider, owner)
+        return await vend_provider_credential(
+            request.app, provider, owner, rejected_digest=rejected
+        )
 
     @router.websocket("/runners/{runner_id}/tunnel")
     async def tunnel(ws: WebSocket, runner_id: str) -> None:

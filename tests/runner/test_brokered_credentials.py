@@ -8,6 +8,7 @@ readiness flag.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 
 import httpx
@@ -155,6 +156,14 @@ async def test_fetch_uses_the_binding_token_and_runner_route(managed_env, monkey
     assert request.headers[RUNNER_TUNNEL_TOKEN_HEADER] == _TOKEN
 
 
+async def test_fetch_reports_a_rejected_token_by_digest_only(managed_env, monkeypatch) -> None:
+    seen = _mock_http(monkeypatch, lambda r: httpx.Response(200, json=_PAYLOAD))
+    await bc.fetch_runner_credential("chatgpt", rejected_token="access-1")
+    (request,) = seen
+    assert request.url.params["rejected"] == hashlib.sha256(b"access-1").hexdigest()
+    assert "access-1" not in str(request.url)
+
+
 async def test_fetch_is_a_noop_outside_a_managed_sandbox(monkeypatch) -> None:
     monkeypatch.delenv("IS_SANDBOX", raising=False)
     seen = _mock_http(monkeypatch, lambda r: httpx.Response(200, json=_PAYLOAD))
@@ -212,7 +221,7 @@ async def _drain() -> None:
 async def test_login_then_answers_refresh_with_a_fresh_token(monkeypatch) -> None:
     fetched = iter([{**_PAYLOAD, "token": "access-2"}])
 
-    async def fake_fetch(provider: str):
+    async def fake_fetch(provider: str, **kwargs):
         return next(fetched)
 
     monkeypatch.setattr(bc, "fetch_runner_credential", fake_fetch)
@@ -248,10 +257,28 @@ async def test_login_then_answers_refresh_with_a_fresh_token(monkeypatch) -> Non
     assert client.closed
 
 
+async def test_refresh_request_reports_the_rejected_token(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    async def fake_fetch(provider: str, **kwargs):
+        calls.append(kwargs)
+        return {**_PAYLOAD, "token": "access-2"}
+
+    monkeypatch.setattr(bc, "fetch_runner_credential", fake_fetch)
+    client = _FakeClient()
+    auth = bc.BrokeredChatgptAuth(client)
+    await auth.login(_PAYLOAD)
+    await client.events.put({"id": 7, "method": "account/chatgptAuthTokens/refresh"})
+    await _drain()
+
+    assert calls == [{"rejected_token": "access-1"}]
+    await auth.close()
+
+
 async def test_not_connected_refresh_fails_fast_and_is_cached(monkeypatch) -> None:
     calls = 0
 
-    async def fake_fetch(provider: str):
+    async def fake_fetch(provider: str, **kwargs):
         nonlocal calls
         calls += 1
         return
@@ -271,7 +298,7 @@ async def test_not_connected_refresh_fails_fast_and_is_cached(monkeypatch) -> No
 async def test_rejected_token_handed_back_again_stops_the_retry_storm(monkeypatch) -> None:
     calls = 0
 
-    async def fake_fetch(provider: str):
+    async def fake_fetch(provider: str, **kwargs):
         nonlocal calls
         calls += 1
         return _PAYLOAD  # the broker still has the token codex just rejected
@@ -289,7 +316,7 @@ async def test_rejected_token_handed_back_again_stops_the_retry_storm(monkeypatc
 
 
 async def test_start_is_a_noop_when_not_connected(monkeypatch) -> None:
-    async def fake_fetch(provider: str):
+    async def fake_fetch(provider: str, **kwargs):
         return None
 
     monkeypatch.setattr(bc, "fetch_runner_credential", fake_fetch)

@@ -10,6 +10,7 @@ every vended token has at least that long to run. See
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 from omnigent.connections.chatgpt import ChatgptConnectionStore
@@ -49,13 +50,23 @@ def build_chatgpt_connection(
     return config, ChatgptConnectionStore(database_url, cipher)
 
 
+def _digest(token: str) -> str:
+    """SHA-256 hex of a token, as the runner reports a rejected one."""
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 async def resolve_chatgpt_credential(
     user_id: str,
     *,
     store: ChatgptConnectionStore,
     client: ChatgptOAuthClient,
+    rejected_digest: str | None = None,
 ) -> dict[str, object] | None:
     """Resolve the ChatGPT broker payload for *user_id*, or ``None``.
+
+    :param rejected_digest: SHA-256 hex of an access token OpenAI refused before
+        its expiry. If it is the stored token, refresh it (coordinated, so
+        concurrent reports refresh once) instead of handing it back.
 
     :returns: ``{"token", "account_id", "plan_type", "expires_at"}``. Never the
         refresh token or id token: those stay on the server.
@@ -63,7 +74,11 @@ async def resolve_chatgpt_credential(
 
     def is_fresh(conn: ChatgptConnection) -> bool:
         expires_at = conn.access_expires_at
-        return expires_at is not None and expires_at > now_epoch() + _REFRESH_MARGIN_S
+        if expires_at is None or expires_at <= now_epoch() + _REFRESH_MARGIN_S:
+            return False
+        if rejected_digest is not None and conn.access_token is not None:
+            return _digest(conn.access_token) != rejected_digest
+        return True
 
     async def refresh(conn: ChatgptConnection) -> ChatgptTokenSet:
         return await client.refresh(ChatgptConnectionStore.token_set(conn))
