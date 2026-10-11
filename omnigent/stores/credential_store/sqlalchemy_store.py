@@ -308,11 +308,14 @@ class CredentialStore:
         :meth:`update_secret` with ``lease_holder``. A lease past its expiry can
         be taken over, so a crashed holder never wedges the connection.
 
-        :returns: ``True`` when *holder* now owns the lease.
+        :returns: ``True`` when *holder* now owns the lease; ``False`` when another
+            holder does or the connection needs a reconnect.
         """
         now = now_epoch()
 
         def claim(meta: dict[str, Any]) -> bool:
+            if meta.get(_NEEDS_RECONNECT):
+                return False
             if int(meta.get(_LEASE_UNTIL) or 0) > now and meta.get(_LEASE_HOLDER) != holder:
                 return False
             meta[_LEASE_HOLDER] = holder
@@ -337,15 +340,27 @@ class CredentialStore:
             "release_refresh_lease", user_id, provider, account_id, release
         )
 
-    def mark_needs_reconnect(self, user_id: str, provider: str, *, account_id: str = "") -> bool:
-        """Flag that the provider rejected the refresh token; clears any lease.
+    def mark_needs_reconnect(
+        self,
+        user_id: str,
+        provider: str,
+        *,
+        holder: str | None = None,
+        account_id: str = "",
+    ) -> bool:
+        """Flag that the stored chain is unusable; clears any lease.
 
         Refreshes stop until the user reconnects (a reconnect's upsert rewrites
         the metadata, clearing the flag). See ``designs/CREDENTIAL_STORE.md``: a
         rotated-away credential degrades to "reconnect", never a retry storm.
+
+        :param holder: Only flag while *holder* still owns the refresh lease, so
+            a refresh that outlived a reconnect can't mark the new login broken.
         """
 
         def flag(meta: dict[str, Any]) -> bool:
+            if holder is not None and meta.get(_LEASE_HOLDER) != holder:
+                return False
             meta[_NEEDS_RECONNECT] = True
             meta.pop(_LEASE_HOLDER, None)
             meta.pop(_LEASE_UNTIL, None)
