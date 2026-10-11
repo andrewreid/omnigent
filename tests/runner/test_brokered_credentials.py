@@ -359,11 +359,19 @@ def test_host_flag_not_set_outside_sandbox_or_when_disconnected(monkeypatch) -> 
     assert CHATGPT_BROKERED_ENV_VAR not in os.environ
 
 
-def test_codex_readiness_honours_the_broker_flag(monkeypatch) -> None:
+def test_broker_flag_only_readies_native_codex(monkeypatch) -> None:
+    # The in-process `codex` executor has no brokered login, so the flag must
+    # not make it look ready.
     from omnigent.harnesses.codex_native import main as codex_main
-    from omnigent.onboarding import harness_install
+    from omnigent.onboarding import harness_install, harness_readiness
 
     monkeypatch.setattr(codex_main, "_find_codex_cli", lambda: "/usr/local/bin/codex")
     monkeypatch.setattr(harness_install, "harness_cli_installed", lambda *a, **k: True)
     monkeypatch.setenv(CHATGPT_BROKERED_ENV_VAR, "1")
-    assert codex_main._codex_auth_unavailable_reason() is None
+    monkeypatch.setattr(codex_main, "_codex_auth_unavailable_reason", lambda: "needs-auth")
+
+    assert harness_readiness._harness_availability("codex-native") is True
+    assert harness_readiness._harness_availability("native-codex") is True
+    assert harness_readiness._harness_availability("codex") == "needs-auth"
+    monkeypatch.delenv(CHATGPT_BROKERED_ENV_VAR)
+    assert harness_readiness._harness_availability("codex-native") == "needs-auth"
