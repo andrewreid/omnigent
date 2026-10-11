@@ -75,16 +75,19 @@ shorter timeout costs a retry, not the connection.
 | | Claude | ChatGPT |
 |---|---|---|
 | What a sandbox holds | the setup token (about 1 year) | an access token (about 10 days; refreshed when under 2 days remain) |
-| Disconnect | Deletes the stored token, so new sandboxes stop getting it. It doesn't invalidate the token: sandboxes already running keep their copy until it expires. | Revokes the refresh chain at OpenAI, which also invalidates the access tokens already handed out, then deletes the connection. |
-| If revoke fails | n/a | The connection stops being vended at once, is kept so it can still be revoked, and the user is asked to disconnect again (`502`). |
+| Disconnect | Deletes the stored token, so new sandboxes stop getting it. It doesn't invalidate the token: sandboxes already running keep their copy until it expires. | Stops vending, revokes the refresh chain at OpenAI (which also invalidated the access tokens handed out from it when we tested), then deletes the connection. A reconnect made while this runs is left alone. |
+| If revoke fails | n/a | The connection stays flagged (nothing more is vended) and is kept so it can still be revoked; the user is asked to disconnect again (`502`). |
+| If the stored sign-in is unreadable | n/a | It is disconnected, but nothing could be revoked at OpenAI; the response says `"revoked": false` and the panel says so. |
 
 ## When something goes wrong
 
 - **"No longer accepts the saved sign-in. Disconnect, then connect again."**
-  The provider refused the refresh token: the chain was revoked, rotated
-  elsewhere, or reused. The same state is set, failing closed, if a refreshed
-  token could not be stored, because the old refresh token is then spent.
-  Reconnecting fixes it.
+  The provider refused the refresh token (the chain was revoked, rotated
+  elsewhere, or reused), or a refresh ended without a known outcome (its
+  answer was lost, its result couldn't be stored, or the server died
+  mid-refresh). Rotating providers spend the old refresh token on use, so the
+  broker fails closed rather than risk sending it twice. Reconnecting fixes it.
+  This applies to the GitHub and Databricks connections too.
 - **A sandbox's codex gets a 401 before its token expires.** The runner reports
   the refused token, as a digest, and the server refreshes it once. If the chain
   can't be refreshed, codex is told to reconnect.
@@ -92,10 +95,25 @@ shorter timeout costs a retry, not the connection.
   even with a leftover binding token: vending requires the session to still be
   on a live, server-managed host.
 
+## Upgrading and rolling back
+
+Upgrade every server replica together; don't run old and new servers side by
+side.
+
+- Older servers don't follow the in-flight refresh marker or the connection
+  generation, so a mixed fleet can refresh one chain twice.
+- Older servers can't read secrets sealed with the KMS envelope (the
+  `kmsenv1:` prefix, used for secrets over 4 KB). After rolling back, any such
+  connection reads as disconnected until the user reconnects. Smaller secrets
+  keep the format older servers read.
+- No schema migration is involved; the new state lives in the existing
+  connection metadata, which older servers ignore.
+
 ## Compatibility
 
 The ChatGPT delivery uses the Codex app-server's `chatgptAuthTokens` login and
 answers its `account/chatgptAuthTokens/refresh` requests. Codex marks that
 interface unstable and internal. It was verified end to end with `codex-cli`
-0.158.0. Pin the Codex version in your host image, and re-verify after
-upgrading.
+0.158.0. A runner whose codex is older than 0.154.0 keeps codex's own login, and
+the brokered login gives up after 30 seconds if the app-server doesn't answer.
+Pin the Codex version in your host image, and re-verify after upgrading.

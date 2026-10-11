@@ -1753,8 +1753,8 @@ function ChatgptIntegrationControl() {
   const description = status.needs_reconnect
     ? "ChatGPT no longer accepts the saved sign-in. Disconnect, then connect again."
     : status.connected
-      ? `Connected${status.email ? ` as ${status.email}` : ""}${status.plan_type ? ` (${status.plan_type})` : ""}. New sandboxes run Codex on your subscription.`
-      : "Sign in with ChatGPT so new sandboxes run Codex on your subscription. Device code sign-in must be enabled in ChatGPT → Settings → Security.";
+      ? `Connected${status.email ? ` as ${status.email}` : ""}${status.plan_type ? ` (${status.plan_type})` : ""}. New sandboxes run native Codex sessions on your subscription.`
+      : "Sign in with ChatGPT so new sandboxes run native Codex sessions on your subscription. Device code sign-in must be enabled in ChatGPT → Settings → Security.";
 
   return (
     <div className="flex flex-col gap-4">
