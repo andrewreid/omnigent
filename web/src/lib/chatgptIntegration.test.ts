@@ -89,6 +89,14 @@ describe("chatgptIntegration", () => {
     expect(fetchMock.mock.calls[0][1]?.signal).toBeInstanceOf(AbortSignal);
   });
 
+  it("reports a disconnect that had nothing readable to revoke", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ disconnected: true, revoked: false }), { status: 200 }),
+    );
+
+    await expect(disconnectChatgpt()).resolves.toBe(false);
+  });
+
   it("surfaces why a disconnect didn't finish", async () => {
     fetchMock.mockResolvedValue(
       new Response(JSON.stringify({ detail: "disconnect again to finish revoking it." }), {

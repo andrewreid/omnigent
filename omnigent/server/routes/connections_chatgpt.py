@@ -90,11 +90,19 @@ class ChatgptConnectionHooks:
             device_auth_id
         )
 
-    async def revoke(self, user_id: str) -> None:
-        """Revoke the refresh chain upstream; every vended access token dies with it."""
+    async def revoke(self, user_id: str) -> bool:
+        """Revoke the refresh chain upstream; every vended access token dies with it.
+
+        :returns: ``False`` when there was nothing to revoke (no connection, or a
+            stored sign-in that can no longer be decrypted).
+        """
         conn = await asyncio.to_thread(self.store.get, user_id, with_tokens=True)
-        if conn is not None and conn.refresh_token:
-            await self.api.revoke(conn.refresh_token)
+        if conn is None or not conn.refresh_token:
+            if conn is not None:
+                _logger.warning("ChatGPT sign-in for %s is unreadable; nothing to revoke", user_id)
+            return False
+        await self.api.revoke(conn.refresh_token)
+        return True
 
 
 def create_connections_chatgpt_router(

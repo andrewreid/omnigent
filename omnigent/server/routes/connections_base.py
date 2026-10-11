@@ -425,26 +425,34 @@ def _mount_status_and_disconnect(
     async def disconnect(request: Request) -> dict[str, bool]:
         """Remove the caller's connection, revoking it upstream when supported.
 
-        A failed revoke stops vending at once (the connection is flagged for
-        reconnect) but keeps the row, so the refresh token is still there to
-        revoke on retry; ``502`` tells the caller to try again.
+        Everything is fenced to the connection generation read first, so a
+        reconnect made meanwhile is left alone. Before revoking, that generation
+        is flagged for reconnect: nothing more is vended and no refresh can
+        rotate the chain mid-revoke. A failed revoke keeps the flagged row, so
+        the refresh token is still there to revoke on retry (``502``).
+        ``revoked`` is ``False`` when there was nothing readable to revoke.
         """
         user_id = _current_user(request)
+        generation = await asyncio.to_thread(store.generation, user_id)
+        if generation is None:
+            return {"disconnected": False}
         revoke = getattr(hooks, "revoke", None)
-        if revoke is not None:
-            try:
-                await revoke(user_id)
-            except Exception as exc:  # any upstream failure is retryable
-                _logger.warning("%s upstream revoke failed for %s: %s", provider, user_id, exc)
-                await asyncio.to_thread(store.mark_needs_reconnect, user_id)
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        f"Couldn't revoke the {provider} sign-in upstream. New sandboxes no "
-                        "longer get it; disconnect again to finish revoking it."
-                    ),
-                ) from exc
-        removed = await asyncio.to_thread(store.delete, user_id)
-        return {"disconnected": removed}
+        if revoke is None:
+            removed = await asyncio.to_thread(store.delete, user_id, generation=generation)
+            return {"disconnected": removed}
+        await asyncio.to_thread(store.mark_needs_reconnect, user_id, generation=generation)
+        try:
+            revoked = bool(await revoke(user_id))
+        except Exception as exc:  # any upstream failure is retryable
+            _logger.warning("%s upstream revoke failed for %s: %s", provider, user_id, exc)
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Couldn't revoke the {provider} sign-in upstream. New sandboxes no "
+                    "longer get it; disconnect again to finish revoking it."
+                ),
+            ) from exc
+        removed = await asyncio.to_thread(store.delete, user_id, generation=generation)
+        return {"disconnected": removed, "revoked": revoked}
 
     return _current_user
