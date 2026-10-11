@@ -255,6 +255,22 @@ class ConversationUpdateResult:
 
 
 @dataclass(frozen=True)
+class DescendantConversation:
+    """
+    A sub-agent beneath another conversation, with its distance from it.
+
+    Returned by :meth:`ConversationStore.list_descendant_conversations`.
+
+    :param conversation: The descendant conversation.
+    :param depth: Levels below the conversation listed from; direct
+        children are 1.
+    """
+
+    conversation: Conversation
+    depth: int
+
+
+@dataclass(frozen=True)
 class SessionConnectivity:
     """
     The minimal session fields the sidebar's online-dot needs.
@@ -638,6 +654,42 @@ class ConversationStore(ABC):
         :returns: Mapping from every unique input parent id to the
             matching direct child ids. Parents with no direct sub-agent
             children, or ids that do not exist, map to an empty list.
+        """
+        ...
+
+    @abstractmethod
+    def list_descendant_conversations(
+        self,
+        conversation_id: str,
+        *,
+        root_conversation_id: str | None = None,
+        limit: int = 100,
+        after: str | None = None,
+        include_archived: bool = False,
+        max_depth: int | None = None,
+    ) -> PagedList[DescendantConversation]:
+        """
+        Page through every sub-agent beneath a conversation, at any depth.
+
+        The subtree is walked in the database, so the work scales with the
+        subtree and the page rather than with the whole spawn tree. Archived
+        conversations are always walked through, so a live descendant of an
+        archived one is still returned; ``include_archived`` only decides
+        whether archived rows themselves appear. Rows are ordered by
+        ``(depth, created_at, id)`` ascending, so parents precede children.
+
+        :param conversation_id: Subtree root, e.g. ``"conv_abc123"``; not
+            itself returned.
+        :param root_conversation_id: When set, return nothing unless
+            ``conversation_id`` currently belongs to this spawn tree. Lets a
+            caller bind the listing to the row it authorized.
+        :param limit: Maximum rows per page.
+        :param after: Id of the last row of the previous page.
+        :param include_archived: Also return archived descendants.
+        :param max_depth: Deepest level to return (1 = direct children);
+            ``None`` is unbounded.
+        :returns: One page of descendants with their depths.
+        :raises StaleCursorError: ``after`` is not in the filtered subtree.
         """
         ...
 

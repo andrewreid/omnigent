@@ -26,7 +26,6 @@ from typing import Any
 import pytest
 from omnigent_client import OmnigentError
 from omnigent_client._sessions import Session as SessionSnapshot
-from omnigent_client._sessions import SessionsNamespace
 from omnigent_ui_sdk.terminal._host import TerminalHost
 
 from omnigent.repl._repl import (
@@ -36,6 +35,7 @@ from omnigent.repl._repl import (
 )
 from omnigent.server.schemas import SessionStatusEvent
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+from tests.repl.helpers import FakeSubagentSessions
 
 # ── Host-level: chattability + closed status (B / F2 / F5) ─────────────────
 
@@ -188,28 +188,9 @@ def test_should_discover_runs_discovery_on_root_change() -> None:
     )
 
 
-class _DiscoverySessions:
-    """``client.sessions`` stub serving a fixed child-session snapshot."""
-
-    def __init__(self, by_parent: dict[str, list[dict[str, Any]]]) -> None:
-        self._by_parent = by_parent
-
-    async def child_sessions(self, session_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
-        return list(self._by_parent.get(session_id, []))
-
-    async def child_sessions_tree(
-        self, session_id: str, *, max_depth: int = 3, limit: int = 100
-    ) -> list[dict[str, Any]]:
-        # The recursion now lives in the SDK; reuse the real implementation
-        # (it only needs this stub's ``child_sessions``).
-        return await SessionsNamespace.child_sessions_tree(
-            self, session_id, max_depth=max_depth, limit=limit
-        )
-
-
 class _DiscoveryClient:
     def __init__(self, by_parent: dict[str, list[dict[str, Any]]]) -> None:
-        self.sessions = _DiscoverySessions(by_parent)
+        self.sessions = FakeSubagentSessions(by_parent)
 
 
 @pytest.mark.asyncio

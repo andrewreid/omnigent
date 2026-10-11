@@ -6641,9 +6641,11 @@ async def _refresh_subagent_tree(
         mid-fetch is dropped instead of resurrecting the cleared nodes.
     """
     try:
-        # Recursion + parent_id tagging now live in the shared SDK helper so the
-        # CLI tree and the SDK rollup (subtree_busy) walk identical data.
-        nodes = await client.sessions.child_sessions_tree(root_id, max_depth=max_depth)
+        # Same SDK helper as subtree_busy, so the CLI tree and the rollup see identical
+        # data. The navigator never shows message previews, so skip that server read.
+        nodes = await client.sessions.child_sessions_tree(
+            root_id, max_depth=max_depth, include_previews=False
+        )
     except Exception:  # noqa: BLE001 — best-effort poll: a failed fetch leaves the prior tree in place rather than crashing the REPL
         return
     host.seed_subagent_tree(root_id, nodes, generation=generation)
