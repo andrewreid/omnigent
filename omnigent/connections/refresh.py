@@ -20,6 +20,8 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Generic, Protocol, TypeVar
 
+import httpx
+
 _logger = logging.getLogger(__name__)
 
 EntityT = TypeVar("EntityT")
@@ -57,6 +59,8 @@ class _LeasedStore(Protocol[EntityT]):
     def get(self, user_id: str, *, with_tokens: bool = False) -> EntityT | None: ...
     def needs_reconnect(self, user_id: str) -> bool: ...
     def acquire_refresh_lease(self, user_id: str, *, holder: str, ttl_s: int) -> bool: ...
+    def get_under_lease(self, user_id: str, *, holder: str) -> EntityT | None: ...
+    def mark_refresh_inflight(self, user_id: str, *, holder: str) -> bool: ...
     def release_refresh_lease(self, user_id: str, *, holder: str) -> bool: ...
     def mark_needs_reconnect(self, user_id: str, *, holder: str | None = None) -> bool: ...
 
@@ -85,10 +89,11 @@ async def refresh_coordinated(
         still usable). ``None`` when there is no connection or it needs a
         reconnect.
 
-    A transient failure after the request reached the provider (e.g. a read
-    timeout) leaves it unknown whether the chain rotated; the current token is
-    kept, and if it did rotate the next refresh is rejected as reused, which
-    degrades to "reconnect".
+    A failure that leaves it unknown whether the provider rotated the chain
+    (a lost answer, a failed save, a crash or cancellation mid-refresh) fails
+    closed: the connection is flagged for reconnect, or the in-flight marker
+    left on the lease makes the next acquirer flag it, so a possibly spent
+    refresh token is never sent again.
     """
     conn = await asyncio.to_thread(store.get, user_id, with_tokens=True)
     if conn is None or await asyncio.to_thread(store.needs_reconnect, user_id):
@@ -103,13 +108,20 @@ async def refresh_coordinated(
     if not acquired:
         return await _await_other_holder(store, user_id, conn, is_fresh, wait_s)
 
+    # Release only when the outcome is known. Otherwise the in-flight marker
+    # outlives the lease, and the next acquirer fails closed instead of
+    # replaying a refresh token that may already be spent.
+    outcome_known = True
     try:
-        # Re-read under the lease: another holder may have just committed.
-        conn = await asyncio.to_thread(store.get, user_id, with_tokens=True)
-        if conn is None:
-            return None
+        # A fenced snapshot: None if a reconnect or flag landed since acquiring.
+        leased = await asyncio.to_thread(store.get_under_lease, user_id, holder=holder)
+        if leased is None:
+            return await _current_or_none(store, user_id, conn)
+        conn = leased
         if is_fresh(conn):
             return Refreshed(conn)
+        if not await asyncio.to_thread(store.mark_refresh_inflight, user_id, holder=holder):
+            return await _current_or_none(store, user_id, conn)
         try:
             tokens = await refresh(conn)
         except RefreshRejected as exc:
@@ -118,20 +130,62 @@ async def refresh_coordinated(
             )
             await asyncio.to_thread(store.mark_needs_reconnect, user_id, holder=holder)
             return None
-        except Exception as exc:  # noqa: BLE001 - transient: keep the current token
-            _logger.warning("%s token refresh failed for %s: %s", provider, user_id, exc)
+        except Exception as exc:  # noqa: BLE001 - classified below
+            if _rotation_ruled_out(exc):
+                _logger.warning("%s token refresh failed for %s: %s", provider, user_id, exc)
+                return Refreshed(conn)
+            # The request may have reached the provider and rotated the chain.
+            outcome_known = False
+            _logger.error(
+                "%s token refresh for %s ended without an answer; needs reconnect: %s",
+                provider,
+                user_id,
+                exc,
+            )
+            await _fail_closed(store, user_id, holder)
             return Refreshed(conn)
         if not await _persist_minted(persist, tokens, holder, provider, user_id):
             # The stored refresh token is spent; never let a later refresh replay it.
+            outcome_known = False
             _logger.error(
                 "%s refreshed token for %s could not be stored; needs reconnect", provider, user_id
             )
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(store.mark_needs_reconnect, user_id, holder=holder)
+            await _fail_closed(store, user_id, holder)
         return Refreshed(conn, minted=tokens)
+    except BaseException:
+        outcome_known = False
+        raise
     finally:
-        with contextlib.suppress(Exception):
-            await asyncio.to_thread(store.release_refresh_lease, user_id, holder=holder)
+        if outcome_known:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(store.release_refresh_lease, user_id, holder=holder)
+
+
+def _rotation_ruled_out(exc: BaseException) -> bool:
+    """Whether a failed refresh certainly left the chain unrotated.
+
+    A connect failure never reached the provider, and a provider error response
+    (raised by the clients as their own errors) issued no tokens. Any other
+    transport failure may have lost the answer to a refresh that succeeded.
+    """
+    if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout):
+        return True
+    return not isinstance(exc, httpx.TransportError)
+
+
+async def _fail_closed(store: _LeasedStore[EntityT], user_id: str, holder: str) -> None:
+    """Flag a reconnect; if even that fails, the in-flight marker stays behind."""
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(store.mark_needs_reconnect, user_id, holder=holder)
+
+
+async def _current_or_none(
+    store: _LeasedStore[EntityT], user_id: str, current: EntityT
+) -> Refreshed[EntityT, TokensT] | None:
+    """After losing the lease: ``None`` if the connection now needs a reconnect."""
+    if await asyncio.to_thread(store.needs_reconnect, user_id):
+        return None
+    return Refreshed(current)
 
 
 async def _persist_minted(

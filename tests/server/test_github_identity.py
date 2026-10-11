@@ -35,6 +35,7 @@ class _Store:
         self.update_attempts = 0
         self.reconnect = False
         self.lease: str | None = None
+        self.inflight: str | None = None
 
     def get(self, user_id: str, with_tokens: bool = False) -> _Conn | None:
         return self._conn
@@ -46,6 +47,17 @@ class _Store:
         if self.reconnect or self.lease not in (None, holder):
             return False
         self.lease = holder
+        return True
+
+    def get_under_lease(self, user_id: str, *, holder: str) -> _Conn | None:
+        if self.reconnect or self.lease != holder:
+            return None
+        return self._conn
+
+    def mark_refresh_inflight(self, user_id: str, *, holder: str) -> bool:
+        if self.reconnect or self.lease != holder:
+            return False
+        self.inflight = holder
         return True
 
     def release_refresh_lease(self, user_id: str, *, holder: str) -> bool:
@@ -123,11 +135,24 @@ def test_refresh_rejected_keeps_still_valid_token() -> None:
     assert _resolve(store, _Client(exc=GitHubAppError("bad refresh"))) == "ghu_old"
 
 
-def test_transient_network_error_does_not_raise_and_keeps_token() -> None:
-    # The P1 core: an httpx timeout during refresh must not escape as a 500.
+def test_unreachable_provider_keeps_the_token_and_retries_later() -> None:
+    # A connect failure never reached GitHub, so the chain is untouched.
     store = _Store(_Conn("ghu_old", "ghr", now_epoch() + 120))
-    assert _resolve(store, _Client(exc=httpx.TimeoutException("slow"))) == "ghu_old"
-    assert _resolve(store, _Client(exc=httpx.ConnectError("down"))) == "ghu_old"
+    client = _Client(exc=httpx.ConnectError("down"))
+    assert _resolve(store, client) == "ghu_old"
+    assert _resolve(store, client) == "ghu_old"
+    assert client.calls == 2 and store.reconnect is False
+
+
+def test_lost_answer_keeps_the_token_once_then_fails_closed() -> None:
+    # A read timeout may have lost the answer to a refresh that rotated the
+    # chain: never send that refresh token again.
+    store = _Store(_Conn("ghu_old", "ghr", now_epoch() + 120))
+    client = _Client(exc=httpx.ReadTimeout("slow"))
+    assert _resolve(store, client) == "ghu_old"
+    assert store.reconnect is True
+    assert _resolve(store, client) is None
+    assert client.calls == 1
 
 
 def test_expired_and_refresh_fails_returns_none() -> None:
