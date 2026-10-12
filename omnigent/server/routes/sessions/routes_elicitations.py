@@ -34,18 +34,30 @@ from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
-from omnigent.server.routes._sessions.common import *
 from omnigent.server.routes._sessions.common import (
+    _logger,
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import *
-from omnigent.server.routes._sessions.orchestration import *
+from omnigent.server.routes._sessions.helpers import (
+    _apply_pending_policy_ask_writes,
+)
+from omnigent.server.routes._sessions.orchestration import (
+    _resolve_elicitation,
+)
 from omnigent.server.schemas import (
     ElicitationResult,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+
+# Level needed to view or answer an elicitation. Elicitations carry
+# collaborative prompts (``AskUserQuestion``, plan review, MCP forms) as
+# well as policy ASK gates, and the in-band ``approval`` session event
+# resolves the same elicitations at the events route's edit bar — so the
+# two paths must stay at the same level. Raising it to owner is a product
+# decision that needs a "waiting for the owner" UI state first.
+ELICITATION_RESOLVE_LEVEL: int = LEVEL_EDIT
 
 
 def register_elicitations_routes(
@@ -91,8 +103,10 @@ def register_elicitations_routes(
         The ``elicitation_id`` is taken from the URL rather than the
         body, so the unguessable id (``secrets.token_hex(16)``) is
         the capability scoping the resolution — combined with the
-        session-owner ``LEVEL_EDIT`` gate below and the server-side
-        ownership check inside :func:`_resolve_elicitation`.
+        :data:`ELICITATION_RESOLVE_LEVEL` gate below (edit, not owner:
+        any collaborator who can drive the agent may answer it) and
+        the server-side ownership check inside
+        :func:`_resolve_elicitation`.
 
         :param request: The inbound request, used for identity
             extraction.
@@ -110,7 +124,7 @@ def register_elicitations_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            user_id, session_id, ELICITATION_RESOLVE_LEVEL, permission_store, conversation_store
         )
         conv = access.conversation
         if conv is None:
@@ -160,7 +174,7 @@ def register_elicitations_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            user_id, session_id, ELICITATION_RESOLVE_LEVEL, permission_store, conversation_store
         )
         if access.conversation is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -172,7 +186,8 @@ def register_elicitations_routes(
             return {"status": "resolved"}
 
         _conv_id, event = found
-        params = event.get("params") if isinstance(event.get("params"), dict) else {}
+        params_value = event.get("params")
+        params = params_value if isinstance(params_value, dict) else {}
         return {
             "status": "pending",
             "message": params.get("message", "Approval required"),

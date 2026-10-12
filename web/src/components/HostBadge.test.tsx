@@ -1,8 +1,14 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { HostBadge, resolveHostBadge } from "./HostBadge";
 import type { Host } from "@/hooks/useHosts";
+import {
+  SANDBOX_SWITCH_HOST_UNSUPPORTED,
+  SESSION_ACTIONS_LOADING,
+  SESSION_ACTIONS_UNAVAILABLE,
+} from "@/lib/sessionCapabilities";
 
 function host(overrides: Partial<Host> = {}): Host {
   return {
@@ -82,6 +88,13 @@ vi.mock("@/hooks/useHosts", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionHostOnline: (id: string | undefined) => useSessionHostOnlineMock(id),
 }));
+// Stub the switch dialog: it owns its own network/query wiring, so the badge
+// test only cares that it is mounted with the session's current binding.
+vi.mock("@/shell/SwitchHostDialog", () => ({
+  SwitchHostDialog: (props: { currentHostId: string | null }) => (
+    <div data-testid="switch-host-dialog" data-current-host={props.currentHostId ?? ""} />
+  ),
+}));
 
 beforeEach(() => {
   useSessionMock.mockReset();
@@ -110,13 +123,193 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("HostBadge", () => {
+  it.each([
+    ["managed snapshot", null],
+    ["Arclet host", "arclet"],
+    ["Databricks Sandbox host", "lakebox"],
+  ])(
+    "explains disabled host switching for %s, including keyboard selection",
+    async (source, provider) => {
+      useSessionMock.mockReturnValue({
+        session: {
+          hostId: "host_a1b2",
+          labels: source === "managed snapshot" ? { "omnigent.host_type": "managed" } : {},
+        },
+      });
+      useHostsMock.mockReturnValue({
+        data: provider ? [host({ sandbox_provider: provider })] : [],
+      });
+      render(<HostBadge sessionId="conv_1" appearance="composer" />);
+      fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+      const item = screen.getByRole("menuitem", { name: "Switch host…" });
+      expect(item).toHaveAttribute("aria-disabled", "true");
+      fireEvent.focus(item);
+      await waitFor(() =>
+        expect(screen.getByRole("tooltip")).toHaveTextContent(SANDBOX_SWITCH_HOST_UNSUPPORTED),
+      );
+      fireEvent.click(item);
+      fireEvent.keyDown(item, { key: "Enter" });
+      fireEvent.keyDown(item, { key: " " });
+      expect(screen.queryByTestId("switch-host-dialog")).not.toBeInTheDocument();
+      expect(item).toBeInTheDocument();
+      expect(screen.getByRole("menu")).toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    ["loading", SESSION_ACTIONS_LOADING],
+    ["failed", SESSION_ACTIONS_UNAVAILABLE],
+  ])("explains a %s host lookup in the composer menu", async (state, reason) => {
+    useHostsMock.mockReturnValue({
+      data: undefined,
+      isLoading: state === "loading",
+      error: state === "failed" ? new Error("Hosts unavailable") : null,
+    });
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+    const item = screen.getByRole("menuitem", { name: "Switch host…" });
+    expect(item).toHaveAttribute("aria-disabled", "true");
+    expect(item).toHaveAccessibleDescription(reason);
+    fireEvent.focus(item);
+    await waitFor(() => expect(screen.getByRole("tooltip")).toHaveTextContent(reason));
+    fireEvent.click(item);
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(screen.queryByTestId("switch-host-dialog")).not.toBeInTheDocument();
+  });
+
+  it.each(["arclet", "lakebox"])(
+    "explains disabled switching on the default %s badge with a keyboard-focusable target",
+    async (provider) => {
+      useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: provider })] });
+      const user = userEvent.setup();
+      render(<HostBadge sessionId="conv_1" />);
+      const button = screen.getByRole("button", { name: "Switch host…" });
+      const target = screen.getByRole("group", { name: "Switch host" });
+      expect(button).toBeDisabled();
+      expect(target).toHaveAttribute("tabindex", "0");
+      expect(screen.getByTestId("host-badge")).not.toHaveAttribute("title");
+      await user.tab();
+      expect(target).toHaveFocus();
+      await waitFor(() =>
+        expect(screen.getByRole("tooltip")).toHaveTextContent(SANDBOX_SWITCH_HOST_UNSUPPORTED),
+      );
+      expect(target).toHaveAccessibleDescription(SANDBOX_SWITCH_HOST_UNSUPPORTED);
+      await user.keyboard("{Enter} ");
+      expect(screen.queryByTestId("switch-host-dialog")).not.toBeInTheDocument();
+    },
+  );
+
+  it("preserves the focused menu item when the host lookup enables switching", async () => {
+    useHostsMock.mockReturnValue({ data: undefined, isLoading: true });
+    const user = userEvent.setup();
+    const { rerender } = render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+    const item = screen.getByRole("menuitem", { name: "Switch host…" });
+    act(() => item.focus());
+    expect(item).toHaveAttribute("aria-disabled", "true");
+    useHostsMock.mockReturnValue({ data: [host()], isLoading: false });
+    rerender(<HostBadge sessionId="conv_1" appearance="composer" />);
+    expect(screen.getByRole("menuitem", { name: "Switch host…" })).toHaveFocus();
+    expect(item).not.toHaveAttribute("aria-disabled", "true");
+    await user.keyboard("{Enter}");
+    expect(screen.getByTestId("switch-host-dialog")).toBeInTheDocument();
+  });
+
+  it("moves focus to the default badge when the host lookup enables switching", async () => {
+    useHostsMock.mockReturnValue({ data: undefined, isLoading: true });
+    const user = userEvent.setup();
+    const { rerender } = render(<HostBadge sessionId="conv_1" />);
+    await user.tab();
+    expect(screen.getByRole("group", { name: "Switch host" })).toHaveFocus();
+    await waitFor(() =>
+      expect(screen.getByRole("tooltip")).toHaveTextContent(SESSION_ACTIONS_LOADING),
+    );
+
+    useHostsMock.mockReturnValue({ data: [host()], isLoading: false });
+    rerender(<HostBadge sessionId="conv_1" />);
+    expect(screen.getByRole("button", { name: "mac-laptop, online" })).toHaveFocus();
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+    await user.keyboard("{Enter}");
+    expect(screen.getByTestId("switch-host-dialog")).toBeInTheDocument();
+  });
+
+  it("keeps focus and an explanation when the host lookup omits the current host", async () => {
+    useHostsMock.mockReturnValue({ data: undefined, isLoading: true });
+    const user = userEvent.setup();
+    const { rerender } = render(<HostBadge sessionId="conv_1" />);
+    await user.tab();
+    useHostsMock.mockReturnValue({ data: [], isLoading: false });
+    rerender(<HostBadge sessionId="conv_1" />);
+    const target = screen.getByRole("group", { name: "Switch host" });
+    expect(target).toHaveFocus();
+    await waitFor(() => expect(target).toHaveAccessibleDescription(SESSION_ACTIONS_UNAVAILABLE));
+    await user.keyboard("{Enter} ");
+    expect(screen.queryByTestId("switch-host-dialog")).not.toBeInTheDocument();
+  });
+
+  it.each(["status", "composer"] as const)(
+    "does not reopen the %s switch dialog after a restriction clears",
+    (appearance) => {
+      const { rerender } = render(<HostBadge sessionId="conv_1" appearance={appearance} />);
+      if (appearance === "composer") {
+        fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+        fireEvent.click(screen.getByRole("menuitem", { name: "Switch host…" }));
+      } else {
+        fireEvent.click(screen.getByTestId("host-badge"));
+      }
+      expect(screen.getByTestId("switch-host-dialog")).toBeInTheDocument();
+      useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: "arclet" })] });
+      rerender(<HostBadge sessionId="conv_1" appearance={appearance} />);
+      expect(screen.queryByTestId("switch-host-dialog")).not.toBeInTheDocument();
+      useHostsMock.mockReturnValue({ data: [host()] });
+      rerender(<HostBadge sessionId="conv_1" appearance={appearance} />);
+      expect(screen.queryByTestId("switch-host-dialog")).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(["ordinary", "arclet", "lakebox", "loading", "failed"])(
+    "hides switch host in read-only %s sessions",
+    (state) => {
+      useHostsMock.mockReturnValue(
+        state === "loading" || state === "failed"
+          ? {
+              data: undefined,
+              isLoading: state === "loading",
+              error: state === "failed" ? new Error("Hosts unavailable") : null,
+            }
+          : { data: [host({ sandbox_provider: state === "ordinary" ? null : state })] },
+      );
+      render(<HostBadge sessionId="conv_1" appearance="composer" readOnly />);
+      fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+      expect(screen.getByRole("menu")).toBeInTheDocument();
+      expect(screen.queryByRole("menuitem", { name: "Switch host…" })).not.toBeInTheDocument();
+    },
+  );
+
+  it("explains unavailable switching for a shared host omitted from the host list", () => {
+    useHostsMock.mockReturnValue({ data: [] });
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+    expect(screen.getByText("host_a1b2")).toBeInTheDocument();
+    const item = screen.getByRole("menuitem", { name: "Switch host…" });
+    expect(item).toHaveAttribute("aria-disabled", "true");
+    expect(item).toHaveAccessibleDescription(SESSION_ACTIONS_UNAVAILABLE);
+  });
+
   it("renders the host name with an online status when reachable", () => {
     render(<HostBadge sessionId="conv_1" />);
     const badge = screen.getByTestId("host-badge");
     // Status is conveyed by the visible name + an sr-only status word
     // (read together as "mac-laptop, online"), with `title` for hover.
     expect(badge.textContent).toBe("mac-laptop, online");
-    expect(badge.getAttribute("title")).toBe("Host mac-laptop, online");
+    // Hover copy also advertises the switch affordance the badge now carries.
+    expect(badge.getAttribute("title")).toBe("Host mac-laptop, online — click to switch");
+  });
+
+  it("labels local hosts as My machines in the composer menu", () => {
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+    expect(screen.getByText("My machines")).toBeTruthy();
   });
 
   it("renders nothing when the session is not host-bound", () => {
@@ -218,29 +411,51 @@ describe("HostBadge", () => {
     expect(screen.getByTestId("host-badge").textContent).toBe("mac-laptop, status unknown");
   });
 
-  it("renders a clickable reconnect affordance in the badge slot when onReconnect is set", () => {
-    // host_offline moves the reconnect prompt up into the host badge: the
-    // passive name + dot is replaced by a button carrying the host-offline
-    // copy, and clicking it opens the reconnect help.
-    useHostsMock.mockReturnValue({
-      data: [
-        {
-          host_id: "host_a1b2",
-          name: "mac-laptop",
-          owner: "alice",
-          status: "offline",
-          sandbox_provider: null,
-        },
-      ],
-    });
+  it("keeps the host name while making an offline host clickable to reconnect", () => {
+    // The one disconnect shape: name + red dot, never swapped for generic
+    // "Host is offline" copy — the user must still read WHICH host dropped —
+    // and clicking it opens the reconnect help.
     useSessionHostOnlineMock.mockReturnValue(false);
     const onReconnect = vi.fn();
     render(<HostBadge sessionId="conv_1" onReconnect={onReconnect} />);
     const badge = screen.getByTestId("host-badge");
     expect(badge.tagName).toBe("BUTTON");
-    expect(badge.textContent).toMatch(/Host is offline/);
+    expect(badge.textContent).toBe("mac-laptop, offline — click to reconnect");
+    expect(badge.getAttribute("title")).toBe("Host mac-laptop, offline — click to reconnect");
     fireEvent.click(badge);
     expect(onReconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it("never offers reconnect for an online host, even when onReconnect is set", () => {
+    // onReconnect is wired for every host-bound session; a reachable host has
+    // nothing to reconnect. The badge is still clickable — that click switches
+    // hosts — but it must never reach onReconnect or show reconnect copy.
+    const onReconnect = vi.fn();
+    render(<HostBadge sessionId="conv_1" onReconnect={onReconnect} />);
+    const badge = screen.getByTestId("host-badge");
+    expect(badge.textContent).toBe("mac-laptop, online");
+    fireEvent.click(badge);
+    expect(onReconnect).not.toHaveBeenCalled();
+    expect(screen.getByTestId("switch-host-dialog")).toBeInTheDocument();
+  });
+
+  it("stays passive for a dormant resumable managed host", () => {
+    // A resumable sandbox host reads offline while idle-stopped, but the next
+    // message wakes it — offering `omnigent host` there would be wrong.
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_a1b2", hostResumable: true },
+      isLoading: false,
+      error: null,
+    });
+    useSessionHostOnlineMock.mockReturnValue(false);
+    const onReconnect = vi.fn();
+    render(<HostBadge sessionId="conv_1" onReconnect={onReconnect} />);
+    const badge = screen.getByTestId("host-badge");
+    expect(badge.textContent).toBe("mac-laptop, offline");
+    // `omnigent host` is the wrong instruction here, so the click must not
+    // reach reconnect — it opens the switch dialog like any non-reconnect host.
+    fireEvent.click(badge);
+    expect(onReconnect).not.toHaveBeenCalled();
   });
 
   it("renders nothing when onReconnect is set but the session isn't host-bound", () => {
@@ -263,5 +478,102 @@ describe("HostBadge", () => {
     useSessionHostOnlineMock.mockReturnValue(undefined);
     render(<HostBadge sessionId="conv_1" />);
     expect(screen.getByTestId("host-badge").textContent).toBe("host_x9, status unknown");
+  });
+
+  it("opens the switch dialog on the current binding when the host name is clicked", () => {
+    render(<HostBadge sessionId="conv_1" />);
+    const badge = screen.getByTestId("host-badge");
+    expect(badge.tagName).toBe("BUTTON");
+    // Closed dialogs stay unmounted so the badge doesn't run the dialog's
+    // host query on every session.
+    expect(screen.queryByTestId("switch-host-dialog")).toBeNull();
+    fireEvent.click(badge);
+    expect(screen.getByTestId("switch-host-dialog").getAttribute("data-current-host")).toBe(
+      "host_a1b2",
+    );
+  });
+
+  it("keeps a sandbox session's badge passive — the server owns its placement", () => {
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_sb" },
+      isLoading: false,
+      error: null,
+    });
+    useHostsMock.mockReturnValue({
+      data: [
+        {
+          host_id: "host_sb",
+          name: "managed-abc123",
+          owner: "alice",
+          status: "online",
+          sandbox_provider: "lakebox",
+        },
+      ],
+    });
+    render(<HostBadge sessionId="conv_1" />);
+    expect(screen.getByTestId("host-badge").tagName).toBe("DIV");
+  });
+
+  it("leaves the click on reconnect for an offline host, not the switch", () => {
+    // Reconnect has no other entry point in that state, so it keeps the
+    // click; the move is offered inside the reconnect dialog instead.
+    useHostsMock.mockReturnValue({
+      data: [
+        {
+          host_id: "host_a1b2",
+          name: "mac-laptop",
+          owner: "alice",
+          status: "offline",
+          sandbox_provider: null,
+        },
+      ],
+    });
+    useSessionHostOnlineMock.mockReturnValue(false);
+    const onReconnect = vi.fn();
+    render(<HostBadge sessionId="conv_1" onReconnect={onReconnect} />);
+    fireEvent.click(screen.getByTestId("host-badge"));
+    expect(onReconnect).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("switch-host-dialog")).toBeNull();
+  });
+
+  it("doesn't paint a just-switched-to host red with the old host's liveness", () => {
+    // Host liveness is keyed by session and polled every ~10s, so right
+    // after a switch it still describes the host we left. The session
+    // snapshot repoints immediately, so attributing that value to the new
+    // host shows a red dot beside a machine that is demonstrably up (it had
+    // to be online to be offered as a target at all).
+    useHostsMock.mockReturnValue({
+      data: [
+        { host_id: "host_dead", name: "old-box", owner: "alice", status: "offline" },
+        { host_id: "host_live", name: "new-box", owner: "alice", status: "online" },
+      ],
+    });
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_dead" },
+      isLoading: false,
+      error: null,
+    });
+    useSessionHostOnlineMock.mockReturnValue(false);
+    const { rerender } = render(<HostBadge sessionId="conv_1" />);
+    expect(screen.getByTestId("host-badge").textContent).toBe("old-box, offline");
+
+    // The switch lands: hostId repoints, but the poll hasn't ticked, so
+    // `useSessionHostOnline` still returns the old host's `false`.
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_live" },
+      isLoading: false,
+      error: null,
+    });
+    rerender(<HostBadge sessionId="conv_1" />);
+    expect(screen.getByTestId("host-badge").textContent).toBe("new-box, online");
+
+    // Once the poll speaks for the new binding it is authoritative again —
+    // including when it reports the new host going down.
+    useSessionHostOnlineMock.mockReturnValue(true);
+    rerender(<HostBadge sessionId="conv_1" />);
+    expect(screen.getByTestId("host-badge").textContent).toBe("new-box, online");
+    useSessionHostOnlineMock.mockReturnValue(false);
+    rerender(<HostBadge sessionId="conv_1" />);
+    expect(screen.getByTestId("host-badge").textContent).toBe("new-box, offline");
   });
 });

@@ -13,6 +13,10 @@ import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { authenticatedFetch } from "@/lib/identity";
+import { useQueryClient } from "@tanstack/react-query";
+import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import { getSessionSlim } from "@/lib/sessionsApi";
+import type { Session } from "@/lib/types";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
  *  nativeBridge). All optional — an older shell may predate the feature, so the
@@ -22,7 +26,7 @@ interface BrowserDesktopBridge {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: { force?: boolean; agent?: boolean },
+    opts?: { force?: boolean; agent?: boolean; sourceHostId?: string },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   browserScreenshot?: (
     conversationId: string,
@@ -217,6 +221,7 @@ async function dispatch(
   action: string,
   args: Record<string, unknown>,
   desktop: BrowserDesktopBridge,
+  sourceHostId: string | null,
 ): Promise<ActionResult> {
   try {
     switch (action) {
@@ -231,6 +236,7 @@ async function dispatch(
         const r = await desktop.browserOpenOrNavigate(conversationId, url, undefined, {
           force: true,
           agent: true,
+          ...(sourceHostId ? { sourceHostId } : {}),
         });
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
         return { ok: true, data: { final_url: url } };
@@ -338,26 +344,70 @@ async function postResult(
 }
 
 /**
- * Register the embedded-browser relay for a conversation. No-op outside Electron.
- * Mount ONE instance per active conversation (typically from `BrowserPane`).
+ * Register the embedded-browser relay. No-op outside Electron. Mounted for the
+ * active conversation (from `AppShell`), but it serves EVERY conversation's
+ * actions: an action is claimed, dispatched, and answered against the session
+ * whose stream delivered it (`sourceConversationId`), not the mounted one — a
+ * background conversation can issue a browser action while another is on screen,
+ * and its WebContentsView is keyed by that session. Claiming at the mounted
+ * (visible) session would be rejected by the server as an owner mismatch.
  *
- * @param conversationId The conversation whose WebContentsView this relay drives.
+ * @param conversationId Gate only — the relay registers while a conversation is
+ *   open. Routing uses the delivering conversation, not this.
  */
 export function useBrowserAgentRelay(conversationId: string | null | undefined): void {
+  const relayEnabled = !!conversationId;
+  const queryClient = useQueryClient();
   useEffect(() => {
-    if (!conversationId) return;
+    if (!relayEnabled) return;
     if (!supportsBrowser()) return;
 
-    const handler = async (evt: BrowserActionRequestEvent) => {
+    let cancelled = false;
+    const handler = async (evt: BrowserActionRequestEvent, sourceConversationId: string | null) => {
+      if (!sourceConversationId) return; // no delivering session — nothing to target
       const desktop = getBrowserDesktop();
       if (!desktop) return; // no browser-capable shell — nothing to claim
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
-      const claimToken = await claimAction(conversationId, evt.actionId);
+      const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
-      const result = await dispatch(conversationId, evt.action, evt.args, desktop);
-      await postResult(conversationId, evt.actionId, claimToken, result);
+      let sourceHostId: string | null = null;
+      if (evt.action === "navigate") {
+        try {
+          // Parent hints cannot establish which ancestor has the nearest own host binding.
+          const visited = new Set<string>();
+          let id: string | null = sourceConversationId;
+          while (id !== null && !visited.has(id)) {
+            visited.add(id);
+            const hopId: string = id;
+            // oxlint-disable-next-line no-await-in-loop -- Each parent comes from the previous snapshot.
+            const source: Session = await queryClient.fetchQuery({
+              queryKey: ["session", hopId],
+              queryFn: () => getSessionSlim(hopId),
+              staleTime: Infinity,
+              retry: false,
+            });
+            setSessionHost(source.id, source.hostId);
+            setSessionParent(source.id, source.parentSessionId);
+            if (source.hostId) {
+              sourceHostId = source.hostId;
+              break;
+            }
+            id = source.parentSessionId;
+          }
+        } catch {
+          // Unknown provenance stays denied for localhost; public browsing still works.
+        }
+      }
+      const result = cancelled
+        ? { ok: false, error: "browser relay context changed" }
+        : await dispatch(sourceConversationId, evt.action, evt.args, desktop, sourceHostId);
+      await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };
 
-    return onBrowserActionRequest(handler);
-  }, [conversationId]);
+    const unsubscribe = onBrowserActionRequest(handler);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [relayEnabled, queryClient]);
 }
