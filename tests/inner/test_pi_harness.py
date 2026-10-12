@@ -53,6 +53,32 @@ def test_create_app_returns_fastapi_with_required_routes() -> None:
     assert "/v1/sessions/{conversation_id}/events" in paths
 
 
+@pytest.mark.parametrize("value", [None, "true", "false"])
+def test_executor_factory_reads_context_files(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    if value is None:
+        monkeypatch.delenv("HARNESS_PI_CONTEXT_FILES", raising=False)
+    else:
+        monkeypatch.setenv("HARNESS_PI_CONTEXT_FILES", value)
+    with patch("omnigent.inner.pi_harness.PiExecutor") as executor:
+        pi_harness._build_pi_executor()
+    assert executor.call_args.kwargs["context_files"] is (value != "false")
+
+
+@pytest.mark.parametrize("mode", [None, "append", "replace"])
+def test_executor_factory_reads_system_prompt_mode(
+    monkeypatch: pytest.MonkeyPatch, mode: str | None
+) -> None:
+    if mode is None:
+        monkeypatch.delenv("HARNESS_PI_SYSTEM_PROMPT_MODE", raising=False)
+    else:
+        monkeypatch.setenv("HARNESS_PI_SYSTEM_PROMPT_MODE", mode)
+    with patch("omnigent.inner.pi_harness.PiExecutor") as executor:
+        pi_harness._build_pi_executor()
+    assert executor.call_args.kwargs["system_prompt_mode"] == (mode or "append")
+
+
 def test_executor_factory_reads_env_vars(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -80,6 +106,7 @@ def test_executor_factory_reads_env_vars(
             }
         ),
     )
+    monkeypatch.setenv("HARNESS_PI_GATEWAY_OPENAI_WIRE_API", "responses")
     monkeypatch.setenv("HARNESS_PI_GATEWAY_AUTH_COMMAND", "printf token")
     monkeypatch.setenv("HARNESS_PI_CWD", "/tmp/test-cwd")
     monkeypatch.setenv("HARNESS_PI_PATH", "/usr/local/bin/pi")
@@ -99,6 +126,7 @@ def test_executor_factory_reads_env_vars(
         gateway_host: str | None,
         base_url_override: str | None,
         base_urls_override: dict[str, str] | None,
+        openai_wire_api: str | None,
         gateway_auth_command: str | None,
         **_kwargs: Any,
     ) -> None:
@@ -111,6 +139,7 @@ def test_executor_factory_reads_env_vars(
         captured["gateway_host"] = gateway_host
         captured["base_url_override"] = base_url_override
         captured["base_urls_override"] = base_urls_override
+        captured["openai_wire_api"] = openai_wire_api
         captured["gateway_auth_command"] = gateway_auth_command
 
     with patch(
@@ -130,6 +159,7 @@ def test_executor_factory_reads_env_vars(
         "claude": "https://example.databricks.com/ai-gateway/anthropic",
         "openai": "https://example.databricks.com/ai-gateway/codex/v1",
     }
+    assert captured["openai_wire_api"] == "responses"
     assert captured["gateway_auth_command"] == "printf token"
     assert captured["cwd"] == "/tmp/test-cwd"
     assert captured["pi_path"] == "/usr/local/bin/pi"

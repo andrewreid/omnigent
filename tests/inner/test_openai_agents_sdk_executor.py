@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import httpx
 import pytest
+from agents.usage import InputTokensDetails, Usage
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -30,10 +32,12 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.openai_agents_sdk_executor import (
     OpenAIAgentsSDKExecutor,
+    _history_via_extra_body,
     _normalize_content_blocks_for_chat,
     _normalize_responses_items_for_chat,
     _ReasoningBlockFilterStream,
     _sanitize_replay_item,
+    _skip_history_transform,
     _wrap_client_for_reasoning_models,
 )
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
@@ -108,17 +112,6 @@ class _FakeModelSettings:
 
 
 @dataclass
-class _FakePromptTokensDetails:
-    """
-    Minimal stand-in for OpenAI's ``prompt_tokens_details`` object.
-
-    :param cached_tokens: Number of tokens served from the prompt cache.
-    """
-
-    cached_tokens: int = 0
-
-
-@dataclass
 class _FakeUsage:
     """
     Minimal stand-in for the openai-agents SDK ModelResponse.usage object.
@@ -128,15 +121,27 @@ class _FakeUsage:
     :param total_tokens: Sum of input and output tokens for this call.
         ``0`` means the SDK did not report a total; the executor falls
         back to ``input_tokens + output_tokens``.
-    :param prompt_tokens_details: Optional breakdown of prompt tokens,
-        including ``cached_tokens``. ``None`` means the SDK did not
-        report cache details.
     """
 
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
-    prompt_tokens_details: _FakePromptTokensDetails | None = None
+
+
+def _sdk_usage(
+    *, input_tokens: int, output_tokens: int, total_tokens: int, cached_tokens: int = 0
+) -> Usage:
+    """
+    Build the real openai-agents ``Usage`` for one LLM call, so cache tests
+    pin the field the SDK actually populates (``input_tokens_details``).
+    """
+    return Usage(
+        requests=1,
+        input_tokens=input_tokens,
+        input_tokens_details=InputTokensDetails(cached_tokens=cached_tokens),
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
 
 
 @dataclass
@@ -147,7 +152,7 @@ class _FakeRawResponse:
     :param usage: Token usage for this LLM call.
     """
 
-    usage: _FakeUsage
+    usage: _FakeUsage | Usage
 
 
 class _FakeResult:
@@ -418,7 +423,292 @@ def test_wrap_client_non_streaming_create_not_wrapped() -> None:
     assert isinstance(result, _FakeResult)
 
 
+_HISTORY = [
+    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Say hello."}]},
+    {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Hello!", "annotations": []}],
+    },
+    {"type": "function_call", "call_id": "c1", "name": "grep", "arguments": '{"q": "x"}'},
+    {"type": "function_call_output", "call_id": "c1", "output": "found"},
+    {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [{"type": "summary_text", "text": "Thinking."}],
+        "encrypted_content": "opaque",
+    },
+    {
+        "type": "message",
+        "role": "user",
+        "content": [
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "auto"},
+            {
+                "type": "input_file",
+                "filename": "a.txt",
+                "file_data": "data:text/plain;base64,aGk=",
+            },
+        ],
+    },
+] * 5
+
+
+def _cyclic_item() -> dict:
+    item: dict = {"type": "message", "role": "user", "content": []}
+    item["content"].append(item)
+    return item
+
+
+def test_history_via_extra_body_moves_plain_history() -> None:
+    """A plain-JSON history list rides in ``extra_body``, merged with any existing keys."""
+    moved = _history_via_extra_body({"model": "m", "input": _HISTORY}, "input")
+    assert moved == {"model": "m", "input": [], "extra_body": {"input": _HISTORY}}
+
+    merged = _history_via_extra_body({"input": _HISTORY, "extra_body": {"seed": 1}}, "input")
+    assert merged["extra_body"] == {"seed": 1, "input": _HISTORY}
+
+    shared = {"type": "input_text", "text": "same block"}
+    dag = [{"type": "message", "role": "user", "content": [shared, shared]}]
+    assert _history_via_extra_body({"input": dag}, "input")["extra_body"] == {"input": dag}
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"input": "plain string prompt"},
+        {"input": []},
+        {"input": [{"type": "message", "content": object()}]},
+        {"input": [{1: "non-str key"}]},
+        {"input": [_cyclic_item()]},
+        {"input": _HISTORY, "extra_body": {"input": ["caller wins"]}},
+        {"input": _HISTORY, "extra_body": "not a mapping"},
+    ],
+)
+def test_history_via_extra_body_leaves_other_calls_alone(kwargs: dict) -> None:
+    """Anything but a plain-JSON list the caller has not already overridden goes the normal way."""
+    assert _history_via_extra_body(kwargs, "input") is kwargs
+
+
+def test_skip_history_transform_sends_identical_request_json() -> None:
+    """Every SDK call path sends the same JSON body with and without the bypass."""
+    import json
+
+    from openai import AsyncOpenAI
+
+    bodies: list[dict] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        if request.url.path.endswith("/chat/completions"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "c",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "m",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "hi"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=b"data: [DONE]\n\n"
+        )
+
+    def _client(bypass: bool) -> AsyncOpenAI:
+        client = AsyncOpenAI(
+            api_key="k",
+            base_url="http://bench/v1",
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(_handler)),
+        )
+        if bypass:
+            _skip_history_transform(client.responses, "input")
+            _skip_history_transform(client.chat.completions, "messages")
+        return client
+
+    messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}] * 5
+
+    async def _send(client: AsyncOpenAI, path: str) -> dict:
+        bodies.clear()
+        kwargs = {"model": "m", "input": _HISTORY, "stream": True, "extra_body": {"seed": 7}}
+        try:
+            if path == "streaming":
+                async with client.responses.with_streaming_response.create(**kwargs) as resp:
+                    await resp.read()
+            elif path == "create":
+                stream = await client.responses.create(**kwargs)
+                await stream.close()
+            else:
+                await client.chat.completions.create(model="m", messages=messages)
+        finally:
+            await client.close()
+        return bodies[-1]
+
+    for path in ("streaming", "create", "chat"):
+        assert _run(_send(_client(True), path)) == _run(_send(_client(False), path)), path
+
+
+def test_executor_skips_history_transform_only_on_its_own_client() -> None:
+    """The executor's own client gets the bypass; an injected client is left as built."""
+    from openai import AsyncOpenAI
+
+    owned = AsyncOpenAI(api_key="k", base_url="http://bench/v1")
+    with patch(
+        "omnigent.inner.openai_agents_sdk_executor._get_openai_async_client",
+        return_value=owned,
+    ):
+        owning = OpenAIAgentsSDKExecutor()
+    assert getattr(owned.responses.create, "_skips_history_transform", False)
+    assert getattr(owned.chat.completions.create, "_skips_history_transform", False)
+    _run(owning.close())
+
+    injected = AsyncOpenAI(api_key="k", base_url="http://bench/v1")
+    OpenAIAgentsSDKExecutor(client=injected)
+    assert not getattr(injected.responses.create, "_skips_history_transform", False)
+    _run(injected.close())
+
+
+def _transform_annotations(param_type: object) -> list[str]:
+    """Return every ``PropertyInfo`` alias/format reachable from *param_type*."""
+    import typing_extensions
+    from openai._utils._transform import PropertyInfo
+
+    found: list[str] = []
+    seen: set[int] = set()
+    stack = [param_type]
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        for meta in getattr(node, "__metadata__", ()):
+            if isinstance(meta, PropertyInfo) and (meta.alias or meta.format):
+                found.append(f"{meta.alias or meta.format} in {node}")
+        if typing_extensions.is_typeddict(node):
+            stack.extend(typing_extensions.get_type_hints(node, include_extras=True).values())
+        stack.extend(typing_extensions.get_args(node))
+        origin = typing_extensions.get_origin(node)
+        if origin is not None:
+            stack.append(origin)
+    return found
+
+
+def test_create_param_types_have_no_transform_annotations() -> None:
+    """The history bypass is only lossless while the param types rename/format nothing.
+
+    If an ``openai`` upgrade adds an alias or format anywhere under these
+    types, the client's transform would change the body and the bypass would
+    skip that change; this fails first.
+    """
+    from typing import Annotated, TypedDict
+
+    from openai._utils._transform import PropertyInfo
+    from openai.types.chat import completion_create_params
+    from openai.types.responses import response_create_params
+
+    class _Inner(TypedDict):
+        name: Annotated[str, PropertyInfo(alias="Name")]
+
+    class _Outer(TypedDict):
+        items: list[_Inner] | str
+
+    assert _transform_annotations(_Outer), "walker must see a nested alias"
+    assert _transform_annotations(response_create_params.ResponseCreateParamsStreaming) == []
+    assert _transform_annotations(completion_create_params.CompletionCreateParamsStreaming) == []
+
+
 class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
+    def test_close_closes_owned_client_but_not_injected_client(self):
+        class _ClosableClient:
+            def __init__(self):
+                self.close_calls = 0
+
+            async def close(self):
+                self.close_calls += 1
+
+        async def _t():
+            owned_client = _ClosableClient()
+            with patch(
+                "omnigent.inner.openai_agents_sdk_executor._get_openai_async_client",
+                return_value=owned_client,
+            ):
+                executor = OpenAIAgentsSDKExecutor()
+            await executor.close()
+            self.assertEqual(owned_client.close_calls, 1)
+
+            injected_client = _ClosableClient()
+            executor = OpenAIAgentsSDKExecutor(client=injected_client)
+            await executor.close()
+            self.assertEqual(injected_client.close_calls, 0)
+
+        _run(_t())
+
+    def test_reasoning_item_id_policy_defaults_to_sdk_behavior(self):
+        async def _t():
+            _FakeRunner.last_calls = []
+            _FakeRunner.next_result = _FakeResult(events=[], final_output="done")
+            executor = OpenAIAgentsSDKExecutor(client=object(), model="gpt-test")
+            with patch(
+                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                return_value=_fake_agents_sdk(),
+            ):
+                _ = [
+                    event
+                    async for event in executor.run_turn(
+                        [{"role": "user", "content": "hi"}],
+                        [],
+                        "Be helpful.",
+                    )
+                ]
+
+            run_config = _FakeRunner.last_calls[0]["run_config"]
+            self.assertNotIn("reasoning_item_id_policy", run_config.kwargs)
+
+        _run(_t())
+
+    def test_reasoning_item_id_policy_is_configurable(self):
+        async def _t():
+            for policy in ("preserve", "omit"):
+                with self.subTest(policy=policy):
+                    _FakeRunner.last_calls = []
+                    _FakeRunner.next_result = _FakeResult(events=[], final_output="done")
+                    executor = OpenAIAgentsSDKExecutor(
+                        client=object(),
+                        model="gpt-test",
+                        reasoning_item_id_policy=policy,
+                    )
+                    with patch(
+                        "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                        return_value=_fake_agents_sdk(),
+                    ):
+                        _ = [
+                            event
+                            async for event in executor.run_turn(
+                                [{"role": "user", "content": "hi"}],
+                                [],
+                                "Be helpful.",
+                            )
+                        ]
+
+                    run_config = _FakeRunner.last_calls[0]["run_config"]
+                    self.assertEqual(run_config.kwargs["reasoning_item_id_policy"], policy)
+
+        _run(_t())
+
+    def test_reasoning_item_id_policy_rejects_invalid_value(self):
+        with self.assertRaisesRegex(ValueError, "reasoning_item_id_policy"):
+            OpenAIAgentsSDKExecutor(
+                client=object(),
+                reasoning_item_id_policy="invalid",  # type: ignore[arg-type]
+            )
+
     def test_sanitize_replay_item_drops_long_ids(self):
         item = {
             "type": "message",
@@ -568,11 +858,11 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             self.assertEqual(events[-1].response, "done")
             self.assertEqual(
                 _FakeRunner.last_calls[0]["agent"].model,
-                "databricks-gpt-5-5",
+                "catalog-databricks-openai-default",
             )
             self.assertEqual(
                 _FakeRunner.last_calls[0]["run_config"].kwargs["model"],
-                "databricks-gpt-5-5",
+                "catalog-databricks-openai-default",
             )
 
         _run(_t())
@@ -1612,7 +1902,7 @@ def test_get_openai_client_api_key_falls_back_to_env_base_url(monkeypatch):
 
     Regression for the residual gateway 401 (continuation-turn daemon
     spawns): the api_key is frequently a gateway credential (e.g. a
-    Databricks AI Gateway PAT detected from ``OPENAI_API_KEY``), and the
+    Databricks Unity Gateway PAT detected from ``OPENAI_API_KEY``), and the
     companion base_url can be dropped on the daemon → runner → harness
     propagation chain (the spec-auth bake omits it when ``OPENAI_BASE_URL``
     is absent at materialization time; a reused local daemon may predate the
@@ -1741,6 +2031,56 @@ def test_get_openai_client_model_service_without_provider_fails_loudly(monkeypat
 
     with pytest.raises(ValueError, match="No provider credentials"):
         _get_openai_async_client(model="production.agents.support_assistant")
+
+
+def test_get_openai_client_unpinned_model_does_not_route_to_databricks(monkeypatch):
+    """An unpinned model is not a Databricks signal.
+
+    Leaving the model unset means "use the provider default", not
+    "this is Databricks-hosted". Routing it to ambient Databricks auth
+    made a credential-less OpenAI agent fail with an "install
+    databricks-sdk" error instead of naming the missing OpenAI key.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="no model is pinned"):
+        _get_openai_async_client(model=None)
+
+
+def test_get_openai_client_databricks_model_still_uses_ambient_auth(monkeypatch):
+    """A ``databricks-`` model keeps the ambient Databricks fallback.
+
+    Guards the unpinned-model fix from over-reaching into the legacy
+    Databricks routing path.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    calls: list[str | None] = []
+
+    def _fake_resolve(profile=None, **kwargs):
+        calls.append(profile)
+        return httpx.BasicAuth("token", ""), "https://example.databricks.com"
+
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+    )
+
+    client = _get_openai_async_client(model="databricks-gpt-5-5")
+
+    assert calls == [None], "a 'databricks-' model must still resolve ambient Databricks auth"
+    assert (
+        str(client.base_url).rstrip("/") == "https://example.databricks.com/ai-gateway/openai/v1"
+    )
 
 
 def test_get_openai_client_invalid_profile_raises_auth_error(monkeypatch):
@@ -1996,6 +2336,43 @@ def test_normalize_content_blocks_strips_filename_from_input_image() -> None:
     assert result == [{"type": "input_image", "image_url": "data:image/png;base64,abcd"}]
     assert "filename" not in result[0]
     assert result is not blocks
+
+
+def test_normalize_responses_items_wraps_string_assistant_content() -> None:
+    """String content must become blocks before the chat converter sees it.
+
+    A plain string is legal Responses-API content, but ``items_to_messages``
+    iterates content expecting blocks — so it walks the string character by
+    character and indexes each one, raising ``string indices must be integers,
+    not 'str'``. Since history is replayed, one such item breaks every later
+    turn in the conversation.
+    """
+    items = [
+        {"type": "message", "role": "assistant", "content": "I'll explore the repo."},
+        {"type": "message", "role": "user", "content": "go ahead"},
+    ]
+
+    result = _normalize_responses_items_for_chat(items)
+
+    assert result[0]["content"] == [{"type": "output_text", "text": "I'll explore the repo."}]
+    # User strings reach a different converter branch that accepts them, and
+    # callers rely on them staying strings.
+    assert result[1]["content"] == "go ahead"
+
+
+def test_normalize_responses_items_leaves_block_content_alone() -> None:
+    """Content that is already a block list is untouched."""
+    items = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi"}],
+        }
+    ]
+
+    result = _normalize_responses_items_for_chat(items)
+
+    assert result[0]["content"] == [{"type": "output_text", "text": "hi"}]
 
 
 def test_normalize_content_blocks_preserves_input_image_detail_for_http_url() -> None:
@@ -2383,8 +2760,8 @@ def test_policy_evaluator_allow_proceeds_to_run() -> None:
 
 def test_turn_usage_subtracts_cached_tokens_from_input() -> None:
     """
-    When ``prompt_tokens_details.cached_tokens`` is present, the
-    executor must subtract cached tokens from ``input_tokens`` and
+    When the SDK ``Usage`` reports ``input_tokens_details.cached_tokens``,
+    the executor must subtract cached tokens from ``input_tokens`` and
     report them as ``cache_read_input_tokens``.
 
     Without this, ``compute_llm_cost`` bills cached tokens at the
@@ -2396,11 +2773,8 @@ def test_turn_usage_subtracts_cached_tokens_from_input() -> None:
         result = _FakeResult(events=[], final_output="hello")
         result.raw_responses = [
             _FakeRawResponse(
-                usage=_FakeUsage(
-                    input_tokens=10000,
-                    output_tokens=500,
-                    total_tokens=10500,
-                    prompt_tokens_details=_FakePromptTokensDetails(cached_tokens=8000),
+                usage=_sdk_usage(
+                    input_tokens=10000, output_tokens=500, total_tokens=10500, cached_tokens=8000
                 )
             )
         ]
@@ -2438,8 +2812,8 @@ def test_turn_usage_subtracts_cached_tokens_from_input() -> None:
 
 def test_turn_usage_no_cached_tokens_omits_cache_key() -> None:
     """
-    When no ``prompt_tokens_details`` is present, the usage dict
-    must NOT contain ``cache_read_input_tokens`` — the executor
+    When the SDK ``Usage`` reports zero cached tokens (its default), the
+    usage dict must NOT contain ``cache_read_input_tokens`` — the executor
     degrades gracefully to the pre-cache behavior.
     """
 
@@ -2448,11 +2822,7 @@ def test_turn_usage_no_cached_tokens_omits_cache_key() -> None:
         result = _FakeResult(events=[], final_output="hello")
         result.raw_responses = [
             _FakeRawResponse(
-                usage=_FakeUsage(
-                    input_tokens=5000,
-                    output_tokens=300,
-                    total_tokens=5300,
-                )
+                usage=_sdk_usage(input_tokens=5000, output_tokens=300, total_tokens=5300)
             )
         ]
         _FakeRunner.next_result = result
@@ -2479,6 +2849,58 @@ def test_turn_usage_no_cached_tokens_omits_cache_key() -> None:
     _run(_t())
 
 
+def test_turn_usage_cached_tokens_clamped_to_input() -> None:
+    """
+    Malformed cached counts clamp per response to [0, input], so they neither
+    drive ``input_tokens`` negative nor absorb another response's uncached input.
+    """
+
+    async def _t() -> None:
+        _FakeRunner.last_calls = []
+        result = _FakeResult(events=[], final_output="hello")
+        result.raw_responses = [
+            _FakeRawResponse(
+                usage=_sdk_usage(
+                    input_tokens=1000, output_tokens=50, total_tokens=1050, cached_tokens=1500
+                )
+            ),
+            _FakeRawResponse(
+                usage=_sdk_usage(
+                    input_tokens=2000, output_tokens=100, total_tokens=2100, cached_tokens=500
+                )
+            ),
+            _FakeRawResponse(
+                usage=_sdk_usage(
+                    input_tokens=100, output_tokens=10, total_tokens=110, cached_tokens=-5
+                )
+            ),
+        ]
+        _FakeRunner.next_result = result
+        executor = OpenAIAgentsSDKExecutor(client=object())
+        with patch(
+            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            return_value=_fake_agents_sdk(),
+        ):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        turn_complete = next(e for e in events if isinstance(e, TurnComplete))
+        usage = turn_complete.usage
+        assert usage is not None
+        # 1500 clamps to 1000, 500 is kept, -5 counts as 0: cached 1500 of 3100 input.
+        assert usage["cache_read_input_tokens"] == 1500
+        assert usage["input_tokens"] == 1600
+        assert usage["total_tokens"] == 3260
+
+    _run(_t())
+
+
 def test_turn_usage_cached_tokens_multi_call_sums_across_responses() -> None:
     """
     Across multiple raw responses in a single turn, cached tokens
@@ -2490,19 +2912,13 @@ def test_turn_usage_cached_tokens_multi_call_sums_across_responses() -> None:
         result = _FakeResult(events=[], final_output="done")
         result.raw_responses = [
             _FakeRawResponse(
-                usage=_FakeUsage(
-                    input_tokens=6000,
-                    output_tokens=100,
-                    total_tokens=6100,
-                    prompt_tokens_details=_FakePromptTokensDetails(cached_tokens=4000),
+                usage=_sdk_usage(
+                    input_tokens=6000, output_tokens=100, total_tokens=6100, cached_tokens=4000
                 )
             ),
             _FakeRawResponse(
-                usage=_FakeUsage(
-                    input_tokens=7000,
-                    output_tokens=200,
-                    total_tokens=7200,
-                    prompt_tokens_details=_FakePromptTokensDetails(cached_tokens=5000),
+                usage=_sdk_usage(
+                    input_tokens=7000, output_tokens=200, total_tokens=7200, cached_tokens=5000
                 )
             ),
         ]

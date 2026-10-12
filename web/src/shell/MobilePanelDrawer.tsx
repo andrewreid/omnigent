@@ -13,7 +13,7 @@
 // can't collide with the rail.
 
 import { XIcon } from "lucide-react";
-import { type ReactNode } from "react";
+import type { ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -31,9 +31,18 @@ interface MobilePanelDrawerProps {
   onClose: () => void;
   /**
    * Panel content. Mounted only while ``open`` so panels that poll
-   * (e.g. ``SubagentsPanel``) don't keep running behind a closed drawer.
+   * (e.g. ``SubagentsPanel``) don't keep running behind a closed drawer —
+   * unless ``keepMounted`` is set.
    */
   children: ReactNode;
+  /**
+   * Keep ``children`` mounted while the drawer is closed. Opt-in, for content
+   * that owns live work the user expects to continue once the drawer is
+   * dismissed — a side chat's in-flight turn and unsent composer text, which
+   * the desktop rail also keeps alive when collapsed. Leave unset for panels
+   * whose only job is display: unmounting stops their polling.
+   */
+  keepMounted?: boolean;
   /** Optional test id applied to the root ``aside`` for assertions. */
   testId?: string;
 }
@@ -46,6 +55,7 @@ interface MobilePanelDrawerProps {
  * @param onClose - Called to dismiss the drawer.
  * @param children - The panel body, mounted only while open.
  * @param testId - Optional ``data-testid`` for the root element.
+ * @param keepMounted - Keep the body mounted while closed (live content).
  */
 export function MobilePanelDrawer({
   open,
@@ -53,27 +63,33 @@ export function MobilePanelDrawer({
   onClose,
   children,
   testId,
+  keepMounted = false,
 }: MobilePanelDrawerProps) {
   return (
     <aside
       data-testid={testId}
       data-state={open ? "open" : "closed"}
       className={cn(
-        "flex flex-col overflow-hidden bg-card transition-[translate] duration-150 ease-out",
-        "fixed inset-0 z-50 shadow-lg md:hidden",
-        open ? "translate-x-0" : "translate-x-full",
+        // `mobile-panel-drawer` is the hook the native shells use to inset the
+        // drawer past the status bar / home indicator (see index.css); without
+        // it the header sits under the notch and Close is untappable.
+        "mobile-panel-drawer flex flex-col overflow-hidden bg-card transition-[translate] duration-150 ease-out",
+        "fixed inset-0 z-50 md:hidden",
+        open ? "translate-x-0 shadow-lg" : "translate-x-full shadow-none",
       )}
       aria-hidden={!open}
       data-collapsed={!open || undefined}
       inert={!open}
     >
       <header className="flex shrink-0 items-center justify-between border-border border-b px-4 py-2">
-        <h2 className="font-medium text-sm">{title}</h2>
+        <h2 className="font-medium text-ui">{title}</h2>
         <Button type="button" variant="ghost" size="icon-sm" aria-label="Close" onClick={onClose}>
           <XIcon className="size-4" />
         </Button>
       </header>
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">{open && children}</div>
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {(open || keepMounted) && children}
+      </div>
     </aside>
   );
 }

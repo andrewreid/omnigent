@@ -2,16 +2,20 @@
 
 When a tool call trips a policy that returns ASK, the runner forwards the
 gate to the server, which publishes a ``response.elicitation_request`` the
-chat renders as an ``ApprovalCard`` (``web/src/components/blocks/
-ApprovalCard.tsx``). This test drives the full loop on the openai-agents
-harness: send a turn that makes the agent attempt a gated ``git push``,
-wait for the pending card, click **Approve**, and assert the card flips to
-its "Approved" responded state and the server clears the pending prompt.
+chat renders as an ``ApprovalCard``. These tests drive the full loop on the
+openai-agents harness: send a turn that makes the agent attempt a gated
+``git push``, wait for the pending card, resolve it, and assert the server
+clears the prompt.
 
-The ``approval_session`` fixture (conftest) supplies an agent whose
-``blast_radius`` guardrail gates pushes; the gate fires on the *tool call*,
-so the push never has to succeed. Real LLM in the loop → nightly + a
-generous timeout, matching the other agent-driven UI suites.
+The ``approval_session`` fixture supplies an agent whose ``blast_radius``
+guardrail gates pushes; the gate fires on the tool call, so the push never has
+to succeed. Real LLM in the loop means nightly coverage and a generous
+timeout.
+
+Fast component coverage owns native-vendor labels and the composer's pending
+approval state. The full-stack cases here stay focused on the real policy ASK
+boundary: an agent tool call parks on the server until the browser approves or
+rejects it.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 _APPROVAL_CARD = '[data-testid="approval-card"]'
 
 # The agent must boot, take a turn, and emit the gated tool call before the
@@ -53,17 +57,13 @@ def test_approval_card_renders_and_approves(
     composer.fill("Run the command now.")
     page.get_by_role("button", name="Send", exact=True).click()
 
-    # The agent calls the gated push; the policy ASK surfaces a pending card.
     card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
     expect(card).to_be_visible(timeout=_AGENT_TURN_TIMEOUT_MS)
     expect(card.get_by_text("Approval required")).to_be_visible()
-    # The server is genuinely parked on this prompt, not just an optimistic UI.
     assert _pending_elicitations(base_url, session_id), "server has no parked elicitation"
 
     card.get_by_role("button", name="Approve").click()
 
-    # Card transitions to the responded "Approved" state and the parked
-    # server-side prompt drains.
     responded = page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first
     expect(responded).to_be_visible(timeout=30_000)
     expect(responded.get_by_text("Approved", exact=False).first).to_be_visible()
