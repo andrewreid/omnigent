@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """Tests for design_sync tool (imports real production functions)."""
 
+import http.client
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import traceback
+import urllib.error
+from io import BytesIO
 from pathlib import Path
+from unittest.mock import Mock
+
+import pytest
 
 # Import production functions
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools/python"))
@@ -23,6 +30,120 @@ from design_sync import (  # noqa: E402 — sys.path + omnigent_client stub must
     _strip_mcp_wrapper,
     _write_file_contained,
 )
+
+
+@pytest.fixture
+def credentials_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    return claude_dir / ".credentials.json"
+
+
+def test_design_token_preferred(credentials_path):
+    credentials_path.write_text(
+        json.dumps(
+            {
+                "designOauth": {"accessToken": "design-token"},
+                "claudeAiOauth": {"accessToken": "login-token"},
+            }
+        )
+    )
+    assert ds._read_bearer_token() == "design-token"
+
+
+@pytest.mark.parametrize(
+    "design_oauth", [{}, {"accessToken": ""}, {"accessToken": None}, {"accessToken": 123}, None]
+)
+def test_login_token_fallback(credentials_path, design_oauth):
+    creds = {"claudeAiOauth": {"accessToken": "login-token"}}
+    if design_oauth is not None:
+        creds["designOauth"] = design_oauth
+    credentials_path.write_text(json.dumps(creds))
+    assert ds._read_bearer_token() == "login-token"
+
+
+@pytest.mark.parametrize(
+    "creds", [{}, {"designOauth": {"accessToken": ""}, "claudeAiOauth": {"accessToken": 123}}]
+)
+def test_missing_token_mentions_design_login(credentials_path, creds):
+    credentials_path.write_text(json.dumps(creds))
+    with pytest.raises(
+        ValueError, match=r"No accessToken found in credentials file.* /design-login"
+    ):
+        ds._read_bearer_token()
+
+
+def test_missing_credentials_file_keeps_message(credentials_path):
+    with pytest.raises(FileNotFoundError) as exc:
+        ds._read_bearer_token()
+    assert str(exc.value) == (
+        f"Credentials file not found: {credentials_path}\nRun `omnigent setup` to authenticate."
+    )
+
+
+@pytest.fixture
+def http_error(monkeypatch):
+    def install(body):
+        stream = Mock(wraps=BytesIO(body))
+
+        def fail(req, timeout):  # noqa: ARG001
+            raise urllib.error.HTTPError(
+                "https://api.anthropic.com/v1/design/mcp", 403, "private_token", {}, stream
+            )
+
+        monkeypatch.setattr(ds.urllib.request, "urlopen", fail)
+        return stream
+
+    return install
+
+
+def test_http_design_scopes_error_is_surfaced(http_error):
+    bearer = "private_token"
+    http_error(json.dumps({"error": "needs_design_scopes", "prompt": "private_token"}).encode())
+    with pytest.raises(RuntimeError) as exc:
+        ds._jsonrpc_call(bearer, "initialize")
+    assert str(exc.value) == "HTTP 403 error: needs_design_scopes"
+    assert "private_token" not in "".join(traceback.format_exception(exc.value))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"not JSON: private_token",
+        b'\xff{"error": "needs_design_scopes"}',
+        b'["private_token"]',
+        b'{"prompt": "private_token"}',
+        *[
+            json.dumps({"error": error, "prompt": "private_token"}).encode()
+            for error in ("Bearer private_token", "x" * 65, "bad\n", "private_token", 403, {})
+        ],
+    ],
+)
+def test_http_error_unsafe_bodies_are_redacted(http_error, body):
+    bearer = "private_token"
+    http_error(body)
+    with pytest.raises(RuntimeError) as exc:
+        ds._jsonrpc_call(bearer, "initialize")
+    assert str(exc.value) == "HTTP 403 error"
+    assert "private_token" not in "".join(traceback.format_exception(exc.value))
+
+
+def test_http_error_body_read_is_bounded(http_error):
+    stream = http_error(b'{"prompt": "' + b"x" * 8192 + b'", "error": "needs_design_scopes"}')
+    with pytest.raises(RuntimeError, match=r"^HTTP 403 error$"):
+        ds._jsonrpc_call("private_token", "initialize")
+    stream.read.assert_called_once_with(4096)
+
+
+def test_http_error_incomplete_read_is_redacted(http_error):
+    stream = http_error(b"")
+    stream.read.side_effect = http.client.IncompleteRead(b"private_token", 100)
+    with pytest.raises(RuntimeError) as exc:
+        ds._jsonrpc_call("private_token", "initialize")
+    assert str(exc.value) == "HTTP 403 error"
+    assert exc.value.__cause__ is None
+    assert exc.value.__suppress_context__ is True
 
 
 def test_strip_mcp_wrapper():
