@@ -14,7 +14,6 @@ executor:
   # allowlist is {claude_sdk, agents_sdk, omnigent} (UNDERSCORE) — a hyphenated
   # `claude-sdk` here is rejected at parse (`must be one of [...]`).
   type: claude_sdk
-  model: claude-haiku-4-5
   # `config.harness` is the RUNNER harness-registry name (HYPHEN): the spawn
   # path resolves `executor.config.harness or executor.type` and looks it up in
   # the harness registry, whose registered name is `claude-sdk`. Without this

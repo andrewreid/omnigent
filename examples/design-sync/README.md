@@ -185,7 +185,7 @@ on the agent.
 
 6. **No incremental sync**: Every run rewrites the full tree. For large projects, this is wasteful but guarantees consistency.
 
-7. **Model availability (DEPLOYMENT-DEPENDENT)**: `executor.model: claude-haiku-4-5` must be available to the configured provider. If model unavailable, agent load fails.
+7. **Model availability (DEPLOYMENT-DEPENDENT)**: The agent uses the configured default model without pinning a model ID. That default must be available to the configured provider.
 
 8. **Live full-session run is a DEPLOY-TIME gate**: Config-load + tool-build + policy-construction are verified offline (see below). A live, zero-elicitation full-session run under the real claude-sdk harness cannot be exercised from a build/review sub-agent (it can't spawn omnigent sessions) — it is the operator's final check at deploy time.
 
