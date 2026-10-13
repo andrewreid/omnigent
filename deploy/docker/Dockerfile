@@ -175,6 +175,13 @@ RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
         uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e ".[${OMNIGENT_EXTRAS}]"; \
     fi
 
+# Optional extra packages for the server image that aren't Omnigent extras,
+# e.g. `--build-arg EXTRA_PIP_PACKAGES=py-spy` for profiling (space-separated).
+ARG EXTRA_PIP_PACKAGES=
+RUN if [ -n "${EXTRA_PIP_PACKAGES}" ]; then \
+        uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} ${EXTRA_PIP_PACKAGES}; \
+    fi
+
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned
 # image; contributes no layers of its own.
