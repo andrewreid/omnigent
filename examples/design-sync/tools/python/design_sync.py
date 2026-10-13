@@ -23,7 +23,7 @@ from omnigent_client import tool
 
 
 def _read_bearer_token() -> str:
-    """Read Claude.ai OAuth bearer token from credentials file."""
+    """Read the Claude Design OAuth token, falling back to the Claude login token."""
     creds_path = Path.home() / ".claude" / ".credentials.json"
     if not creds_path.exists():
         raise FileNotFoundError(
@@ -33,11 +33,15 @@ def _read_bearer_token() -> str:
     with open(creds_path) as f:
         creds = json.load(f)
 
-    token = creds.get("claudeAiOauth", {}).get("accessToken")
-    if not isinstance(token, str) or not token:
-        raise ValueError("No accessToken found in credentials file")
+    for oauth_key in ("designOauth", "claudeAiOauth"):
+        oauth = creds.get(oauth_key, {})
+        token = oauth.get("accessToken") if isinstance(oauth, dict) else None
+        if isinstance(token, str) and token:
+            return token
 
-    return token
+    raise ValueError(
+        "No accessToken found in credentials file. Run /design-login to authenticate."
+    )
 
 
 def _jsonrpc_call(  # type: ignore[explicit-any]  # JSON-RPC uses schema-less JSON.
@@ -70,9 +74,20 @@ def _jsonrpc_call(  # type: ignore[explicit-any]  # JSON-RPC uses schema-less JS
 
             return result.get("result")
     except urllib.error.HTTPError as e:
-        # Redact HTTP error bodies; `from None` drops the chained
-        # HTTPError so its (possibly sensitive) body never surfaces.
-        raise RuntimeError(f"HTTP {e.code} error") from None
+        message = f"HTTP {e.code} error"
+        # Only expose a short error identifier; bodies and prompts may contain secrets.
+        try:
+            body = json.loads(e.read(4096).decode("utf-8"))
+        except Exception:  # noqa: BLE001 — body failures must preserve HTTP error redaction
+            body = None
+        error_code = body.get("error") if isinstance(body, dict) else None
+        if (
+            isinstance(error_code, str)
+            and re.fullmatch(r"[a-z0-9_.:-]{1,64}", error_code)
+            and bearer not in error_code
+        ):
+            message += f": {error_code}"
+        raise RuntimeError(message) from None
 
 
 def _strip_mcp_wrapper(content: str) -> str:

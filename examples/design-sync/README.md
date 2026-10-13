@@ -29,7 +29,7 @@ This design is **proven** by 4 prior spikes + cross-vendor review rounds. The ON
   - `copy_files` = remote→remote only
   - `DesignSync` tool = upload, not download
 - So download MUST be done in-process by our python tool via raw JSON-RPC to the SAME endpoint the MCP uses: `https://api.anthropic.com/v1/design/mcp`
-- Bearer token read from `~/.claude/.credentials.json` (field `claudeAiOauth.accessToken`)
+- Bearer token read from `~/.claude/.credentials.json`, preferring `designOauth.accessToken` and falling back to `claudeAiOauth.accessToken` when the Design token is unavailable
 - Content is entity-decoded and wrapper-stripped in the python tool (not by the model)
 
 ### Download-only enforcement (accurate tool surface)
@@ -162,9 +162,10 @@ local python tool needs, at execution time:
    sandboxes local tools without egress, the download fails — that is the
    **operator's** environment to provision, not something this spec can assert.
 2. **Read access to `~/.claude/.credentials.json`** — the tool reads
-   `claudeAiOauth.accessToken` for the bearer. The host must run the tool as a
-   principal that can read this file, with a non-expired token
-   (`omnigent setup` refreshes it).
+   `designOauth.accessToken` for the bearer, falling back to
+   `claudeAiOauth.accessToken` when the Design token is unavailable. The host must
+   run the tool as a principal that can read this file, with a non-expired token
+   carrying Claude Design scopes (`/design-login` authenticates Claude Design).
 
 If either is missing the tool returns a structured error (no crash), but the
 sync will not produce files. Verify both in your target deployment before relying
@@ -174,7 +175,7 @@ on the agent.
 
 1. **Sandbox egress (HOST-DEPENDENT)**: The python tool makes outbound HTTPS to `api.anthropic.com`. On hosts with strict `bwrap`/`srt` sandboxing that denies egress, the tool will fail. This is a deployment property (see **Deployment Requirements** above), not an agent-config setting — `spec.tools.sandbox` does not control host egress.
 
-2. **Bearer token expiry**: If `~/.claude/.credentials.json` has an expired `accessToken`, the tool fails with HTTP 401. Run `omnigent setup` to refresh. Token availability depends on authentication state.
+2. **Bearer token authentication**: An expired token causes HTTP 401. A token without Claude Design scopes causes `HTTP 403 error: needs_design_scopes`. Run `/design-login` to authenticate Claude Design. Token availability depends on authentication state.
 
 3. **Byte-exact validation**: Tool validates `len(written_bytes) == size` from `list_files` EXACTLY (no tolerance). If MCP's `size` field is stale, sync fails with size mismatch error.
 
