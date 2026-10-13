@@ -55,6 +55,8 @@ env:
   HOST_REPO: ghcr.io/andrewreid/omnigent-host
   # Keep in step with integration.env.
   EXTRAS: tracing,kms,kubernetes
+  # Non-extra packages for the server image (needs the EXTRA_PIP_PACKAGES build arg).
+  EXTRA_PIP_PACKAGES: py-spy
   HOST_HARNESSES: claude codex
   AGENT_BUNDLES: patricia scribe sentinel remy design-sync aws_analyst holly molly rosie
   # The cluster is amd64 on every node; the arm64 leg upstream builds would
@@ -126,7 +128,9 @@ jobs:
           context: .
           file: deploy/docker/Dockerfile
           target: runtime
-          build-args: OMNIGENT_EXTRAS=${{ env.EXTRAS }}
+          build-args: |
+            OMNIGENT_EXTRAS=${{ env.EXTRAS }}
+            EXTRA_PIP_PACKAGES=${{ env.EXTRA_PIP_PACKAGES }}
           tags: ${{ steps.tag.outputs.server }}
           platforms: ${{ env.PLATFORM }}
           # Loaded, not pushed: the smoke and boot checks below run the image,
@@ -143,6 +147,14 @@ jobs:
           echo "$out"
           echo "$out" | grep -q "imports ok" || { echo "::error::SERVER_SMOKE_FAILED"; exit 1; }
           echo "server smoke: $(echo "$out" | tail -1)" >> status.txt
+
+      - name: Smoke py-spy
+        if: contains(env.EXTRA_PIP_PACKAGES, 'py-spy')
+        run: |
+          out=$(docker run --rm --entrypoint py-spy "${{ steps.tag.outputs.server }}" --version 2>&1)
+          echo "$out"
+          echo "$out" | grep -q "^py-spy " || { echo "::error::PYSPY_SMOKE_FAILED"; exit 1; }
+          echo "server py-spy: $out" >> status.txt
 
       - name: Smoke KMS credential cipher
         run: |
@@ -293,7 +305,7 @@ jobs:
             echo "base:     ${BASE:-unknown} ($( [ -n "$BASE" ] && git log -1 --format=%cs "$BASE"))"
             echo "migration head: ${STAMP:-unknown}"
             echo; echo "build:"
-            echo "  docker build -f deploy/docker/Dockerfile --target runtime --build-arg OMNIGENT_EXTRAS=$EXTRAS -t $SERVER_IMG ."
+            echo "  docker build -f deploy/docker/Dockerfile --target runtime --build-arg OMNIGENT_EXTRAS=$EXTRAS --build-arg EXTRA_PIP_PACKAGES=\"$EXTRA_PIP_PACKAGES\" -t $SERVER_IMG ."
             echo "  docker build -f deploy/docker/Dockerfile --target host --build-arg HOST_HARNESSES=\"$HOST_HARNESSES\" -t $HOST_IMG ."
             echo; echo "ingredients:"
             # Recovered from the branch itself: each compose merge commit names
