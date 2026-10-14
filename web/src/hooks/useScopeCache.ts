@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { appendScopePage, refreshScopeWindow, type ScopeCacheData } from "@/lib/sidebarData";
+import { SCOPE_PAGE_MUTATION_KEY } from "@/lib/sessionListCache";
 import { filterSessionScope } from "@/lib/sessionVisibility";
 import { sidebarConfig } from "@/lib/sidebarConfig";
 import { useViewerId } from "./useViewerId";
@@ -89,6 +90,7 @@ export function useScopeCache(
     }
   }, [enabled, entryKey, data, client, queryKey, refreshHead]);
   const pagination = useMutation({
+    mutationKey: SCOPE_PAGE_MUTATION_KEY,
     mutationFn: async ({ controller }: { controller: AbortController }) => {
       let refreshing = client.getQueryCache().find({ queryKey, exact: true });
       while (refreshing?.state.fetchStatus === "fetching" && refreshing.promise) {
