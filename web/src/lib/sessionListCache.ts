@@ -12,6 +12,7 @@
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
 import type { Conversation, ConversationsPage, SessionSortBy } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
+import { compareSessionRows } from "@/lib/sidebarData";
 
 /** Cache value shape for a `useConversations` infinite query. */
 export type ConversationsInfiniteData = InfiniteData<ConversationsPage, string | undefined>;
@@ -41,6 +42,9 @@ export const PINNED_LABEL_KEY = "omnigent.pinned";
 /** Mutation key shared by every pin, unpin, and pinned-reorder write. */
 export const PIN_WRITE_MUTATION_KEY = ["pin-write"] as const;
 
+/** Mutation key for a sidebar scope's "load more" page request. */
+export const SCOPE_PAGE_MUTATION_KEY = ["session-scope-page"] as const;
+
 /**
  * The reserved `conversation_labels` key holding the epoch-SECONDS time a
  * session was archived. Written by the server on the archive transition and
@@ -68,6 +72,13 @@ export interface ConversationListFilters {
    * only archived sessions. ``undefined`` is the default all-sessions list.
    */
   visibility?: "mine" | "shared" | "archived";
+  /**
+   * Project folder (`["project-sessions", name]`) the list holds, resolved
+   * from the projects list so dual-read membership can be decided locally.
+   */
+  folder?: { id: string | null; name: string };
+  /** Sort key of the list's server pages; absent means `updated_at`. */
+  sortBy?: SessionSortBy;
 }
 
 /**
@@ -180,7 +191,36 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
     // Treat null (visibility-scoped key) the same as undefined (no project filter).
     project: project ?? undefined,
     visibility: visibility as ConversationListFilters["visibility"],
+    ...(key[5] === "created_at" ? { sortBy: "created_at" as const } : {}),
   };
+}
+
+/**
+ * Dual-read project membership: the row carries the project's first-class
+ * `project_id` or its legacy `omni_project` label.
+ */
+export function isInProject(
+  conv: Pick<Conversation, "project_id" | "labels">,
+  project: { id: string | null; name: string },
+): boolean {
+  return (
+    (project.id !== null && conv.project_id === project.id) ||
+    conv.labels?.[PROJECT_LABEL_KEY] === project.name
+  );
+}
+
+/**
+ * Whether only the server can decide which rows a list holds: search lists
+ * match item content, and the archived / project-filtered lists can gain rows
+ * the client never had cached. Push frames reconcile these by refetching.
+ */
+export function serverDecidesMembership(filters: ConversationListFilters): boolean {
+  return (
+    filters.searchQuery !== "" ||
+    filters.includeArchived ||
+    filters.visibility === "archived" ||
+    Boolean(filters.project)
+  );
 }
 
 /**
@@ -213,44 +253,29 @@ function violatesKnownMembership(conv: Conversation, filters: ConversationListFi
   }
   if (!filters.includeArchived && conv.archived === true) return true;
   if (filters.project && conv.labels?.[PROJECT_LABEL_KEY] !== filters.project) return true;
+  if (filters.folder && !isInProject(conv, filters.folder)) return true;
   return false;
 }
 
 /**
- * Decide whether a field change needs server-side list reconciliation.
+ * Decide whether a field change can move rows into or out of lists the
+ * client can't evaluate (see {@link serverDecidesMembership}).
  *
- * The server owns pagination, updated_at sorting, search matches over title
- * and item content, and archive filtering. Push frames update visible row
- * fields immediately; this tells the provider when to follow with a list
- * refetch so filtered query membership and page order converge. Title
- * changes reconcile every list variant because a row absent from a search
- * query may now match it.
+ * `updated_at` is deliberately absent: every sidebar list renders through
+ * `sortConversations`, and a bump only raises a row (or, in a creation-ordered
+ * list, doesn't move it), so the loaded rows stay a prefix of the server's
+ * order without a refetch.
  *
  * @param changed - Names of wire fields that changed the cached row.
- * @param isActiveRow - Whether this row is the active chat (the one held
- *   in place by `ActiveChatOverride`). An `updated_at`-only change on it
- *   doesn't move the visible row, so it doesn't need a server resort.
- * @returns `true` when the query should be invalidated after patching.
+ * @returns `true` when membership-deciding lists should reconcile.
  */
-function changedFieldsNeedRefetch(changed: Set<string>, isActiveRow: boolean): boolean {
-  if (changed.has("archived")) return true;
-  if (changed.has("title")) return true;
-  // A labels change can move a row between project-filtered variants and the
-  // project folders (["project-sessions", …]). A session relabeled INTO the
-  // selected project isn't in that filtered cache yet, so no local patch can
-  // place it; only a server reconcile can. The unfiltered variant where the
-  // row lives detects the label change here and flags the refetch, and the
-  // caller's invalidation is prefix-wide (["conversations"]), so it reconciles
-  // the filtered variants too.
-  if (changed.has("labels")) return true;
-  // updated_at only affects the server's sort order. The active chat row is
-  // pinned at its position by ActiveChatOverride regardless of that order, so
-  // an updated_at bump on it — the common case while the user sends messages —
-  // never changes what's visible. Skip the full-list refetch it would
-  // otherwise force every tick. Any other row's updated_at still needs the
-  // server resort to move it.
-  if (changed.has("updated_at") && !isActiveRow) return true;
-  return false;
+function changedFieldsNeedRefetch(changed: Set<string>): boolean {
+  return (
+    changed.has("archived") ||
+    changed.has("title") ||
+    changed.has("labels") ||
+    changed.has("project_id")
+  );
 }
 
 /**
@@ -261,63 +286,85 @@ function changedFieldsNeedRefetch(changed: Set<string>, isActiveRow: boolean): b
  * value actually changed — pages and the top-level object keep their old
  * reference when nothing changed, so the caller can skip the
  * `setQueryData` (and the re-render) entirely. Items whose id isn't present
- * in any page are reported back via `found` so the caller can treat them as
- * structural additions (a debounced refetch), rather than guessing where to
- * insert them in the server's sort order.
+ * in any page are absent from `found`, so the caller can place them
+ * ({@link insertNewRowsIntoPages}) or leave them to a reconcile.
  *
  * @param data - The cached infinite data, or `undefined` for an unfetched
  *   query.
  * @param itemsById - Wire items keyed by conversation id.
  * @param filters - Canonical filters for this conversations query.
- * @param activeId - The active chat's conversation id (`/c/:id`), or
- *   `undefined` when not on a chat route. Its `updated_at` bumps don't force
- *   a refetch because `ActiveChatOverride` pins its visible position.
- * @returns The possibly updated data, ids found in it, and whether this
- *   query needs a server refetch after the local patch.
+ * @returns The possibly updated data, ids found in it, whether a
+ *   membership-deciding field changed, and whether a row-id cursor lost its
+ *   anchor with no in-place row to fall back to (the list needs a refetch).
  */
 export function mergeItemsIntoPages(
   data: ConversationsInfiniteData | undefined,
   itemsById: Map<string, SessionListWireItem>,
   filters: ConversationListFilters,
-  activeId: string | undefined,
-): { data: ConversationsInfiniteData | undefined; found: Set<string>; needsRefetch: boolean } {
+): {
+  data: ConversationsInfiniteData | undefined;
+  found: Set<string>;
+  needsRefetch: boolean;
+  cursorLost: boolean;
+} {
   const found = new Set<string>();
-  if (!data) return { data, found, needsRefetch: false };
+  if (!data) return { data, found, needsRefetch: false, cursorLost: false };
+  const sortBy = filters.sortBy ?? "updated_at";
   let anyPageChanged = false;
   let needsRefetch = false;
-  const pages = data.pages.map((page) => {
+  let cursorLost = false;
+  const pages = data.pages.map((page, index) => {
     let rowChanged = false;
-    const nextData: Conversation[] = [];
+    const kept: Conversation[] = [];
+    const moved: Conversation[] = [];
+    // Rows that no longer hold their server position: evicted, or sort key changed.
+    const displaced = new Set<string>();
     for (const conv of page.data) {
       const wire = itemsById.get(conv.id);
       if (!wire) {
-        nextData.push(conv);
+        kept.push(conv);
         continue;
       }
       found.add(conv.id);
       const changed = changedWireFields(conv, wire);
       if (changed.size === 0) {
-        nextData.push(conv);
+        kept.push(conv);
         continue;
-      }
-      const nextConv = { ...conv, ...wire };
-      if (violatesKnownMembership(nextConv, filters)) {
-        rowChanged = true;
-        needsRefetch = true;
-        continue;
-      }
-      if (changedFieldsNeedRefetch(changed, conv.id === activeId)) {
-        needsRefetch = true;
       }
       rowChanged = true;
-      nextData.push(nextConv);
+      const nextConv = { ...conv, ...wire };
+      if (violatesKnownMembership(nextConv, filters)) {
+        needsRefetch = true;
+        displaced.add(conv.id);
+        continue;
+      }
+      if (changedFieldsNeedRefetch(changed)) needsRefetch = true;
+      if (changed.has(sortBy)) {
+        displaced.add(conv.id);
+        moved.push(nextConv);
+      } else {
+        kept.push(nextConv);
+      }
     }
     if (!rowChanged) return page;
     anyPageChanged = true;
-    return { ...page, data: nextData };
+    // Unchanged rows keep the server's order (its tiebreak may differ from
+    // ours); moved rows lead the page, and rendering sorts them into place.
+    const nextData = [...moved, ...kept];
+    // Only the last page's cursor is ever followed, and only while it has more.
+    const pagesOn = index === data.pages.length - 1 && page.has_more;
+    const anchor = pagesOn ? page.data.findIndex((row) => row.id === page.last_id) : -1;
+    if (anchor === -1 || !displaced.has(page.data[anchor].id)) {
+      return { ...page, data: nextData };
+    }
+    // A legacy row-id cursor whose row moved: continue after a row still in
+    // place before it, or let the server rebuild the page.
+    const stay = cursorReplacement(page, anchor, (row) => !displaced.has(row.id), sortBy);
+    if (!stay) cursorLost = true;
+    return { ...page, data: nextData, last_id: stay?.id ?? page.last_id };
   });
-  if (!anyPageChanged) return { data, found, needsRefetch };
-  return { data: { ...data, pages }, found, needsRefetch };
+  if (!anyPageChanged) return { data, found, needsRefetch, cursorLost };
+  return { data: { ...data, pages }, found, needsRefetch, cursorLost };
 }
 
 // ── Recently-created keep-alive ───────────────────────────────────────
@@ -359,11 +406,13 @@ export function unmarkRecentlyCreated(id: string): void {
 /**
  * Prepend brand-new rows (a create here or elsewhere, a share) to page 0 so the
  * sidebar shows them the instant the push lands, instead of after the debounced
- * refetch (which lags the search index). A new row sorts newest-first, so page 0
- * is its home. Skips: search lists (membership unknown), archived/wrong-project
- * rows, sub-agent children (`parent_session_id` — they live off the sidebar),
- * and ids the caller excludes via `skip` (e.g. an optimistic delete in flight).
- * `candidates` should already exclude rows the list holds.
+ * refetch (which lags the search index). Rendering sorts by the list's key, so
+ * page 0 is a fine home for any row newer than the oldest loaded one. Skips:
+ * search lists (membership unknown), archived/wrong-project rows, sub-agent
+ * children (`parent_session_id` — they live off the sidebar), rows that sort
+ * onto an unloaded page, and ids the caller excludes via `skip` (e.g. an
+ * optimistic delete in flight). `candidates` should already exclude rows the
+ * list holds.
  */
 export function insertNewRowsIntoPages(
   data: ConversationsInfiniteData | undefined,
@@ -371,13 +420,28 @@ export function insertNewRowsIntoPages(
   filters: ConversationListFilters,
   skip?: (id: string) => boolean,
   viewerId?: string | null,
-): { data: ConversationsInfiniteData | undefined; inserted: Conversation[] } {
+): { data: ConversationsInfiniteData | undefined; inserted: Conversation[]; undecided: boolean } {
   // Archived caches hold only archived rows; new sessions are never archived.
-  if (!data || candidates.size === 0 || filters.searchQuery) return { data, inserted: [] };
-  if (filters.visibility === "archived") return { data, inserted: [] };
+  if (!data || candidates.size === 0 || filters.searchQuery) {
+    return { data, inserted: [], undecided: false };
+  }
+  if (filters.visibility === "archived") return { data, inserted: [], undecided: false };
   const present = new Set<string>();
-  for (const page of data.pages) for (const c of page.data) present.add(c.id);
+  const sortBy = filters.sortBy ?? "updated_at";
+  let oldest: Conversation | undefined;
+  for (const page of data.pages) {
+    for (const c of page.data) {
+      present.add(c.id);
+      if (!oldest || compareSessionRows(c, oldest, sortBy) > 0) oldest = c;
+    }
+  }
+  // Pagination resumes after a row-id cursor; with history retained past a gap
+  // that row, not the oldest loaded one, bounds the loaded window.
+  const tail = data.pages.at(-1);
+  const boundary = tail?.data.find((row) => row.id === tail.last_id) ?? oldest;
+  const complete = !data.pages.at(-1)?.has_more;
   const rows: Conversation[] = [];
+  let undecided = false;
   for (const [id, wire] of candidates) {
     if (present.has(id) || skip?.(id)) continue;
     const conv: Conversation = {
@@ -397,29 +461,84 @@ export function insertNewRowsIntoPages(
     const ownedByViewer = conv.owner == null || conv.owner === viewerId;
     if (filters.visibility === "mine" && !ownedByViewer) continue;
     if (filters.visibility === "shared" && ownedByViewer) continue;
+    if (!complete) {
+      // No loaded rows left to place against: only a refetch can position it.
+      if (!boundary) {
+        undecided = true;
+        continue;
+      }
+      // The server's tiebreak (rowid on SQLite) can't be reproduced locally.
+      if (conv[sortBy] === boundary[sortBy]) {
+        undecided = true;
+        continue;
+      }
+      // Sorts past the loaded window: it belongs on a page that isn't loaded yet.
+      if (compareSessionRows(conv, boundary, sortBy) > 0) continue;
+    }
     rows.push(conv);
   }
-  if (rows.length === 0) return { data, inserted: [] };
+  if (rows.length === 0) return { data, inserted: [], undecided };
   const [first, ...rest] = data.pages;
   const nextFirst = { ...first, data: [...rows, ...first.data], first_id: rows[0].id };
-  return { data: { ...data, pages: [nextFirst, ...rest] }, inserted: rows };
+  return { data: { ...data, pages: [nextFirst, ...rest] }, inserted: rows, undecided };
+}
+
+/**
+ * The nearest row before a row-id cursor's anchor that can replace it: still
+ * in place and strictly newer than the anchor was. Array position alone isn't
+ * proof, since rows retained past a gap or moved by a push can sit before it.
+ */
+function cursorReplacement(
+  original: ConversationsPage,
+  anchor: number,
+  inPlace: (row: Conversation) => boolean,
+  sortBy: SessionSortBy,
+): Conversation | undefined {
+  const bound = original.data[anchor][sortBy];
+  return original.data.slice(0, anchor).findLast((row) => inPlace(row) && row[sortBy] > bound);
 }
 
 // Only known legacy row-ID cursors can be repaired after removing their anchor.
 // All other continuation tokens must round-trip unchanged, even on empty pages.
+// A removed anchor falls back to the nearest surviving row before it: a later
+// row would skip the unloaded gap a rewind cursor marks.
 export function lastIdAfterFiltering(
   original: ConversationsPage,
   rows: Conversation[],
   emptyCursor: string | null = null,
+  sortBy: SessionSortBy = "updated_at",
 ): string | null {
-  if (!original.data.some((row) => row.id === original.last_id)) return original.last_id;
-  return rows.at(-1)?.id ?? emptyCursor;
+  const anchor = original.data.findIndex((row) => row.id === original.last_id);
+  if (anchor === -1) return original.last_id;
+  const kept = new Set(rows.map((row) => row.id));
+  if (kept.has(original.data[anchor].id)) return original.last_id;
+  const before = cursorReplacement(original, anchor, (row) => kept.has(row.id), sortBy);
+  return before?.id ?? rows.at(-1)?.id ?? emptyCursor;
+}
+
+/**
+ * Whether filtering removed a legacy row-id cursor with no surviving row before
+ * it, so the repaired cursor is a guess that only a refetch can confirm.
+ */
+export function cursorAnchorLost(
+  original: ConversationsPage,
+  rows: Conversation[],
+  sortBy: SessionSortBy = "updated_at",
+): boolean {
+  const anchor = original.data.findIndex((row) => row.id === original.last_id);
+  if (anchor === -1) return false;
+  const kept = new Set(rows.map((row) => row.id));
+  return (
+    !kept.has(original.data[anchor].id) &&
+    !cursorReplacement(original, anchor, (row) => kept.has(row.id), sortBy)
+  );
 }
 
 /** Drop matching rows while preserving opaque continuation metadata. */
 export function removeIdsFromPages(
   data: ConversationsInfiniteData | undefined,
   ids: Set<string>,
+  sortBy: SessionSortBy = "updated_at",
 ): { data: ConversationsInfiniteData | undefined; removed: boolean } {
   if (!data || ids.size === 0) return { data, removed: false };
   let changed = false;
@@ -431,11 +550,22 @@ export function removeIdsFromPages(
       ...page,
       data: nextData,
       first_id: nextData[0]?.id ?? null,
-      last_id: lastIdAfterFiltering(page, nextData),
+      last_id: lastIdAfterFiltering(page, nextData, null, sortBy),
     };
   });
   if (!changed) return { data, removed: false };
   return { data: { ...data, pages }, removed: true };
+}
+
+/**
+ * Keep only an infinite query's first page, so the refetch that follows costs
+ * one request instead of one per loaded page.
+ */
+export function firstPageOnly(
+  data: ConversationsInfiniteData | undefined,
+): ConversationsInfiniteData | undefined {
+  if (!data || data.pages.length <= 1) return data;
+  return { ...data, pages: data.pages.slice(0, 1), pageParams: data.pageParams.slice(0, 1) };
 }
 
 /**
@@ -522,25 +652,18 @@ export function overlayTitleIntoCaches(
   for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["conversations"],
   })) {
-    // activeId only gates `needsRefetch`, which both callers ignore —
-    // they patch in place rather than refetching.
+    // Both callers ignore `needsRefetch` — they patch in place.
     const { data: next } = mergeItemsIntoPages(
       data,
       itemsById,
       filtersFromConversationQueryKey(key),
-      undefined,
     );
     if (next !== data) queryClient.setQueryData(key, next);
   }
   for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["project-sessions"],
   })) {
-    const { data: next } = mergeItemsIntoPages(
-      data,
-      itemsById,
-      filtersFromProjectQueryKey(key),
-      undefined,
-    );
+    const { data: next } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key));
     if (next !== data) queryClient.setQueryData(key, next);
   }
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
@@ -581,19 +704,13 @@ export function overlayArchivedIntoCaches(
       data,
       itemsById,
       filtersFromConversationQueryKey(key),
-      undefined,
     );
     if (next !== data) queryClient.setQueryData(key, next);
   }
   for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["project-sessions"],
   })) {
-    const { data: next } = mergeItemsIntoPages(
-      data,
-      itemsById,
-      filtersFromProjectQueryKey(key),
-      undefined,
-    );
+    const { data: next } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key));
     if (next !== data) queryClient.setQueryData(key, next);
   }
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>

@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import {
+  type Conversation,
   type ConversationsPage,
   useConversations,
   useSessionSearch,
@@ -35,7 +36,11 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
-import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
+import {
+  conversationDisplayLabel,
+  getConversationAgentType,
+  sortConversations,
+} from "./sidebarNav";
 
 export interface CommandPaletteProps {
   sessionsOnly?: boolean;
@@ -109,24 +114,27 @@ interface PaletteSession {
 function paletteSessions(
   pages: readonly ConversationsPage[],
   excludeIds: ReadonlySet<string> = new Set(),
+  byRecency = false,
 ): PaletteSession[] {
   const seen = new Set(excludeIds);
-  const out: PaletteSession[] = [];
+  const rows: Conversation[] = [];
   for (const page of pages) {
     for (const c of page.data) {
       if (c.archived || seen.has(c.id)) continue;
       seen.add(c.id);
-      out.push({
-        id: c.id,
-        label: conversationDisplayLabel(c),
-        agent: getConversationAgentType(c),
-        // Present only when the match was in chat content (not the title);
-        // the server omits it otherwise. Shown as a dimmed second line.
-        snippet: c.search_snippet ?? null,
-      });
+      rows.push(c);
     }
   }
-  return out;
+  // Live updates move rows between cached pages without a refetch, so an
+  // unsearched list is ordered by recency here; search keeps the server's order.
+  return (byRecency ? sortConversations(rows, null) : rows).map((c) => ({
+    id: c.id,
+    label: conversationDisplayLabel(c),
+    agent: getConversationAgentType(c),
+    // Present only when the match was in chat content (not the title);
+    // the server omits it otherwise. Shown as a dimmed second line.
+    snippet: c.search_snippet ?? null,
+  }));
 }
 
 export function CommandPalette({
@@ -272,7 +280,7 @@ export function CommandPalette({
 
   const sessions = useMemo(() => {
     if (searching) return paletteSessions(titleSearch.data?.pages ?? []);
-    const out = paletteSessions(data?.pages ?? []);
+    const out = paletteSessions(data?.pages ?? [], undefined, true);
     if (sessionsOnly) {
       if (!query.trim()) return out;
       return out
