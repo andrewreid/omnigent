@@ -438,6 +438,16 @@ class RunnerRouter:
         """
         return self._runner_absent_code(host_id) == ErrorCode.WRONG_REPLICA
 
+    def online_runner_clients(self) -> list[httpx.AsyncClient]:
+        """
+        Return a tunnel-backed client for every runner connected to this replica.
+
+        :returns: One client per online runner, possibly empty.
+        """
+        return [
+            self._client_for_runner(runner_id) for runner_id in self._registry.online_runner_ids()
+        ]
+
     def _client_for_runner(self, runner_id: str) -> httpx.AsyncClient:
         """
         Return a cached tunnel-backed client for *runner_id*.
