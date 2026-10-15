@@ -2445,6 +2445,57 @@ def _spawn_native_blocked_notice_forward(
     task.add_done_callback(_native_popup_forward_tasks.discard)
 
 
+def _spawn_policies_changed_forward(session_id: str) -> None:
+    """
+    Tell the bound runner that this session's policies changed.
+
+    The runner skips built-in tool policy round trips while the server reports
+    that no policy applies; this drops that hint at once instead of after its
+    TTL. Fire-and-forget: a lost notice is bounded by the hint's TTL.
+
+    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
+    :returns: None.
+    """
+
+    async def _forward() -> None:
+        await _forward_session_change_to_runner(
+            session_id, get_server_runner_router(), {"type": "policies_changed"}
+        )
+
+    task = asyncio.create_task(_forward())
+    _native_popup_forward_tasks.add(task)
+    task.add_done_callback(_native_popup_forward_tasks.discard)
+
+
+def _spawn_default_policies_changed_broadcast() -> None:
+    """
+    Tell every runner on this replica that server-wide policies changed.
+
+    Default policies apply to every session, so each runner drops all of its
+    no-policies reports. Fire-and-forget: a runner the notice misses (one on
+    another replica, or an older runner) keeps its report until its TTL.
+
+    :returns: None.
+    """
+    from omnigent.runtime import get_runner_client
+
+    router = get_server_runner_router()
+    clients: list[Any] = router.online_runner_clients() if router is not None else []
+    if not clients and (fallback := get_runner_client()) is not None:
+        clients = [fallback]
+
+    async def _notify(client: Any) -> None:
+        try:
+            await client.post("/v1/policies/changed", timeout=5.0)
+        except Exception:  # noqa: BLE001 — best-effort; the TTL bounds a missed notice
+            _logger.debug("default-policy change notice failed", exc_info=True)
+
+    for client in clients:
+        task = asyncio.create_task(_notify(client))
+        _native_popup_forward_tasks.add(task)
+        task.add_done_callback(_native_popup_forward_tasks.discard)
+
+
 async def _hold_native_ask_gate(*args: Any, **kwargs: Any) -> bool:
     """Call-time proxy so a facade patch of this symbol is honored here."""
     from omnigent.server.routes import sessions as _facade
