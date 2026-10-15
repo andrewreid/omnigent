@@ -2252,6 +2252,36 @@ async def test_action_required_marker_round_trips_to_relayed_frame() -> None:
 
 
 @pytest.mark.asyncio
+async def test_action_required_builtin_runs_locally_under_server_policy() -> None:
+    """A dispatched built-in skips the server's ``/mcp`` but both phases are checked."""
+    app, _mcp_manager, _client, server_client = _build_app_with_mcp_tool(
+        dispatched_tool="sys_os_read"
+    )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/4e92b5a0c0ee6db3f874f9c4a3f855a5/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "openai-agents",
+                "has_mcp_servers": True,
+            },
+        )
+        async for _chunk in resp.aiter_text():
+            pass
+
+    assert server_client.call_tool_invocations == []
+    assert [event["type"] for event in server_client.policy_events] == [
+        "PHASE_TOOL_CALL",
+        "PHASE_TOOL_RESULT",
+    ]
+    assert server_client.policy_events[0]["data"]["name"] == "sys_os_read"
+
+
+@pytest.mark.asyncio
 async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
     tmp_path: Path,
 ) -> None:
