@@ -13524,3 +13524,41 @@ async def test_eager_mcp_cache_keeps_named_child_scope_after_revision_change(mon
             assert response.status_code == 200, response.text
             assert "Worker instructions." in recording.posted_bodies[-1]["instructions"]
             assert "Root instructions." not in recording.posted_bodies[-1]["instructions"]
+
+
+@pytest.mark.asyncio
+async def test_policy_and_agent_changes_drop_the_no_policies_hint() -> None:
+    """A pushed policy change or an agent-cache reset re-enables policy checks."""
+    from omnigent.runner import policy_proxy
+
+    session_id = "conv_no_policies_hint"
+    app = create_runner_app(
+        process_manager=_RecoveryFakeProcessManager(  # type: ignore[arg-type]
+            _RecoveryScriptedHarnessClient([])
+        ),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    def _arm() -> None:
+        epoch = policy_proxy.no_policies_hint_epoch(session_id)
+        policy_proxy.note_no_policies(session_id, 60, epoch)
+        assert policy_proxy.no_policies_apply(session_id)
+
+    async with _recovery_runner_client(app) as client:
+        _arm()
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "policies_changed"}
+        )
+        assert resp.status_code == 204
+        assert not policy_proxy.no_policies_apply(session_id)
+
+        _arm()
+        resp = await client.post(f"/v1/sessions/{session_id}/agent-cache/reset", json={})
+        assert resp.status_code == 200
+        assert not policy_proxy.no_policies_apply(session_id)
+
+        # A server-wide (default) policy change drops every session's report.
+        _arm()
+        resp = await client.post("/v1/policies/changed")
+        assert resp.status_code == 204
+        assert not policy_proxy.no_policies_apply(session_id)

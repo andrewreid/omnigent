@@ -8,6 +8,7 @@ a ``policy_store``. These tests use the shared policy app with a route-only clie
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from unittest.mock import patch
 
@@ -21,6 +22,7 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from tests.server.helpers import CapturingRunnerClient
 
 
 @pytest_asyncio.fixture()
@@ -231,6 +233,34 @@ async def test_delete_session_policy(client: httpx.AsyncClient, session_id: str)
     # Verify it's gone from the session policies
     get_resp = await client.get(f"/v1/sessions/{session_id}/policies/{pid}")
     assert get_resp.status_code == 404
+
+
+async def test_session_policy_changes_notify_the_runner(
+    client: httpx.AsyncClient, session_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Create, update and delete each tell the runner to re-check policies."""
+    runner = CapturingRunnerClient()
+    monkeypatch.setattr("omnigent.runtime._globals._runner_client", runner)
+
+    async def _notices() -> int:
+        await asyncio.sleep(0)
+        for _ in range(100):
+            notices = [e for e in runner.posted if e["json"] == {"type": "policies_changed"}]
+            if notices:
+                runner.posted.clear()
+                assert notices[0]["url"] == f"/v1/sessions/{session_id}/events"
+                return len(notices)
+            await asyncio.sleep(0.01)
+        return 0
+
+    pid = (
+        await client.post(f"/v1/sessions/{session_id}/policies", json=_policy_payload())
+    ).json()["id"]
+    assert await _notices() == 1
+    await client.patch(f"/v1/sessions/{session_id}/policies/{pid}", json={"enabled": False})
+    assert await _notices() == 1
+    await client.delete(f"/v1/sessions/{session_id}/policies/{pid}")
+    assert await _notices() == 1
 
 
 # ── Telemetry ─────────────────────────────────────────────────────────
