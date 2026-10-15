@@ -1593,6 +1593,7 @@ async def _attach_cost_budget(
     if deps.policy_store is None or (task.max_cost_usd is None and not replace):
         return
     from omnigent.runtime.policies.builder import invalidate_session_policy_specs_cache
+    from omnigent.server.routes._sessions.orchestration import _spawn_policies_changed_forward
 
     policy_id = _cost_budget_policy_id(task.id, conversation_id)
     cap = None if task.max_cost_usd is None else {"max_cost_usd": spent_usd + task.max_cost_usd}
@@ -1632,6 +1633,8 @@ async def _attach_cost_budget(
                     raise _BudgetConflict from None
         if replace:
             invalidate_session_policy_specs_cache(conversation_id)
+            # A continued session's runner may be skipping policy checks.
+            _spawn_policies_changed_forward(conversation_id)
     except _BudgetConflict:
         raise
     except Exception as exc:

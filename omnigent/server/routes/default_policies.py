@@ -47,6 +47,16 @@ from omnigent.telemetry.installation_id import get_installation_id as _get_insta
 _logger = logging.getLogger(__name__)
 
 
+def _invalidate_default_policies() -> None:
+    """Evict cached default policies and notify this replica's runners."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _spawn_default_policies_changed_broadcast,
+    )
+
+    invalidate_default_policy_specs_cache()
+    _spawn_default_policies_changed_broadcast()
+
+
 def _generate_default_policy_id() -> str:
     """Generate a unique default policy identifier.
 
@@ -228,7 +238,7 @@ def create_default_policies_router(
                 f"Default policy with name '{body.name}' already exists",
                 code=ErrorCode.CONFLICT,
             ) from exc
-        invalidate_default_policy_specs_cache()
+        _invalidate_default_policies()
         _logger.info(
             "policies/create: user=%s created policy_id=%s handler=%s",
             user_id or "(single-user)",
@@ -366,7 +376,7 @@ def create_default_policies_router(
             ) from exc
         if policy is None:
             raise OmnigentError("Policy not found", code=ErrorCode.NOT_FOUND)
-        invalidate_default_policy_specs_cache()
+        _invalidate_default_policies()
         _logger.info(
             "policies/update: user=%s updated policy_id=%s",
             user_id or "(single-user)",
@@ -394,7 +404,7 @@ def create_default_policies_router(
         """
         user_id = await _require_admin(request, auth_provider, permission_store)
         store.delete_default(policy_id)
-        invalidate_default_policy_specs_cache()
+        _invalidate_default_policies()
         _logger.info(
             "policies/delete: user=%s deleted policy_id=%s",
             user_id or "(single-user)",

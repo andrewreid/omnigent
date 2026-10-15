@@ -79,6 +79,14 @@ _log = logging.getLogger(__name__)
 # can't drift if the set of fail-closed phases changes.
 FAIL_CLOSED_PHASES: tuple[str, ...] = ("PHASE_TOOL_CALL", "PHASE_REQUEST")
 
+# Tools whose TOOL_CALL always reaches the policy engine, even when no
+# user-defined policy exists: persistent policy and schedule changes require
+# approval. A caller that skips evaluation when no policies apply must still
+# evaluate these.
+ALWAYS_EVALUATED_TOOL_CALLS: frozenset[str] = frozenset(
+    {"sys_add_policy", "sys_scheduled_task_create", "sys_scheduled_task_update"}
+)
+
 
 @dataclass(frozen=True)
 class EvaluationContext:

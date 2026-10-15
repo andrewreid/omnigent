@@ -233,6 +233,23 @@ async def test_runner_router_uses_pinned_runner_when_multiple_online() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_router_lists_a_client_per_online_runner() -> None:
+    """Server-wide notices reach each runner connected to this replica once."""
+    registry = TunnelRegistry()
+    router = RunnerRouter(registry=registry, conversation_store=_ConversationStore({}))  # type: ignore[arg-type]
+    try:
+        assert router.online_runner_clients() == []
+        registry.register("runner_one", _FakeWebSocket(), _hello(harnesses=["codex"]))
+        registry.register("runner_two", _FakeWebSocket(), _hello(harnesses=["codex"]))
+        clients = router.online_runner_clients()
+
+        assert len(clients) == 2
+        assert clients == router.online_runner_clients(), "clients are cached per runner"
+    finally:
+        await router.aclose()
+
+
+@pytest.mark.asyncio
 async def test_runner_router_fails_when_no_runner_supports_harness() -> None:
     """A harness capability mismatch fails before dispatching."""
     registry = TunnelRegistry()
