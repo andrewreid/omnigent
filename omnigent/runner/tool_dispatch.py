@@ -373,6 +373,9 @@ _TIMER_TOOLS = frozenset({"sys_timer_set", "sys_timer_cancel"})
 # Priority 5f.3: sys_advise_models — server-side via MCP intercept;
 # included in the tool surface only when smart routing is enabled.
 _ADVISE_MODELS_TOOLS = frozenset({"sys_advise_models"})
+# Built-ins the Omnigent server executes itself, so dispatch must reach its
+# MCP endpoint rather than run them in the runner.
+SERVER_EXECUTED_TOOLS = _ADVISE_MODELS_TOOLS
 
 # Priority 5h: Task lifecycle tools — runner-local sys_cancel_task.
 # The only cancellable task ids visible to the LLM are async dispatches
@@ -6591,10 +6594,9 @@ async def execute_tool(
         )
     try:
         if mcp_manager is not None:
-            # All MCP tool calls are routed through the AP server's
-            # /mcp endpoint, which enforces TOOL_CALL and TOOL_RESULT
-            # policies centrally before forwarding to the runner's
-            # /mcp/execute. No runner-side policy gate needed.
+            # The manager applies TOOL_CALL and TOOL_RESULT policies: the
+            # server's /mcp endpoint for MCP tools, /policies/evaluate around
+            # built-ins it runs locally. No further gate needed here.
             if agent_spec is None:
                 return "Error: agent_spec not available for MCP dispatch"
             output = await mcp_manager.call_tool(agent_spec, tool_name, args)

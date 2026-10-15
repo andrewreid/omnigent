@@ -43,6 +43,7 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
     touch_connect_marker,
 )
+from omnigent.runner.policy_proxy import drop_all_no_policies_hints
 from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -1243,6 +1244,9 @@ async def _serve_tunnel_once(
                         await shutdown_wait
         finally:
             diagnostics.freeze()
+            # Policy changes are pushed over this tunnel, so a no-policies
+            # report cannot be trusted while it is down.
+            drop_all_no_policies_hints()
             if event_dispatcher is not None:
                 event_dispatcher.disconnected()
             if reconnect_task is not None:
