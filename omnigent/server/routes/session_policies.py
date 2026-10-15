@@ -48,6 +48,19 @@ from omnigent.telemetry.installation_id import get_installation_id as _get_insta
 _logger = logging.getLogger(__name__)
 
 
+def _invalidate_session_policies(session_id: str) -> None:
+    """
+    Evict cached session policies and notify the session's runner.
+
+    :param session_id: Session whose policies changed, e.g. ``"conv_abc123"``.
+    :returns: None.
+    """
+    from omnigent.server.routes._sessions.orchestration import _spawn_policies_changed_forward
+
+    invalidate_session_policy_specs_cache(session_id)
+    _spawn_policies_changed_forward(session_id)
+
+
 def _generate_policy_id() -> str:
     """Generate a unique policy identifier.
 
@@ -215,7 +228,7 @@ def create_session_policies_router(
                 f"Policy with name '{body.name}' already exists in this session",
                 code=ErrorCode.CONFLICT,
             ) from exc
-        invalidate_session_policy_specs_cache(session_id)
+        _invalidate_session_policies(session_id)
         _logger.info(
             "session_policies/create: user=%s created policy_id=%s session_id=%s handler=%s",
             user_id or "(single-user)",
@@ -378,7 +391,7 @@ def create_session_policies_router(
             ) from exc
         if policy is None:
             raise OmnigentError("Policy not found", code=ErrorCode.NOT_FOUND)
-        invalidate_session_policy_specs_cache(session_id)
+        _invalidate_session_policies(session_id)
         _logger.info(
             "session_policies/update: user=%s updated policy_id=%s session_id=%s",
             user_id or "(single-user)",
@@ -414,7 +427,7 @@ def create_session_policies_router(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
             )
         store.delete(policy_id, session_id)
-        invalidate_session_policy_specs_cache(session_id)
+        _invalidate_session_policies(session_id)
         _logger.info(
             "session_policies/delete: user=%s deleted policy_id=%s session_id=%s",
             user_id or "(single-user)",

@@ -254,6 +254,7 @@ def _llm_response_payload(
 async def test_tool_call_allow_when_no_matching_policy(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
     """
     A tool call with no matching policy returns ALLOW.
@@ -276,6 +277,24 @@ async def test_tool_call_allow_when_no_matching_policy(
     assert "reason" not in body
     # The allow cache is opt-in: no window unless the operator configures one.
     assert "allow_cache_seconds" not in body
+    # The runner hint is only for tool dispatch, which sets the flag.
+    assert "no_policies_ttl_s" not in body
+    flagged = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json={**_tool_call_request("Read"), "_omnigent_return_ask": True},
+    )
+    assert flagged.json()["no_policies_ttl_s"] > 0
+    # A sub-agent may also take the fast path, but root policy changes are only
+    # pushed to the root's runner, so its tool dispatch keeps evaluating.
+    child = SqlAlchemyConversationStore(db_uri).create_conversation(
+        agent_id=agent["id"], parent_conversation_id=session_id
+    )
+    child_resp = await client.post(
+        f"/v1/sessions/{child.id}/policies/evaluate",
+        json={**_tool_call_request("Read"), "_omnigent_return_ask": True},
+    )
+    assert child_resp.json()["result"] == "POLICY_ACTION_ALLOW"
+    assert "no_policies_ttl_s" not in child_resp.json()
 
 
 def _patch_allow_cache(
@@ -384,6 +403,8 @@ async def test_tool_call_deny_with_default_policy(
     )
     assert resp2.status_code == 200
     assert resp2.json()["result"] == "POLICY_ACTION_ALLOW"
+    # A policy exists, so no caller may skip later evaluations.
+    assert "no_policies_ttl_s" not in resp2.json()
 
 
 async def test_deny_verdict_log_carries_deciding_policy_workspace_id(
@@ -940,6 +961,52 @@ async def test_tool_call_ask_returns_deny_on_decline(
     resp = await evaluate
     assert resp.status_code == 200, resp.text
     assert resp.json()["result"] == "POLICY_ACTION_DENY"
+
+
+async def test_runner_dispatch_takes_ask_unresolved_and_no_deny_signal(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_omnigent_return_ask`` returns ASK without parking, and skips the deny signal.
+
+    The runner's built-in dispatch hands an ASK to the MCP endpoint's approval
+    flow and reports a DENY in its own tool result. Parking here would prompt
+    twice; publishing ``response.policy_denied`` would add a second deny block.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._ask_for_bash")
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await asyncio.wait_for(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json={**_tool_call_request("Bash"), "_omnigent_return_ask": True},
+        ),
+        timeout=5.0,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_ASK"
+    assert "Approve running Bash?" in body["reason"]
+    # The echo tells the runner this server honoured the flag.
+    assert body["_omnigent_return_ask"] is True
+
+    denied: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_hooks._publish_policy_denied",
+        lambda session, reason, phase: denied.append(reason),
+    )
+    _patch_default_policies(monkeypatch, f"{__name__}._deny_bash_tool")
+    deny_request = _tool_call_request("Bash")
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json={**deny_request, "_omnigent_return_ask": True},
+    )
+    assert resp.json()["result"] == "POLICY_ACTION_DENY"
+    assert denied == []
+    await client.post(f"/v1/sessions/{session_id}/policies/evaluate", json=deny_request)
+    assert len(denied) == 1, "native hook callers still get the deny signal"
 
 
 async def test_tool_call_ask_forwards_popup_event_to_runner(

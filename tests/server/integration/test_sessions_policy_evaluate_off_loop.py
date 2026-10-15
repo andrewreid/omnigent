@@ -134,9 +134,9 @@ class _GatedBuilds:
     """
     Stand-in for ``build_policy_engine`` whose calls each block until the test releases them.
 
-    It also records requests for the per-session build lock. A free ``asyncio.Lock`` is
-    granted without yielding, so a request counted but not yet granted is blocked behind
-    the lock holder.
+    It also records requests for the per-session build lock and the evaluation lock that
+    holds it across build and evaluate. A free ``asyncio.Lock`` is granted without
+    yielding, so a request counted but not yet granted is blocked behind the lock holder.
     """
 
     def __init__(self, real_build: Any, real_lock_factory: Any) -> None:
@@ -169,7 +169,7 @@ class _GatedBuilds:
         assert await asyncio.to_thread(wait), f"expected {count} builds to start"
 
     async def assert_blocked_behind(self, started: int) -> None:
-        """Wait until a competing request is blocked on the build lock, with ``started`` builds."""
+        """Wait until a competing request is blocked on a session lock, with ``started`` builds."""
         await poll_until_async(lambda: self.lock_requests > self.lock_grants, timeout_s=5)
         assert len(self.releases) == started
 
@@ -208,6 +208,12 @@ async def _setup_sessions(
     gated = _GatedBuilds(routes_hooks.build_policy_engine, routes_hooks._policy_engine_build_lock)
     monkeypatch.setattr(routes_hooks, "build_policy_engine", gated.build)
     monkeypatch.setattr(routes_hooks, "_policy_engine_build_lock", gated.build_lock)
+    real_evaluation_lock = routes_hooks._policy_evaluation_lock
+    monkeypatch.setattr(
+        routes_hooks,
+        "_policy_evaluation_lock",
+        lambda session_id: _RecordingLock(real_evaluation_lock(session_id), gated),
+    )
     return session_ids, gated
 
 
