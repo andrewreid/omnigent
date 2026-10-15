@@ -6634,10 +6634,9 @@ async def execute_tool(
         )
     try:
         if mcp_manager is not None:
-            # All MCP tool calls are routed through the AP server's
-            # /mcp endpoint, which enforces TOOL_CALL and TOOL_RESULT
-            # policies centrally before forwarding to the runner's
-            # /mcp/execute. No runner-side policy gate needed.
+            # The manager applies TOOL_CALL and TOOL_RESULT policies: the
+            # server's /mcp endpoint for MCP tools, /policies/evaluate around
+            # built-ins it runs locally. No further gate needed here.
             if agent_spec is None:
                 return "Error: agent_spec not available for MCP dispatch"
             output = await mcp_manager.call_tool(agent_spec, tool_name, args)

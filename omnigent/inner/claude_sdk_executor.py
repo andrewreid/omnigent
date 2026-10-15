@@ -2476,9 +2476,8 @@ class ClaudeSDKExecutor(Executor):
         (``_stable_tool_executor`` -> ``TurnContext.dispatch_tool`` ->
         ``action_required``), and the runner re-dispatches it via
         ``ProxyMcpManager``, which enforces TOOL_CALL + TOOL_RESULT
-        policies server-side before forwarding to ``/mcp/execute``
-        (see ``omnigent/runner/app.py`` "All tool calls go through AP:/mcp
-        ... which enforces TOOL_CALL + TOOL_RESULT policies server-side").
+        policies through the server (``/policies/evaluate`` around runner
+        built-ins, ``/mcp`` for MCP tools).
         Spec-declared MCP tools are surfaced through that same
         ``mcp__omnigent__*`` server, so they are covered there too.
         Evaluating ``mcp__omnigent__*`` here as well would double-count

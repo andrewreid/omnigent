@@ -99,11 +99,65 @@ def register_mcp_routes(
     server_client: httpx.AsyncClient,
     spec_resolver: SpecResolver | None,
     terminal_registry: TerminalRegistry | None,
-) -> None:
+) -> Callable[[str, str, _JsonObject], Coroutine[Any, Any, str]]:
     """Register ``/mcp/execute``, ``/v1/summarize``, and ``/v1/elicitations`` on *app*.
 
     The keyword arguments are the runner app's shared session state and helpers.
+
+    :returns: The executor ``/mcp/execute`` uses for runner built-in tools, so
+        local dispatch runs them with the same session context.
     """
+
+    async def execute_runner_tool(
+        session_id: str,
+        tool_name: str,
+        arguments: _JsonObject,
+    ) -> str:
+        """Execute a runner built-in tool with the session's context.
+
+        :param session_id: Session id, e.g. ``"conv_abc123"``.
+        :param tool_name: Built-in tool name without ``__``, e.g. ``"sys_os_read"``.
+        :param arguments: Decoded tool arguments.
+        :returns: The tool output.
+        """
+        from omnigent.runner.tool_dispatch import execute_tool
+
+        if tool_name == "sys_read_inbox":
+            # A scan that failed at initialization must not leave the
+            # drain reporting an empty inbox; this is a no-op once done.
+            await _recover_undrained_subagent_results(session_id)
+        spec_entry = _session_spec_cache.get(session_id)
+        spec_workdir = _resolved_workdir_for_spec(spec_entry, runner_workspace)
+        spec = _unwrap_resolved_spec(spec_entry)
+        if spec is None and spec_resolver is not None:
+            try:
+                resolved_entry = await _resolve_session_spec_entry(session_id)
+                spec_workdir = _resolved_workdir_for_spec(resolved_entry, runner_workspace)
+                spec = _unwrap_resolved_spec(resolved_entry)
+            except (OmnigentError, httpx.HTTPError, RuntimeError):
+                pass
+        dispatch_workspace = await _session_runtime_cwd(session_id)
+        return await execute_tool(
+            tool_name=tool_name,
+            arguments=json.dumps(arguments),
+            server_client=server_client,
+            terminal_registry=terminal_registry,
+            resource_registry=resource_registry,
+            agent_spec=spec,
+            conversation_id=session_id,
+            task_id=session_id,
+            agent_id=_session_agent_ids.get(session_id),
+            agent_name=getattr(spec, "name", None),
+            runner_workspace=dispatch_workspace,
+            local_tool_workdir=spec_workdir,
+            mcp_manager=None,
+            session_inbox=_session_inboxes.get(session_id),
+            session_async_tasks=_session_async_tasks.get(session_id),
+            harness_client=None,
+            publish_event=_publish_event,
+            filesystem_registry=filesystem_registry,
+            effective_harness=_session_harness_name(session_id),
+        )
 
     @app.post("/v1/sessions/{session_id}/mcp/execute")
     async def mcp_execute(session_id: str, request: Request) -> JSONResponse:
@@ -217,10 +271,6 @@ def register_mcp_routes(
             )
 
         if method == "tools/call":
-            import json as _json
-
-            from omnigent.runner.tool_dispatch import execute_tool
-
             tool_name = cast(str, params.get("name") or "")
             arguments = cast(_JsonObject, params.get("arguments") or {})
             input_responses = cast(_JsonObject | None, params.get("inputResponses"))
@@ -230,11 +280,6 @@ def register_mcp_routes(
                     status_code=200,
                     content={"error": {"code": -32000, "message": "Missing tool name"}},
                 )
-
-            if tool_name == "sys_read_inbox":
-                # A scan that failed at initialization must not leave the
-                # drain reporting an empty inbox; this is a no-op once done.
-                await _recover_undrained_subagent_results(session_id)
 
             if "__" in tool_name:
                 if mcp_manager is None:
@@ -317,40 +362,8 @@ def register_mcp_routes(
                         },
                     )
             else:
-                spec_entry = _session_spec_cache.get(session_id)
-                spec_workdir = _resolved_workdir_for_spec(spec_entry, runner_workspace)
-                spec = _unwrap_resolved_spec(spec_entry)
-                if spec is None and spec_resolver is not None:
-                    try:
-                        resolved_entry = await _resolve_session_spec_entry(session_id)
-                        spec_workdir = _resolved_workdir_for_spec(resolved_entry, runner_workspace)
-                        spec = _unwrap_resolved_spec(resolved_entry)
-                    except (OmnigentError, httpx.HTTPError, RuntimeError):
-                        pass
-                _agent_id_local = _session_agent_ids.get(session_id)
                 try:
-                    dispatch_workspace = await _session_runtime_cwd(session_id)
-                    output = await execute_tool(
-                        tool_name=tool_name,
-                        arguments=_json.dumps(arguments),
-                        server_client=server_client,
-                        terminal_registry=terminal_registry,
-                        resource_registry=resource_registry,
-                        agent_spec=spec,
-                        conversation_id=session_id,
-                        task_id=session_id,
-                        agent_id=_agent_id_local,
-                        agent_name=getattr(spec, "name", None),
-                        runner_workspace=dispatch_workspace,
-                        local_tool_workdir=spec_workdir,
-                        mcp_manager=None,
-                        session_inbox=_session_inboxes.get(session_id),
-                        session_async_tasks=_session_async_tasks.get(session_id),
-                        harness_client=None,
-                        publish_event=_publish_event,
-                        filesystem_registry=filesystem_registry,
-                        effective_harness=_session_harness_name(session_id),
-                    )
+                    output = await execute_runner_tool(session_id, tool_name, arguments)
                 except Exception as exc:
                     _logger.exception(
                         "MCP tool dispatch failed for %s",
@@ -583,3 +596,5 @@ def register_mcp_routes(
                     "detail": _client_safe_error_detail(exc, context="elicitation forward"),
                 },
             )
+
+    return execute_runner_tool

@@ -296,8 +296,8 @@ def hook_payload_to_evaluation_request(
     ``PHASE_REQUEST`` event (the prompt text from the payload's
     ``prompt`` field becomes the request content). Omnigent MCP tools
     (``mcp__omnigent__*``) are skipped because they are already
-    policy-checked by the relay path (``ProxyMcpManager`` → Omnigent
-    ``/mcp`` endpoint → ``_evaluate_tool_call_policy``); evaluating
+    policy-checked by the relay path (``ProxyMcpManager``, which
+    evaluates through the Omnigent server); evaluating
     them here would double-count. Connector-native MCP tools
     (for example ``mcp__github__*``) still need this pre-call gate.
 
@@ -327,7 +327,7 @@ def hook_payload_to_evaluation_request(
         }
     tool_name = payload.get("tool_name", "")
     # Omnigent MCP tools are already policy-checked by the relay path
-    # (ProxyMcpManager → Omnigent /mcp endpoint → _evaluate_tool_call_policy).
+    # (ProxyMcpManager, which evaluates through the Omnigent server).
     # Skip only those here to avoid double evaluation; connector-native MCP
     # tools such as mcp__github__* must still go through this hook.
     if isinstance(tool_name, str) and tool_name.startswith("mcp__omnigent__"):
