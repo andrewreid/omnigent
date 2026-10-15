@@ -79,6 +79,43 @@ async def test_recovery_waiting_on_peer_keeps_receiving(
     assert recovery_complete.is_set()
 
 
+async def test_tunnel_loss_drops_no_policies_hints() -> None:
+    """Policy pushes ride the tunnel, so its loss ends every no-policies skip."""
+    from omnigent.runner import policy_proxy
+
+    session_id = "conv_tunnel_hint"
+    armed = asyncio.Event()
+
+    async def arm() -> None:
+        epoch = policy_proxy.no_policies_hint_epoch(session_id)
+        policy_proxy.note_no_policies(session_id, 120, epoch)
+        armed.set()
+
+    async def app(_scope: Any, _receive: Any, _send: Any) -> None:
+        raise AssertionError("No application request is expected")
+
+    async def peer(ws: ServerConnection) -> None:
+        assert isinstance(decode_frame(await ws.recv()), HelloFrame)
+        await armed.wait()
+        assert policy_proxy.no_policies_apply(session_id)
+        await ws.close()
+
+    async with serve(peer, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        await asyncio.wait_for(
+            _serve_tunnel_once(
+                app,
+                tunnel_url=f"ws://127.0.0.1:{port}/tunnel",
+                server_url=f"http://127.0.0.1:{port}",
+                runner_id="runner-hint",
+                runner_version="0.1.0",
+                on_ready=arm,
+            ),
+            timeout=2,
+        )
+    assert not policy_proxy.no_policies_apply(session_id)
+
+
 @pytest.mark.parametrize("shutdown_signal", [False, True])
 async def test_peer_close_cancels_pending_recovery(shutdown_signal: bool) -> None:
     recovery_started = asyncio.Event()

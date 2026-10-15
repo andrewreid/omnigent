@@ -29,13 +29,12 @@ from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
 from omnigent.llms.context_window import fetch_model_pricing_with_provider
 from omnigent.policies.base import Policy
-from omnigent.policies.builtins.safety import SCHEDULED_TASK_APPROVAL_TOOLS
 from omnigent.policies.function import resolve_function_policy
 from omnigent.policies.schema import (
     SESSION_COST_ASK_APPROVED_STATE_KEY,
     SESSION_COST_UNPRICED_APPROVED_KEY,
 )
-from omnigent.policies.types import PolicyLLMClient
+from omnigent.policies.types import ALWAYS_EVALUATED_TOOL_CALLS, PolicyLLMClient
 from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.spec.types import (
@@ -435,12 +434,9 @@ def any_policies_apply(
     :returns: ``False`` when the engine would have an empty policy list and
         ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
     """
-    # The engine unconditionally injects _REQUIRED_APPROVAL_SPECS, so their
-    # TOOL_CALL events must always reach it: never fast-path sys_add_policy
-    # or the scheduled-task mutation tools.
-    if phase == Phase.TOOL_CALL and (
-        tool_name == "sys_add_policy" or tool_name in SCHEDULED_TASK_APPROVAL_TOOLS
-    ):
+    # Persistent policy and schedule changes always require approval, even
+    # when no user-defined policy would otherwise build an engine.
+    if phase == Phase.TOOL_CALL and tool_name in ALWAYS_EVALUATED_TOOL_CALLS:
         return True
     if spec.guardrails and spec.guardrails.policies:
         return True
