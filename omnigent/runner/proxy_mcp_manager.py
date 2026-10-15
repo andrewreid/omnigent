@@ -1,10 +1,14 @@
 """Runner-side MCP proxy manager.
 
 Registry services use ``POST /v1/mcp/{service}`` with session context for
-server policy enforcement. Existing runner-local tools and custom MCPs use
-``POST /v1/sessions/{session_id}/mcp``. Both speak JSON-RPC 2.0.
+server policy enforcement. Custom MCPs use ``POST /v1/sessions/{session_id}/mcp``.
+Both speak JSON-RPC 2.0, and the server applies TOOL_CALL and TOOL_RESULT
+policies around execution.
 
-The server applies TOOL_CALL and TOOL_RESULT policies around execution.
+Runner built-in tools run in this process when a local executor is wired.
+Each phase is checked through ``POST /v1/sessions/{session_id}/policies/evaluate``
+(skipped while the server reports that no policy applies), and an ASK falls
+back to the session MCP endpoint, which owns the approval flow.
 :class:`ProxyMcpManager` implements the same public
 interface as :class:`omnigent.runner.mcp_manager.RunnerMcpManager` so
 it can be substituted transparently at every dispatch site in
@@ -26,11 +30,13 @@ import asyncio
 import json
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import cast
 
 import httpx
 
+from omnigent.policies.types import ALWAYS_EVALUATED_TOOL_CALLS
 from omnigent.runner import pending_approvals
 from omnigent.runner.mcp_execution_registry import (
     MCP_OPERATION_ID_PARAM,
@@ -38,14 +44,48 @@ from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
 from omnigent.runner.mcp_manager import McpSchemasResult
-from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S
+from omnigent.runner.policy_proxy import (
+    no_policies_apply,
+    no_policies_hint_epoch,
+    note_no_policies,
+)
+from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S, SERVER_EXECUTED_TOOLS
 from omnigent.spec.types import AgentSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
 _EventPublisher = Callable[[str, _JsonObject], None]
+#: Runs a runner built-in tool for ``(session_id, tool_name, arguments)``.
+LocalToolExecutor = Callable[[str, str, _JsonObject], Awaitable[str]]
 _SERVER_RECONNECT_WAIT_S = 120.0
+# ``POLICY_ACTION_UNSPECIFIED`` means the server found no agent to evaluate,
+# where the MCP endpoint refuses the call, so it never counts as a verdict.
+_RESULT_ACTIONS = frozenset({"POLICY_ACTION_ALLOW", "POLICY_ACTION_ASK", "POLICY_ACTION_DENY"})
+
+
+@dataclass(frozen=True)
+class _PolicyVerdict:
+    """One ``/policies/evaluate`` answer."""
+
+    action: str
+    reason: str | None
+    data: object
+    #: Whether the server echoed ``_omnigent_return_ask``; an older server
+    #: ignores the flag and resolves ASK itself without the reviewed arguments.
+    honoured: bool
+
+
+def _proxy_call_timeout() -> httpx.Timeout:
+    """Return the budget for one runner → server proxy request."""
+    # Short connect timeout still fails fast on an unreachable server; the
+    # read timeout covers ordinary proxy request hangs.
+    return httpx.Timeout(connect=10.0, read=MCP_PROXY_CALL_TIMEOUT_S, write=10.0, pool=10.0)
+
+
+def _mcp_text_result(text: str) -> str:
+    """Return *text* as the MCP endpoint path reports a single text block."""
+    return text if text else json.dumps({"content": [{"type": "text", "text": text}]})
 
 
 def _json_object(value: object) -> _JsonObject | None:
@@ -158,6 +198,7 @@ class ProxyMcpManager:
         ap_client: httpx.AsyncClient,
         publish_event: _EventPublisher | None = None,
         execution_registry: McpExecutionRegistry | None = None,
+        local_executor: LocalToolExecutor | None = None,
     ) -> None:
         """Create a proxy manager bound to one session.
 
@@ -171,11 +212,14 @@ class ProxyMcpManager:
             is irrelevant.
         :param execution_registry: Runner-owned MCP operations that a new
             server generation can reattach to after a tunnel replacement.
+        :param local_executor: Runs runner built-in tools in this process.
+            ``None`` sends every call through the server's MCP endpoint.
         """
         self._session_id = session_id
         self._omnigent_client = ap_client
         self._publish_event = publish_event
         self._execution_registry = execution_registry
+        self._local_executor = local_executor
         self._registry_services: set[str] = set()
 
     @property
@@ -341,10 +385,213 @@ class ProxyMcpManager:
         if registry is not None:
             registry.retain_operation(self._session_id, operation_id)
         try:
+            if self._runs_locally(tool_name):
+                return await self._call_local_tool(tool_name, arguments, operation_id)
             return await self._call_tool_with_operation(tool_name, arguments, operation_id)
         finally:
             if registry is not None:
                 registry.release_operation(self._session_id, operation_id)
+
+    def _runs_locally(self, tool_name: str) -> bool:
+        """Whether *tool_name* is a runner built-in this manager can execute.
+
+        Matches the runner MCP execute route: names with ``__`` belong to an
+        MCP server; tools the server itself executes keep the proxy path.
+        """
+        return (
+            self._local_executor is not None
+            and "__" not in tool_name
+            and tool_name not in SERVER_EXECUTED_TOOLS
+        )
+
+    async def _call_local_tool(
+        self,
+        tool_name: str,
+        arguments: _JsonObject,
+        operation_id: str,
+    ) -> str:
+        """Execute a runner built-in here, with server policy for each phase.
+
+        Mirrors the MCP endpoint: a TOOL_CALL DENY or an unevaluable check
+        never runs the tool, transformed arguments replace the originals, and
+        TOOL_RESULT may suppress or rewrite the output. An unevaluable result
+        check withholds the output, as the endpoint's error response does.
+        """
+        assert self._local_executor is not None
+        if tool_name in ALWAYS_EVALUATED_TOOL_CALLS or not no_policies_apply(self._session_id):
+            call_verdict = await self._evaluate_tool_policy(
+                tool_name,
+                operation_id,
+                {"type": "PHASE_TOOL_CALL", "data": {"name": tool_name, "arguments": arguments}},
+            )
+            if call_verdict is None:
+                return json.dumps(
+                    {"error": f"Policy check for {tool_name!r} failed; the tool was not run."}
+                )
+            if not call_verdict.honoured:
+                return await self._call_tool_with_operation(tool_name, arguments, operation_id)
+            if call_verdict.action == "POLICY_ACTION_DENY":
+                return json.dumps(
+                    {"error": f"Denied by policy: {call_verdict.reason or 'no reason given'}"}
+                )
+            if call_verdict.action == "POLICY_ACTION_ASK":
+                # The MCP endpoint parks, applies approved writes and reviewed
+                # arguments, executes, and checks the result.
+                return await self._call_tool_with_operation(tool_name, arguments, operation_id)
+            if call_verdict.action != "POLICY_ACTION_ALLOW":
+                return json.dumps(
+                    {"error": f"Policy check for {tool_name!r} failed; the tool was not run."}
+                )
+            if call_verdict.data is not None:
+                transformed = _json_object(call_verdict.data)
+                if transformed is None:
+                    return json.dumps(
+                        {"error": f"Policy rewrote {tool_name!r} arguments to a non-object."}
+                    )
+                arguments = transformed
+
+        try:
+            output = await self._local_executor(self._session_id, tool_name, arguments)
+        except Exception as exc:  # noqa: BLE001 — reported like the MCP execute route's error
+            from omnigent.runner.app_support import _client_safe_error_detail
+
+            return json.dumps(
+                {"error": _client_safe_error_detail(exc, context="MCP tool dispatch")}
+            )
+
+        if no_policies_apply(self._session_id):
+            return _mcp_text_result(output)
+        result_verdict = await self._evaluate_tool_policy(
+            tool_name,
+            operation_id,
+            {
+                "type": "PHASE_TOOL_RESULT",
+                "data": {"result": output},
+                "request_data": {"name": tool_name, "arguments": arguments},
+            },
+        )
+        if (
+            result_verdict is None
+            or not result_verdict.honoured
+            or result_verdict.action not in _RESULT_ACTIONS
+        ):
+            return json.dumps(
+                {"error": f"Policy check for the {tool_name!r} result failed; it was withheld."}
+            )
+        if result_verdict.action == "POLICY_ACTION_DENY":
+            output = f"[Result suppressed by policy: {result_verdict.reason or 'no reason given'}]"
+        elif result_verdict.data is not None:
+            if not isinstance(result_verdict.data, str):
+                _logger.warning(
+                    "TOOL_RESULT policy data must be str; got %s — coercing via str()",
+                    type(result_verdict.data).__name__,
+                    extra={"session_id": self._session_id},
+                )
+            output = str(result_verdict.data)
+        return _mcp_text_result(output)
+
+    async def _evaluate_tool_policy(
+        self,
+        tool_name: str,
+        operation_id: str,
+        event: _JsonObject,
+    ) -> _PolicyVerdict | None:
+        """POST one tool phase to ``/policies/evaluate``.
+
+        Waits for a replacement server after a transport failure, like the
+        MCP endpoint path. A fast-path answer arms the no-policies hint.
+
+        :returns: The verdict, or ``None`` when it could not be evaluated.
+        """
+        while True:
+            request_generation = pending_approvals.current_server_generation()
+            hint_epoch = no_policies_hint_epoch(self._session_id)
+            try:
+                resp = await self._omnigent_client.post(
+                    f"/v1/sessions/{self._session_id}/policies/evaluate",
+                    json={"event": event, "_omnigent_return_ask": True},
+                    timeout=_proxy_call_timeout(),
+                )
+            except httpx.TransportError as exc:
+                try:
+                    await self._wait_to_reattach(tool_name, operation_id, request_generation, exc)
+                except RuntimeError:
+                    _logger.warning(
+                        "%s policy evaluation for %s lost its server",
+                        event.get("type"),
+                        tool_name,
+                        exc_info=True,
+                        extra={"session_id": self._session_id},
+                    )
+                    return None
+                continue
+            except Exception:  # noqa: BLE001 — unevaluable verdicts fail closed
+                _logger.warning(
+                    "%s policy evaluation for %s failed",
+                    event.get("type"),
+                    tool_name,
+                    exc_info=True,
+                    extra={"session_id": self._session_id},
+                )
+                return None
+            break
+        body: _JsonObject | None = None
+        if resp.status_code == 200:
+            try:
+                body = _response_json_object(resp)
+            except ValueError:
+                body = None
+        action = body.get("result") if body is not None else None
+        if body is None or not isinstance(action, str):
+            _logger.warning(
+                "%s policy evaluation for %s returned HTTP %d without a verdict",
+                event.get("type"),
+                tool_name,
+                resp.status_code,
+                extra={"session_id": self._session_id},
+            )
+            return None
+        honoured = body.get("_omnigent_return_ask") is True
+        if honoured and action == "POLICY_ACTION_ALLOW":
+            note_no_policies(self._session_id, body.get("no_policies_ttl_s"), hint_epoch)
+        reason = body.get("reason")
+        return _PolicyVerdict(
+            action=action,
+            reason=reason if isinstance(reason, str) else None,
+            data=body.get("data"),
+            honoured=honoured,
+        )
+
+    async def _wait_to_reattach(
+        self,
+        tool_name: str,
+        operation_id: str,
+        request_generation: int,
+        cause: BaseException | None = None,
+    ) -> None:
+        """Wait for a replacement server to take over a retained operation.
+
+        :raises RuntimeError: When the operation is not retained or no
+            server reconnects in time.
+        """
+        registry = self._execution_registry
+        if registry is None or not registry.has_operation(self._session_id, operation_id):
+            raise RuntimeError(
+                f"MCP proxy call for tool {tool_name!r} in session "
+                f"{self._session_id!r} lost its server without a reserved "
+                "runner operation"
+            ) from cause
+        try:
+            await pending_approvals.wait_for_server_reconnect(
+                request_generation,
+                timeout_seconds=_SERVER_RECONNECT_WAIT_S,
+            )
+        except asyncio.TimeoutError as reconnect_exc:
+            raise RuntimeError(
+                f"MCP proxy call for tool {tool_name!r} in session "
+                f"{self._session_id!r} lost its server and no replacement "
+                f"connected within {_SERVER_RECONNECT_WAIT_S:.0f}s"
+            ) from reconnect_exc
 
     async def _call_tool_with_operation(
         self,
@@ -371,29 +618,6 @@ class ProxyMcpManager:
                 },
             }
 
-        async def _wait_to_reattach(
-            request_generation: int,
-            cause: BaseException | None = None,
-        ) -> None:
-            registry = self._execution_registry
-            if registry is None or not registry.has_operation(self._session_id, operation_id):
-                raise RuntimeError(
-                    f"MCP proxy call for tool {tool_name!r} in session "
-                    f"{self._session_id!r} lost its server without a reserved "
-                    "runner operation"
-                ) from cause
-            try:
-                await pending_approvals.wait_for_server_reconnect(
-                    request_generation,
-                    timeout_seconds=_SERVER_RECONNECT_WAIT_S,
-                )
-            except asyncio.TimeoutError as reconnect_exc:
-                raise RuntimeError(
-                    f"MCP proxy call for tool {tool_name!r} in session "
-                    f"{self._session_id!r} lost its server and no replacement "
-                    f"connected within {_SERVER_RECONNECT_WAIT_S:.0f}s"
-                ) from reconnect_exc
-
         payload = _initial_payload()
         approval_retries = 0
 
@@ -404,16 +628,9 @@ class ProxyMcpManager:
                     url,
                     json=payload,
                     headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},
-                    # Short connect timeout still fails fast on an unreachable
-                    # server; the read timeout covers ordinary proxy request
-                    # hangs. Sub-agent dispatch returns an async handle
-                    # immediately and no longer holds this call for a child turn.
-                    timeout=httpx.Timeout(
-                        connect=10.0,
-                        read=MCP_PROXY_CALL_TIMEOUT_S,
-                        write=10.0,
-                        pool=10.0,
-                    ),
+                    # Sub-agent dispatch returns an async handle immediately
+                    # and no longer holds this call for a child turn.
+                    timeout=_proxy_call_timeout(),
                 )
                 resp.raise_for_status()
                 data = _response_json_object(resp)
@@ -423,7 +640,7 @@ class ProxyMcpManager:
                         "MCP gateway transport failed; completion is unknown. "
                         "Call was not retried."
                     ) from exc
-                await _wait_to_reattach(request_generation, exc)
+                await self._wait_to_reattach(tool_name, operation_id, request_generation, exc)
                 # Reattach the new server generation to the same runner-owned
                 # operation. A fresh JSON-RPC id distinguishes this transport
                 # attempt; the operation id prevents external work from replaying.
@@ -445,7 +662,7 @@ class ProxyMcpManager:
                 code = err.get("code")
                 msg = err.get("message", "")
                 if code == RUNNER_MCP_EXECUTION_DETACHED_CODE:
-                    await _wait_to_reattach(request_generation)
+                    await self._wait_to_reattach(tool_name, operation_id, request_generation)
                     request_id += 1
                     payload = cast("_JsonObject", {**payload, "id": request_id})
                     continue
