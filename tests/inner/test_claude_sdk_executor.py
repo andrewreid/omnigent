@@ -3999,6 +3999,128 @@ if __name__ == "__main__":
     unittest.main()
 
 
+@pytest.mark.asyncio
+async def test_cli_builtin_tools_do_not_shift_omnigent_dispatch_call_ids() -> None:
+    """Every tool renders under its own call_id and receives exactly one output.
+
+    The SDK MCP handler gets no tool_use id, so the adapter pairs dispatches
+    with observed ids FIFO. CLI built-ins must stay out of that queue.
+    """
+    from claude_agent_sdk import types as sdk
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    prefix = "mcp__omnigent__"
+    calls = [
+        ("toolu_1", "Skill", {"skill": "orchestrate"}),
+        ("toolu_2", "ToolSearch", {"query": "select:sys_session_send"}),
+        ("toolu_3", f"{prefix}sys_session_get_info", {"session_id": "a"}),
+        ("toolu_4", f"{prefix}sys_session_get_info", {"session_id": "b"}),
+        ("toolu_5", f"{prefix}sys_session_send", {"session_id": "a", "message": "go"}),
+    ]
+
+    class _FakeSDK(_sdk_types(), _SDKTools):
+        AssistantMessage = sdk.AssistantMessage
+        UserMessage = sdk.UserMessage
+        ResultMessage = sdk.ResultMessage
+        ClaudeAgentOptions = sdk.ClaudeAgentOptions
+        TextBlock = sdk.TextBlock
+        ThinkingBlock = sdk.ThinkingBlock
+        ToolUseBlock = sdk.ToolUseBlock
+        ToolResultBlock = sdk.ToolResultBlock
+
+        class ClaudeSDKClient(_SDKClient):
+            async def receive_response(self):
+                servers = self.options.mcp_servers
+                handlers = {t.name: type(t).handler for t in servers["omnigent"]["tools"]}
+                # The two get_info calls share one assistant message (parallel tool use).
+                for batch in (calls[:1], calls[1:2], calls[2:4], calls[4:]):
+                    yield sdk.AssistantMessage(
+                        content=[sdk.ToolUseBlock(id=i, name=n, input=a) for i, n, a in batch],
+                        model="claude-sonnet-4",
+                    )
+                    results = []
+                    for tool_use_id, name, args in batch:
+                        if name.startswith(prefix):
+                            # The CLI runs Omnigent tools through the in-process MCP handler.
+                            handler = handlers[name.removeprefix(prefix)]
+                            content = (await handler(args))["content"]
+                        else:
+                            content = f"{name} ran in the CLI"
+                        results.append(
+                            sdk.ToolResultBlock(tool_use_id=tool_use_id, content=content)
+                        )
+                    yield sdk.UserMessage(content=results)
+                yield sdk.ResultMessage(
+                    subtype="result",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=1,
+                    session_id="s1",
+                    result="done",
+                )
+
+    class _DispatchingTurnContext:
+        """Emits a dispatched call's function_call and output like ``TurnContext``."""
+
+        session_id = None
+        response_id = "resp_1"
+
+        def __init__(self) -> None:
+            self.items: list[dict] = []
+
+        def emit(self, event) -> None:
+            self.items.append(event.item)
+
+        async def dispatch_tool(self, *, call_id: str, name: str, arguments: str, agent: str):
+            del agent
+            self.items.append(
+                {"type": "function_call", "status": "completed", "name": name, "call_id": call_id}
+            )
+            output = json.dumps({"ran": name, "args": json.loads(arguments)})
+            self.items.append(
+                {"type": "function_call_output", "call_id": call_id, "output": output}
+            )
+            return output
+
+    executor = ClaudeSDKExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = _DispatchingTurnContext()
+    executor._tool_executor = adapter._stable_tool_executor
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+    adapter._current_agent = "agent"
+    schemas = [
+        {"name": name, "description": name, "parameters": {"type": "object"}}
+        for name in ("sys_session_get_info", "sys_session_send")
+    ]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        async for event in executor.run_turn([{"role": "user", "content": "go"}], schemas, ""):
+            adapter._translate_event(event, ctx)  # type: ignore[arg-type]
+
+    names_by_call_id: dict[str, set[str]] = {}
+    outputs_by_call_id: dict[str, list[str]] = {}
+    for item in ctx.items:
+        if item["type"] == "function_call":
+            names_by_call_id.setdefault(item["call_id"], set()).add(item["name"])
+        elif item["type"] == "function_call_output":
+            outputs_by_call_id.setdefault(item["call_id"], []).append(item["output"])
+
+    assert names_by_call_id == {
+        tool_use_id: {name.removeprefix(prefix)} for tool_use_id, name, _ in calls
+    }
+    assert {call_id: len(outputs) for call_id, outputs in outputs_by_call_id.items()} == {
+        tool_use_id: 1 for tool_use_id, _, _ in calls
+    }
+    for tool_use_id, name, args in calls[2:]:
+        assert json.loads(outputs_by_call_id[tool_use_id][0]) == {
+            "ran": name.removeprefix(prefix),
+            "args": args,
+        }
+    assert list(adapter._pending_mcp_call_ids) == []
+
+
 # ---------------------------------------------------------------------------
 # Tests: TurnComplete.usage populated from ResultMessage.usage
 # ---------------------------------------------------------------------------
