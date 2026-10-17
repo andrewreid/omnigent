@@ -26,18 +26,27 @@ threads, check runs and required check/status results. Apply in order:
    are expected. Newly appearing checks retire that exemption. Read legacy
    statuses too where configured; don't confuse their absence with check success.
 5. Checks pass and every bot finding on the current head has an outcome (fixed,
-   follow-up issue, or advisory) with no unresolved required gate: external
+   deferred, or advisory) with no unresolved required gate: external
    readiness established. A clean bot verdict is not required.
 6. Otherwise submit the current evidence and return.
 
 Report exactly what is pending. Never call silence approval.
-A valid FOLLOW_UP needs no edit: open a follow-up issue, reply on the thread with
-the disposition and link, then resolve it. ADVISORY: reply with the rationale,
-then resolve. Resolve only threads you replied to. Ask the human only when a
-required defect cannot be fixed within scope.
+Give every finding one outcome. Fix in this PR: a real defect in the plan's area
+with a small, local fix (the default for in-scope nits). FOLLOW_UP: a real defect
+with real-world impact outside the plan, or one that would materially grow the
+PR. ADVISORY: a speculative edge case with no realistic trigger here, a style
+preference, or hardening against threats not in play. For both, reply on the
+thread with the outcome and resolve it, then list it in the result's `deferred`;
+the factory files one follow-up issue per PR. If the issue is itself a follow-up,
+defer nothing as a follow-up. Resolve only threads you replied to. From review
+round strict_from_round (factory_get_status) only P1 findings with real impact
+must be fixed; once the rounds are used up, fix remaining in-scope P1s, defer the
+rest and do not request another review. Work the owner directs be filed
+separately is not a finding: list it in `split_out`. Never open issues yourself.
+Ask the human only when a required defect cannot be fixed within scope.
 
 Use remediate's shared budget and targeted recheck for fixes. After accepted
 fixes, publish an additional commit with a plain push. Reply in-thread with each
-disposition (the factory authorizes this, issue creation and thread resolution
-through the bot wrapper), then resolve that thread, and request review on the PR
-root. Refresh the bot verdict for the new head. Report unresolved thread counts.
+disposition (the factory authorizes this and thread resolution through the bot
+wrapper), then resolve that thread, and request review on the PR root while
+review rounds remain. Refresh the bot verdict for the new head. Report unresolved thread counts.
