@@ -7094,12 +7094,16 @@ def create_runner_app(
             # more than consent (an MCP ``requestedSchema``). Dropping it here
             # is what used to make the awaiting caller invent one.
             _elicit_content = _data.get("content")
-            pending_approvals.resolve(
-                _data.get("elicitation_id", ""),
+            _elicitation_id = _data.get("elicitation_id", "")
+            _runner_owned = pending_approvals.owns(_elicitation_id)
+            _delivered = pending_approvals.resolve(
+                _elicitation_id,
                 _elicit_action == "accept",
                 _elicit_content if isinstance(_elicit_content, dict) else None,
             )
-            if _elicit_action == "decline":
+            # A repeat of a verdict this runner already applied must not
+            # interrupt whatever turn is running now.
+            if _elicit_action == "decline" and (_delivered or not _runner_owned):
                 try:
                     _int_client = await process_manager.get_client(conversation_id, "any")
                     await _int_client.post(
@@ -7109,6 +7113,15 @@ def create_runner_app(
                     )
                 except Exception:  # noqa: BLE001 — best-effort; deny path continues
                     pass
+            if _runner_owned:
+                # The runner parked on this prompt (an MCP ASK); the harness
+                # has no record of it, so forwarding would only 404.
+                if not _delivered:
+                    _logger.info(
+                        "approval for %s already settled on the runner; ignoring repeat",
+                        _elicitation_id,
+                    )
+                return Response(status_code=204)
             body = {**_data, "type": "approval"}
 
         try:
