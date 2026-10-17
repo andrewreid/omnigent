@@ -106,6 +106,7 @@ from omnigent.stores.conversation_store import (
     ConversationUpdateResult,
     CreatedSession,
     DailyCostState,
+    DescendantConversation,
     SessionConnectivity,
     pinned_label_key,
 )
@@ -174,6 +175,11 @@ _LIST_ITEMS_MAX_ROWS_PER_STATEMENT = 200
 # bound keeps the archived-filter query's ``IN`` list small and caps the work a
 # pathological directory can impose on a delete. Hitting it answers "in use".
 _WORKSPACE_SHARER_SCAN_LIMIT = 32
+
+# Recursion bound for ``list_descendant_conversations`` when no ``max_depth`` is
+# given. Parent links are fixed at creation, so real trees never approach it; it
+# only stops a corrupt parent cycle from recursing forever.
+_MAX_DESCENDANT_DEPTH = 1000
 
 
 class _RowCountResult(Protocol):
@@ -589,6 +595,28 @@ def _fetch_labels(
             .all()
         )
     return dict(rows)
+
+
+def _fetch_metadata_bulk(
+    meta_sess: Session,
+    conversation_ids: list[str],
+) -> dict[str, SqlConversationMetadata]:
+    """
+    Load Omnigent-DB metadata rows for many conversations in one query.
+
+    :param meta_sess: Open Omnigent-DB session.
+    :param conversation_ids: Conversation ids, e.g. ``["conv_abc123"]``.
+    :returns: ``{conversation_id: metadata_row}``; ids without a row are absent.
+    """
+    if not conversation_ids:
+        return {}
+    rows = meta_sess.execute(
+        select(SqlConversationMetadata).where(
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.id.in_(conversation_ids),
+        )
+    ).scalars()
+    return {row.id: row for row in rows}
 
 
 def _fetch_labels_bulk(
@@ -1386,21 +1414,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # too — _to_conversation reads ORM columns, which would raise
             # DetachedInstanceError once the session closes.
             labels_by_conv = _fetch_labels_bulk(session, [row.id for row in rows])
-        meta_rows: list[SqlConversationMetadata] = []
+        meta_by_id: dict[str, SqlConversationMetadata] = {}
         if rows:
-            row_ids = [r.id for r in rows]
             with self._session("get_conversations") as meta_sess:
-                meta_rows = list(
-                    meta_sess.execute(
-                        select(SqlConversationMetadata).where(
-                            SqlConversationMetadata.workspace_id == current_workspace_id(),
-                            SqlConversationMetadata.id.in_(row_ids),
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-        meta_by_id = {m.id: m for m in meta_rows}
+                meta_by_id = _fetch_metadata_bulk(meta_sess, [r.id for r in rows])
         return {
             row.id: _to_conversation(
                 row,
@@ -1477,6 +1494,140 @@ class SqlAlchemyConversationStore(ConversationStore):
                     ).limit(limit)
                 ).all()
             ]
+
+    def list_descendant_conversations(
+        self,
+        conversation_id: str,
+        *,
+        root_conversation_id: str | None = None,
+        limit: int = 100,
+        after: str | None = None,
+        include_archived: bool = False,
+        max_depth: int | None = None,
+    ) -> PagedList[DescendantConversation]:
+        """
+        Page through a subtree with one recursive query per page.
+
+        The recursive step joins on the CTE's own ``workspace_id`` so it can
+        only be driven from subtree rows through ``idx_conversations_parent``;
+        a constant workspace filter let SQLite scan the workspace instead. The
+        CTE also carries every sort and filter column, so ordering and paging
+        never join back over unrelated conversations, and full rows are then
+        read by primary key for the page only. See
+        :meth:`ConversationStore.list_descendant_conversations`.
+        """
+        depth_bound = _MAX_DESCENDANT_DEPTH if max_depth is None else max_depth
+        anchor = select(
+            SqlConversation.workspace_id,
+            SqlConversation.id,
+            literal(0).label("depth"),
+            SqlConversation.created_at,
+            SqlConversation.archived,
+            self._tiebreaker_col.label("tiebreaker"),
+        ).where(
+            SqlConversation.workspace_id == current_workspace_id(),
+            SqlConversation.id == conversation_id,
+        )
+        if root_conversation_id is not None:
+            anchor = anchor.where(SqlConversation.root_conversation_id == root_conversation_id)
+        tree = anchor.cte(name="descendants", recursive=True)
+        tree = tree.union_all(
+            select(
+                SqlConversation.workspace_id,
+                SqlConversation.id,
+                (tree.c.depth + 1).label("depth"),
+                SqlConversation.created_at,
+                SqlConversation.archived,
+                self._tiebreaker_col.label("tiebreaker"),
+            )
+            .select_from(tree)
+            .join(
+                SqlConversation,
+                and_(
+                    SqlConversation.workspace_id == tree.c.workspace_id,
+                    SqlConversation.parent_conversation_id == tree.c.id,
+                ),
+            )
+            # Also bounds the recursion should a corrupt parent link form a cycle.
+            .where(tree.c.depth < depth_bound)
+        )
+        # One row per id at its shallowest depth, so a cycle cannot repeat ids.
+        nodes = (
+            select(
+                tree.c.id,
+                func.min(tree.c.depth).label("depth"),
+                tree.c.created_at,
+                tree.c.archived,
+                tree.c.tiebreaker,
+            )
+            .group_by(tree.c.id, tree.c.created_at, tree.c.archived, tree.c.tiebreaker)
+            .subquery("subtree")
+        )
+        visible = [nodes.c.depth >= 1]
+        if not include_archived:
+            visible.append(nodes.c.archived.is_(False))
+        sort_key = (nodes.c.depth, nodes.c.created_at, nodes.c.tiebreaker)
+
+        with self._conv_session("list_descendant_conversations") as session:
+            page_stmt = select(nodes.c.id, nodes.c.depth).where(*visible)
+            if after is not None:
+                cursor_row = session.execute(
+                    select(*sort_key).where(*visible, nodes.c.id == after)
+                ).first()
+                if cursor_row is None:
+                    raise StaleCursorError(after)
+                cursor_depth, cursor_created_at, cursor_tiebreaker = cursor_row
+                # Bind with column types; see _apply_cursor for why tuple_ needs them.
+                page_stmt = page_stmt.where(
+                    tuple_(*sort_key)
+                    > tuple_(
+                        literal(cursor_depth),
+                        literal(cursor_created_at, SqlConversation.created_at.type),
+                        literal(cursor_tiebreaker, self._tiebreaker_col.type)
+                        if isinstance(self._tiebreaker_col, QueryableAttribute)
+                        else cursor_tiebreaker,
+                    )
+                )
+            page = session.execute(page_stmt.order_by(*sort_key).limit(limit + 1)).all()
+            has_more = len(page) > limit
+            depth_by_id = {row.id: row.depth for row in page[:limit]}
+            rows_by_id: dict[str, SqlConversation] = {}
+            labels_by_conv: dict[str, dict[str, str]] = {}
+            if depth_by_id:
+                rows_by_id = {
+                    row.id: row
+                    for row in session.execute(
+                        select(SqlConversation).where(
+                            SqlConversation.workspace_id == current_workspace_id(),
+                            SqlConversation.id.in_(list(depth_by_id)),
+                        )
+                    ).scalars()
+                }
+                labels_by_conv = _fetch_labels_bulk(session, list(rows_by_id))
+        meta_by_id: dict[str, SqlConversationMetadata] = {}
+        if rows_by_id:
+            with self._session("list_descendant_conversations") as meta_sess:
+                meta_by_id = _fetch_metadata_bulk(meta_sess, list(rows_by_id))
+        # Page order; a row deleted between the two reads is skipped.
+        data = [
+            DescendantConversation(
+                conversation=_to_conversation(
+                    rows_by_id[conv_id],
+                    meta_by_id.get(conv_id),
+                    labels_by_conv.get(conv_id, {}),
+                ),
+                depth=depth,
+            )
+            for conv_id, depth in depth_by_id.items()
+            if conv_id in rows_by_id
+        ]
+        return PagedList(
+            data=data,
+            first_id=data[0].conversation.id if data else None,
+            # Falls back to the last paged id so a page whose rows all vanished still advances.
+            last_id=data[-1].conversation.id if data else next(reversed(depth_by_id), None),
+            has_more=has_more,
+        )
 
     def set_labels(
         self,

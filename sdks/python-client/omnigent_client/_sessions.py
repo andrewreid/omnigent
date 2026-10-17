@@ -24,6 +24,7 @@ from __future__ import annotations
 import builtins
 import json
 import logging
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -34,7 +35,13 @@ from pydantic import TypeAdapter
 from omnigent.server.schemas import ServerStreamEvent
 
 from ._child_status import child_summary_busy
-from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
+from ._errors import (
+    OmnigentError,
+    StaleCursorError,
+    raise_for_status,
+    require_json_object,
+    response_body,
+)
 from ._timeouts import _SSE_TIMEOUT
 from ._types import PaginatedList
 
@@ -42,6 +49,13 @@ from ._types import PaginatedList
 # ``MAX_TREE_DEPTH`` and the REPL's ``_MAX_SUBAGENT_TREE_DEPTH`` so the SDK
 # rollup, the CLI ``↓`` tree, and the web Agents rail all walk the same depth.
 _DEFAULT_SUBTREE_DEPTH = 3
+
+# Full restarts of a descendants walk after a page cursor was deleted mid-walk.
+_DESCENDANTS_STALE_CURSOR_ATTEMPTS = 3
+
+# How long a 404 from the descendants route keeps the client on the per-node
+# walk before probing again, so a misread 404 or a server upgrade self-heals.
+_DESCENDANTS_REPROBE_SECONDS = 300.0
 
 # Adapter that validates a single SSE ``data:`` payload against the
 # typed discriminated union. Built once at module load — TypeAdapter
@@ -372,6 +386,8 @@ class SessionsNamespace:
         """
         self._http = http
         self._base = base_url
+        # Monotonic deadline before which the descendants route is assumed absent.
+        self._descendants_route_missing_until = 0.0
 
     async def create(
         self,
@@ -951,8 +967,8 @@ class SessionsNamespace:
         returns a page of ``ChildSessionSummary`` dicts (``id``,
         ``title``, ``tool``, ``agent_name``, ``busy``,
         ``current_task_status``, ``last_message_preview``,
-        ``pending_elicitations_count``, …). The REPL recurses this per
-        node to assemble the sub-agent tree shown on the main interface.
+        ``pending_elicitations_count``, …). One level only; use
+        :meth:`descendants` or :meth:`child_sessions_tree` for a subtree.
 
         :param session_id: Parent session/conversation identifier,
             e.g. ``"conv_parent123"``.
@@ -976,32 +992,130 @@ class SessionsNamespace:
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/child_sessions")
         return PaginatedList.from_dict(body)
 
+    async def descendants(
+        self,
+        session_id: str,
+        *,
+        include_archived: bool = False,
+        max_depth: int | None = None,
+        limit: int = 100,
+        include_previews: bool = True,
+    ) -> builtins.list[dict[str, Any]]:
+        """List every sub-agent beneath *session_id*, at any depth.
+
+        Pages through ``GET /v1/sessions/{session_id}/descendants`` and
+        returns all ``DescendantSessionSummary`` dicts, breadth-first. Each
+        row carries ``parent_session_id`` and ``depth`` (direct children are
+        1). Live sessions under an archived one are returned even when
+        archived rows are excluded. *session_id* itself is not included.
+
+        :param session_id: Subtree root, e.g. ``"conv_parent123"``.
+        :param include_archived: Also return archived descendants.
+        :param max_depth: Deepest level to return; ``None`` is unbounded.
+        :param limit: Page size (1-1000).
+        :param include_previews: Populate ``last_message_preview``. ``False``
+            skips the server's message read when only shape and status matter.
+        :returns: Every descendant summary dict (empty for a leaf).
+        :raises OmnigentError: On non-2xx status (404 when the session does
+            not exist, or on servers without this route).
+        """
+        params: dict[str, str | int] = {"limit": limit}
+        if include_archived:
+            params["include_archived"] = "true"
+        if max_depth is not None:
+            params["max_depth"] = max_depth
+        if not include_previews:
+            params["include_previews"] = "false"
+        for attempt in range(_DESCENDANTS_STALE_CURSOR_ATTEMPTS):
+            rows: list[dict[str, Any]] = []
+            after: str | None = None
+            try:
+                while True:
+                    page_params = params if after is None else {**params, "after": after}
+                    resp = await self._http.get(
+                        f"{self._base}/v1/sessions/{session_id}/descendants",
+                        params=page_params,
+                    )
+                    raise_for_status(resp.status_code, response_body(resp))
+                    body = require_json_object(resp, "GET /v1/sessions/{session_id}/descendants")
+                    data = body.get("data")
+                    if isinstance(data, list):
+                        rows.extend(row for row in data if isinstance(row, dict))
+                    last_id = body.get("last_id")
+                    # A cursor that does not advance would loop forever.
+                    if (
+                        not body.get("has_more")
+                        or not isinstance(last_id, str)
+                        or last_id == after
+                    ):
+                        return rows
+                    after = last_id
+            except StaleCursorError:
+                # The cursor row was deleted mid-walk; restart from the first page.
+                if attempt == _DESCENDANTS_STALE_CURSOR_ATTEMPTS - 1:
+                    raise
+        raise AssertionError("unreachable")
+
     async def child_sessions_tree(
         self,
         session_id: str,
         *,
         max_depth: int = _DEFAULT_SUBTREE_DEPTH,
         limit: int = 100,
+        include_previews: bool = True,
     ) -> builtins.list[dict[str, Any]]:
         """List the whole sub-agent subtree under *session_id*, flattened.
 
-        :meth:`child_sessions` is one level deep; this recurses it breadth-first
-        to *max_depth*, mirroring web's ``useChildSessions`` per-node fetch.
-        Each returned row is the raw ``ChildSessionSummary`` dict with an added
-        ``parent_id`` recording the session it was queried under, so callers can
+        One :meth:`descendants` walk, so the request count scales with pages,
+        not nodes. Each returned row is the ``ChildSessionSummary`` dict with
+        an added ``parent_id`` naming its direct parent, so callers can
         reconstruct the hierarchy. *session_id* itself is not included.
 
-        This is the shared recursion behind both the CLI ``↓`` sub-agent tree
+        This is the shared source behind both the CLI ``↓`` sub-agent tree
         (the REPL seeds its registry from this) and :meth:`subtree_busy`.
 
         :param session_id: Root parent session identifier.
         :param max_depth: Levels to descend (1 = direct children only). Capped
             to match the CLI tree and the web Agents rail.
-        :param limit: Per-level page size passed to :meth:`child_sessions`.
+        :param limit: Page size for the descendants listing.
+        :param include_previews: Populate ``last_message_preview`` (see
+            :meth:`descendants`). Older servers always populate it.
         :returns: Flattened list of child-session summary dicts, each carrying a
             ``parent_id`` key (empty when the session has no sub-agents).
         :raises OmnigentError: On non-2xx status (404 when the session does not
             exist).
+        """
+        if time.monotonic() < self._descendants_route_missing_until:
+            return await self._child_sessions_tree_per_node(
+                session_id, max_depth=max_depth, limit=limit
+            )
+        try:
+            rows = await self.descendants(
+                session_id, max_depth=max_depth, limit=limit, include_previews=include_previews
+            )
+        except OmnigentError as exc:
+            if exc.status_code != 404:
+                raise
+            # Either an older server without the route or a missing session.
+            # Only the former survives the per-node walk, so remember it then.
+            nodes = await self._child_sessions_tree_per_node(
+                session_id, max_depth=max_depth, limit=limit
+            )
+            self._descendants_route_missing_until = time.monotonic() + _DESCENDANTS_REPROBE_SECONDS
+            return nodes
+        return [{**row, "parent_id": row.get("parent_session_id")} for row in rows]
+
+    async def _child_sessions_tree_per_node(
+        self,
+        session_id: str,
+        *,
+        max_depth: int,
+        limit: int,
+    ) -> builtins.list[dict[str, Any]]:
+        """Walk :meth:`child_sessions` once per node, for servers before 0.19.
+
+        @deprecated: remove in 0.20.0, once servers without
+        ``GET /v1/sessions/{id}/descendants`` are unsupported.
         """
         nodes: list[dict[str, Any]] = []
         seen: set[str] = {session_id}
@@ -1049,7 +1163,9 @@ class SessionsNamespace:
         :returns: ``True`` while any descendant is busy, else ``False``.
         :raises OmnigentError: On non-2xx status.
         """
-        nodes = await self.child_sessions_tree(session_id, max_depth=max_depth, limit=limit)
+        nodes = await self.child_sessions_tree(
+            session_id, max_depth=max_depth, limit=limit, include_previews=False
+        )
         return any(child_summary_busy(node) for node in nodes)
 
     async def get(self, session_id: str) -> Session:

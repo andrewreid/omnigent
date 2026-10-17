@@ -3154,8 +3154,8 @@ class TerminalHost:
             node.title = child.get("title")
         # Adopt only a REAL (non-null) task status. The live SSE
         # (``session.child_session.updated``) delivers a real
-        # ``current_task_status``, but the REST poll (used for deeper tree
-        # levels) hardcodes it to ``None`` — letting that null overwrite the
+        # ``current_task_status``, but the REST poll reports ``None`` when the
+        # server has no cached status — letting that null overwrite the
         # status would erase the SSE-delivered terminal state and resurrect a
         # finished sub-agent on every 2 s poll.
         incoming_status = child.get("current_task_status")
