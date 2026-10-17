@@ -9779,6 +9779,63 @@ async def test_approval_event_without_content_flattened() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["accept", "decline"])
+async def test_runner_owned_approval_is_not_forwarded_to_harness(action: str) -> None:
+    """An approval the runner parked on resolves here, once, without a harness hop.
+
+    The MCP ASK parks in the runner, so the harness has nothing to resolve
+    and would 404. A repeated verdict for the same card must not reach the
+    harness either, nor interrupt the turn a second time.
+    """
+    from omnigent.runner import pending_approvals
+
+    posted: list[dict[str, Any]] = []
+
+    class _CapturingHarnessClient:
+        async def post(
+            self, url: str, *, json: dict[str, Any], timeout: float | None = None
+        ) -> httpx.Response:
+            posted.append(json)
+            return httpx.Response(404)
+
+    mgr = _FakeProcessManager(harness_client=cast(Any, _CapturingHarnessClient()))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, mgr),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    verdict = pending_approvals.register("elicit_runner_owned")
+    try:
+        async with _runner_test_client(app) as http:
+            responses = [
+                await http.post(
+                    "/v1/sessions/conv_owned/events",
+                    json={
+                        "type": "approval",
+                        "data": {"elicitation_id": "elicit_runner_owned", "action": action},
+                    },
+                )
+                for _ in range(2)
+            ]
+            pending_approvals.cleanup("elicit_runner_owned")
+            responses.append(
+                await http.post(
+                    "/v1/sessions/conv_owned/events",
+                    json={
+                        "type": "approval",
+                        "data": {"elicitation_id": "elicit_runner_owned", "action": action},
+                    },
+                )
+            )
+    finally:
+        pending_approvals.cleanup("elicit_runner_owned")
+
+    assert [r.status_code for r in responses] == [204, 204, 204]
+    assert verdict.result().approved is (action == "accept")
+    # Only the first decline interrupts the turn; nothing else reaches the harness.
+    assert posted == ([{"type": "interrupt"}] if action == "decline" else [])
+
+
+@pytest.mark.asyncio
 async def test_spawn_handle_round_trips_to_sys_cancel_async(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
