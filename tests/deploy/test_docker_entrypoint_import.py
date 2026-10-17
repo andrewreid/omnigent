@@ -235,3 +235,33 @@ def test_resolve_execution_timeout(cfg: dict[str, int], expected_timeout: int) -
     from deploy.docker.entrypoint import _resolve_execution_timeout
 
     assert _resolve_execution_timeout(cfg) == expected_timeout
+
+
+# ── MCP registry wiring ───────────────────────────────────────────────────
+# OMNIGENT_MCP_REGISTRY must mount the managed-MCP routes in the container,
+# exactly as it does under `omnigent server`.
+
+
+def test_build_app_mounts_mcp_registry_from_env(
+    _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from deploy.docker.entrypoint import _resolve_config, build_app, run_migrations
+
+    registry_file = tmp_path / "mcp-registry.yaml"
+    registry_file.write_text(
+        "services:\n"
+        "  - id: tracker\n"
+        "    title: Tracker\n"
+        "    url: https://mcp.example.test/mcp\n"
+        "    auth: none\n"
+        "    tools: [read_ticket]\n"
+    )
+    monkeypatch.setenv("OMNIGENT_MCP_REGISTRY", str(registry_file))
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'entrypoint.db'}")
+    resolved = _resolve_config()
+    run_migrations(resolved.database_url)
+
+    app = build_app(resolved).app
+
+    assert list(app.state.mcp_registry.services) == ["tracker"]
+    assert "/v1/mcp-registry/services" in {route.path for route in app.routes}
