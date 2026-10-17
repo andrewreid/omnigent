@@ -34,7 +34,7 @@ from omnigent.policies.schema import (
     SESSION_COST_ASK_APPROVED_STATE_KEY,
     SESSION_COST_UNPRICED_APPROVED_KEY,
 )
-from omnigent.policies.types import PolicyLLMClient
+from omnigent.policies.types import ALWAYS_EVALUATED_TOOL_CALLS, PolicyLLMClient
 from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.spec.types import (
@@ -492,11 +492,7 @@ def any_policies_apply(
     """
     # Persistent policy and schedule changes always require approval, even
     # when no user-defined policy would otherwise build an engine.
-    if phase == Phase.TOOL_CALL and tool_name in {
-        "sys_add_policy",
-        "sys_scheduled_task_create",
-        "sys_scheduled_task_update",
-    }:
+    if phase == Phase.TOOL_CALL and tool_name in ALWAYS_EVALUATED_TOOL_CALLS:
         return True
     if spec.guardrails and spec.guardrails.policies:
         return True
