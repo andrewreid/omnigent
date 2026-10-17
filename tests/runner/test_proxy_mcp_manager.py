@@ -168,9 +168,10 @@ class _RetainedExecutionTransport(httpx.AsyncBaseTransport):
 
     Each request consumes one scripted outcome: ``"input_required"`` answers
     with a policy ASK; ``"refuse"`` fails to connect before reaching the
-    server; ``"detached"``, ``"drop"`` and ``"ok"`` first execute (or reattach
-    to) the operation, then reply with a detached RPC error, a dropped
-    connection, or the tool result.
+    server; ``"status:<code>"`` answers that HTTP status without reaching it;
+    ``"late-status:<code>"``, ``"detached"``, ``"drop"`` and ``"ok"`` first
+    execute (or reattach to) the operation, then reply with that HTTP status,
+    a detached RPC error, a dropped connection, or the tool result.
     """
 
     def __init__(self, registry: McpExecutionRegistry, outcomes: list[str]) -> None:
@@ -187,6 +188,8 @@ class _RetainedExecutionTransport(httpx.AsyncBaseTransport):
             return _input_required("elicit_live", "live-state", body["id"])
         if outcome == "refuse":
             raise httpx.ConnectError("connection refused")
+        if outcome.startswith("status:"):
+            return httpx.Response(int(outcome.removeprefix("status:")))
 
         async def _retained_work() -> McpExecutionResult:
             self.external_invocations += 1
@@ -201,6 +204,8 @@ class _RetainedExecutionTransport(httpx.AsyncBaseTransport):
         )
         if outcome == "drop":
             raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        if outcome.startswith("late-status:"):
+            return httpx.Response(int(outcome.removeprefix("late-status:")))
         if outcome == "detached":
             return _json_resp(
                 {
@@ -629,16 +634,24 @@ async def test_call_tool_live_tunnel_retry_keeps_parked_approval(
 
 
 @pytest.mark.asyncio
-async def test_call_tool_does_not_resend_approval_dropped_after_send() -> None:
-    """The server consumes an approval before executing, so a sent resume is not replayed."""
+@pytest.mark.parametrize("tunnel_connected", [True, False])
+@pytest.mark.parametrize("failure", ["drop", "status:503"])
+async def test_call_tool_does_not_resend_approval_dropped_after_send(
+    tunnel_connected: bool,
+    failure: str,
+) -> None:
+    """The server consumes an approval before executing, so a sent resume is not replayed.
+
+    Holds with the tunnel down too: a reconnected server cannot resume it either.
+    """
     registry = McpExecutionRegistry()
-    transport = _RetainedExecutionTransport(registry, ["input_required", "drop"])
+    transport = _RetainedExecutionTransport(registry, ["input_required", failure])
     client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
     manager = ProxyMcpManager(
         session_id="conv_test",
         ap_client=client,
         execution_registry=registry,
-        server_connected=lambda: True,
+        server_connected=lambda: tunnel_connected,
     )
     pending_approvals.reset_for_tests()
     task = asyncio.create_task(manager.call_tool(None, "sys_os_shell", {}))
@@ -646,7 +659,7 @@ async def test_call_tool_does_not_resend_approval_dropped_after_send() -> None:
         await _wait_until_registered("elicit_live")
         assert pending_approvals.resolve("elicit_live", approved=True)
 
-        with pytest.raises(RuntimeError, match="completion is unknown"):
+        with pytest.raises(RuntimeError, match=r"completion is unknown|503"):
             await asyncio.wait_for(task, timeout=5.0)
     finally:
         if not task.done():
@@ -654,8 +667,124 @@ async def test_call_tool_does_not_resend_approval_dropped_after_send() -> None:
         await client.aclose()
         pending_approvals.reset_for_tests()
 
+    assert transport.external_invocations == (1 if failure == "drop" else 0)
+    assert [call.body["id"] for call in transport.calls] == [1, 2]
+    assert not pending_approvals._server_reconnect_waiters
+
+
+def _registry_manager(
+    transport: httpx.AsyncBaseTransport,
+    registry: McpExecutionRegistry,
+) -> tuple[ProxyMcpManager, httpx.AsyncClient]:
+    """Build a manager with a retained-operation registry and a live tunnel."""
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+        server_connected=lambda: True,
+    )
+    return manager, client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["status:502", "status:503", "late-status:504"])
+async def test_call_tool_retries_gateway_status_on_same_operation(failure: str) -> None:
+    """A 502/503/504 is retried promptly on the same operation; the tool runs once."""
+    registry = McpExecutionRegistry()
+    transport = _RetainedExecutionTransport(registry, [failure, "ok"])
+    manager, client = _registry_manager(transport, registry)
+    pending_approvals.reset_for_tests()
+    try:
+        result = await asyncio.wait_for(manager.call_tool(None, "echo__echo", {}), timeout=5.0)
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert result == "completed"
     assert transport.external_invocations == 1
     assert [call.body["id"] for call in transport.calls] == [1, 2]
+    first_params, retry_params = [call.body["params"] for call in transport.calls]
+    assert retry_params == first_params
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 404, 500])
+async def test_call_tool_does_not_retry_other_http_errors(status: int) -> None:
+    """Only gateway statuses are retried; any other HTTP error fails at once."""
+    registry = McpExecutionRegistry()
+    transport = _RetainedExecutionTransport(registry, [f"status:{status}"])
+    manager, client = _registry_manager(transport, registry)
+    try:
+        with pytest.raises(RuntimeError, match=str(status)):
+            await manager.call_tool(None, "echo__echo", {})
+    finally:
+        await client.aclose()
+
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_call_tool_gateway_status_retries_are_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persistent 503 fails after the retry budget instead of waiting for a reconnect."""
+    monkeypatch.setattr(
+        "omnigent.runner.proxy_mcp_manager._LIVE_TUNNEL_RETRY_DELAYS_S", (0.01, 0.01)
+    )
+    registry = McpExecutionRegistry()
+    transport = _RetainedExecutionTransport(registry, ["status:503"] * 3)
+    manager, client = _registry_manager(transport, registry)
+    pending_approvals.reset_for_tests()
+    try:
+        with pytest.raises(RuntimeError, match="503"):
+            await asyncio.wait_for(manager.call_tool(None, "echo__echo", {}), timeout=5.0)
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert len(transport.calls) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["sys_advise_models", "mcp__omnigent__sys_advise_models"])
+@pytest.mark.parametrize("failure", ["drop", "late-status:504"])
+async def test_call_tool_does_not_replay_server_executed_tool(
+    tool_name: str,
+    failure: str,
+) -> None:
+    """The server runs these itself, outside the runner operation, so a sent call is not resent."""
+    registry = McpExecutionRegistry()
+    transport = _RetainedExecutionTransport(registry, [failure])
+    manager, client = _registry_manager(transport, registry)
+    pending_approvals.reset_for_tests()
+    try:
+        with pytest.raises(RuntimeError, match=r"completion is unknown|504"):
+            await asyncio.wait_for(manager.call_tool(None, tool_name, {}), timeout=5.0)
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_call_tool_retries_unsent_server_executed_tool() -> None:
+    """A server-executed tool whose request never connected is safe to resend."""
+    registry = McpExecutionRegistry()
+    transport = _RetainedExecutionTransport(registry, ["refuse", "ok"])
+    manager, client = _registry_manager(transport, registry)
+    pending_approvals.reset_for_tests()
+    try:
+        result = await asyncio.wait_for(
+            manager.call_tool(None, "sys_advise_models", {}), timeout=5.0
+        )
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert result == "completed"
+    assert len(transport.calls) == 2
 
 
 @pytest.mark.asyncio
