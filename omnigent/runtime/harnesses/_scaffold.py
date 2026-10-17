@@ -39,6 +39,7 @@ import asyncio
 import contextlib
 import gc
 import hmac
+import json
 import logging
 import os
 import time
@@ -590,27 +591,40 @@ class TurnContext:
         self.emit(OutputItemDoneEvent(type="response.output_item.done", item=item))
         try:
             result = await future
-            item["status"] = "completed"
-            self.emit(OutputItemDoneEvent(type="response.output_item.done", item=item))
-            self.emit(
-                OutputItemDoneEvent(
-                    type="response.output_item.done",
-                    item={
-                        "id": f"fco_{uuid.uuid4().hex[:12]}",
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": cap_tool_output(result),
-                        "arguments": arguments,
-                        "status": "completed",
-                    },
-                )
+        except asyncio.CancelledError:
+            # Only completed calls persist; record an interrupted one (e.g. a
+            # declined approval) so history still shows the attempt.
+            self._emit_completed_tool_call(
+                item,
+                json.dumps({"error": "Tool call cancelled before it returned a result"}),
             )
+            raise
+        else:
+            self._emit_completed_tool_call(item, cap_tool_output(result))
             return result
         finally:
             # Always remove — whether the Future resolved cleanly
             # or was cancelled, holding it in the dict would
             # leak memory across turns.
             self._pending_tool_calls.pop(call_id, None)
+
+    def _emit_completed_tool_call(self, item: dict[str, Any], output: str) -> None:
+        """Re-emit a dispatched ``function_call`` as completed, then its output."""
+        item["status"] = "completed"
+        self.emit(OutputItemDoneEvent(type="response.output_item.done", item=item))
+        self.emit(
+            OutputItemDoneEvent(
+                type="response.output_item.done",
+                item={
+                    "id": f"fco_{uuid.uuid4().hex[:12]}",
+                    "type": "function_call_output",
+                    "call_id": item["call_id"],
+                    "output": output,
+                    "arguments": item["arguments"],
+                    "status": "completed",
+                },
+            )
+        )
 
     async def elicit(
         self, elicitation_id: str, params: ElicitationRequestParams
