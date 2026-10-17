@@ -96,3 +96,90 @@ async def test_headless_recovers_final_text_when_completion_event_is_missed(
     assert streams == completion_stream
     assert transcript_reads[0] is False
     assert result == (final_text if item_status == "completed" else None)
+
+
+async def test_headless_declines_approval_with_a_stderr_notice(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    session_id = "conv_headless_ask"
+    snapshot = {"id": session_id, "agent_id": "ag_probe", "status": "idle", "created_at": 1}
+    resolutions: list[dict] = []
+    streams = 0
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal streams
+        path = request.url.path
+        if request.method == "POST" and path == "/v1/sessions":
+            return httpx.Response(200, json={"session_id": session_id})
+        if path == f"/v1/sessions/{session_id}" and request.method in {"GET", "PATCH"}:
+            return httpx.Response(200, json=snapshot)
+        if path.endswith("/agent"):
+            return httpx.Response(200, json={"tools": []})
+        if path.endswith("/events") and request.method == "POST":
+            return httpx.Response(200, json={"queued": True})
+        if path.endswith("/elicitations/elicit_1/resolve"):
+            resolutions.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": False})
+        if path.endswith("/stream"):
+            streams += 1
+            events = (
+                []
+                if streams > 1
+                else [
+                    {"type": "session.heartbeat", "conversation_id": session_id},
+                    {
+                        "type": "response.elicitation_request",
+                        "elicitation_id": "elicit_1",
+                        "method": "elicitation/create",
+                        "params": {
+                            "mode": "form",
+                            "message": "approval required",
+                            "requestedSchema": {},
+                            "phase": "tool_call",
+                            "policy_name": "ask-read",
+                            "content_preview": 'sys_os_read({"path": "notes.txt"})',
+                        },
+                    },
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_1",
+                            "status": "completed",
+                            "model": "test-model",
+                            "created_at": 1,
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "declined"}],
+                                }
+                            ],
+                        },
+                    },
+                ]
+            )
+            wire = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events)
+            return httpx.Response(200, text=wire, headers={"Content-Type": "text/event-stream"})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    monkeypatch.setattr(
+        "omnigent_client._client.httpx.AsyncClient",
+        partial(httpx.AsyncClient, transport=httpx.MockTransport(handle)),
+    )
+    async with OmnigentClient(base_url="http://127.0.0.1") as client:
+        await _query_sessions_once(
+            client=client,
+            agent_name="probe",
+            tool_handler=None,
+            prompt="read notes.txt",
+            session_bundle=b"bundle",
+            session_bundle_filename="agent.tar.gz",
+            runner_id="runner_test",
+        )
+
+    # One-shot mode has nobody to ask, so it stays fail-closed but says why.
+    assert resolutions == [{"action": "decline"}]
+    stderr = capsys.readouterr().err
+    assert 'sys_os_read({"path": "notes.txt"})' in stderr
+    assert "ask-read" in stderr
+    assert "without -p" in stderr

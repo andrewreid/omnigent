@@ -324,6 +324,51 @@ async def test_forged_retry_with_ask_policy_rejects_unknown_elicitation(
 
 
 @pytest.mark.asyncio
+async def test_ask_elicitation_preview_names_the_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh ASK names the tool so approvers can tell which call they review."""
+    ask_engine = _FixedPolicyEngine(
+        result=PolicyResult(
+            action=PolicyAction.ASK,
+            reason="approval required",
+            deciding_policies=["test-gate"],
+        )
+    )
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        sessions_mod,
+        "_load_agent_spec_for_session",
+        lambda conv, agent_store: "fake_spec",
+    )
+    monkeypatch.setattr(
+        sessions_mod,
+        "_build_policy_engine_from_spec",
+        _engine_factory_expecting_preload(ask_engine),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _sid, event: published.append(event),
+    )
+    monkeypatch.setattr(
+        orchestration, "_publish_elicitation_request_to_ancestors", lambda *_args: None
+    )
+
+    await _handle_mcp_tools_call(
+        rpc_id=3,
+        session_id=_SESSION_ID,
+        params={"name": "sys_os_read", "arguments": {"path": "notes.txt"}},
+        conversation_store=_StubConversationStore(_make_conversation()),  # type: ignore[arg-type]
+        agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+        runner_router=None,
+    )
+
+    [event] = published
+    _pending_policy_ask_writes.pop(event["elicitation_id"], None)
+    assert event["params"]["content_preview"] == 'sys_os_read({"path": "notes.txt"})'
+
+
+@pytest.mark.asyncio
 async def test_retry_with_allow_policy_falls_through(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
