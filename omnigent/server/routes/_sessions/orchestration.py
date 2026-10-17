@@ -1308,6 +1308,13 @@ def _publish_subtree_cost_to_ancestors(
         session_stream.publish(ancestor_id, event.model_dump(exclude_none=True))
 
 
+class _UnresolvedHarness:
+    """Sentinel: the caller has not resolved the session harness yet."""
+
+
+_UNRESOLVED_HARNESS = _UnresolvedHarness()
+
+
 def _build_session_response(
     conv: Conversation,
     items: list[ConversationItem],
@@ -1330,6 +1337,7 @@ def _build_session_response(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     side_chat_sealed: bool = False,
+    harness: str | None | _UnresolvedHarness = _UNRESOLVED_HARNESS,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -1397,6 +1405,8 @@ def _build_session_response(
         ``None`` is treated as ``[]``.
     :param agent_store: Optional store used to resolve the session harness.
     :param agent_cache: Optional cache used to load the session harness spec.
+    :param harness: The session harness when the caller already resolved it,
+        e.g. ``"claude-sdk"``; resolved here from the agent spec otherwise.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
     """
@@ -1410,7 +1420,8 @@ def _build_session_response(
     # usage. Shared by the cost indicator and the per-model breakdown so
     # both read the same numbers.
     display_usage = subtree_usage if subtree_usage is not None else (conv.session_usage or {})
-    harness = _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
+    if isinstance(harness, _UnresolvedHarness):
+        harness = _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
     # Collapse per-user pin keys to the canonical bare key for this viewer, so
     # the snapshot never carries another user's pin key (see _labels_for_viewer).
     labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
@@ -12459,6 +12470,9 @@ async def _fetch_model_options(
     session_id: str,
     conv: Conversation,
     agent_store: AgentStore | None = None,
+    *,
+    harness: str | None | _UnresolvedHarness = _UNRESOLVED_HARNESS,
+    agent_cache: AgentCache | None = None,
 ) -> list[dict[str, Any]]:
     """
     Resolve the Web UI model-picker options for a native session.
@@ -12491,6 +12505,11 @@ async def _fetch_model_options(
     :param conv: Conversation row whose labels identify the wrapper.
     :param agent_store: Optional store for the ACP spec lookup; resolves
         from the runtime globals when ``None``.
+    :param harness: The session harness when the caller already resolved it,
+        e.g. ``"acp"``; resolved here for sessions without a native wrapper
+        otherwise.
+    :param agent_cache: Cache the harness was resolved with, reused for the
+        ACP spec load; the runtime global cache when ``None``.
     :returns: Model options, or ``[]`` when the session has no model picker or
         the runner-owned options are not yet available.
     """
@@ -12508,8 +12527,17 @@ async def _fetch_model_options(
         # Generic ACP sessions carry no native wrapper label; their picker
         # serves the deployment's curated provider ``models:`` shortlist
         # resolved from the spec instead of a runner-owned catalog.
-        if _resolve_harness_impl_is_acp(conv, agent_store):
-            return await _load_acp_model_options(session_id, conv, agent_store)
+        from omnigent.harness_aliases import canonicalize_harness
+
+        is_acp = (
+            _resolve_harness_impl_is_acp(conv, agent_store)
+            if isinstance(harness, _UnresolvedHarness)
+            else canonicalize_harness(harness) == "acp"
+        )
+        if is_acp:
+            return await _load_acp_model_options(
+                session_id, conv, agent_store, agent_cache=agent_cache
+            )
         return []
     cached = _model_options_cache.get(session_id)
     if runner_client is None:
@@ -12710,6 +12738,7 @@ async def _load_acp_model_options(
     session_id: str,
     conv: Conversation,
     agent_store: AgentStore | None,
+    agent_cache: AgentCache | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve the curated picker options for a generic ACP session.
 
@@ -12725,6 +12754,8 @@ async def _load_acp_model_options(
     :param conv: Conversation row the options are resolved for.
     :param agent_store: Store for the bound-agent spec load; ``None`` falls
         back to the runtime global store.
+    :param agent_cache: Cache for the bundle load; ``None`` falls back to the
+        runtime global cache.
     :returns: Option dicts (``id`` / ``displayName`` / ``isDefault``), or
         ``[]`` when nothing was curated.
     """
@@ -12737,7 +12768,7 @@ async def _load_acp_model_options(
         agent_store = _agent_store
     if agent_store is None:
         return []
-    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store, agent_cache)
     if spec is None:
         return []
     from omnigent.models.model_catalog import _acp_launch_model, acp_curated_models
@@ -13146,6 +13177,11 @@ async def _get_session_snapshot(
 
     inference_configured = configured_snapshot(conv.inference_snapshot)
     inference_error = None
+    # Resolved once, off the event loop: the model picker and the response
+    # both need it, and resolving reads the agent row and its bundle.
+    harness = await asyncio.to_thread(
+        _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+    )
     if inference_configured and conv.inference_snapshot is not None:
         catalog = (
             await inference_service(request).catalog(conv.inference_snapshot)
@@ -13157,7 +13193,9 @@ async def _get_session_snapshot(
         if not conv.reported_model:
             llm_model = conv.model_override or catalog.get("default_model")
     else:
-        model_options = await _fetch_model_options(runner_client, session_id, conv, agent_store)
+        model_options = await _fetch_model_options(
+            runner_client, session_id, conv, agent_store, harness=harness, agent_cache=agent_cache
+        )
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the
     # spec default applies.
@@ -13227,6 +13265,7 @@ async def _get_session_snapshot(
         viewer_id=viewer_id,
         agent_store=agent_store,
         agent_cache=agent_cache,
+        harness=harness,
     )
     response.inference_configured = inference_configured
     response.inference_error = inference_error
