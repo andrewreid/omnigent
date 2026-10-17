@@ -76,6 +76,7 @@ from .executor import (
     ReasoningChunk,
     TextChunk,
     ToolCallComplete,
+    ToolCallMetadata,
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
@@ -868,6 +869,21 @@ def _ensure_sdk() -> ModuleType:
             "ClaudeSDKExecutor requires the 'claude-agent-sdk' package. "
             "Install it with: pip install claude-agent-sdk"
         ) from exc
+
+
+_OMNIGENT_MCP_TOOL_PREFIX = "mcp__omnigent__"
+
+
+def _tool_use_metadata(tool_block: _ToolUseBlockObj) -> ToolCallMetadata:
+    """Metadata for a ``ToolCallRequest`` observed from a ``ToolUseBlock``.
+
+    Only ``mcp__omnigent__*`` calls reach the dispatch bridge, which receives
+    no tool_use id; marking the CLI's own tools keeps their ids out of its queue.
+    """
+    metadata: ToolCallMetadata = {"call_id": tool_block.id}
+    if not tool_block.name.startswith(_OMNIGENT_MCP_TOOL_PREFIX):
+        metadata["internally_executed"] = True
+    return metadata
 
 
 def _build_mcp_tools(
@@ -3104,7 +3120,7 @@ class ClaudeSDKExecutor(Executor):
                                         # with the matching
                                         # :class:`ToolCallComplete`
                                         # by call_id.
-                                        metadata={"call_id": tool_block.id},
+                                        metadata=_tool_use_metadata(tool_block),
                                     )
                         else:
                             # No streaming — emit events from the full message.
@@ -3135,7 +3151,7 @@ class ClaudeSDKExecutor(Executor):
                                     yield ToolCallRequest(
                                         name=tool_block.name,
                                         args=tool_block.input,
-                                        metadata={"call_id": tool_block.id},
+                                        metadata=_tool_use_metadata(tool_block),
                                     )
 
                     elif isinstance(message, sdk.UserMessage):
