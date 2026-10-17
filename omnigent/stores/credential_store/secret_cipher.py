@@ -18,6 +18,7 @@ no non-KMS fallback. See ``designs/CREDENTIAL_STORE.md``.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 from collections.abc import Callable, Mapping
@@ -45,6 +46,12 @@ CREDENTIAL_CIPHER_ENV_VAR = "OMNIGENT_CREDENTIAL_CIPHER"
 #: These degrade to "reconnect" (``decrypt`` → ``None``); anything else
 #: (AccessDenied, disabled key, throttling) is operational and propagates.
 _SOFT_FAIL_KMS_CODES = frozenset({"InvalidCiphertextException", "IncorrectKeyException"})
+
+#: KMS ``Encrypt`` accepts at most this much plaintext; larger secrets use an envelope.
+_KMS_DIRECT_MAX_BYTES = 4096
+#: Marks an envelope ciphertext (a KMS data key wrapping AES-256-GCM).
+_ENVELOPE_PREFIX = "kmsenv1:"
+_ENVELOPE_NONCE_BYTES = 12
 
 
 class SecretTooLargeError(ValueError):
@@ -133,6 +140,11 @@ def build_secret_cipher() -> SecretCipher | None:
     return next(iter(configured.values()), None)
 
 
+def _envelope_aad(kms_context: Mapping[str, str]) -> bytes:
+    """Bind an envelope's sealed data to its row identity, like the KMS context."""
+    return json.dumps(dict(kms_context), sort_keys=True).encode("utf-8")
+
+
 def _kms_context(context: SecretContext) -> dict[str, str]:
     """Encryption context for a KMS call.
 
@@ -149,8 +161,9 @@ class KmsSecretCipher:
 
     Each secret is a single ``kms:Encrypt`` call under ``key_id`` with the row
     identity as the encryption context; the ciphertext blob is stored base64.
-    Serialized secrets must fit the 4096-byte KMS ``Encrypt`` limit. Larger
-    credentials require another backend, such as Vault Transit. The KMS client
+    A secret over the 4 KB ``Encrypt`` limit (e.g. a full OAuth token set) is
+    sealed with AES-256-GCM under a ``kms:GenerateDataKey`` data key bound to the
+    same context, and stored with a ``kmsenv1:`` prefix. The KMS client
     is created lazily so importing this module never requires boto3 or AWS
     credentials — only constructing the cipher (which only happens when a key is
     configured) does.
@@ -178,18 +191,31 @@ class KmsSecretCipher:
         return self._client
 
     def encrypt(self, plaintext: str, *, context: SecretContext) -> str:
-        encoded = plaintext.encode("utf-8")
-        if len(encoded) > 4096:
-            raise SecretTooLargeError(
-                "Credential exceeds the KMS limit of 4096 serialized bytes. "
-                "Ask your administrator to configure Vault Transit for larger credentials."
-            )
+        data = plaintext.encode("utf-8")
+        if len(data) > _KMS_DIRECT_MAX_BYTES:
+            return self._seal_envelope(data, context)
         response = self._kms.encrypt(
             KeyId=self._key_id,
-            Plaintext=encoded,
+            Plaintext=data,
             EncryptionContext=_kms_context(context),
         )
         return base64.b64encode(response["CiphertextBlob"]).decode("ascii")
+
+    def _seal_envelope(self, data: bytes, context: SecretContext) -> str:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        kms_context = _kms_context(context)
+        key = self._kms.generate_data_key(
+            KeyId=self._key_id, KeySpec="AES_256", EncryptionContext=kms_context
+        )
+        nonce = os.urandom(_ENVELOPE_NONCE_BYTES)
+        sealed = AESGCM(key["Plaintext"]).encrypt(nonce, data, _envelope_aad(kms_context))
+        body = {
+            "key": base64.b64encode(key["CiphertextBlob"]).decode("ascii"),
+            "nonce": base64.b64encode(nonce).decode("ascii"),
+            "data": base64.b64encode(sealed).decode("ascii"),
+        }
+        return _ENVELOPE_PREFIX + base64.b64encode(json.dumps(body).encode()).decode("ascii")
 
     def decrypt(self, ciphertext: str, *, context: SecretContext) -> str | None:
         """Return the plaintext for *ciphertext*, or ``None`` if unreadable.
@@ -202,6 +228,8 @@ class KmsSecretCipher:
         """
         from botocore.exceptions import ClientError
 
+        if ciphertext.startswith(_ENVELOPE_PREFIX):
+            return self._open_envelope(ciphertext.removeprefix(_ENVELOPE_PREFIX), context)
         try:
             blob = base64.b64decode(ciphertext.encode("ascii"), validate=True)
         except ValueError:
@@ -228,3 +256,46 @@ class KmsSecretCipher:
                 return None
             raise
         return response["Plaintext"].decode("utf-8")
+
+    def _open_envelope(self, encoded: str, context: SecretContext) -> str | None:
+        from botocore.exceptions import ClientError
+        from cryptography.exceptions import InvalidTag
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        kms_context = _kms_context(context)
+        try:
+            body = json.loads(base64.b64decode(encoded.encode("ascii"), validate=True))
+            wrapped_key = base64.b64decode(body["key"], validate=True)
+            nonce = base64.b64decode(body["nonce"], validate=True)
+            sealed = base64.b64decode(body["data"], validate=True)
+            if len(nonce) != _ENVELOPE_NONCE_BYTES:
+                raise ValueError("bad nonce length")
+        except (ValueError, KeyError, TypeError):
+            _logger.warning(
+                "secretbox: stored envelope ciphertext is corrupt — the affected "
+                "integration will read as disconnected until reconnected"
+            )
+            return None
+        try:
+            key = self._kms.decrypt(
+                CiphertextBlob=wrapped_key, EncryptionContext=kms_context, KeyId=self._key_id
+            )
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in _SOFT_FAIL_KMS_CODES:
+                _logger.warning(
+                    "secretbox: KMS could not unwrap the data key (code=%s) — the affected "
+                    "integration will read as disconnected until reconnected",
+                    code,
+                )
+                return None
+            raise
+        try:
+            data = AESGCM(key["Plaintext"]).decrypt(nonce, sealed, _envelope_aad(kms_context))
+        except (InvalidTag, ValueError):
+            _logger.warning(
+                "secretbox: envelope ciphertext failed authentication (wrong context or "
+                "corrupt) — the affected integration will read as disconnected until reconnected"
+            )
+            return None
+        return data.decode("utf-8")

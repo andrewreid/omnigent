@@ -49,9 +49,48 @@ class ConnectionStore(ABC, Generic[EntityT]):
         conn = self._store.get(user_id, self._PROVIDER, with_secret=with_tokens)
         return self._to_entity(conn) if conn is not None else None
 
-    def delete(self, user_id: str) -> bool:
-        """Remove the user's connection for this provider. ``True`` if a row went."""
-        return self._store.delete(user_id, self._PROVIDER)
+    def delete(self, user_id: str, *, generation: str | None = None) -> bool:
+        """Remove the user's connection for this provider. ``True`` if a row went.
+
+        With *generation*, only that generation goes (see :meth:`generation`).
+        """
+        return self._store.delete(user_id, self._PROVIDER, generation=generation)
+
+    def generation(self, user_id: str) -> str | None:
+        """The connection's generation, fresh per connect, or ``None`` if absent."""
+        return self._store.generation(user_id, self._PROVIDER)
+
+    def needs_reconnect(self, user_id: str) -> bool:
+        """Whether the provider rejected this connection's refresh token."""
+        conn = self._store.get(user_id, self._PROVIDER)
+        return bool(conn is not None and conn.metadata.get("needs_reconnect"))
+
+    def acquire_refresh_lease(self, user_id: str, *, holder: str, ttl_s: int) -> bool:
+        """Claim the token-refresh lease; see ``CredentialStore.acquire_refresh_lease``."""
+        return self._store.acquire_refresh_lease(
+            user_id, self._PROVIDER, holder=holder, ttl_s=ttl_s
+        )
+
+    def release_refresh_lease(self, user_id: str, *, holder: str) -> bool:
+        """Drop *holder*'s lease without writing tokens."""
+        return self._store.release_refresh_lease(user_id, self._PROVIDER, holder=holder)
+
+    def mark_needs_reconnect(
+        self, user_id: str, *, holder: str | None = None, generation: str | None = None
+    ) -> bool:
+        """Stop refreshing until the user reconnects (see the store method)."""
+        return self._store.mark_needs_reconnect(
+            user_id, self._PROVIDER, holder=holder, generation=generation
+        )
+
+    def get_under_lease(self, user_id: str, *, holder: str) -> EntityT | None:
+        """The connection with tokens, only while *holder* owns its refresh lease."""
+        conn = self._store.get_under_lease(user_id, self._PROVIDER, holder=holder)
+        return self._to_entity(conn) if conn is not None else None
+
+    def mark_refresh_inflight(self, user_id: str, *, holder: str) -> bool:
+        """Record that *holder* is about to call the provider (lease-fenced)."""
+        return self._store.mark_refresh_inflight(user_id, self._PROVIDER, holder=holder)
 
     def list_all(self) -> list[EntityT]:
         """All connections for this provider (metadata only) — tests/admin."""
