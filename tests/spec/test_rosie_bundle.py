@@ -2,8 +2,6 @@
 
 from pathlib import Path
 
-import pytest
-
 from omnigent.policies.builtins.cel import cel_policy
 from omnigent.spec import load
 
@@ -24,12 +22,7 @@ FACTORY_TOOLS = [
 FACTORY_TOOL_PATTERN = "^(factory__|mcp__omnigent__factory__|mcp__factory__)?factory_.*$"
 
 
-def test_rosie_loads_workers_skills_and_factory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("FACTORY_MCP_URL", "http://factory.test/mcp")
-    monkeypatch.setenv("FACTORY_MCP_TOKEN", "factory-test-token")
-
+def test_rosie_loads_workers_skills_and_factory() -> None:
     spec = load(BUNDLE)
 
     assert PACKAGED_BUNDLE.resolve() == BUNDLE.resolve()
@@ -54,17 +47,12 @@ def test_rosie_loads_workers_skills_and_factory(
 
     assert [server.name for server in spec.mcp_servers] == ["factory"]
     factory = spec.mcp_servers[0]
-    assert factory.url == "http://factory.test/mcp"
-    assert factory.headers == {"Authorization": "Bearer factory-test-token"}
+    assert factory.transport == "registry"
+    assert factory.url is None and not factory.headers
     assert factory.tools == FACTORY_TOOLS
 
 
-def test_rosie_workers_deny_factory_tools_without_factory_server(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("FACTORY_MCP_URL", "http://factory.test/mcp")
-    monkeypatch.setenv("FACTORY_MCP_TOKEN", "factory-test-token")
-
+def test_rosie_workers_deny_factory_tools_without_factory_server() -> None:
     spec = load(BUNDLE)
 
     for worker in spec.sub_agents:
