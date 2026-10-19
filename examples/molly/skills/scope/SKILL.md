@@ -8,6 +8,9 @@ user-invocable: false
 
 Orchestrator only. Workers carry out their dispatched task, never this playbook.
 
+When the task is a GitHub issue, read it and its comments with `issue_read`
+before recording the contract.
+
 Record a short contract in `.molly/registry.json` (use an ignored or external
 scratch location if `.molly` is not ignored): goal, acceptance criteria, non-goals,
 constraints, task class with rationale, verification plan and delivery endpoint

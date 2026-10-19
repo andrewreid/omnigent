@@ -44,3 +44,11 @@ def test_molly_publication_reference_survives_bundle_copy(tmp_path: Path) -> Non
         reference.read_text()
         == (BUNDLE / "skills" / "publish" / "references" / "review-bot.md").read_text()
     )
+
+
+def test_molly_github_is_a_registry_reference() -> None:
+    spec = load(BUNDLE, expand_env=False)
+    (github,) = [server for server in spec.mcp_servers if server.name == "github"]
+    assert github.transport == "registry"
+    assert github.url is None and not github.headers
+    assert github.tools == ["pull_request_read", "issue_read", "get_job_logs", "actions_list"]

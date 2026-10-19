@@ -13,6 +13,8 @@ immutable report(s), digests, review target(s), and the accepted BLOCKING and
 SHOULD_FIX action list. Preserve challenges/dispositions, including FOLLOW_UP and
 ADVISORY. For findings from gates rather than a reviewer, record command, candidate,
 output and the concrete failure instead of inventing a review artifact.
+For a failed CI check, read the failing job's log with `actions_list` and
+`get_job_logs` before diagnosing; a red check alone is not a diagnosis.
 
 Before the first fix, ask the implementer to distinguish an isolated mistake
 from a shared cause. For a shared cause, identify the affected execution paths

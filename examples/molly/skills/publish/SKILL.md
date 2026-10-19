@@ -36,7 +36,8 @@ Only then authorize a plain push and requested PR creation. Never amend publishe
 commits, force-push, delete remote refs, or merge a PR. Fixes use additional commits.
 Check the remote branch equals the accepted local HEAD after every push.
 
-GitHub reads prefer the read-only `pull_request_read` MCP tool. Mutations use shell
+GitHub reads prefer the read-only GitHub MCP tools: `pull_request_read` for PRs,
+reviews and threads, `actions_list` and `get_job_logs` for failing runs. Mutations use shell
 Git/gh, preserving the existing policy route; do not bypass it with MCP writes,
 aliases, eval or nested shells. The text-matching blast_radius policy is not a
 sandbox or an atomic publication gate. Respect repository PR templates. Read check
