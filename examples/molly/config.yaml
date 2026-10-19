@@ -98,27 +98,22 @@ terminals:
         type: none
 
 tools:
-  # GitHub, READ ONLY. Review-thread resolution state is the reason this is
-  # here: it is the one thing `gh` cannot report without a hand-written GraphQL
-  # query, and Molly needs it to tell the human how many threads are still
-  # unresolved. Pinned to one tool deliberately: the full
-  # server exposes dozens, whose schemas would land in every turn's context,
-  # and Molly needs exactly one of them. Mutations deliberately stay on the shell:
-  # blast_radius only inspects shell text (it claims sys_os_shell/Bash/bash and
-  # ALLOWs everything else), so an MCP write would bypass the only mechanical
-  # protection Molly has. REQUIRES ${GITHUB_TOKEN} wherever this spec is
-  # parsed — a missing value is a parse error, not a degraded start. It must
-  # also reach the RUNNER: GitHub tokens are not forwarded host->runner by
-  # default, so set OMNIGENT_RUNNER_ENV_PASSTHROUGH=GITHUB_TOKEN as well.
+  # GitHub, READ ONLY, through the operator MCP registry: the `github` service
+  # uses the caller's linked GitHub account, so no token lives in this bundle.
+  # Review-thread resolution state is the main reason this is here: `gh` cannot
+  # report it without a hand-written GraphQL query. The tool list is kept short
+  # because every schema lands in each turn's context. Mutations deliberately
+  # stay on the shell: blast_radius only inspects shell text (it claims
+  # sys_os_shell/Bash/bash and ALLOWs everything else), so an MCP write would
+  # bypass the only mechanical protection Molly has.
   github:
     type: mcp
-    url: https://api.githubcopilot.com/mcp/
-    headers:
-      Authorization: Bearer ${GITHUB_TOKEN}
-      X-MCP-Tools: pull_request_read
-      X-MCP-Readonly: "true"
+    transport: registry
     tools:
       - pull_request_read
+      - issue_read
+      - get_job_logs
+      - actions_list
 
   # Coding sub-agents — see agents/<name>/. Both implement, review
   # (cross-vendor), and explore.
