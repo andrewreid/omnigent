@@ -107,11 +107,11 @@ terminals:
         type: none
 
 tools:
+  # Factory tools through the operator MCP registry: the `factory` service holds
+  # the endpoint, and each caller's bearer token is connected in Settings > MCP.
   factory:
     type: mcp
-    url: ${FACTORY_MCP_URL}
-    headers:
-      Authorization: Bearer ${FACTORY_MCP_TOKEN}
+    transport: registry
     tools:
       - factory_get_issue
       - factory_get_plan
