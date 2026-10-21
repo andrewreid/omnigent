@@ -26,6 +26,7 @@ import json
 import logging
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import cast
 
 import httpx
@@ -37,7 +38,7 @@ from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
 from omnigent.runner.mcp_manager import McpSchemasResult
-from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S
+from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S, SERVER_EXECUTED_TOOLS
 from omnigent.spec.types import AgentSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -45,6 +46,21 @@ _logger = logging.getLogger(__name__)
 
 _EventPublisher = Callable[[str, _JsonObject], None]
 _SERVER_RECONNECT_WAIT_S = 120.0
+# A request dropped while the tunnel stays up is retried promptly against the
+# same retained operation; a reconnect that never comes is not worth waiting for.
+_LIVE_TUNNEL_RETRY_DELAYS_S = (0.5, 1.0, 2.0)
+# Transport failures raised before the request reached the server.
+_REQUEST_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+# Gateway answers for a request the server may not have handled; retried on
+# the same operation, which the runner execution registry deduplicates.
+_RETRYABLE_STATUS_CODES = frozenset({502, 503, 504})
+
+
+@dataclass
+class _ReattachBudget:
+    """Fast retries a call has spent on a live tunnel."""
+
+    live_tunnel_retries: int = 0
 
 
 def _json_object(value: object) -> _JsonObject | None:
@@ -157,6 +173,7 @@ class ProxyMcpManager:
         ap_client: httpx.AsyncClient,
         publish_event: _EventPublisher | None = None,
         execution_registry: McpExecutionRegistry | None = None,
+        server_connected: Callable[[], bool] | None = None,
     ) -> None:
         """Create a proxy manager bound to one session.
 
@@ -170,11 +187,15 @@ class ProxyMcpManager:
             is irrelevant.
         :param execution_registry: Runner-owned MCP operations that a new
             server generation can reattach to after a tunnel replacement.
+        :param server_connected: Whether the runner's server tunnel is open.
+            Lets a dropped request on a live tunnel retry promptly instead of
+            waiting for a reconnect. ``None`` always waits for a reconnect.
         """
         self._session_id = session_id
         self._omnigent_client = ap_client
         self._publish_event = publish_event
         self._execution_registry = execution_registry
+        self._server_connected = server_connected
         self._registry_services: set[str] = set()
 
     @property
@@ -345,6 +366,70 @@ class ProxyMcpManager:
             if registry is not None:
                 registry.release_operation(self._session_id, operation_id)
 
+    def _tunnel_connected(self) -> bool:
+        """Whether the runner's server tunnel is open."""
+        return self._server_connected is not None and self._server_connected()
+
+    async def _wait_to_reattach(
+        self,
+        tool_name: str,
+        operation_id: str,
+        request_generation: int,
+        cause: BaseException | None = None,
+        *,
+        budget: _ReattachBudget,
+        request_dropped: bool = False,
+    ) -> None:
+        """Wait until a retained operation can be retried or reattached.
+
+        :raises RuntimeError: When the operation is not retained or no
+            server reconnects in time.
+        """
+        registry = self._execution_registry
+        if registry is None or not registry.has_operation(self._session_id, operation_id):
+            raise RuntimeError(
+                f"MCP proxy call for tool {tool_name!r} in session "
+                f"{self._session_id!r} lost its server without a reserved "
+                "runner operation"
+            ) from cause
+        if (
+            request_dropped
+            and budget.live_tunnel_retries < len(_LIVE_TUNNEL_RETRY_DELAYS_S)
+            and self._tunnel_connected()
+        ):
+            # Only this request failed: back off briefly, then retry the
+            # same operation unless the tunnel dropped in the meantime.
+            delay = _LIVE_TUNNEL_RETRY_DELAYS_S[budget.live_tunnel_retries]
+            budget.live_tunnel_retries += 1
+            _logger.info(
+                "MCP proxy request for tool %r dropped on a live tunnel; "
+                "retrying in %.1fs (attempt %d)",
+                tool_name,
+                delay,
+                budget.live_tunnel_retries,
+                extra={"session_id": self._session_id},
+            )
+            try:
+                await pending_approvals.wait_for_server_reconnect(
+                    request_generation,
+                    timeout_seconds=delay,
+                )
+                return
+            except TimeoutError:
+                if self._tunnel_connected():
+                    return
+        try:
+            await pending_approvals.wait_for_server_reconnect(
+                request_generation,
+                timeout_seconds=_SERVER_RECONNECT_WAIT_S,
+            )
+        except TimeoutError as reconnect_exc:
+            raise RuntimeError(
+                f"MCP proxy call for tool {tool_name!r} in session "
+                f"{self._session_id!r} lost its server and no replacement "
+                f"connected within {_SERVER_RECONNECT_WAIT_S:.0f}s"
+            ) from reconnect_exc
+
     async def _call_tool_with_operation(
         self,
         tool_name: str,
@@ -370,28 +455,15 @@ class ProxyMcpManager:
                 },
             }
 
-        async def _wait_to_reattach(
-            request_generation: int,
-            cause: BaseException | None = None,
-        ) -> None:
-            registry = self._execution_registry
-            if registry is None or not registry.has_operation(self._session_id, operation_id):
-                raise RuntimeError(
-                    f"MCP proxy call for tool {tool_name!r} in session "
-                    f"{self._session_id!r} lost its server without a reserved "
-                    "runner operation"
-                ) from cause
-            try:
-                await pending_approvals.wait_for_server_reconnect(
-                    request_generation,
-                    timeout_seconds=_SERVER_RECONNECT_WAIT_S,
-                )
-            except TimeoutError as reconnect_exc:
-                raise RuntimeError(
-                    f"MCP proxy call for tool {tool_name!r} in session "
-                    f"{self._session_id!r} lost its server and no replacement "
-                    f"connected within {_SERVER_RECONNECT_WAIT_S:.0f}s"
-                ) from reconnect_exc
+        budget = _ReattachBudget()
+
+        def _replayable() -> bool:
+            # The server consumes an approval, and runs its own tools, outside
+            # the runner operation, so neither can reattach to a result.
+            return (
+                approval_retries == 0
+                and tool_name.removeprefix("mcp__omnigent__") not in SERVER_EXECUTED_TOOLS
+            )
 
         payload = _initial_payload()
         approval_retries = 0
@@ -422,13 +494,49 @@ class ProxyMcpManager:
                         "MCP gateway transport failed; completion is unknown. "
                         "Call was not retried."
                     ) from exc
-                await _wait_to_reattach(request_generation, exc)
-                # Reattach the new server generation to the same runner-owned
-                # operation. A fresh JSON-RPC id distinguishes this transport
-                # attempt; the operation id prevents external work from replaying.
+                if not _replayable() and not isinstance(exc, _REQUEST_NOT_SENT_ERRORS):
+                    raise RuntimeError(
+                        f"MCP proxy call for tool {tool_name!r} dropped after it was "
+                        "sent; completion is unknown. Call was not retried."
+                    ) from exc
+                await self._wait_to_reattach(
+                    tool_name,
+                    operation_id,
+                    request_generation,
+                    exc,
+                    budget=budget,
+                    request_dropped=True,
+                )
+                # Retry, or reattach a new server generation, on the same
+                # runner-owned operation. A fresh JSON-RPC id distinguishes this
+                # transport attempt; the operation id prevents external work
+                # from replaying.
                 request_id += 1
                 payload = cast("_JsonObject", {**payload, "id": request_id})
                 continue
+            except httpx.HTTPStatusError as exc:
+                if (
+                    not managed
+                    and _replayable()
+                    and self._execution_registry is not None
+                    and exc.response.status_code in _RETRYABLE_STATUS_CODES
+                    and budget.live_tunnel_retries < len(_LIVE_TUNNEL_RETRY_DELAYS_S)
+                ):
+                    await self._wait_to_reattach(
+                        tool_name,
+                        operation_id,
+                        request_generation,
+                        exc,
+                        budget=budget,
+                        request_dropped=True,
+                    )
+                    request_id += 1
+                    payload = cast("_JsonObject", {**payload, "id": request_id})
+                    continue
+                raise RuntimeError(
+                    f"MCP proxy call failed for tool {tool_name!r} in session "
+                    f"{self._session_id!r}: {exc}"
+                ) from exc
             except Exception as exc:
                 raise RuntimeError(
                     f"MCP proxy call failed for tool {tool_name!r} in session "
@@ -444,7 +552,9 @@ class ProxyMcpManager:
                 code = err.get("code")
                 msg = err.get("message", "")
                 if code == RUNNER_MCP_EXECUTION_DETACHED_CODE:
-                    await _wait_to_reattach(request_generation)
+                    await self._wait_to_reattach(
+                        tool_name, operation_id, request_generation, budget=budget
+                    )
                     request_id += 1
                     payload = cast("_JsonObject", {**payload, "id": request_id})
                     continue
