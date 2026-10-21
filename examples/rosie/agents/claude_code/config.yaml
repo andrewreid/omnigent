@@ -6,10 +6,9 @@ executor:
   type: omnigent
   config:
     harness: claude-native
-    # Headless workers can't answer ApprovalCards, and managed Claude
-    # settings disable ``bypassPermissions``. ``auto`` auto-approves without
-    # prompting and is allowed under managed settings (-> ``--permission-mode auto``).
-    permission_mode: auto
+    # Owner-authorized non-prompting workers: maps to --permission-mode bypassPermissions.
+    # Factory command policies, the push guard and GitHub merge rules remain the boundaries.
+    permission_mode: bypassPermissions
 
 prompt: |
   You are Claude Code, a coding sub-agent dispatched by the Rosie
