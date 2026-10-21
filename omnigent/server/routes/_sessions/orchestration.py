@@ -9821,6 +9821,7 @@ async def _ensure_runner_relay_ready_impl(
 async def _register_policy_elicitation(
     session_id: str,
     result: PolicyResult,
+    tool_name: str,
     arguments_preview: str,
     conversation_store: ConversationStore,
 ) -> str:
@@ -9837,6 +9838,7 @@ async def _register_policy_elicitation(
         e.g. ``"conv_abc123"``.
     :param result: The :class:`PolicyResult` with action=ASK,
         carrying the reason and deciding_policy fields.
+    :param tool_name: Tool being approved, e.g. ``"sys_os_read"``.
     :param arguments_preview: Truncated argument string for
         the elicitation UI preview (max ~1024 chars).
     :param conversation_store: Store used to mirror child-session
@@ -9850,7 +9852,7 @@ async def _register_policy_elicitation(
         requested_schema={},
         phase=Phase.TOOL_CALL.value,
         policy_names=result.deciding_policies or ["unknown"],
-        content_preview=arguments_preview[:1024],
+        content_preview=f"{tool_name}({arguments_preview})"[:1024],
     )
     # Approval state lives on the runner (in-memory
     # _pending_approvals dict of elicitation_id → Future).
@@ -9973,6 +9975,7 @@ async def _evaluate_tool_call_policy(
     elicitation_id = await _register_policy_elicitation(
         session_id=session_id,
         result=result,
+        tool_name=tool_name,
         arguments_preview=arguments_str,
         conversation_store=conversation_store,
     )
@@ -12390,6 +12393,7 @@ async def _handle_mcp_tools_call(
             elicitation_id = await _register_policy_elicitation(
                 session_id,
                 call_result,
+                namespaced_name,
                 json.dumps(arguments)[:1024],
                 conversation_store,
             )

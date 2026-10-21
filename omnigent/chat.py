@@ -27,6 +27,7 @@ import click
 import httpx
 import yaml
 from omnigent_client import (
+    ElicitationRequestCtx,
     OmnigentClient,
     RegisteredAgent,
     SessionToolCallInfo,
@@ -2328,6 +2329,20 @@ def _run_headless_prompt(
         raise SystemExit(1) from exc
 
 
+def _decline_headless_elicitation(ctx: ElicitationRequestCtx) -> bool:
+    """Decline an approval a one-shot ``-p`` run cannot answer, and say so on stderr."""
+    subject = ctx.content_preview or ctx.message or "a request"
+    if len(subject) > 200:
+        subject = subject[:200] + "…"
+    policy = f" (policy: {ctx.policy_name})" if ctx.policy_name else ""
+    click.echo(
+        f"Declined {subject}{policy}: one-shot -p runs cannot approve. "
+        "Run without -p to approve interactively.",
+        err=True,
+    )
+    return False
+
+
 async def _query_sessions_once(
     *,
     client: OmnigentClient,
@@ -2365,7 +2380,7 @@ async def _query_sessions_once(
         emitted.
     :raises RuntimeError: If no runner id was supplied.
     """
-    from omnigent_client import SessionsChat
+    from omnigent_client import SessionsChat, StreamHooks
 
     # Remote target: no local bundle means no local runner either, so
     # adopt one the server already has online before the dispatch
@@ -2422,6 +2437,7 @@ async def _query_sessions_once(
         session=bound,
         tool_callables=tool_callables,
         agent_tools_getter=client._fetch_agent_tools,
+        hooks=StreamHooks(on_elicitation_request=_decline_headless_elicitation),
     )
     del agent_name
     # A transport-level runner disconnect publishes ``session.status:

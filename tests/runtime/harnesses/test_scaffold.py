@@ -1197,6 +1197,50 @@ async def test_session_tool_result_event_resolves_parked_dispatch(
         await side_client.aclose()
 
 
+async def test_session_interrupt_records_parked_dispatch_as_cancelled(
+    use_tool_dispatch: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """An interrupted dispatch still streams a durable call and output.
+
+    A declined approval interrupts the turn while its tool call is parked;
+    only completed function_calls persist, so without these items the
+    attempted call vanishes from history.
+    """
+    conv_id = "conv_session_tool_interrupt"
+    stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    events: list[_ParsedSSEEvent] = []
+    start_body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
+    try:
+        async with stream_client.stream(
+            "POST", f"/v1/sessions/{conv_id}/events", json=start_body
+        ) as response:
+            interrupted = False
+            async for event in _stream_iter(response):
+                events.append(event)
+                if (
+                    not interrupted
+                    and event.event == "response.output_item.done"
+                    and event.data["item"].get("status") == "action_required"
+                ):
+                    resp = await side_client.post(
+                        f"/v1/sessions/{conv_id}/events", json={"type": "interrupt"}
+                    )
+                    assert resp.status_code == 204
+                    interrupted = True
+        items = [e.data["item"] for e in events if e.event == "response.output_item.done"]
+        assert [(i["type"], i.get("status"), i["call_id"]) for i in items] == [
+            ("function_call", "action_required", "call_test_1"),
+            ("function_call", "completed", "call_test_1"),
+            ("function_call_output", "completed", "call_test_1"),
+        ]
+        assert "cancelled" in json.loads(items[-1]["output"])["error"]
+        assert events[-1].event == "response.cancelled"
+    finally:
+        await side_client.aclose()
+
+
 async def test_session_tool_result_over_cap_streams_truncated_but_returns_full(
     use_tool_dispatch: None,
     manager: HarnessProcessManager,

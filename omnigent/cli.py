@@ -7359,7 +7359,10 @@ _FROM_OPENCLAW_HELP = (
     "Launch one agent from the OpenClaw/acpx registry without saving it to Omnigent config."
 )
 _MODEL_HELP = "Model to use for the agent."
-_PROMPT_HELP = "Send this as the first message when the REPL starts."
+_PROMPT_HELP = (
+    "Run this prompt as one headless turn and print the reply. Tool calls "
+    "that need approval are declined; run without -p to approve them."
+)
 _SYSTEM_PROMPT_HELP = "Instructions to use for the agent."
 _RESUME_HELP = (
     "Resume a prior conversation. With no value, opens an interactive "

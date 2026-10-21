@@ -99,6 +99,11 @@ _server_reconnect_waiters: set[asyncio.Future[int]] = set()
 # ``omnigent/runner/app.py``.
 _session_pending: dict[str, int] = {}
 
+# Ids registered here, kept past ``cleanup`` (oldest dropped first) so a
+# repeated verdict for a prompt this runner already settled is still ours.
+_RECENTLY_OWNED_LIMIT = 256
+_recently_owned: dict[str, None] = {}
+
 
 def has_pending(conversation_id: str) -> bool:
     """
@@ -141,6 +146,10 @@ def register(
     """
     fut: asyncio.Future[Verdict] = asyncio.get_running_loop().create_future()
     _pending[elicitation_id] = fut
+    _recently_owned.pop(elicitation_id, None)
+    _recently_owned[elicitation_id] = None
+    if len(_recently_owned) > _RECENTLY_OWNED_LIMIT:
+        del _recently_owned[next(iter(_recently_owned))]
     if retry_on_server_reconnect:
         _retry_on_server_reconnect.add(elicitation_id)
     else:
@@ -160,6 +169,19 @@ def cleanup(elicitation_id: str) -> None:
     """
     _pending.pop(elicitation_id, None)
     _retry_on_server_reconnect.discard(elicitation_id)
+
+
+def owns(elicitation_id: str) -> bool:
+    """
+    Report whether this runner parked on ``elicitation_id``.
+
+    True while the wait is registered and for a while after it ends, so a
+    verdict for it never needs to travel on to the harness.
+
+    :param elicitation_id: Correlation id, e.g. ``"elicit_abc123"``.
+    :returns: ``True`` if :func:`register` recorded this id.
+    """
+    return elicitation_id in _pending or elicitation_id in _recently_owned
 
 
 def current_server_generation() -> int:
@@ -363,6 +385,7 @@ def reset_for_tests() -> None:
     _pending.clear()
     _retry_on_server_reconnect.clear()
     _session_pending.clear()
+    _recently_owned.clear()
     for waiter in tuple(_server_reconnect_waiters):
         waiter.cancel()
     _server_reconnect_waiters.clear()
