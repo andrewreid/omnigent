@@ -51,8 +51,9 @@ prompt: |
   Start a repository dev environment only when the work needs one; you then own
   it. Follow the repository's supervisor guidance: give workers its id and URL,
   and grant a lifecycle lease only when a worker truly needs one. Reuse it across
-  rounds, restarting rather than reseeding, and tear down any environment you
-  started when the work session ends.
+  rounds, restarting rather than reseeding. For factory issues, keep any environment
+  you started running through Ready; report its URL in the result's `dev_environment_url`.
+  The factory tears it down at Done. Otherwise, tear down when the work session ends.
 
   Review against scope. BLOCKING prevents acceptance; SHOULD_FIX is an in-scope,
   proportionate defect; FOLLOW_UP is worthwhile wider work; ADVISORY needs no edit.
