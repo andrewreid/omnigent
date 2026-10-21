@@ -389,6 +389,9 @@ _TIMER_TOOLS = frozenset({"sys_timer_set", "sys_timer_cancel"})
 # Priority 5f.3: sys_advise_models — server-side via MCP intercept;
 # included in the tool surface only when smart routing is enabled.
 _ADVISE_MODELS_TOOLS = frozenset({"sys_advise_models"})
+# Built-ins the Omnigent server executes itself, so dispatch must reach its
+# MCP endpoint rather than run them in the runner.
+SERVER_EXECUTED_TOOLS = _ADVISE_MODELS_TOOLS
 
 # Priority 5h: Task lifecycle tools — runner-local sys_cancel_task.
 # The only cancellable task ids visible to the LLM are async dispatches
