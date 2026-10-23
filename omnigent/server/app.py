@@ -4570,6 +4570,32 @@ def create_app(
                 return owner
         return None
 
+    def _resolve_runner_credential_owner(runner_id: str) -> str | None:
+        """Owner of a managed runner whose sandbox host is still live, else ``None``.
+
+        Host deletion clears ``host_id`` but not ``runner_id``, so the binding
+        token alone would keep resolving after teardown; require the bound
+        session's managed host to exist, belong to the owner, not be
+        terminating, and still hold an unexpired, unrevoked launch credential
+        before vending that owner's provider credentials.
+        """
+        owner = _resolve_managed_runner_owner(runner_id)
+        if owner is None or host_store is None:
+            return None
+        for conv in conversation_store.list_conversations_by_runner_id(runner_id):
+            if conv.host_id is None:
+                continue
+            host = host_store.get_host(conv.host_id)
+            if (
+                host is not None
+                and host.user_id == owner
+                and host.sandbox_provider is not None
+                and host.terminating_sandbox_id is None
+                and host_store.has_live_launch_credential(host.host_id)
+            ):
+                return owner
+        return None
+
     # WS tunnel endpoint for runners (RUNNER.md §2-3).
     app.include_router(
         create_runner_tunnel_router(
@@ -4580,6 +4606,7 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            resolve_runner_credential_owner=_resolve_runner_credential_owner,
             mint_managed_runner_token=(
                 _mint_managed_runner_token if runner_account_store is not None else None
             ),

@@ -79,3 +79,31 @@ def configure_host_claude(server_url: str, host_id: str) -> bool:
     os.environ[CLAUDE_TOKEN_ENV_VAR] = token
     _logger.info("Claude credential: exported the owner's brokered subscription token")
     return True
+
+
+#: Set (to ``"1"``) on a sandbox host whose owner has connected ChatGPT, so codex
+#: readiness reports ready: the runner signs codex in from the broker at launch.
+CHATGPT_BROKERED_ENV_VAR = "OMNIGENT_CHATGPT_SUBSCRIPTION_BROKERED"
+
+
+def configure_host_chatgpt(server_url: str, host_id: str) -> bool:
+    """Record whether the owner's ChatGPT subscription is available via the broker.
+
+    Unlike Claude, the token is **not** exported: the codex harness fetches a
+    short-lived token itself (runner route) and keeps it in memory. This only
+    sets :data:`CHATGPT_BROKERED_ENV_VAR` so readiness doesn't report codex as
+    needing a login. Sandbox-only and non-raising.
+
+    :returns: ``True`` when the owner has ChatGPT connected.
+    """
+    if os.environ.get("IS_SANDBOX") != "1":
+        return False
+    host_token = (os.environ.get(HOST_TOKEN_ENV_VAR) or "").strip()
+    if not host_token:
+        return False
+    data = _fetch(server_url, host_id, host_token, "chatgpt")
+    if not data or not data.get("connected"):
+        return False
+    os.environ[CHATGPT_BROKERED_ENV_VAR] = "1"
+    _logger.info("ChatGPT credential: owner's subscription is available via the broker")
+    return True

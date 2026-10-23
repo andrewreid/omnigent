@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -954,6 +955,32 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
     )
 
 
+#: Codex spellings whose launch takes a brokered ChatGPT login (the in-process
+#: ``codex`` executor doesn't).
+_BROKERED_CODEX_HARNESSES: frozenset[str] = frozenset({"codex-native", "native-codex"})
+
+
+def _brokered_chatgpt_login(canonical: str) -> bool:
+    """Whether this managed sandbox signs *canonical* in from the credential broker,
+    so a connected ChatGPT subscription stands in for a local codex login."""
+    from omnigent.host.claude_credential import CHATGPT_BROKERED_ENV_VAR
+
+    return (
+        canonical in _BROKERED_CODEX_HARNESSES and os.environ.get(CHATGPT_BROKERED_ENV_VAR) == "1"
+    )
+
+
+def _codex_takes_brokered_login() -> bool:
+    """Whether the installed codex is new enough for the brokered ChatGPT login."""
+    from omnigent.onboarding.harness_install import harness_cli_version
+    from omnigent.runner.brokered_credentials import brokered_login_supported
+
+    version, _range = harness_cli_version(OPENAI_FAMILY)
+    numbers = [int(part) for part in re.findall(r"\d+", version or "")[:3]]
+    parsed = (numbers[0], numbers[1], numbers[2]) if len(numbers) == 3 else None
+    return brokered_login_supported(parsed)
+
+
 def _harness_availability(canonical: str) -> HarnessAvailability:
     """Return picker-facing availability for one canonical harness spelling."""
     if IS_WINDOWS and canonical in NATIVE_HARNESSES:
@@ -961,7 +988,11 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
     if _is_codex_family_harness(canonical):
         from omnigent.harnesses.codex_native.main import _codex_auth_unavailable_reason
 
-        return _codex_auth_unavailable_reason() or True
+        reason = _codex_auth_unavailable_reason()
+        if reason == "needs-auth" and _brokered_chatgpt_login(canonical):
+            # The same version gate the runner applies before the brokered login.
+            return True if _codex_takes_brokered_login() else HARNESS_VERSION_TOO_LOW
+        return reason or True
     install_key = _AUTH_AWARE_NATIVE_HARNESSES.get(canonical)
     if install_key is not None:
         # Cursor is auth-aware like the other native CLI harnesses, so a missing
