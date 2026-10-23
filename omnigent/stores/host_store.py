@@ -1442,7 +1442,7 @@ class HostStore:
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         """
-        with self._session("select_host_launch_credential") as session:
+        with self._session("check_launch_credential") as session:
             row = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),

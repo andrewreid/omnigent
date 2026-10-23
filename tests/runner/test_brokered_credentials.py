@@ -336,6 +336,21 @@ async def test_rejected_token_handed_back_again_stops_the_retry_storm(monkeypatc
     await auth.close()
 
 
+def test_readiness_asks_for_an_upgrade_when_codex_is_too_old_for_the_broker(monkeypatch) -> None:
+    # Launch skips the brokered login below the minimum, so readiness must not
+    # advertise it as signed in.
+    from omnigent.harnesses.codex_native import main as codex_main
+    from omnigent.onboarding import harness_install, harness_readiness
+
+    monkeypatch.setenv(CHATGPT_BROKERED_ENV_VAR, "1")
+    monkeypatch.setattr(codex_main, "_codex_auth_unavailable_reason", lambda: "needs-auth")
+    monkeypatch.setattr(
+        harness_install, "harness_cli_version", lambda key: ("codex-cli 0.153.9", None)
+    )
+
+    assert harness_readiness._harness_availability("codex-native") == "version-too-low"
+
+
 async def test_start_skips_codex_too_old_for_brokered_sign_in(monkeypatch) -> None:
     fetched: list[str] = []
 
@@ -378,7 +393,9 @@ async def test_start_is_a_noop_when_not_connected(monkeypatch) -> None:
 def test_host_flags_chatgpt_availability_without_taking_the_token(monkeypatch) -> None:
     monkeypatch.setenv("IS_SANDBOX", "1")
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
-    monkeypatch.delenv(CHATGPT_BROKERED_ENV_VAR, raising=False)
+    # setenv first so teardown restores it: the code under test sets it for real.
+    monkeypatch.setenv(CHATGPT_BROKERED_ENV_VAR, "")
+    monkeypatch.delenv(CHATGPT_BROKERED_ENV_VAR)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     seen: list[str] = []
 
@@ -396,7 +413,8 @@ def test_host_flags_chatgpt_availability_without_taking_the_token(monkeypatch) -
 
 
 def test_host_flag_not_set_outside_sandbox_or_when_disconnected(monkeypatch) -> None:
-    monkeypatch.delenv(CHATGPT_BROKERED_ENV_VAR, raising=False)
+    monkeypatch.setenv(CHATGPT_BROKERED_ENV_VAR, "")
+    monkeypatch.delenv(CHATGPT_BROKERED_ENV_VAR)
     monkeypatch.setattr(claude_credential, "_fetch", lambda *a, **k: {"connected": False})
     monkeypatch.setenv("IS_SANDBOX", "1")
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
@@ -418,6 +436,9 @@ def test_broker_flag_only_readies_native_codex(monkeypatch) -> None:
     monkeypatch.setattr(harness_install, "harness_cli_installed", lambda *a, **k: True)
     monkeypatch.setenv(CHATGPT_BROKERED_ENV_VAR, "1")
     monkeypatch.setattr(codex_main, "_codex_auth_unavailable_reason", lambda: "needs-auth")
+    monkeypatch.setattr(
+        harness_install, "harness_cli_version", lambda key: ("codex-cli 0.158.0", None)
+    )
 
     assert harness_readiness._harness_availability("codex-native") is True
     assert harness_readiness._harness_availability("native-codex") is True
