@@ -51,6 +51,7 @@ def connection_providers() -> list[ConnectionProvider]:
     """
     from functools import partial
 
+    from omnigent.server.claude_subscription import resolve_claude_credential
     from omnigent.server.databricks_app_client import DatabricksAppClient
     from omnigent.server.databricks_identity import (
         OWNER_IDENTITY_LEASE_WAIT_S,
@@ -59,6 +60,7 @@ def connection_providers() -> list[ConnectionProvider]:
     )
     from omnigent.server.github_app_client import GitHubAppClient
     from omnigent.server.github_identity import resolve_github_credential
+    from omnigent.server.routes.connections_claude import create_connections_claude_router
     from omnigent.server.routes.connections_databricks import (
         create_connections_databricks_router,
     )
@@ -83,6 +85,14 @@ def connection_providers() -> list[ConnectionProvider]:
                 refresh_margin_s=OWNER_IDENTITY_REFRESH_MARGIN_S,
                 lease_wait_s=OWNER_IDENTITY_LEASE_WAIT_S,
             ),
+        ),
+        ConnectionProvider(
+            name="claude",
+            # Paste flow: the token comes from the user's own `claude
+            # setup-token`, so there is no OAuth client.
+            client_factory=lambda _config: None,
+            router_factory=create_connections_claude_router,
+            credential_resolver=resolve_claude_credential,
         ),
     ]
 

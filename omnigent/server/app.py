@@ -1388,6 +1388,8 @@ def create_app(
     github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
     databricks_config: Any | None = None,  # DatabricksConfig — Databricks Connect
     databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
+    claude_config: Any | None = None,  # ClaudeSubscriptionConfig — Claude subscription
+    claude_store: Any | None = None,  # ClaudeConnectionStore — Claude subscription
     mcp_registry: Any | None = None,
     mcp_gateway_backend: McpGatewayBackend | None = None,
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
@@ -1501,6 +1503,11 @@ def create_app(
         (:class:`omnigent.connections.github.GithubConnectionStore`).
         Required alongside ``github_config`` to enable the integration;
         wired together by ``create_app``'s caller.
+    :param claude_config: Enables the Claude subscription connection
+        (:class:`omnigent.server.claude_subscription.ClaudeSubscriptionConfig`).
+    :param claude_store: Persistence for per-user Claude subscription tokens
+        (:class:`omnigent.connections.claude.ClaudeConnectionStore`). Required
+        alongside ``claude_config``.
     :param sharing_mode: Server policy for creating new session
         permission grants (see :class:`SharingMode`): ``ON`` allows
         grants at any level plus public/workspace read, ``READ_ONLY``
@@ -2128,6 +2135,7 @@ def create_app(
     _connection_inputs = {
         "github": (github_config, github_store),
         "databricks": (databricks_config, databricks_store),
+        "claude": (claude_config, claude_store),
     }
     for _provider in connection_providers():
         _cfg, _store = _connection_inputs.get(_provider.name, (None, None))
@@ -3297,10 +3305,10 @@ def create_app(
         # one panel per provider. A provider appears only when both its config
         # and its connection store are present.
         enabled_connections = [
-            provider
-            for provider in ("github", "databricks")
-            if getattr(app.state, f"{provider}_config", None) is not None
-            and getattr(app.state, f"{provider}_store", None) is not None
+            provider.name
+            for provider in connection_providers()
+            if getattr(app.state, f"{provider.name}_config", None) is not None
+            and getattr(app.state, f"{provider.name}_store", None) is not None
         ]
         if mcp_registry is not None:
             enabled_connections.append("mcp")
