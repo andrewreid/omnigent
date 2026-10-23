@@ -44,6 +44,11 @@ MIN_BROKERED_CODEX_VERSION = (0, 154, 0)
 _LOGIN_TIMEOUT_S = 30.0
 
 
+def brokered_login_supported(codex_version: tuple[int, int, int] | None) -> bool:
+    """Whether codex at *codex_version* can take the brokered login (unknown: try)."""
+    return codex_version is None or codex_version >= MIN_BROKERED_CODEX_VERSION
+
+
 def _in_managed_sandbox() -> bool:
     return (os.environ.get("IS_SANDBOX") or "").strip() == "1"
 
@@ -163,7 +168,7 @@ async def start_brokered_chatgpt_auth(
     :data:`MIN_BROKERED_CODEX_VERSION`; the caller keeps codex's own login path.
     Never raises.
     """
-    if codex_version is not None and codex_version < MIN_BROKERED_CODEX_VERSION:
+    if codex_version is not None and not brokered_login_supported(codex_version):
         _logger.warning(
             "codex %s predates brokered ChatGPT sign-in (needs %s+); using codex's own login",
             ".".join(map(str, codex_version)),

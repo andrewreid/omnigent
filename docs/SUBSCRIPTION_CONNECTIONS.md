@@ -67,15 +67,17 @@ connections are unaffected.
 The poll that completes the sign-in can then run for over 20 seconds, including
 a short wait for a racing save. Give the Omnigent route a request timeout of at
 least 60 seconds. Envoy's default is 15 seconds. The web UI retries a poll that
-a proxy cuts off, and the server answers a completed sign-in idempotently, so a
-shorter timeout costs a retry, not the connection.
+a proxy cuts off, and the server answers a completed sign-in idempotently. A
+retry that arrives while the cut-off poll is still saving waits up to 10 seconds
+for that save; if the save takes longer, the sign-in fails and the user starts
+again.
 
 ## Token lifetimes and revocation
 
 | | Claude | ChatGPT |
 |---|---|---|
 | What a sandbox holds | the setup token (about 1 year) | an access token (about 10 days; refreshed when under 2 days remain) |
-| Disconnect | Deletes the stored token, so new sandboxes stop getting it. It doesn't invalidate the token: sandboxes already running keep their copy until it expires. | Stops vending, revokes the refresh chain at OpenAI (which also invalidated the access tokens handed out from it when we tested), then deletes the connection. A reconnect made while this runs is left alone. |
+| Disconnect | Deletes the stored token, so new sandboxes stop getting it. It doesn't invalidate the token: sandboxes already running keep their copy until it expires. | Stops vending, waits up to 60 seconds for a refresh already in progress to save its result, revokes the newest refresh chain at OpenAI (which also invalidated the access tokens handed out from it when we tested), then deletes the connection. A reconnect made while this runs is left alone. |
 | If revoke fails | n/a | The connection stays flagged (nothing more is vended) and is kept so it can still be revoked; the user is asked to disconnect again (`502`). |
 | If the stored sign-in is unreadable | n/a | It is disconnected, but nothing could be revoked at OpenAI; the response says `"revoked": false` and the panel says so. |
 
