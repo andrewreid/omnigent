@@ -91,7 +91,7 @@ class Refreshed(Generic[EntityT, TokensT]):
 
 class _LeasedStore(Protocol[EntityT]):
     def get(self, user_id: str, *, with_tokens: bool = False) -> EntityT | None: ...
-    def needs_reconnect(self, user_id: str) -> bool: ...
+    def get_usable(self, user_id: str) -> EntityT | None: ...
     def acquire_refresh_lease(self, user_id: str, *, holder: str, ttl_s: int) -> bool: ...
     def get_under_lease(self, user_id: str, *, holder: str) -> EntityT | None: ...
     def mark_refresh_inflight(self, user_id: str, *, holder: str) -> bool: ...
@@ -129,8 +129,8 @@ async def refresh_coordinated(
     left on the lease makes the next acquirer flag it, so a possibly spent
     refresh token is never sent again.
     """
-    conn = await asyncio.to_thread(store.get, user_id, with_tokens=True)
-    if conn is None or await asyncio.to_thread(store.needs_reconnect, user_id):
+    conn = await asyncio.to_thread(store.get_usable, user_id)
+    if conn is None:
         return None
     if is_fresh(conn):
         return Refreshed(conn)
@@ -226,10 +226,8 @@ async def _current_or_none(
 ) -> Refreshed[EntityT, TokensT] | None:
     """After losing the lease: the stored connection, or ``None`` if it's gone or
     needs a reconnect."""
-    conn = await asyncio.to_thread(store.get, user_id, with_tokens=True)
-    if conn is None or await asyncio.to_thread(store.needs_reconnect, user_id):
-        return None
-    return Refreshed(conn)
+    conn = await asyncio.to_thread(store.get_usable, user_id)
+    return Refreshed(conn) if conn is not None else None
 
 
 async def _persist_minted(
@@ -265,8 +263,8 @@ async def _await_other_holder(
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
         await asyncio.sleep(_POLL_S)
-        conn = await asyncio.to_thread(store.get, user_id, with_tokens=True)
-        if conn is None or await asyncio.to_thread(store.needs_reconnect, user_id):
+        conn = await asyncio.to_thread(store.get_usable, user_id)
+        if conn is None:
             return None
         if is_fresh(conn):
             return Refreshed(conn)

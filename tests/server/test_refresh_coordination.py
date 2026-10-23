@@ -431,6 +431,32 @@ def test_refresh_the_store_refuses_is_never_vended(db_uri: str) -> None:
     assert client.calls == 1
 
 
+def test_refused_save_never_falls_back_to_a_disconnected_chain(db_uri: str) -> None:
+    # A reconnect lands right after the fallback read the fenced chain: what it
+    # read must still count as disconnected, never be vended.
+    store = _seed(db_uri)
+    gen = store.generation(_USER)
+    read = store._store.get
+    reconnect_after_next_read: list[bool] = []
+
+    def read_then_reconnect(*args, **kwargs):
+        conn = read(*args, **kwargs)
+        if reconnect_after_next_read and kwargs.get("with_secret"):
+            reconnect_after_next_read.clear()
+            store.upsert(_USER, github_login="alice", github_user_id=7, tokens=_tokens("re", 3600))
+        return conn
+
+    class FencedMidRefresh(_Client):
+        async def refresh_token(self, refresh_token: str) -> GitHubTokenSet:
+            _expire_lease(store)
+            assert store.fence_refresh(_USER, generation=gen) == "ready"
+            reconnect_after_next_read.append(True)
+            return await super().refresh_token(refresh_token)
+
+    store._store.get = read_then_reconnect  # type: ignore[method-assign]
+    assert _resolve(store, FencedMidRefresh(result=_tokens("new", 3600))) is None
+
+
 def test_refresh_persists_and_clears_the_lease(db_uri: str) -> None:
     store = _seed(db_uri)
     assert _resolve(store, _Client(result=_tokens("new", 28800))) == "new"

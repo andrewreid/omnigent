@@ -43,6 +43,9 @@ class _Store:
     def needs_reconnect(self, user_id: str) -> bool:
         return self.reconnect
 
+    def get_usable(self, user_id: str) -> _Conn | None:
+        return None if self.reconnect else self._conn
+
     def acquire_refresh_lease(self, user_id: str, *, holder: str, ttl_s: int) -> bool:
         if self.reconnect or self.lease not in (None, holder):
             return False
