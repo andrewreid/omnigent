@@ -32,7 +32,7 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import ProviderConnection
-from omnigent.stores.credential_store.secret_cipher import SecretCipher
+from omnigent.stores.credential_store.secret_cipher import SecretCipher, SecretTooLargeError
 
 _logger = logging.getLogger(__name__)
 
@@ -48,6 +48,15 @@ _REFRESH_INFLIGHT = "refresh_inflight"
 #: Fresh per connect/reconnect, so a slow operation can tell the row it read
 #: from a replacement (``upsert`` keeps ``created_at``).
 _GENERATION = "connection_generation"
+
+
+def _check_encrypted_size(secret_enc: str, dialect_name: str) -> None:
+    """Keep the full cipher envelope within MySQL TEXT's byte capacity."""
+    if dialect_name in {"mysql", "mariadb"} and len(secret_enc.encode("utf-8")) > 65_535:
+        raise SecretTooLargeError(
+            "Encrypted credential exceeds the storage limit of 65535 bytes. "
+            "Ask your provider for a smaller credential."
+        )
 
 
 def _enc_context(
@@ -154,6 +163,7 @@ class CredentialStore:
         pk = (workspace_id, user_id, provider, account_id)
         context = _enc_context(workspace_id, user_id, provider, account_id)
         secret_enc = self._cipher.encrypt(json.dumps(secret), context=context)
+        _check_encrypted_size(secret_enc, self._engine.dialect.name)
         metadata_json = json.dumps({**metadata, _GENERATION: uuid.uuid4().hex})
 
         def _apply(session: Session, row: SqlConnection | None) -> SqlConnection:
@@ -220,6 +230,7 @@ class CredentialStore:
         workspace_id = current_workspace_id()
         context = _enc_context(workspace_id, user_id, provider, account_id)
         secret_enc = self._cipher.encrypt(json.dumps(secret), context=context)
+        _check_encrypted_size(secret_enc, self._engine.dialect.name)
         updated_at = now_epoch()
 
         def write(session: Session) -> bool:

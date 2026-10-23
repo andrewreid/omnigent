@@ -54,6 +54,10 @@ _ENVELOPE_PREFIX = "kmsenv1:"
 _ENVELOPE_NONCE_BYTES = 12
 
 
+class SecretTooLargeError(ValueError):
+    """The serialized secret exceeds the configured encryption backend limit."""
+
+
 @runtime_checkable
 class SecretCipher(Protocol):
     """Port for encrypting integration secrets at rest.
@@ -159,7 +163,8 @@ class KmsSecretCipher:
     identity as the encryption context; the ciphertext blob is stored base64.
     A secret over the 4 KB ``Encrypt`` limit (e.g. a full OAuth token set) is
     sealed with AES-256-GCM under a ``kms:GenerateDataKey`` data key bound to the
-    same context, and stored with a ``kmsenv1:`` prefix. The KMS client
+    same context, and stored with a ``kmsenv1:`` prefix. The credential store
+    still caps the stored ciphertext where the column type demands it. The KMS client
     is created lazily so importing this module never requires boto3 or AWS
     credentials — only constructing the cipher (which only happens when a key is
     configured) does.
