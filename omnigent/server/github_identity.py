@@ -13,7 +13,7 @@ from omnigent.connections.github import GithubConnectionStore
 from omnigent.connections.refresh import refresh_coordinated
 from omnigent.db.utils import now_epoch
 from omnigent.entities import GithubConnection
-from omnigent.server.github_app import GitHubAppError, GitHubTokenSet
+from omnigent.server.github_app import GitHubTokenRequestFailed, GitHubTokenSet
 from omnigent.server.github_app_client import GitHubAppClient
 
 _logger = logging.getLogger(__name__)
@@ -57,7 +57,7 @@ async def resolve_access_token(
 
     async def refresh(conn: GithubConnection) -> GitHubTokenSet:
         if not conn.refresh_token:
-            raise GitHubAppError("no refresh token stored")
+            raise GitHubTokenRequestFailed("no refresh token stored")
         return await client.refresh_token(conn.refresh_token)
 
     def persist(tokens: GitHubTokenSet, holder: str) -> bool:

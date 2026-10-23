@@ -40,6 +40,12 @@ class RefreshRejected(Exception):
     is dead and only a reconnect can fix it. Raised by provider clients."""
 
 
+class RefreshNotRotated(Exception):
+    """The refresh certainly issued no tokens: the provider answered with an
+    error, or nothing was sent. The stored refresh token is still current.
+    Raised by provider clients; any other failure counts as an unknown outcome."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Refreshed(Generic[EntityT, TokensT]):
     """What :func:`refresh_coordinated` resolved.
@@ -164,13 +170,11 @@ async def refresh_coordinated(
 def _rotation_ruled_out(exc: BaseException) -> bool:
     """Whether a failed refresh certainly left the chain unrotated.
 
-    A connect failure never reached the provider, and a provider error response
-    (raised by the clients as their own errors) issued no tokens. Any other
-    transport failure may have lost the answer to a refresh that succeeded.
+    Only a connect failure (never reached the provider) or an explicit provider
+    error (:class:`RefreshNotRotated`) qualifies. Anything else, such as a lost
+    answer or a success response that couldn't be parsed, may have rotated it.
     """
-    if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout):
-        return True
-    return not isinstance(exc, httpx.TransportError)
+    return isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout | RefreshNotRotated)
 
 
 async def _fail_closed(store: _LeasedStore[EntityT], user_id: str, holder: str) -> None:

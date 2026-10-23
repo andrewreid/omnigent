@@ -15,7 +15,10 @@ from omnigent.connections.databricks import DatabricksConnectionStore
 from omnigent.connections.refresh import LEASE_TTL_S, refresh_coordinated
 from omnigent.db.utils import now_epoch
 from omnigent.entities import DatabricksConnection
-from omnigent.server.databricks_app import DatabricksAppError, DatabricksTokenSet
+from omnigent.server.databricks_app import (
+    DatabricksTokenRequestFailed,
+    DatabricksTokenSet,
+)
 from omnigent.server.databricks_app_client import DatabricksAppClient
 
 _logger = logging.getLogger(__name__)
@@ -66,7 +69,7 @@ async def resolve_databricks_token(
 
     async def refresh(conn: DatabricksConnection) -> DatabricksTokenSet:
         if not conn.refresh_token:
-            raise DatabricksAppError("no refresh token stored")
+            raise DatabricksTokenRequestFailed("no refresh token stored")
         return await client.refresh_token(conn.workspace_host, conn.refresh_token)
 
     def persist(tokens: DatabricksTokenSet, holder: str) -> bool:

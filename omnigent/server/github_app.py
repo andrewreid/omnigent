@@ -34,7 +34,7 @@ from dataclasses import dataclass
 
 import jwt
 
-from omnigent.connections.refresh import RefreshRejected
+from omnigent.connections.refresh import RefreshNotRotated, RefreshRejected
 
 _logger = logging.getLogger(__name__)
 
@@ -248,7 +248,7 @@ def token_set_from_payload(payload: dict) -> GitHubTokenSet:
     """
     if "error" in payload:
         detail = payload.get("error_description", payload["error"])
-        raise GitHubAppError(f"GitHub token exchange failed: {detail}")
+        raise GitHubTokenRequestFailed(f"GitHub token exchange failed: {detail}")
     access = payload.get("access_token")
     if not access:
         raise GitHubAppError("GitHub token response missing access_token")
@@ -274,3 +274,7 @@ REFRESH_REJECTED_ERRORS = frozenset({"bad_refresh_token", "invalid_grant"})
 
 class GitHubRefreshRejected(GitHubAppError, RefreshRejected):
     """GitHub rejected the refresh token; the user must reconnect."""
+
+
+class GitHubTokenRequestFailed(GitHubAppError, RefreshNotRotated):
+    """GitHub answered the token request with an error and issued no tokens."""

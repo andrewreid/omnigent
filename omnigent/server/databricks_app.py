@@ -31,7 +31,7 @@ import os
 import time
 from dataclasses import dataclass
 
-from omnigent.connections.refresh import RefreshRejected
+from omnigent.connections.refresh import RefreshNotRotated, RefreshRejected
 
 _logger = logging.getLogger(__name__)
 
@@ -245,7 +245,7 @@ def token_set_from_payload(payload: dict) -> DatabricksTokenSet:
     """Parse a token-endpoint JSON payload into a :class:`DatabricksTokenSet`."""
     if "error" in payload:
         detail = payload.get("error_description", payload["error"])
-        raise DatabricksAppError(f"Databricks token exchange failed: {detail}")
+        raise DatabricksTokenRequestFailed(f"Databricks token exchange failed: {detail}")
     access = payload.get("access_token")
     if not access:
         raise DatabricksAppError("Databricks token response missing access_token")
@@ -271,3 +271,7 @@ REFRESH_REJECTED_ERRORS = frozenset({"invalid_grant"})
 
 class DatabricksRefreshRejected(DatabricksAppError, RefreshRejected):
     """Databricks rejected the refresh token; the user must reconnect."""
+
+
+class DatabricksTokenRequestFailed(DatabricksAppError, RefreshNotRotated):
+    """Databricks answered the token request with an error and issued no tokens."""
