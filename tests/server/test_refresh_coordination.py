@@ -20,11 +20,16 @@ import time
 from pathlib import Path
 
 import httpx
+import pytest
 
 from omnigent.connections.github import GithubConnectionStore
 from omnigent.db.utils import now_epoch
 from omnigent.server import github_identity
-from omnigent.server.github_app import GitHubRefreshRejected, GitHubTokenSet
+from omnigent.server.github_app import (
+    GitHubRefreshRejected,
+    GitHubTokenRequestFailed,
+    GitHubTokenSet,
+)
 
 _USER = "alice@example.com"
 _PROVIDER = "github"
@@ -217,6 +222,24 @@ def test_refresh_keeps_the_generation(db_uri: str) -> None:
     assert store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)
     assert store.update_tokens(_USER, _tokens("new", 3600), lease_holder="a")
     assert store.generation(_USER) == gen
+
+
+@pytest.mark.parametrize(
+    ("exc", "safe"),
+    [
+        (httpx.ConnectError("refused"), True),
+        (httpx.ConnectTimeout("no route"), True),
+        (GitHubTokenRequestFailed("GitHub token endpoint returned 503"), True),
+        (httpx.ReadTimeout("answer lost"), False),
+        (httpx.RemoteProtocolError("connection dropped"), False),
+        (ValueError("Expecting value: line 1 column 1"), False),
+        (RuntimeError("unexpected"), False),
+    ],
+)
+def test_only_connect_failures_and_provider_errors_rule_out_rotation(exc, safe) -> None:
+    from omnigent.connections.refresh import _rotation_ruled_out
+
+    assert _rotation_ruled_out(exc) is safe
 
 
 # --- resolver against the real store ----------------------------------------

@@ -58,6 +58,8 @@ class FakeAuthService:
         self.pending_polls = 1
         self.usercode_status = 200
         self.refresh_error: tuple[int, dict] | None = None
+        # A 200 whose body can't be parsed: the refresh may have rotated the chain.
+        self.refresh_garbled = False
         self.refreshes: list[str] = []
         self.revoked: list[str] = []
         self.revoke_status = 200
@@ -107,6 +109,8 @@ class FakeAuthService:
             if self.refresh_error is not None:
                 status, payload = self.refresh_error
                 return httpx.Response(status, json=payload)
+            if self.refresh_garbled:
+                return httpx.Response(200, content=b"<html>gateway page</html>")
             n = int(body["refresh_token"].split("-")[1]) + 1
             return httpx.Response(200, json=_tokens(n))
         if path == "/oauth/revoke":
@@ -503,6 +507,17 @@ def test_rejected_refresh_needs_reconnect_and_stops(store, api, auth, status, bo
     _seed(store, ttl=3600)
     auth.refresh_error = (status, body)
     assert _resolve(store, api) is None
+    assert store.needs_reconnect(_USER)
+    assert _resolve(store, api) is None
+    assert auth.refreshes == ["rt-1"]
+
+
+def test_unparseable_success_fails_closed_and_never_resends(store, api, auth) -> None:
+    # A 200 that can't be read may still have rotated the chain upstream: keep
+    # the current token for this call, but never present that refresh token again.
+    _seed(store, ttl=3600)
+    auth.refresh_garbled = True
+    assert _resolve(store, api) is not None
     assert store.needs_reconnect(_USER)
     assert _resolve(store, api) is None
     assert auth.refreshes == ["rt-1"]

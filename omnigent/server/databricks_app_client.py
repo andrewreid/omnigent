@@ -17,6 +17,7 @@ from omnigent.server.databricks_app import (
     DatabricksAppError,
     DatabricksConfig,
     DatabricksRefreshRejected,
+    DatabricksTokenRequestFailed,
     DatabricksTokenSet,
     token_set_from_payload,
     token_url,
@@ -101,5 +102,7 @@ class DatabricksAppClient:
                     f"{payload.get('error_description') or payload['error']}"
                 )
         if resp.status_code != 200:
-            raise DatabricksAppError(f"Databricks token endpoint returned {resp.status_code}")
+            raise DatabricksTokenRequestFailed(
+                f"Databricks token endpoint returned {resp.status_code}"
+            )
         return token_set_from_payload(resp.json())

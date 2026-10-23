@@ -19,6 +19,7 @@ from omnigent.server.github_app import (
     GitHubAppConfig,
     GitHubAppError,
     GitHubRefreshRejected,
+    GitHubTokenRequestFailed,
     GitHubTokenSet,
     token_set_from_payload,
 )
@@ -213,7 +214,7 @@ class GitHubAppClient:
             )
         _raise_if_rejected(resp, rejected)
         if resp.status_code != 200:
-            raise GitHubAppError(f"GitHub token endpoint returned {resp.status_code}")
+            raise GitHubTokenRequestFailed(f"GitHub token endpoint returned {resp.status_code}")
         return token_set_from_payload(resp.json())
 
 

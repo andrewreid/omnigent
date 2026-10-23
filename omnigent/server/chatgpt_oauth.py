@@ -20,7 +20,7 @@ from typing import Any
 
 import httpx
 
-from omnigent.connections.refresh import RefreshRejected
+from omnigent.connections.refresh import RefreshNotRotated, RefreshRejected
 
 _logger = logging.getLogger(__name__)
 
@@ -48,6 +48,10 @@ class ChatgptOAuthError(Exception):
 
 class ChatgptRefreshRejected(ChatgptOAuthError, RefreshRejected):
     """The refresh token was rejected (expired, reused or revoked); reconnect."""
+
+
+class ChatgptRefreshFailed(ChatgptOAuthError, RefreshNotRotated):
+    """The auth service answered with an error and issued no tokens."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -251,7 +255,7 @@ class ChatgptOAuthClient:
         :raises ChatgptOAuthError: Any other (transient) failure.
         """
         if not previous.refresh_token:
-            raise ChatgptOAuthError("no refresh token stored")
+            raise ChatgptRefreshFailed("no refresh token stored")
         async with self._http() as http:
             resp = await http.post(
                 f"{self._config.issuer}/oauth/token",
@@ -268,7 +272,7 @@ class ChatgptOAuthClient:
             raise ChatgptRefreshRejected(
                 f"ChatGPT refused the refresh token ({code or resp.status_code})"
             )
-        raise ChatgptOAuthError(f"ChatGPT token refresh failed ({resp.status_code})")
+        raise ChatgptRefreshFailed(f"ChatGPT token refresh failed ({resp.status_code})")
 
     async def revoke(self, refresh_token: str) -> None:
         """Revoke the refresh chain upstream, which also kills its access tokens.
