@@ -20,6 +20,8 @@ import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nat
 
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
+  claudeStatus: vi.fn(),
+  claudeSubmit: vi.fn(),
   theme: "system" as string,
   isEmbedded: false,
   archiveMutate: vi.fn(),
@@ -61,6 +63,11 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     single_user: mocks.singleUser,
     enabled_connections: mocks.enabledConnections,
   }),
+}));
+vi.mock("@/lib/claudeIntegration", () => ({
+  fetchClaudeStatus: mocks.claudeStatus,
+  submitClaudeToken: mocks.claudeSubmit,
+  disconnectClaude: vi.fn(),
 }));
 vi.mock("@/shell/ImportSessionsPanel", () => ({
   ImportSessionsPanel: mocks.importSessionsPanel,
@@ -228,6 +235,8 @@ function renderPage(path = "/settings") {
 
 beforeEach(() => {
   mocks.setTheme.mockReset();
+  mocks.claudeStatus.mockReset();
+  mocks.claudeSubmit.mockReset();
   mocks.archiveMutate.mockReset();
   mocks.deleteMutate.mockReset();
   mocks.bulkArchiveMutate.mockReset();
@@ -327,6 +336,21 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
     unsubscribe,
   };
 }
+
+describe("Claude subscription", () => {
+  it("labels the token field and explains a save that can't reach the server", async () => {
+    mocks.enabledConnections = ["claude"];
+    mocks.claudeStatus.mockResolvedValue({ enabled: true, connected: false, token_hint: null });
+    mocks.claudeSubmit.mockRejectedValue(new TypeError("Failed to fetch"));
+    renderPage("/settings/integrations");
+
+    const field = await screen.findByLabelText("Claude setup token");
+    fireEvent.change(field, { target: { value: "sk-ant-oat01-abc" } });
+    fireEvent.click(screen.getByTestId("claude-connect"));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't reach the server");
+  });
+});
 
 describe("SettingsPage", () => {
   beforeEach(() => {
