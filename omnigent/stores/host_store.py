@@ -1432,6 +1432,28 @@ class HostStore:
                 session.delete(row)
             return True
 
+    def has_live_launch_credential(self, host_id: str) -> bool:
+        """
+        Whether a managed host still holds an unexpired launch credential.
+
+        The same lifecycle :meth:`resolve_launch_token` enforces, without the
+        token itself: ``False`` once the host is deleted, its credential was
+        revoked (:meth:`revoke_launch_token`), or it expired.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        """
+        with self._session("check_launch_credential") as session:
+            row = session.execute(
+                select(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+            if row is None or row.token_hash is None or row.token_expires_at is None:
+                return False
+            return row.token_expires_at >= now_epoch()
+
     def revoke_launch_token(self, host_id: str) -> None:
         """
         Clear a managed host's launch credential, keeping the row.

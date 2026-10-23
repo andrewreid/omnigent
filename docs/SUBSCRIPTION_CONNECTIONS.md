@@ -3,8 +3,8 @@
 How to turn on per-user **Claude** and **ChatGPT** subscription connections.
 Once enabled, a signed-in user connects their own subscription once, under
 **Settings → Sandbox Integrations**. Their managed sandboxes then run Claude Code
-(and, once delivery lands, Codex) on that subscription, with no API key and
-nothing to paste into each sandbox.
+and Codex on that subscription, with no API key and nothing to paste into each
+sandbox.
 
 Both connections are **off by default**. The design, and the decisions behind it,
 are in `designs/SUBSCRIPTION_BROKER.md`.
@@ -19,8 +19,11 @@ are in `designs/SUBSCRIPTION_BROKER.md`.
   exports `CLAUDE_CODE_OAUTH_TOKEN` for Claude Code.
 - **ChatGPT.** The user clicks **Connect ChatGPT**, enters the one-time code on
   OpenAI's page, and approves it. The server keeps the refresh chain (encrypted)
-  and refreshes it server-side. Delivering access tokens to `codex-native`
-  sandboxes is a separate change.
+  and refreshes it server-side. A managed `codex-native` runner fetches a
+  short-lived access token from `GET /v1/runners/{id}/credentials/chatgpt`. It
+  signs codex in through the app-server's `chatgptAuthTokens` login, so nothing
+  credential-shaped is written to disk, and it answers codex's token-refresh
+  requests from the broker.
 - **What sandboxes never get:** the ChatGPT refresh token. Only access tokens
   leave the server.
 
@@ -38,7 +41,9 @@ are in `designs/SUBSCRIPTION_BROKER.md`.
    config. Sessions on a user's own registered machine keep using that
    machine's local logins.
 3. **ChatGPT:** device-code sign-in must be enabled for the user's account,
-   under ChatGPT → Settings → Security.
+   under ChatGPT → Settings → Security. Only the native Codex harness
+   (`codex-native`) uses the brokered login. The in-process `codex` harness
+   still needs its own login.
 
 ## Configuration
 
@@ -85,6 +90,12 @@ again.
   be stored, or the server died mid-refresh). Rotating providers spend the old refresh token on use, so the
   broker fails closed rather than risk sending it twice. Reconnecting fixes it.
   This applies to the GitHub and Databricks connections too.
+- **A sandbox's codex gets a 401 before its token expires.** The runner reports
+  the refused token, as a digest, and the server refreshes it once. If the chain
+  can't be refreshed, codex is told to reconnect.
+- **The sandbox was torn down.** Its runner can no longer fetch credentials,
+  even with a leftover binding token: vending requires the session to still be
+  on a live, server-managed host.
 
 ## Upgrading and rolling back
 
@@ -99,3 +110,12 @@ side.
   keep the format older servers read.
 - No schema migration is involved; the new state lives in the existing
   connection metadata, which older servers ignore.
+
+## Compatibility
+
+The ChatGPT delivery uses the Codex app-server's `chatgptAuthTokens` login and
+answers its `account/chatgptAuthTokens/refresh` requests. Codex marks that
+interface unstable and internal. It was verified end to end with `codex-cli`
+0.158.0. A runner whose codex is older than 0.154.0 keeps codex's own login, and
+the brokered login gives up after 30 seconds if the app-server doesn't answer.
+Pin the Codex version in your host image, and re-verify after upgrading.
