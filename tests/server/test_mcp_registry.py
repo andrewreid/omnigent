@@ -370,14 +370,25 @@ async def test_connection_test_preserves_safe_upstream_diagnosis(registry, monke
     assert "HTTP 403" in response.json()["detail"]
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("token", ["a" * 4080, "é" * 1000])
-async def test_kms_rejects_oversized_serialized_bearer_before_encrypt(db_uri, token):
+def _envelope_kms():
+    """A KMS client mock whose ``generate_data_key`` returns a usable AES-256 key."""
+    import os
     from unittest.mock import Mock
 
+    kms = Mock()
+    kms.generate_data_key.return_value = {
+        "Plaintext": os.urandom(32),
+        "CiphertextBlob": b"wrapped",
+    }
+    return kms
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token", ["a" * 4080, "é" * 1000])
+async def test_kms_seals_oversized_serialized_bearer_in_an_envelope(db_uri, token):
     from omnigent.stores.credential_store.secret_cipher import KmsSecretCipher
 
-    kms = Mock()
+    kms = _envelope_kms()
     store = CredentialStore(db_uri, KmsSecretCipher("test-key", client=kms))
     registry = McpRegistry(McpRegistryConfig(services=[service()]), store)
     app = FastAPI()
@@ -390,11 +401,11 @@ async def test_kms_rejects_oversized_serialized_bearer_before_encrypt(db_uri, to
             headers={"x-test-user": "alice"},
             json={"token": token},
         )
-    assert response.status_code == 400, response.text
-    assert "4096 serialized bytes" in response.text and "Vault" in response.text
+    assert response.status_code < 300, response.text
     assert token not in response.text
-    kms.encrypt.assert_not_called()
-    assert store.get("alice", "mcp:tracker") is None
+    kms.encrypt.assert_not_called()  # over the direct Encrypt limit
+    kms.generate_data_key.assert_called_once()
+    assert store.get("alice", "mcp:tracker") is not None
 
 
 @pytest.mark.asyncio
@@ -422,12 +433,11 @@ async def test_bearer_rejects_oversized_ciphertext_after_expansion(registry, mon
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ["kms", "expanding"])
 async def test_oauth_size_error_is_a_connection_error(db_uri, monkeypatch, backend):
-    from unittest.mock import Mock
 
     from omnigent.server.mcp_registry import McpOAuthHooks
     from omnigent.stores.credential_store.secret_cipher import KmsSecretCipher
 
-    kms = Mock()
+    kms = _envelope_kms()
     kms.encrypt.return_value = {"CiphertextBlob": b"test-cipher"}
     kms.decrypt.return_value = {"Plaintext": b'{"nonce": "nonce", "verifier": "verifier"}'}
     cipher = KmsSecretCipher("test-key", client=kms) if backend == "kms" else _FakeCipher()
@@ -458,13 +468,12 @@ async def test_oauth_size_error_is_a_connection_error(db_uri, monkeypatch, backe
         AsyncMock(
             return_value={
                 "access_token": "short",
-                "refresh_token": "x" * 4096 if backend == "kms" else "é" * 9000,
+                "refresh_token": "é" * 9000,
             }
         ),
     )
-    with pytest.raises(
-        ConnectionError, match="4096 serialized bytes" if backend == "kms" else "65535 bytes"
-    ):
+    # KMS seals it in an envelope, which still exceeds MySQL TEXT's capacity.
+    with pytest.raises(ConnectionError, match="65535 bytes"):
         await McpOAuthHooks(registry, entry).complete(
             "alice", "code", {"nonce": "nonce", "service": "tracker"}
         )
@@ -539,19 +548,17 @@ async def test_backend_value_errors_do_not_expose_details(oauth_app, monkeypatch
     assert marker not in response.text + caplog.text
 
 
-def test_kms_size_boundary_counts_utf8_bytes():
-    from unittest.mock import Mock
+def test_kms_direct_limit_counts_utf8_bytes_then_uses_an_envelope():
+    from omnigent.stores.credential_store.secret_cipher import KmsSecretCipher
 
-    from omnigent.stores.credential_store.secret_cipher import KmsSecretCipher, SecretTooLargeError
-
-    kms = Mock()
+    kms = _envelope_kms()
     kms.encrypt.return_value = {"CiphertextBlob": b"cipher"}
     cipher = KmsSecretCipher("test-key", client=kms)
     cipher.encrypt("é" * 2048, context={"user_id": "alice"})
     assert len(kms.encrypt.call_args.kwargs["Plaintext"]) == 4096
     kms.encrypt.reset_mock()
-    with pytest.raises(SecretTooLargeError):
-        cipher.encrypt("é" * 2049, context={"user_id": "alice"})
+    sealed = cipher.encrypt("é" * 2049, context={"user_id": "alice"})
+    assert sealed.startswith("kmsenv1:")
     kms.encrypt.assert_not_called()
 
 
