@@ -1,20 +1,28 @@
-# Claude subscription connections
+# Claude and ChatGPT subscription connections
 
-How to turn on per-user **Claude** subscription connections. Once enabled, a
-signed-in user connects their own subscription once, under **Settings → Sandbox
-Integrations**. Their managed sandboxes then run Claude Code on that
-subscription, with no API key and nothing to paste into each sandbox.
+How to turn on per-user **Claude** and **ChatGPT** subscription connections.
+Once enabled, a signed-in user connects their own subscription once, under
+**Settings → Sandbox Integrations**. Their managed sandboxes then run Claude Code
+(and, once delivery lands, Codex) on that subscription, with no API key and
+nothing to paste into each sandbox.
 
-The connection is **off by default**.
+Both connections are **off by default**. The design, and the decisions behind it,
+are in `designs/SUBSCRIPTION_BROKER.md`.
 
 ---
 
 ## How it works
 
-The user runs `claude setup-token` on their own machine and pastes the token
-into Settings. The server stores it encrypted. When a managed sandbox host
-starts, it fetches the token with its launch credential and exports
-`CLAUDE_CODE_OAUTH_TOKEN` for Claude Code.
+- **Claude.** The user runs `claude setup-token` on their own machine and pastes
+  the token into Settings. The server stores it encrypted. When a managed
+  sandbox host starts, it fetches the token with its launch credential and
+  exports `CLAUDE_CODE_OAUTH_TOKEN` for Claude Code.
+- **ChatGPT.** The user clicks **Connect ChatGPT**, enters the one-time code on
+  OpenAI's page, and approves it. The server keeps the refresh chain (encrypted)
+  and refreshes it server-side. Delivering access tokens to `codex-native`
+  sandboxes is a separate change.
+- **What sandboxes never get:** the ChatGPT refresh token. Only access tokens
+  leave the server.
 
 ## Requirements
 
@@ -29,18 +37,54 @@ starts, it fetches the token with its launch credential and exports
    sandbox hosts, configured through the `sandbox:` section of the server
    config. Sessions on a user's own registered machine keep using that
    machine's local logins.
+3. **ChatGPT:** device-code sign-in must be enabled for the user's account,
+   under ChatGPT → Settings → Security.
 
 ## Configuration
 
 | Variable | Required | Meaning |
 |---|---|---|
 | `OMNIGENT_CLAUDE_SUBSCRIPTION_CONNECT` | to enable Claude | `1` shows the Claude panel and enables the paste flow. |
+| `OMNIGENT_CHATGPT_SUBSCRIPTION_CONNECT` | to enable ChatGPT | `1` shows the ChatGPT panel and enables device-code sign-in. |
+| `OMNIGENT_CHATGPT_STATE_KEY` | strongly recommended | The secret that signs the 15-minute sign-in handle. It must be at least 32 characters. If unset, each server process uses a random key, so a sign-in only works if every poll reaches the process that started it, and a restart cancels sign-ins in progress. **Set it whenever you run more than one worker or replica.** |
+| `OMNIGENT_CHATGPT_ISSUER`, `OMNIGENT_CHATGPT_CLIENT_ID` | no | Overrides for the auth service and OAuth client. The defaults match the Codex CLI. |
 
-## Token lifetime and revocation
+Generate a state key with:
 
-A sandbox holds the setup token, which lasts about a year. Disconnecting deletes
-the stored token, so new sandboxes stop getting it. It doesn't invalidate the
-token: sandboxes already running keep their copy until it expires.
+```bash
+openssl rand -base64 32
+```
+
+Rotating the state key only cancels sign-ins that are in progress. Existing
+connections are unaffected.
+
+**Proxies:** once the user approves, OpenAI can take about 13 seconds to answer.
+The poll that completes the sign-in can then run for over 20 seconds, including
+a short wait for a racing save. Give the Omnigent route a request timeout of at
+least 60 seconds. Envoy's default is 15 seconds. The web UI retries a poll that
+a proxy cuts off, and the server answers a completed sign-in idempotently. A
+retry that arrives while the cut-off poll is still saving waits up to 10 seconds
+for that save; if the save takes longer, the sign-in fails and the user starts
+again.
+
+## Token lifetimes and revocation
+
+| | Claude | ChatGPT |
+|---|---|---|
+| What a sandbox holds | the setup token (about 1 year) | an access token (about 10 days; refreshed when under 2 days remain) |
+| Disconnect | Deletes the stored token, so new sandboxes stop getting it. It doesn't invalidate the token: sandboxes already running keep their copy until it expires. | Stops vending, waits up to a minute for a refresh already in progress to save its result, revokes the newest refresh chain at OpenAI (which also invalidated the access tokens handed out from it when we tested), then deletes the connection. A reconnect made while this runs is left alone. |
+| If revoke fails | n/a | The connection stays flagged (nothing more is vended) and is kept so it can still be revoked; the user is asked to disconnect again (`502`). The same applies if a refresh is still unfinished after the wait (`503`). |
+| If the stored sign-in is unreadable | n/a | It is disconnected, but nothing could be revoked at OpenAI; the response says `"revoked": false` and the panel says so. |
+
+## When something goes wrong
+
+- **"No longer accepts the saved sign-in. Disconnect, then connect again."**
+  The provider refused the refresh token (the chain was revoked, rotated
+  elsewhere, or reused), or a refresh ended without a known outcome (its
+  answer was lost or unreadable, a gateway returned a 5xx, its result couldn't
+  be stored, or the server died mid-refresh). Rotating providers spend the old refresh token on use, so the
+  broker fails closed rather than risk sending it twice. Reconnecting fixes it.
+  This applies to the GitHub and Databricks connections too.
 
 ## Upgrading and rolling back
 

@@ -1364,6 +1364,8 @@ def create_app(
     databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
     claude_config: Any | None = None,  # ClaudeSubscriptionConfig — Claude subscription
     claude_store: Any | None = None,  # ClaudeConnectionStore — Claude subscription
+    chatgpt_config: Any | None = None,  # ChatgptConfig — ChatGPT subscription
+    chatgpt_store: Any | None = None,  # ChatgptConnectionStore — ChatGPT subscription
     mcp_registry: Any | None = None,
     mcp_gateway_backend: McpGatewayBackend | None = None,
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
@@ -1470,6 +1472,10 @@ def create_app(
     :param claude_store: Persistence for per-user Claude subscription tokens
         (:class:`omnigent.connections.claude.ClaudeConnectionStore`). Required
         alongside ``claude_config``.
+    :param chatgpt_config: Enables the ChatGPT subscription device-code connection
+        (:class:`omnigent.server.chatgpt_oauth.ChatgptConfig`).
+    :param chatgpt_store: Persistence for per-user ChatGPT token chains
+        (:class:`omnigent.connections.chatgpt.ChatgptConnectionStore`).
     :param sharing_mode: Server policy for creating new session
         permission grants (see :class:`SharingMode`): ``ON`` allows
         grants at any level plus public/workspace read, ``READ_ONLY``
@@ -1996,6 +2002,7 @@ def create_app(
         "github": (github_config, github_store),
         "databricks": (databricks_config, databricks_store),
         "claude": (claude_config, claude_store),
+        "chatgpt": (chatgpt_config, chatgpt_store),
     }
     for _provider in connection_providers():
         _cfg, _store = _connection_inputs.get(_provider.name, (None, None))
