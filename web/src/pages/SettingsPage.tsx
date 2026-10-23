@@ -1451,9 +1451,11 @@ function GithubIntegrationControl() {
           labelClassName="text-sm"
           className="flex-1"
           description={
-            status.connected && status.login
-              ? `Connected as ${status.login}. New sandboxes use your gh and git credentials and add your public SSH keys for SSH access.`
-              : "Connect GitHub to use your gh and git credentials and add your public SSH keys in new sandboxes."
+            status.needs_reconnect
+              ? "GitHub no longer accepts the saved authorization. Disconnect, then connect again."
+              : status.connected && status.login
+                ? `Connected as ${status.login}. New sandboxes use your gh and git credentials and add your public SSH keys for SSH access.`
+                : "Connect GitHub to use your gh and git credentials and add your public SSH keys in new sandboxes."
           }
         />
         <div className="flex shrink-0 items-center gap-2">
@@ -1647,9 +1649,11 @@ function DatabricksIntegrationControl() {
           labelClassName="text-sm"
           className="flex-1"
           description={
-            status.connected && status.workspace_host
-              ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes access Unity Gateway (MCP and model serving) as you.`
-              : "Connect a Databricks workspace to access Unity Gateway (MCP and model serving) as you in new sandboxes."
+            status.needs_reconnect
+              ? "Databricks no longer accepts the saved authorization. Disconnect, then connect again."
+              : status.connected && status.workspace_host
+                ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes access Unity Gateway (MCP and model serving) as you.`
+                : "Connect a Databricks workspace to access Unity Gateway (MCP and model serving) as you in new sandboxes."
           }
         />
         <div className="flex shrink-0 items-center gap-2">

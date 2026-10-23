@@ -80,19 +80,26 @@ class GithubConnectionStore(ConnectionStore[GithubConnection]):
         )
         return self._to_entity(conn)
 
-    def update_tokens(self, user_id: str, tokens: GitHubTokenSet) -> None:
+    def update_tokens(
+        self, user_id: str, tokens: GitHubTokenSet, *, lease_holder: str | None = None
+    ) -> bool:
         """Persist a refreshed token set, preserving the connected login/id.
 
-        No-op if the connection was removed between read and refresh.
+        Returns ``False`` if the connection was removed between read and refresh,
+        or *lease_holder* no longer owns the refresh lease.
         """
         existing = self._store.get(user_id, self._PROVIDER)
         if existing is None:
-            return
+            return False
         meta = dict(existing.metadata)
         meta["token_expires_at"] = tokens.expires_at
         meta["refresh_token_expires_at"] = tokens.refresh_token_expires_at
         if tokens.scopes:
             meta["scopes"] = tokens.scopes
-        self._store.update_secret(
-            user_id, self._PROVIDER, secret=self._secret(tokens), metadata=meta
+        return self._store.update_secret(
+            user_id,
+            self._PROVIDER,
+            secret=self._secret(tokens),
+            metadata=meta,
+            lease_holder=lease_holder,
         )
