@@ -20,8 +20,6 @@ import type { ElectronUpdateBridge, UpdateConfig, UpdateStatus } from "@/lib/nat
 
 const mocks = vi.hoisted(() => ({
   setTheme: vi.fn(),
-  // Server `enabled_connections`: which Sandbox Integrations panels render.
-  enabledConnections: [] as string[],
   chatgptStatus: vi.fn(),
   chatgptStart: vi.fn(),
   chatgptPoll: vi.fn(),
@@ -246,7 +244,6 @@ function renderPage(path = "/settings") {
 
 beforeEach(() => {
   mocks.setTheme.mockReset();
-  mocks.enabledConnections = [];
   mocks.chatgptStatus.mockReset();
   mocks.chatgptStart.mockReset();
   mocks.chatgptPoll.mockReset();
