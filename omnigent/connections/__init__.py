@@ -68,9 +68,9 @@ class ConnectionStore(ABC, Generic[EntityT]):
         generation = conn.metadata.get("connection_generation")
         return self._to_entity(conn), generation if isinstance(generation, str) else ""
 
-    def refresh_in_flight(self, user_id: str) -> bool:
-        """Whether a refresh holds a live lease on the connection."""
-        return self._store.refresh_in_flight(user_id, self._PROVIDER)
+    def fence_refresh(self, user_id: str, *, generation: str) -> str:
+        """Stop *generation* refreshing before a revoke (see the store method)."""
+        return self._store.fence_refresh(user_id, self._PROVIDER, generation=generation)
 
     def needs_reconnect(self, user_id: str) -> bool:
         """Whether the provider rejected this connection's refresh token."""
@@ -93,11 +93,10 @@ class ConnectionStore(ABC, Generic[EntityT]):
         *,
         holder: str | None = None,
         generation: str | None = None,
-        keep_lease: bool = False,
     ) -> bool:
         """Stop refreshing until the user reconnects (see the store method)."""
         return self._store.mark_needs_reconnect(
-            user_id, self._PROVIDER, holder=holder, generation=generation, keep_lease=keep_lease
+            user_id, self._PROVIDER, holder=holder, generation=generation
         )
 
     def get_under_lease(self, user_id: str, *, holder: str) -> EntityT | None:

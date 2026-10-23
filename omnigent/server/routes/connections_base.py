@@ -399,26 +399,18 @@ def create_device_connection_router(
 async def _quiesce_refresh(
     store: Any, user_id: str, generation: str
 ) -> Literal["ready", "replaced", "busy"]:
-    """Flag *generation* for reconnect, then wait out a refresh already in flight.
+    """Fence *generation* against refreshes, waiting out one already in flight.
 
-    The flag refuses new refresh leases but keeps an in-flight one, so a refresh
-    that already reached the provider can still save its result; once its lease
-    expires it can no longer land. A refresh commit keeps the flag.
-
-    :returns: ``"replaced"`` when a reconnect replaced the connection, ``"busy"``
-        when a refresh still holds a live lease after the wait.
+    A refresh that already reached the provider can still save its result while
+    its lease lives; once fenced (``"ready"``) nothing more can land, so the
+    stored chain is final. ``"busy"`` when a lease outlives the wait.
     """
-    flagged = await asyncio.to_thread(
-        store.mark_needs_reconnect, user_id, generation=generation, keep_lease=True
-    )
-    if not flagged:
-        return "replaced"
     deadline = time.monotonic() + _DISCONNECT_REFRESH_WAIT_S
-    while await asyncio.to_thread(store.refresh_in_flight, user_id):
-        if time.monotonic() >= deadline:
-            return "busy"
+    while True:
+        fenced = await asyncio.to_thread(store.fence_refresh, user_id, generation=generation)
+        if fenced != "busy" or time.monotonic() >= deadline:
+            return fenced
         await asyncio.sleep(_DISCONNECT_REFRESH_POLL_S)
-    return "ready"
 
 
 def _mount_status_and_disconnect(

@@ -438,16 +438,14 @@ def test_reconnect_before_the_revoke_snapshot_is_left_alone(
     # The reconnect lands after disconnect flagged the old generation but before
     # it read what to revoke: the new chain must not be revoked or flagged.
     _connect(client)
-    in_flight = store.refresh_in_flight
-    reconnected = []
+    fence = store.fence_refresh
 
-    def reconnect_once(user_id: str) -> bool:
-        if not reconnected:
-            reconnected.append(True)
-            store.upsert(_USER, token_set_from_payload(_tokens(9)))
-        return in_flight(user_id)
+    def fence_then_reconnect(user_id: str, *, generation: str) -> str:
+        fenced = fence(user_id, generation=generation)
+        store.upsert(_USER, token_set_from_payload(_tokens(9)))
+        return fenced
 
-    store.refresh_in_flight = reconnect_once  # type: ignore[method-assign]
+    store.fence_refresh = fence_then_reconnect  # type: ignore[method-assign]
 
     resp = client.post("/v1/connections/chatgpt/disconnect").json()
 
@@ -480,18 +478,25 @@ def test_disconnect_waits_for_an_in_flight_refresh_and_revokes_its_result(
 def test_refresh_landing_during_disconnect_keeps_the_connection_disabled(
     client: TestClient, auth: FakeAuthService, store: ChatgptConnectionStore
 ) -> None:
-    # The refresh commits right after disconnect flagged the connection; the
-    # revoke then fails, and nothing may be vended until a retry finishes.
+    # The refresh commits after disconnect fenced the connection; the revoke
+    # then fails, and nothing may be vended until a retry finishes.
     _connect(client)
     assert store.acquire_refresh_lease(_USER, holder="refresher", ttl_s=60)
     assert store.mark_refresh_inflight(_USER, holder="refresher")
-    in_flight = store.refresh_in_flight
+    fence = store.fence_refresh
+    committed: list[bool] = []
 
-    def commit_then_check(user_id: str) -> bool:
-        store.update_tokens(_USER, token_set_from_payload(_tokens(2)), lease_holder="refresher")
-        return in_flight(user_id)
+    def fence_then_commit(user_id: str, *, generation: str) -> str:
+        fenced = fence(user_id, generation=generation)
+        if not committed:
+            committed.append(
+                store.update_tokens(
+                    _USER, token_set_from_payload(_tokens(2)), lease_holder="refresher"
+                )
+            )
+        return fenced
 
-    store.refresh_in_flight = commit_then_check  # type: ignore[method-assign]
+    store.fence_refresh = fence_then_commit  # type: ignore[method-assign]
     auth.revoke_status = 503
 
     assert client.post("/v1/connections/chatgpt/disconnect").status_code == 502
