@@ -31,6 +31,7 @@ the trust boundary is the sandbox itself, not this endpoint. See
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import Any
 
@@ -61,7 +62,8 @@ async def vend_provider_credential(
         raise HTTPException(status_code=404, detail="unknown credential provider")
     try:
         # Only resolvers that can refresh a refused token take rejected_digest.
-        extra = {"rejected_digest": rejected_digest} if rejected_digest else {}
+        accepts = rejected_digest and _accepts_rejected_digest(resolver)
+        extra = {"rejected_digest": rejected_digest} if accepts else {}
         payload = await resolver(owner, store=store, client=client, **extra)
     except Exception:  # a provider resolver fault must degrade, not 500
         _logger.warning("credential resolve failed for provider %r", provider, exc_info=True)
@@ -69,6 +71,17 @@ async def vend_provider_credential(
     if payload is None:
         return {"connected": False}
     return {"connected": True, "owner": owner, **payload}
+
+
+def _accepts_rejected_digest(resolver: Any) -> bool:
+    """Whether *resolver* takes the optional ``rejected_digest`` keyword."""
+    try:
+        params = inspect.signature(resolver).parameters
+    except (TypeError, ValueError):
+        return False
+    return "rejected_digest" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
 
 
 def _broker_resolvers() -> dict[str, Any]:

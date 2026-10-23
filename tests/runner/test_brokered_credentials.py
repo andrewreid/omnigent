@@ -101,6 +101,27 @@ async def test_runner_route_vends_to_the_managed_runner(patched_resolvers) -> No
     assert patched_resolvers["user"] == "owner@example.com"
 
 
+async def test_rejected_digest_is_not_sent_to_a_resolver_that_cannot_take_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Only the ChatGPT resolver refreshes a refused token; another provider must
+    # not turn into "not connected" because a caller added ?rejected=.
+    import omnigent.server.routes.host_credentials as hc
+
+    async def plain_resolver(user_id: str, *, store, client):
+        return {"token": "databricks-token"}
+
+    monkeypatch.setattr(hc, "_broker_resolvers", lambda: {"databricks": plain_resolver})
+    app = FastAPI()
+    app.state.databricks_store = object()
+
+    vended = await hc.vend_provider_credential(
+        app, "databricks", "owner@example.com", rejected_digest="0" * 64
+    )
+
+    assert vended == {"connected": True, "owner": "owner@example.com", "token": "databricks-token"}
+
+
 async def test_runner_route_reports_not_connected(patched_resolvers) -> None:
     resp = await _get(_route_app(), token_bound_runner_id(_TOKEN), _TOKEN)
     assert resp.json() == {"connected": False}
