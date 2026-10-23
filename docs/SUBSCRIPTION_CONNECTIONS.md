@@ -77,8 +77,8 @@ again.
 | | Claude | ChatGPT |
 |---|---|---|
 | What a sandbox holds | the setup token (about 1 year) | an access token (about 10 days; refreshed when under 2 days remain) |
-| Disconnect | Deletes the stored token, so new sandboxes stop getting it. It doesn't invalidate the token: sandboxes already running keep their copy until it expires. | Stops vending, waits up to 60 seconds for a refresh already in progress to save its result, revokes the newest refresh chain at OpenAI (which also invalidated the access tokens handed out from it when we tested), then deletes the connection. A reconnect made while this runs is left alone. |
-| If revoke fails | n/a | The connection stays flagged (nothing more is vended) and is kept so it can still be revoked; the user is asked to disconnect again (`502`). |
+| Disconnect | Deletes the stored token, so new sandboxes stop getting it. It doesn't invalidate the token: sandboxes already running keep their copy until it expires. | Stops vending, waits up to a minute for a refresh already in progress to save its result, revokes the newest refresh chain at OpenAI (which also invalidated the access tokens handed out from it when we tested), then deletes the connection. A reconnect made while this runs is left alone. |
+| If revoke fails | n/a | The connection stays flagged (nothing more is vended) and is kept so it can still be revoked; the user is asked to disconnect again (`502`). The same applies if a refresh is still unfinished after the wait (`503`). |
 | If the stored sign-in is unreadable | n/a | It is disconnected, but nothing could be revoked at OpenAI; the response says `"revoked": false` and the panel says so. |
 
 ## When something goes wrong
@@ -86,8 +86,8 @@ again.
 - **"No longer accepts the saved sign-in. Disconnect, then connect again."**
   The provider refused the refresh token (the chain was revoked, rotated
   elsewhere, or reused), or a refresh ended without a known outcome (its
-  answer was lost, its result couldn't be stored, or the server died
-  mid-refresh). Rotating providers spend the old refresh token on use, so the
+  answer was lost or unreadable, a gateway returned a 5xx, its result couldn't
+  be stored, or the server died mid-refresh). Rotating providers spend the old refresh token on use, so the
   broker fails closed rather than risk sending it twice. Reconnecting fixes it.
   This applies to the GitHub and Databricks connections too.
 - **A sandbox's codex gets a 401 before its token expires.** The runner reports

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import httpx
 
+from omnigent.connections.refresh import provider_refusal_code
 from omnigent.server.databricks_app import (
     REFRESH_REJECTED_ERRORS,
     DatabricksAppError,
@@ -102,7 +103,8 @@ class DatabricksAppClient:
                     f"{payload.get('error_description') or payload['error']}"
                 )
         if resp.status_code != 200:
-            raise DatabricksTokenRequestFailed(
-                f"Databricks token endpoint returned {resp.status_code}"
-            )
+            # Only an explicit refusal proves no tokens were issued.
+            refused = provider_refusal_code(resp)
+            failure = DatabricksTokenRequestFailed if refused else DatabricksAppError
+            raise failure(f"Databricks token endpoint returned {resp.status_code}")
         return token_set_from_payload(resp.json())

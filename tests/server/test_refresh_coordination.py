@@ -25,11 +25,13 @@ import pytest
 from omnigent.connections.github import GithubConnectionStore
 from omnigent.db.utils import now_epoch
 from omnigent.server import github_identity
+from omnigent.server.databricks_app import token_set_from_payload as databricks_token_set
 from omnigent.server.github_app import (
     GitHubRefreshRejected,
     GitHubTokenRequestFailed,
     GitHubTokenSet,
 )
+from omnigent.server.github_app import token_set_from_payload as github_token_set
 
 _USER = "alice@example.com"
 _PROVIDER = "github"
@@ -217,6 +219,19 @@ def test_flag_keeping_the_lease_lets_an_in_flight_refresh_commit(db_uri: str) ->
     assert store.update_tokens(_USER, _tokens("new", 3600), lease_holder="a")
     assert not store.refresh_in_flight(_USER)
     assert store.get(_USER, with_tokens=True).access_token == "new"
+    assert store.needs_reconnect(_USER)  # the refresh doesn't undo the disconnect
+
+
+def test_commit_after_the_lease_expired_is_refused(db_uri: str) -> None:
+    # Past its lease a refresh must not land: a disconnect may already have
+    # read, revoked and deleted what the lease protected.
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="slow", ttl_s=60)
+    assert store.mark_refresh_inflight(_USER, holder="slow")
+    _expire_lease(store)
+
+    assert not store.update_tokens(_USER, _tokens("late", 3600), lease_holder="slow")
+    assert store.get(_USER, with_tokens=True).access_token == "old"
 
 
 def test_generation_fences_delete_and_flag(db_uri: str) -> None:
@@ -243,7 +258,7 @@ def test_refresh_keeps_the_generation(db_uri: str) -> None:
     [
         (httpx.ConnectError("refused"), True),
         (httpx.ConnectTimeout("no route"), True),
-        (GitHubTokenRequestFailed("GitHub token endpoint returned 503"), True),
+        (GitHubTokenRequestFailed("GitHub token exchange failed: slow_down"), True),
         (httpx.ReadTimeout("answer lost"), False),
         (httpx.RemoteProtocolError("connection dropped"), False),
         (ValueError("Expecting value: line 1 column 1"), False),
@@ -254,6 +269,36 @@ def test_only_connect_failures_and_provider_errors_rule_out_rotation(exc, safe) 
     from omnigent.connections.refresh import _rotation_ruled_out
 
     assert _rotation_ruled_out(exc) is safe
+
+
+@pytest.mark.parametrize(
+    ("response", "code"),
+    [
+        (httpx.Response(400, json={"error": "slow_down"}), "slow_down"),
+        (httpx.Response(429, json={"error": "rate_limited"}), "rate_limited"),
+        # A gateway error or an unreadable body may follow a refresh that rotated.
+        (httpx.Response(502, json={"error": "bad_gateway"}), None),
+        (httpx.Response(503, text="<html>unavailable</html>"), None),
+        (httpx.Response(400, text="<html>bad request</html>"), None),
+        (httpx.Response(400, json={"error": "x", "access_token": "a"}), None),
+        (httpx.Response(400, json={"error": None}), None),
+    ],
+)
+def test_only_an_explicit_provider_refusal_counts_as_not_rotated(response, code) -> None:
+    from omnigent.connections.refresh import provider_refusal_code
+
+    assert provider_refusal_code(response) == code
+
+
+@pytest.mark.parametrize("parse", [github_token_set, databricks_token_set])
+def test_a_token_response_with_an_error_field_is_not_a_refusal(parse) -> None:
+    from omnigent.connections.refresh import RefreshNotRotated
+
+    issued = {"access_token": "a", "refresh_token": "r2", "expires_in": 60}
+    assert parse({**issued, "error": None}).refresh_token == "r2"
+    with pytest.raises(Exception) as raised:
+        parse({**issued, "error": "server_error"})
+    assert not isinstance(raised.value, RefreshNotRotated)  # tokens may have been issued
 
 
 # --- resolver against the real store ----------------------------------------

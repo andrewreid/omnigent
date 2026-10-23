@@ -224,8 +224,9 @@ class CredentialStore:
         user until they reconnect — worth surfacing, not swallowing.
 
         :param lease_holder: When set, commit only if this holder still owns the
-            row's refresh lease (see :meth:`acquire_refresh_lease`), and release
-            it in the same write. ``False`` then also means the lease was lost.
+            row's unexpired refresh lease (see :meth:`acquire_refresh_lease`), and
+            release it in the same write. ``False`` then also means the lease was
+            lost, so once a lease expires its refresh can no longer land.
         """
         workspace_id = current_workspace_id()
         context = _enc_context(workspace_id, user_id, provider, account_id)
@@ -239,14 +240,20 @@ class CredentialStore:
             if row is None:
                 return False
             current = _safe_json_obj(row.metadata_json) or {}
-            if lease_holder is not None and current.get(_LEASE_HOLDER) != lease_holder:
+            if lease_holder is not None and (
+                current.get(_LEASE_HOLDER) != lease_holder
+                or int(current.get(_LEASE_UNTIL) or 0) <= now_epoch()
+            ):
                 return False
             new_meta = dict(metadata) if metadata is not None else current
-            if _GENERATION in current:
-                new_meta[_GENERATION] = current[_GENERATION]
-            # Fresh tokens clear the reconnect flag. Only the holder's own
-            # commit releases the lease; an unleased write keeps someone else's.
-            new_meta.pop(_NEEDS_RECONNECT, None)
+            # Only a reconnect clears the reconnect flag: a refresh that lands
+            # during a disconnect must not re-enable the connection.
+            for key in (_GENERATION, _NEEDS_RECONNECT):
+                new_meta.pop(key, None)
+                if key in current:
+                    new_meta[key] = current[key]
+            # Only the holder's own commit releases the lease; an unleased
+            # write keeps someone else's.
             for key in (_LEASE_HOLDER, _LEASE_UNTIL, _REFRESH_INFLIGHT):
                 new_meta.pop(key, None)
                 if lease_holder is None and key in current:

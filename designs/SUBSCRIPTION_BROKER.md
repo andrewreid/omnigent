@@ -119,9 +119,10 @@ tiny transaction is simpler and portable.
   lease unless another holder's lease is still live. An expired lease can be
   taken over, so a crashed holder never wedges the row.
 - `update_secret(..., lease_holder=holder) -> bool`: commits only if *holder*
-  still owns the lease, and releases it in the same write. Fresh tokens also
-  clear `needs_reconnect`. A write without a lease leaves another holder's lease
-  in place.
+  still owns an unexpired lease, and releases it in the same write, so a refresh
+  can't land after its lease runs out. It keeps `needs_reconnect`: only a
+  reconnect clears it. A write without a lease leaves another holder's lease in
+  place.
 - `release_refresh_lease(...)` and `mark_needs_reconnect(...)`. A reconnect's
   `upsert` rewrites the metadata, which clears the flag.
 - As built, also: `get_under_lease` (a snapshot only while the holder still
@@ -144,8 +145,10 @@ core (lease TTL 60 s, above the clients' 15 s HTTP timeout):
      transaction**, then persist through `update_secret(lease_holder=…)`.
 3. `RefreshRejected` (GitHub `bad_refresh_token`/`invalid_grant`, Databricks
    `invalid_grant`) marks `needs_reconnect` and returns `None`, with no retries.
-   A connect failure or a provider error response left the chain unrotated:
-   return the current row. Any other failure (a lost answer, a failed save
+   A connect failure, or the provider's explicit refusal (a 4xx OAuth error
+   body without tokens), left the chain unrotated: return the current row. A
+   5xx or an unreadable body may come from a proxy after the provider rotated,
+   so it counts as unknown. Any other failure (a lost answer, a failed save
    after retries, a crash or cancellation) fails closed: flag `needs_reconnect`,
    or leave the in-flight marker for the next acquirer to flag. A possibly
    spent refresh token is never sent again.

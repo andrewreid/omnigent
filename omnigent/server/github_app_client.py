@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import httpx
 
+from omnigent.connections.refresh import provider_refusal_code
 from omnigent.server.github_app import (
     REFRESH_REJECTED_ERRORS,
     GitHubAppConfig,
@@ -214,7 +215,9 @@ class GitHubAppClient:
             )
         _raise_if_rejected(resp, rejected)
         if resp.status_code != 200:
-            raise GitHubTokenRequestFailed(f"GitHub token endpoint returned {resp.status_code}")
+            # Only an explicit refusal proves no tokens were issued.
+            failure = GitHubTokenRequestFailed if provider_refusal_code(resp) else GitHubAppError
+            raise failure(f"GitHub token endpoint returned {resp.status_code}")
         return token_set_from_payload(resp.json())
 
 

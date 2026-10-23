@@ -31,7 +31,7 @@ import os
 import time
 from dataclasses import dataclass
 
-from omnigent.connections.refresh import RefreshNotRotated, RefreshRejected
+from omnigent.connections.refresh import RefreshNotRotated, RefreshRejected, oauth_error_code
 
 _logger = logging.getLogger(__name__)
 
@@ -243,9 +243,11 @@ def token_url(workspace_host: str) -> str:
 
 def token_set_from_payload(payload: dict) -> DatabricksTokenSet:
     """Parse a token-endpoint JSON payload into a :class:`DatabricksTokenSet`."""
-    if "error" in payload:
-        detail = payload.get("error_description", payload["error"])
+    if code := oauth_error_code(payload):
+        detail = payload.get("error_description") or code
         raise DatabricksTokenRequestFailed(f"Databricks token exchange failed: {detail}")
+    if payload.get("error"):
+        raise DatabricksAppError("Databricks token response mixed tokens and an error")
     access = payload.get("access_token")
     if not access:
         raise DatabricksAppError("Databricks token response missing access_token")

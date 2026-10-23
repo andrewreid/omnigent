@@ -19,7 +19,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from urllib.parse import urlencode
 
 import jwt
@@ -253,8 +253,9 @@ def create_paste_connection_router(
     return router
 
 
-#: How long a disconnect waits for an in-flight refresh to finish (one lease TTL).
-_DISCONNECT_REFRESH_WAIT_S = float(LEASE_TTL_S)
+#: How long a disconnect waits for an in-flight refresh to finish: one lease TTL,
+#: plus slack for the lease's whole-second expiry.
+_DISCONNECT_REFRESH_WAIT_S = float(LEASE_TTL_S + 2)
 _DISCONNECT_REFRESH_POLL_S = 0.25
 #: Device codes expire upstream after 15 minutes; the handle matches that.
 _DEVICE_HANDLE_TTL_S = 900
@@ -395,28 +396,29 @@ def create_device_connection_router(
     return router
 
 
-async def _quiesce_refresh(store: Any, user_id: str, generation: str) -> bool:
-    """Flag *generation* for reconnect and wait out a refresh already in flight.
+async def _quiesce_refresh(
+    store: Any, user_id: str, generation: str
+) -> Literal["ready", "replaced", "busy"]:
+    """Flag *generation* for reconnect, then wait out a refresh already in flight.
 
     The flag refuses new refresh leases but keeps an in-flight one, so a refresh
-    that already reached the provider still saves its result (a finished
-    refresh clears the flag, so it is set again). Bounded by the lease TTL; a
-    holder that died leaves a lease that simply expires.
+    that already reached the provider can still save its result; once its lease
+    expires it can no longer land. A refresh commit keeps the flag.
 
-    :returns: ``False`` when the connection was replaced meanwhile.
+    :returns: ``"replaced"`` when a reconnect replaced the connection, ``"busy"``
+        when a refresh still holds a live lease after the wait.
     """
+    flagged = await asyncio.to_thread(
+        store.mark_needs_reconnect, user_id, generation=generation, keep_lease=True
+    )
+    if not flagged:
+        return "replaced"
     deadline = time.monotonic() + _DISCONNECT_REFRESH_WAIT_S
-    while True:
-        flagged = await asyncio.to_thread(
-            store.mark_needs_reconnect, user_id, generation=generation, keep_lease=True
-        )
-        if not flagged:
-            return False
-        if not await asyncio.to_thread(store.refresh_in_flight, user_id):
-            return True
+    while await asyncio.to_thread(store.refresh_in_flight, user_id):
         if time.monotonic() >= deadline:
-            return True
+            return "busy"
         await asyncio.sleep(_DISCONNECT_REFRESH_POLL_S)
+    return "ready"
 
 
 def _mount_status_and_disconnect(
@@ -460,9 +462,10 @@ def _mount_status_and_disconnect(
         Everything is fenced to the connection generation read first, so a
         reconnect made meanwhile is left alone. Before revoking, that generation
         stops being vended or refreshed; a refresh already sent may finish, and
-        the newest chain is then revoked from one snapshot. A failed revoke keeps
-        the flagged row so it can be revoked on retry (``502``). ``revoked`` is
-        ``False`` when there was nothing readable to revoke.
+        the newest chain is then revoked from one snapshot. A refresh still
+        unfinished after one lease TTL (``503``) or a failed revoke (``502``)
+        keeps the flagged row so a retry can finish. ``revoked`` is ``False``
+        when there was nothing readable to revoke.
         """
         user_id = _current_user(request)
         generation = await asyncio.to_thread(store.generation, user_id)
@@ -472,8 +475,17 @@ def _mount_status_and_disconnect(
         if revoke is None:
             removed = await asyncio.to_thread(store.delete, user_id, generation=generation)
             return {"disconnected": removed}
-        if not await _quiesce_refresh(store, user_id, generation):
-            return {"disconnected": False}  # replaced by a reconnect meanwhile
+        quiesced = await _quiesce_refresh(store, user_id, generation)
+        if quiesced == "replaced":
+            return {"disconnected": False}
+        if quiesced == "busy":
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"A {provider} token refresh is still finishing. New sandboxes no "
+                    "longer get the sign-in; disconnect again to finish."
+                ),
+            )
         snapshot = await asyncio.to_thread(store.get_with_generation, user_id)
         if snapshot is None or snapshot[1] != generation:
             return {"disconnected": False}

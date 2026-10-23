@@ -34,7 +34,7 @@ from dataclasses import dataclass
 
 import jwt
 
-from omnigent.connections.refresh import RefreshNotRotated, RefreshRejected
+from omnigent.connections.refresh import RefreshNotRotated, RefreshRejected, oauth_error_code
 
 _logger = logging.getLogger(__name__)
 
@@ -246,9 +246,11 @@ def token_set_from_payload(payload: dict) -> GitHubTokenSet:
     :raises GitHubAppError: When the payload carries an ``error`` or lacks
         an access token.
     """
-    if "error" in payload:
-        detail = payload.get("error_description", payload["error"])
+    if code := oauth_error_code(payload):
+        detail = payload.get("error_description") or code
         raise GitHubTokenRequestFailed(f"GitHub token exchange failed: {detail}")
+    if payload.get("error"):
+        raise GitHubAppError("GitHub token response mixed tokens and an error")
     access = payload.get("access_token")
     if not access:
         raise GitHubAppError("GitHub token response missing access_token")
