@@ -29,6 +29,8 @@ class ConnectionProvider:
         to vend this provider's secret to a sandbox. ``None`` when the provider
         has no broker endpoint (connect-only, or on-demand delivery not built
         yet), in which case ``/hosts/{id}/credentials/{name}`` returns ``404``.
+        A resolver that can refresh a token the provider refused also takes
+        ``rejected_digest`` (the SHA-256 hex of that token).
     :param owner_identity_resolver: Same shape as *credential_resolver*, used
         when the SERVER acts as the user against the provider's API — a
         managed-sandbox launcher whose ``owner_credential_provider`` is this
