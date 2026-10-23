@@ -63,7 +63,7 @@ async def vend_provider_credential(
         # Only resolvers that can refresh a refused token take rejected_digest.
         extra = {"rejected_digest": rejected_digest} if rejected_digest else {}
         payload = await resolver(owner, store=store, client=client, **extra)
-    except Exception:  # noqa: BLE001 - a provider resolver fault must degrade, not 500
+    except Exception:  # a provider resolver fault must degrade, not 500
         _logger.warning("credential resolve failed for provider %r", provider, exc_info=True)
         return {"connected": False}
     if payload is None:
@@ -113,7 +113,9 @@ def create_host_credentials_router(host_store: HostStore) -> APIRouter:
         if managed is None:
             raise HTTPException(status_code=401, detail="unauthenticated")
         # Resolve provider only after auth so the endpoint reveals nothing to an
-        # unauthenticated caller.
+        # unauthenticated caller. A provider with no resolver or no configured
+        # store on this server is a 404, and a resolver fault degrades to
+        # {"connected": false} (see vend_provider_credential).
         return await vend_provider_credential(request.app, provider, managed.user_id)
 
     return router

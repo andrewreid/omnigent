@@ -121,7 +121,7 @@ class BrokeredChatgptAuth:
                 continue  # notifications and other clients' requests
             try:
                 await self._answer(message["id"])
-            except Exception:  # noqa: BLE001 - one bad answer must not stop serving
+            except Exception:  # one bad answer must not stop serving
                 _logger.warning("could not answer codex token refresh", exc_info=True)
 
     async def _answer(self, request_id: int | str) -> None:
@@ -181,7 +181,7 @@ async def start_brokered_chatgpt_auth(
         async with asyncio.timeout(_LOGIN_TIMEOUT_S):
             await client.connect()
             await auth.login(payload)
-    except Exception:  # noqa: BLE001 - fall back to codex's own login
+    except Exception:  # fall back to codex's own login
         _logger.warning("codex: brokered ChatGPT login failed", exc_info=True)
         await auth.close()
         return None
