@@ -51,6 +51,8 @@ def connection_providers() -> list[ConnectionProvider]:
     """
     from functools import partial
 
+    from omnigent.server.chatgpt_identity import resolve_chatgpt_credential
+    from omnigent.server.chatgpt_oauth import ChatgptOAuthClient
     from omnigent.server.claude_subscription import resolve_claude_credential
     from omnigent.server.databricks_app_client import DatabricksAppClient
     from omnigent.server.databricks_identity import (
@@ -60,6 +62,7 @@ def connection_providers() -> list[ConnectionProvider]:
     )
     from omnigent.server.github_app_client import GitHubAppClient
     from omnigent.server.github_identity import resolve_github_credential
+    from omnigent.server.routes.connections_chatgpt import create_connections_chatgpt_router
     from omnigent.server.routes.connections_claude import create_connections_claude_router
     from omnigent.server.routes.connections_databricks import (
         create_connections_databricks_router,
@@ -93,6 +96,12 @@ def connection_providers() -> list[ConnectionProvider]:
             client_factory=lambda _config: None,
             router_factory=create_connections_claude_router,
             credential_resolver=resolve_claude_credential,
+        ),
+        ConnectionProvider(
+            name="chatgpt",
+            client_factory=ChatgptOAuthClient,
+            router_factory=create_connections_chatgpt_router,
+            credential_resolver=resolve_chatgpt_credential,
         ),
     ]
 
