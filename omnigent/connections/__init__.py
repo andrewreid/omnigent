@@ -72,6 +72,14 @@ class ConnectionStore(ABC, Generic[EntityT]):
         """Stop *generation* refreshing before a revoke (see the store method)."""
         return self._store.fence_refresh(user_id, self._PROVIDER, generation=generation)
 
+    def get_usable(self, user_id: str) -> EntityT | None:
+        """The connection with tokens, or ``None`` if absent or flagged for
+        reconnect; one read, so a reconnect can't slip between the two checks."""
+        conn = self._store.get(user_id, self._PROVIDER, with_secret=True)
+        if conn is None or conn.metadata.get("needs_reconnect"):
+            return None
+        return self._to_entity(conn)
+
     def needs_reconnect(self, user_id: str) -> bool:
         """Whether the provider rejected this connection's refresh token."""
         conn = self._store.get(user_id, self._PROVIDER)
