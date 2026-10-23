@@ -424,6 +424,51 @@ def test_reconnect_during_disconnect_survives(
     assert store.get(_USER, with_tokens=True).refresh_token == "rt-9"
 
 
+def test_reconnect_before_the_revoke_snapshot_is_left_alone(
+    client: TestClient, auth: FakeAuthService, store: ChatgptConnectionStore
+) -> None:
+    # The reconnect lands after disconnect flagged the old generation but before
+    # it read what to revoke: the new chain must not be revoked or flagged.
+    _connect(client)
+    in_flight = store.refresh_in_flight
+    reconnected = []
+
+    def reconnect_once(user_id: str) -> bool:
+        if not reconnected:
+            reconnected.append(True)
+            store.upsert(_USER, token_set_from_payload(_tokens(9)))
+        return in_flight(user_id)
+
+    store.refresh_in_flight = reconnect_once  # type: ignore[method-assign]
+
+    resp = client.post("/v1/connections/chatgpt/disconnect").json()
+
+    assert resp == {"disconnected": False}
+    assert auth.revoked == []
+    status = client.get("/v1/connections/chatgpt/status").json()
+    assert status["connected"] is True and status["needs_reconnect"] is False
+
+
+def test_disconnect_waits_for_an_in_flight_refresh_and_revokes_its_result(
+    client: TestClient, auth: FakeAuthService, store: ChatgptConnectionStore
+) -> None:
+    # A refresh already reached OpenAI when the user disconnects: let it save
+    # its rotated chain, then revoke that newest chain rather than its predecessor.
+    _connect(client)
+    assert store.acquire_refresh_lease(_USER, holder="refresher", ttl_s=60)
+    assert store.mark_refresh_inflight(_USER, holder="refresher")
+
+    def finish_refresh() -> None:
+        store.update_tokens(_USER, token_set_from_payload(_tokens(2)), lease_holder="refresher")
+
+    threading.Timer(0.5, finish_refresh).start()
+
+    resp = client.post("/v1/connections/chatgpt/disconnect").json()
+
+    assert resp == {"disconnected": True, "revoked": True}
+    assert auth.revoked == ["rt-2"]
+
+
 def test_unreadable_sign_in_is_disconnected_but_reported_unrevoked(
     client: TestClient, auth: FakeAuthService, store: ChatgptConnectionStore
 ) -> None:

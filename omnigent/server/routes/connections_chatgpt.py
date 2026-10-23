@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 
 from omnigent.connections.chatgpt import ChatgptConnectionStore
+from omnigent.entities import ChatgptConnection
 from omnigent.server.auth import AuthProvider
 from omnigent.server.chatgpt_oauth import ChatgptConfig, ChatgptOAuthClient, ChatgptOAuthError
 from omnigent.server.routes.connections_base import (
@@ -90,18 +91,17 @@ class ChatgptConnectionHooks:
             device_auth_id
         )
 
-    async def revoke(self, user_id: str) -> bool:
-        """Revoke the refresh chain upstream; every vended access token dies with it.
+    async def revoke(self, user_id: str, connection: ChatgptConnection) -> bool:
+        """Revoke *connection*'s refresh chain upstream; its access tokens die with it.
 
-        :returns: ``False`` when there was nothing to revoke (no connection, or a
-            stored sign-in that can no longer be decrypted).
+        :param connection: The snapshot the disconnect is removing (with tokens).
+        :returns: ``False`` when its stored sign-in can no longer be decrypted, so
+            there is nothing to revoke.
         """
-        conn = await asyncio.to_thread(self.store.get, user_id, with_tokens=True)
-        if conn is None or not conn.refresh_token:
-            if conn is not None:
-                _logger.warning("ChatGPT sign-in for %s is unreadable; nothing to revoke", user_id)
+        if not connection.refresh_token:
+            _logger.warning("ChatGPT sign-in for %s is unreadable; nothing to revoke", user_id)
             return False
-        await self.api.revoke(conn.refresh_token)
+        await self.api.revoke(connection.refresh_token)
         return True
 
 
