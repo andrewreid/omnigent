@@ -402,6 +402,14 @@ class CredentialStore:
 
         return self._update_metadata("mark_refresh_inflight", user_id, provider, account_id, mark)
 
+    def refresh_in_flight(self, user_id: str, provider: str, *, account_id: str = "") -> bool:
+        """Whether a holder still owns a live refresh lease on the connection."""
+        conn = self.get(user_id, provider, account_id=account_id)
+        if conn is None:
+            return False
+        meta = conn.metadata
+        return bool(meta.get(_LEASE_HOLDER)) and int(meta.get(_LEASE_UNTIL) or 0) > now_epoch()
+
     def generation(self, user_id: str, provider: str, *, account_id: str = "") -> str | None:
         """The connection's current generation (see :data:`_GENERATION`), or ``None``."""
         conn = self.get(user_id, provider, account_id=account_id)
@@ -433,6 +441,7 @@ class CredentialStore:
         *,
         holder: str | None = None,
         generation: str | None = None,
+        keep_lease: bool = False,
         account_id: str = "",
     ) -> bool:
         """Flag that the stored chain is unusable; clears any lease.
@@ -445,6 +454,8 @@ class CredentialStore:
             a refresh that outlived a reconnect can't mark the new login broken.
         :param generation: Only flag that generation of the connection (see
             :meth:`generation`), not a replacement made since it was read.
+        :param keep_lease: Leave a refresh already in flight its lease, so its
+            result still commits; new leases are refused either way.
         """
 
         def flag(meta: dict[str, Any]) -> bool:
@@ -453,8 +464,9 @@ class CredentialStore:
             if generation is not None and meta.get(_GENERATION, "") != generation:
                 return False
             meta[_NEEDS_RECONNECT] = True
-            for key in (_LEASE_HOLDER, _LEASE_UNTIL, _REFRESH_INFLIGHT):
-                meta.pop(key, None)
+            if not keep_lease:
+                for key in (_LEASE_HOLDER, _LEASE_UNTIL, _REFRESH_INFLIGHT):
+                    meta.pop(key, None)
             return True
 
         return self._update_metadata("mark_needs_reconnect", user_id, provider, account_id, flag)

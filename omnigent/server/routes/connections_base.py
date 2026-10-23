@@ -27,6 +27,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from starlette.responses import RedirectResponse
 
+from omnigent.connections.refresh import LEASE_TTL_S
 from omnigent.db.account_authority import account_generation
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
@@ -252,6 +253,9 @@ def create_paste_connection_router(
     return router
 
 
+#: How long a disconnect waits for an in-flight refresh to finish (one lease TTL).
+_DISCONNECT_REFRESH_WAIT_S = float(LEASE_TTL_S)
+_DISCONNECT_REFRESH_POLL_S = 0.25
 #: Device codes expire upstream after 15 minutes; the handle matches that.
 _DEVICE_HANDLE_TTL_S = 900
 #: How long a poll whose redemption was refused waits for another poll (or
@@ -391,6 +395,30 @@ def create_device_connection_router(
     return router
 
 
+async def _quiesce_refresh(store: Any, user_id: str, generation: str) -> bool:
+    """Flag *generation* for reconnect and wait out a refresh already in flight.
+
+    The flag refuses new refresh leases but keeps an in-flight one, so a refresh
+    that already reached the provider still saves its result (a finished
+    refresh clears the flag, so it is set again). Bounded by the lease TTL; a
+    holder that died leaves a lease that simply expires.
+
+    :returns: ``False`` when the connection was replaced meanwhile.
+    """
+    deadline = time.monotonic() + _DISCONNECT_REFRESH_WAIT_S
+    while True:
+        flagged = await asyncio.to_thread(
+            store.mark_needs_reconnect, user_id, generation=generation, keep_lease=True
+        )
+        if not flagged:
+            return False
+        if not await asyncio.to_thread(store.refresh_in_flight, user_id):
+            return True
+        if time.monotonic() >= deadline:
+            return True
+        await asyncio.sleep(_DISCONNECT_REFRESH_POLL_S)
+
+
 def _mount_status_and_disconnect(
     router: APIRouter,
     hooks: ConnectionHooks | PasteSecretHooks | DeviceCodeHooks,
@@ -431,10 +459,10 @@ def _mount_status_and_disconnect(
 
         Everything is fenced to the connection generation read first, so a
         reconnect made meanwhile is left alone. Before revoking, that generation
-        is flagged for reconnect: nothing more is vended and no refresh can
-        rotate the chain mid-revoke. A failed revoke keeps the flagged row, so
-        the refresh token is still there to revoke on retry (``502``).
-        ``revoked`` is ``False`` when there was nothing readable to revoke.
+        stops being vended or refreshed; a refresh already sent may finish, and
+        the newest chain is then revoked from one snapshot. A failed revoke keeps
+        the flagged row so it can be revoked on retry (``502``). ``revoked`` is
+        ``False`` when there was nothing readable to revoke.
         """
         user_id = _current_user(request)
         generation = await asyncio.to_thread(store.generation, user_id)
@@ -444,9 +472,13 @@ def _mount_status_and_disconnect(
         if revoke is None:
             removed = await asyncio.to_thread(store.delete, user_id, generation=generation)
             return {"disconnected": removed}
-        await asyncio.to_thread(store.mark_needs_reconnect, user_id, generation=generation)
+        if not await _quiesce_refresh(store, user_id, generation):
+            return {"disconnected": False}  # replaced by a reconnect meanwhile
+        snapshot = await asyncio.to_thread(store.get_with_generation, user_id)
+        if snapshot is None or snapshot[1] != generation:
+            return {"disconnected": False}
         try:
-            revoked = bool(await revoke(user_id))
+            revoked = bool(await revoke(user_id, snapshot[0]))
         except Exception as exc:  # any upstream failure is retryable
             _logger.warning("%s upstream revoke failed for %s: %s", provider, user_id, exc)
             raise HTTPException(

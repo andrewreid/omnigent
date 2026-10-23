@@ -205,6 +205,20 @@ def test_flag_landing_after_acquire_stops_the_refresh(db_uri: str) -> None:
     assert client.calls == 0
 
 
+def test_flag_keeping_the_lease_lets_an_in_flight_refresh_commit(db_uri: str) -> None:
+    # Disconnect stops new refreshes but lets one already sent save its result.
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)
+    assert store.mark_refresh_inflight(_USER, holder="a")
+    assert store.mark_needs_reconnect(_USER, keep_lease=True)
+
+    assert store.refresh_in_flight(_USER)
+    assert not store.acquire_refresh_lease(_USER, holder="b", ttl_s=60)
+    assert store.update_tokens(_USER, _tokens("new", 3600), lease_holder="a")
+    assert not store.refresh_in_flight(_USER)
+    assert store.get(_USER, with_tokens=True).access_token == "new"
+
+
 def test_generation_fences_delete_and_flag(db_uri: str) -> None:
     store = _seed(db_uri)
     old = store.generation(_USER)

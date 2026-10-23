@@ -60,6 +60,18 @@ class ConnectionStore(ABC, Generic[EntityT]):
         """The connection's generation, fresh per connect, or ``None`` if absent."""
         return self._store.generation(user_id, self._PROVIDER)
 
+    def get_with_generation(self, user_id: str) -> tuple[EntityT, str] | None:
+        """The connection with tokens and its generation, read together."""
+        conn = self._store.get(user_id, self._PROVIDER, with_secret=True)
+        if conn is None:
+            return None
+        generation = conn.metadata.get("connection_generation")
+        return self._to_entity(conn), generation if isinstance(generation, str) else ""
+
+    def refresh_in_flight(self, user_id: str) -> bool:
+        """Whether a refresh holds a live lease on the connection."""
+        return self._store.refresh_in_flight(user_id, self._PROVIDER)
+
     def needs_reconnect(self, user_id: str) -> bool:
         """Whether the provider rejected this connection's refresh token."""
         conn = self._store.get(user_id, self._PROVIDER)
@@ -76,11 +88,16 @@ class ConnectionStore(ABC, Generic[EntityT]):
         return self._store.release_refresh_lease(user_id, self._PROVIDER, holder=holder)
 
     def mark_needs_reconnect(
-        self, user_id: str, *, holder: str | None = None, generation: str | None = None
+        self,
+        user_id: str,
+        *,
+        holder: str | None = None,
+        generation: str | None = None,
+        keep_lease: bool = False,
     ) -> bool:
         """Stop refreshing until the user reconnects (see the store method)."""
         return self._store.mark_needs_reconnect(
-            user_id, self._PROVIDER, holder=holder, generation=generation
+            user_id, self._PROVIDER, holder=holder, generation=generation, keep_lease=keep_lease
         )
 
     def get_under_lease(self, user_id: str, *, holder: str) -> EntityT | None:
