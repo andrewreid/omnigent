@@ -53,6 +53,7 @@ def connection_providers() -> list[ConnectionProvider]:
 
     from omnigent.server.databricks_app_client import DatabricksAppClient
     from omnigent.server.databricks_identity import (
+        OWNER_IDENTITY_LEASE_WAIT_S,
         OWNER_IDENTITY_REFRESH_MARGIN_S,
         resolve_databricks_credential,
     )
@@ -80,6 +81,7 @@ def connection_providers() -> list[ConnectionProvider]:
             owner_identity_resolver=partial(
                 resolve_databricks_credential,
                 refresh_margin_s=OWNER_IDENTITY_REFRESH_MARGIN_S,
+                lease_wait_s=OWNER_IDENTITY_LEASE_WAIT_S,
             ),
         ),
     ]
