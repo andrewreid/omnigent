@@ -131,7 +131,10 @@ tiny transaction is simpler and portable.
   `connection_generation` stamped on every connect so slower operations
   (disconnect) can fence on the row they read. `acquire_refresh_lease` refuses
   a flagged row, and an expired lease that still carries the in-flight marker
-  fails closed (flags reconnect) instead of being taken over.
+  fails closed (flags reconnect) instead of being taken over. `fence_refresh`
+  is disconnect's single locked step: it flags the generation, leaves a live
+  lease to commit (`busy`), and otherwise drops any expired lease so nothing
+  can land before the revoke reads the final chain.
 
 `omnigent/connections/refresh.py::refresh_coordinated` is the shared resolver
 core (lease TTL 60 s, above the clients' 15 s HTTP timeout):
@@ -153,7 +156,9 @@ core (lease TTL 60 s, above the clients' 15 s HTTP timeout):
    or leave the in-flight marker for the next acquirer to flag. A possibly
    spent refresh token is never sent again.
 4. It returns `Refreshed(connection, minted)`. Callers prefer `minted`: newly
-   minted tokens are valid for that call even when they couldn't be stored.
+   minted tokens are valid for that call even when a database failure kept
+   them from being stored. A save the store refuses (the lease was lost to
+   expiry, a disconnect or a reconnect) is discarded and never vended.
 
 GitHub and Databricks resolvers are retrofitted onto it. The shared `status`
 endpoint reports `needs_reconnect`, and the Settings panels say "reconnect".

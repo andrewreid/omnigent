@@ -16,7 +16,7 @@ import json
 import logging
 import uuid
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from sqlalchemy import delete, select
 from sqlalchemy.engine import CursorResult
@@ -245,7 +245,7 @@ class CredentialStore:
                 or int(current.get(_LEASE_UNTIL) or 0) <= now_epoch()
             ):
                 return False
-            new_meta = dict(metadata) if metadata is not None else current
+            new_meta = dict(metadata if metadata is not None else current)
             # Only a reconnect clears the reconnect flag: a refresh that lands
             # during a disconnect must not re-enable the connection.
             for key in (_GENERATION, _NEEDS_RECONNECT):
@@ -409,13 +409,33 @@ class CredentialStore:
 
         return self._update_metadata("mark_refresh_inflight", user_id, provider, account_id, mark)
 
-    def refresh_in_flight(self, user_id: str, provider: str, *, account_id: str = "") -> bool:
-        """Whether a holder still owns a live refresh lease on the connection."""
-        conn = self.get(user_id, provider, account_id=account_id)
-        if conn is None:
-            return False
-        meta = conn.metadata
-        return bool(meta.get(_LEASE_HOLDER)) and int(meta.get(_LEASE_UNTIL) or 0) > now_epoch()
+    def fence_refresh(
+        self, user_id: str, provider: str, *, generation: str, account_id: str = ""
+    ) -> Literal["ready", "busy", "replaced"]:
+        """Stop *generation* refreshing before a disconnect revokes it, in one locked write.
+
+        Flags the connection for reconnect. A refresh still holding a live lease
+        keeps it, so its result can commit (``"busy"``). Otherwise any expired
+        lease is dropped, so no refresh can land after ``"ready"``. ``"replaced"``
+        when the connection is gone or is a newer generation.
+        """
+        outcome: Literal["ready", "busy", "replaced"] = "replaced"
+
+        def fence(meta: dict[str, Any]) -> bool:
+            nonlocal outcome
+            if meta.get(_GENERATION, "") != generation:
+                return False
+            meta[_NEEDS_RECONNECT] = True
+            if meta.get(_LEASE_HOLDER) and int(meta.get(_LEASE_UNTIL) or 0) > now_epoch():
+                outcome = "busy"
+            else:
+                for key in (_LEASE_HOLDER, _LEASE_UNTIL, _REFRESH_INFLIGHT):
+                    meta.pop(key, None)
+                outcome = "ready"
+            return True
+
+        self._update_metadata("fence_refresh", user_id, provider, account_id, fence)
+        return outcome
 
     def generation(self, user_id: str, provider: str, *, account_id: str = "") -> str | None:
         """The connection's current generation (see :data:`_GENERATION`), or ``None``."""
@@ -448,7 +468,6 @@ class CredentialStore:
         *,
         holder: str | None = None,
         generation: str | None = None,
-        keep_lease: bool = False,
         account_id: str = "",
     ) -> bool:
         """Flag that the stored chain is unusable; clears any lease.
@@ -461,8 +480,6 @@ class CredentialStore:
             a refresh that outlived a reconnect can't mark the new login broken.
         :param generation: Only flag that generation of the connection (see
             :meth:`generation`), not a replacement made since it was read.
-        :param keep_lease: Leave a refresh already in flight its lease, so its
-            result still commits; new leases are refused either way.
         """
 
         def flag(meta: dict[str, Any]) -> bool:
@@ -471,9 +488,8 @@ class CredentialStore:
             if generation is not None and meta.get(_GENERATION, "") != generation:
                 return False
             meta[_NEEDS_RECONNECT] = True
-            if not keep_lease:
-                for key in (_LEASE_HOLDER, _LEASE_UNTIL, _REFRESH_INFLIGHT):
-                    meta.pop(key, None)
+            for key in (_LEASE_HOLDER, _LEASE_UNTIL, _REFRESH_INFLIGHT):
+                meta.pop(key, None)
             return True
 
         return self._update_metadata("mark_needs_reconnect", user_id, provider, account_id, flag)

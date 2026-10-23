@@ -46,12 +46,15 @@ class RefreshNotRotated(Exception):
     Raised by provider clients; any other failure counts as an unknown outcome."""
 
 
+_TOKEN_FIELDS = ("access_token", "refresh_token", "id_token")
+
+
 def oauth_error_code(payload: object) -> str | None:
     """The ``error`` code of an OAuth error body that carries no tokens, else ``None``.
 
     A body with both tokens and an error is ambiguous and yields ``None``.
     """
-    if not isinstance(payload, dict) or "access_token" in payload:
+    if not isinstance(payload, dict) or any(key in payload for key in _TOKEN_FIELDS):
         return None
     error = payload.get("error")
     return error if isinstance(error, str) and error else None
@@ -147,12 +150,12 @@ async def refresh_coordinated(
         # A fenced snapshot: None if a reconnect or flag landed since acquiring.
         leased = await asyncio.to_thread(store.get_under_lease, user_id, holder=holder)
         if leased is None:
-            return await _current_or_none(store, user_id, conn)
+            return await _current_or_none(store, user_id)
         conn = leased
         if is_fresh(conn):
             return Refreshed(conn)
         if not await asyncio.to_thread(store.mark_refresh_inflight, user_id, holder=holder):
-            return await _current_or_none(store, user_id, conn)
+            return await _current_or_none(store, user_id)
         try:
             tokens = await refresh(conn)
         except RefreshRejected as exc:
@@ -175,13 +178,23 @@ async def refresh_coordinated(
             )
             await _fail_closed(store, user_id, holder)
             return Refreshed(conn)
-        if not await _persist_minted(persist, tokens, holder, provider, user_id):
+        stored = await _persist_minted(persist, tokens, holder, provider, user_id)
+        if stored is None:
             # The stored refresh token is spent; never let a later refresh replay it.
             outcome_known = False
             _logger.error(
                 "%s refreshed token for %s could not be stored; needs reconnect", provider, user_id
             )
             await _fail_closed(store, user_id, holder)
+        elif not stored:
+            # The lease was lost (expired, fenced by a disconnect, or replaced by a
+            # reconnect): the minted chain is discarded unvended, and the marker
+            # left behind makes the next acquirer fail closed.
+            outcome_known = False
+            _logger.error(
+                "%s refreshed token for %s was refused by the store; discarded", provider, user_id
+            )
+            return await _current_or_none(store, user_id)
         return Refreshed(conn, minted=tokens)
     except BaseException:
         outcome_known = False
@@ -209,12 +222,14 @@ async def _fail_closed(store: _LeasedStore[EntityT], user_id: str, holder: str) 
 
 
 async def _current_or_none(
-    store: _LeasedStore[EntityT], user_id: str, current: EntityT
+    store: _LeasedStore[EntityT], user_id: str
 ) -> Refreshed[EntityT, TokensT] | None:
-    """After losing the lease: ``None`` if the connection now needs a reconnect."""
-    if await asyncio.to_thread(store.needs_reconnect, user_id):
+    """After losing the lease: the stored connection, or ``None`` if it's gone or
+    needs a reconnect."""
+    conn = await asyncio.to_thread(store.get, user_id, with_tokens=True)
+    if conn is None or await asyncio.to_thread(store.needs_reconnect, user_id):
         return None
-    return Refreshed(current)
+    return Refreshed(conn)
 
 
 async def _persist_minted(
@@ -223,19 +238,20 @@ async def _persist_minted(
     holder: str,
     provider: str,
     user_id: str,
-) -> bool:
+) -> bool | None:
     """Store minted tokens, retrying a failing write while the lease is still ours.
 
-    :returns: ``False`` when every attempt raised or the lease was lost.
+    :returns: ``True`` once stored, ``False`` when the store refused the write
+        (the lease was lost), ``None`` when every attempt raised.
     """
     for delay in (0.0, *_PERSIST_RETRY_S):
         if delay:
             await asyncio.sleep(delay)
         try:
-            return await asyncio.to_thread(persist, tokens, holder)
+            return bool(await asyncio.to_thread(persist, tokens, holder))
         except Exception as exc:  # noqa: BLE001 - retried, then fails closed
             _logger.warning("%s refreshed token for %s not stored: %s", provider, user_id, exc)
-    return False
+    return None
 
 
 async def _await_other_holder(
