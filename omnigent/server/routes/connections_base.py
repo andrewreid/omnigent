@@ -17,14 +17,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from urllib.parse import urlencode
 
 import jwt
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from starlette.responses import RedirectResponse
 
+from omnigent.connections.refresh import LEASE_TTL_S
 from omnigent.db.account_authority import account_generation
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
@@ -119,28 +121,12 @@ def create_connection_router(
     :returns: A FastAPI router with status / connect / callback / disconnect.
     """
     provider = hooks.provider
-    store = hooks.store
     router = APIRouter()
     key = hooks.signing_key()
-
-    def _current_user(request: Request) -> str:
-        user_id = require_user(request, auth_provider)
-        return user_id if user_id is not None else RESERVED_USER_LOCAL
+    _current_user = _mount_status_and_disconnect(router, hooks, auth_provider)
 
     def _verify_state(state: str) -> dict:
         return jwt.decode(state, key, algorithms=[_STATE_ALG])
-
-    @router.get(f"/connections/{provider}/status")
-    async def status(request: Request) -> dict[str, object]:
-        """Return the caller's connection status. Never surfaces tokens."""
-        user_id = _current_user(request)
-        connection = await asyncio.to_thread(store.get, user_id)
-        return {
-            "enabled": True,
-            "connected": connection is not None,
-            "connected_at": connection.created_at if connection is not None else None,
-            **hooks.status_fields(connection),
-        }
 
     @router.get(f"/connections/{provider}/connect")
     async def connect(request: Request, return_to: str | None = None) -> RedirectResponse:
@@ -205,13 +191,114 @@ def create_connection_router(
             return redirect_with_status(provider, return_to, "error")
         return redirect_with_status(provider, return_to, "connected")
 
-    @router.post(f"/connections/{provider}/disconnect")
-    async def disconnect(request: Request) -> dict[str, bool]:
-        """Remove the caller's connection."""
-        user_id = _current_user(request)
-        removed = await asyncio.to_thread(store.delete, user_id)
-        return {"disconnected": removed}
-
     if extra_routes is not None:
         extra_routes(router)
     return router
+
+
+#: How long a disconnect waits for an in-flight refresh to finish: one lease TTL,
+#: plus slack for the lease's whole-second expiry.
+_DISCONNECT_REFRESH_WAIT_S = float(LEASE_TTL_S + 2)
+_DISCONNECT_REFRESH_POLL_S = 0.25
+
+
+async def _quiesce_refresh(
+    store: Any, user_id: str, generation: str
+) -> Literal["ready", "replaced", "busy"]:
+    """Fence *generation* against refreshes, waiting out one already in flight.
+
+    A refresh that already reached the provider can still save its result while
+    its lease lives; once fenced (``"ready"``) nothing more can land, so the
+    stored chain is final. ``"busy"`` when a lease outlives the wait.
+    """
+    deadline = time.monotonic() + _DISCONNECT_REFRESH_WAIT_S
+    while True:
+        fenced = await asyncio.to_thread(store.fence_refresh, user_id, generation=generation)
+        if fenced != "busy" or time.monotonic() >= deadline:
+            return fenced
+        await asyncio.sleep(_DISCONNECT_REFRESH_POLL_S)
+
+
+def _mount_status_and_disconnect(
+    router: APIRouter,
+    hooks: ConnectionHooks,
+    auth_provider: AuthProvider | None,
+) -> Callable[[Request], str]:
+    """Mount the shared ``status`` / ``disconnect`` endpoints on *router*.
+
+    :returns: The caller-identity resolver the flow's own endpoints reuse.
+    """
+    provider = hooks.provider
+    store = hooks.store
+
+    def _current_user(request: Request) -> str:
+        user_id = require_user(request, auth_provider)
+        return user_id if user_id is not None else RESERVED_USER_LOCAL
+
+    @router.get(f"/connections/{provider}/status")
+    async def status(request: Request) -> dict[str, object]:
+        """Return the caller's connection status. Never surfaces tokens."""
+        user_id = _current_user(request)
+        connection = await asyncio.to_thread(store.get, user_id)
+        # The provider rejected the stored refresh token: the connection row is
+        # still there but the user must connect again.
+        needs_reconnect = connection is not None and bool(
+            await asyncio.to_thread(getattr(store, "needs_reconnect", lambda _u: False), user_id)
+        )
+        return {
+            "enabled": True,
+            "connected": connection is not None,
+            "connected_at": connection.created_at if connection is not None else None,
+            "needs_reconnect": needs_reconnect,
+            **hooks.status_fields(connection),
+        }
+
+    @router.post(f"/connections/{provider}/disconnect")
+    async def disconnect(request: Request) -> dict[str, bool]:
+        """Remove the caller's connection, revoking it upstream when supported.
+
+        Everything is fenced to the connection generation read first, so a
+        reconnect made meanwhile is left alone. Before revoking, that generation
+        stops being vended or refreshed; a refresh already sent may finish, and
+        the newest chain is then revoked from one snapshot. A refresh still
+        unfinished after one lease TTL (``503``) or a failed revoke (``502``)
+        keeps the flagged row so a retry can finish. ``revoked`` is ``False``
+        when there was nothing readable to revoke.
+        """
+        user_id = _current_user(request)
+        generation = await asyncio.to_thread(store.generation, user_id)
+        if generation is None:
+            return {"disconnected": False}
+        revoke = getattr(hooks, "revoke", None)
+        if revoke is None:
+            removed = await asyncio.to_thread(store.delete, user_id, generation=generation)
+            return {"disconnected": removed}
+        quiesced = await _quiesce_refresh(store, user_id, generation)
+        if quiesced == "replaced":
+            return {"disconnected": False}
+        if quiesced == "busy":
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"A {provider} token refresh is still finishing. New sandboxes no "
+                    "longer get the sign-in; disconnect again to finish."
+                ),
+            )
+        snapshot = await asyncio.to_thread(store.get_with_generation, user_id)
+        if snapshot is None or snapshot[1] != generation:
+            return {"disconnected": False}
+        try:
+            revoked = bool(await revoke(user_id, snapshot[0]))
+        except Exception as exc:  # any upstream failure is retryable
+            _logger.warning("%s upstream revoke failed for %s: %s", provider, user_id, exc)
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Couldn't revoke the {provider} sign-in upstream. New sandboxes no "
+                    "longer get it; disconnect again to finish revoking it."
+                ),
+            ) from exc
+        removed = await asyncio.to_thread(store.delete, user_id, generation=generation)
+        return {"disconnected": removed, "revoked": revoked}
+
+    return _current_user

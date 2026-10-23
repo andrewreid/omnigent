@@ -34,6 +34,8 @@ from dataclasses import dataclass
 
 import jwt
 
+from omnigent.connections.refresh import RefreshNotRotated, RefreshRejected, oauth_error_code
+
 _logger = logging.getLogger(__name__)
 
 _AUTHORIZE_ENDPOINT = "https://github.com/login/oauth/authorize"
@@ -244,9 +246,11 @@ def token_set_from_payload(payload: dict) -> GitHubTokenSet:
     :raises GitHubAppError: When the payload carries an ``error`` or lacks
         an access token.
     """
-    if "error" in payload:
-        detail = payload.get("error_description", payload["error"])
-        raise GitHubAppError(f"GitHub token exchange failed: {detail}")
+    if code := oauth_error_code(payload):
+        detail = payload.get("error_description") or code
+        raise GitHubTokenRequestFailed(f"GitHub token exchange failed: {detail}")
+    if payload.get("error"):
+        raise GitHubAppError("GitHub token response mixed tokens and an error")
     access = payload.get("access_token")
     if not access:
         raise GitHubAppError("GitHub token response missing access_token")
@@ -264,3 +268,15 @@ def token_set_from_payload(payload: dict) -> GitHubTokenSet:
 
 class GitHubAppError(Exception):
     """Raised when a GitHub App API interaction fails."""
+
+
+#: Token-endpoint ``error`` codes meaning the refresh token itself is dead.
+REFRESH_REJECTED_ERRORS = frozenset({"bad_refresh_token", "invalid_grant"})
+
+
+class GitHubRefreshRejected(GitHubAppError, RefreshRejected):
+    """GitHub rejected the refresh token; the user must reconnect."""
+
+
+class GitHubTokenRequestFailed(GitHubAppError, RefreshNotRotated):
+    """GitHub answered the token request with an error and issued no tokens."""
