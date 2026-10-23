@@ -8,6 +8,7 @@ the session owner's own (server-refreshed) token.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
@@ -15,6 +16,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
+import pytest
 from fastapi import FastAPI
 
 from omnigent.connections.databricks import DatabricksConnectionStore
@@ -92,6 +95,48 @@ async def test_owner_resolver_refreshes_a_token_that_would_lapse_before_the_next
     assert broker == {"token": "bob-current", "workspace_host": _WS}
     client.refresh_token.assert_not_awaited()
     assert await asyncio.to_thread(resolve, "carol") is None
+
+
+async def test_owner_resolver_keeps_a_still_valid_token_when_refresh_is_unreachable(
+    db_uri: str,
+) -> None:
+    # Inside the 900 s owner margin but not expired: a transient refresh failure
+    # should not turn a working token into "not connected" for the launcher.
+    store = DatabricksConnectionStore(db_uri, _MemoryCipher())
+    _connect(store, "alice", "still-valid", ttl_s=600)
+    client = SimpleNamespace(refresh_token=AsyncMock(side_effect=httpx.ConnectError("down")))
+    resolve = blocking_owner_resolver(
+        _databricks_provider().owner_identity_resolver, store=store, client=client
+    )
+
+    payload = await asyncio.to_thread(resolve, "alice")
+
+    assert payload == {"token": "still-valid", "workspace_host": _WS}
+    assert not store.needs_reconnect("alice")
+
+
+async def test_owner_resolver_does_not_wait_out_another_refresh(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The keepalive resolves owners on one worker thread; a refresh held
+    # elsewhere must not stall it for the full lease TTL.
+    import omnigent.server.databricks_identity as databricks_identity
+
+    monkeypatch.setattr(databricks_identity, "OWNER_IDENTITY_LEASE_WAIT_S", 0.3)
+    store = DatabricksConnectionStore(db_uri, _MemoryCipher())
+    _connect(store, "alice", "current", ttl_s=600)
+    assert store.acquire_refresh_lease("alice", holder="another-replica", ttl_s=60)
+    client = SimpleNamespace(refresh_token=AsyncMock())
+    resolve = blocking_owner_resolver(
+        _databricks_provider().owner_identity_resolver, store=store, client=client
+    )
+
+    started = time.monotonic()
+    payload = await asyncio.to_thread(resolve, "alice")
+
+    assert time.monotonic() - started < 5
+    assert payload == {"token": "current", "workspace_host": _WS}
+    client.refresh_token.assert_not_awaited()
 
 
 def _app(db_uri: str, tmp_path: Path, **kwargs: Any) -> FastAPI:

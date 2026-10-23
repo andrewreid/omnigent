@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 
 from omnigent.connections.databricks import DatabricksConnectionStore
-from omnigent.connections.refresh import refresh_coordinated
+from omnigent.connections.refresh import LEASE_TTL_S, refresh_coordinated
 from omnigent.db.utils import now_epoch
 from omnigent.entities import DatabricksConnection
 from omnigent.server.databricks_app import DatabricksAppError, DatabricksTokenSet
@@ -28,6 +28,10 @@ _REFRESH_MARGIN_S = 300
 # proxy bearer, refreshed by the keepalive, so keep them valid past one interval.
 OWNER_IDENTITY_REFRESH_MARGIN_S = 900
 
+# How long an owner-identity resolve waits for another holder's refresh. Its
+# callers (launcher, single-worker keepalive) are blocking, so keep it short.
+OWNER_IDENTITY_LEASE_WAIT_S = 5.0
+
 
 async def resolve_databricks_token(
     user_id: str,
@@ -35,6 +39,7 @@ async def resolve_databricks_token(
     store: DatabricksConnectionStore,
     client: DatabricksAppClient,
     refresh_margin_s: int = _REFRESH_MARGIN_S,
+    lease_wait_s: float = LEASE_TTL_S,
 ) -> tuple[str, str] | None:
     """Resolve a valid ``(access_token, workspace_host)`` for *user_id*, or ``None``.
 
@@ -47,6 +52,12 @@ async def resolve_databricks_token(
 
     :param refresh_margin_s: Refresh when the token expires within this many
         seconds, so the returned token stays valid at least that long.
+    :param lease_wait_s: How long to wait for another holder's refresh before
+        settling for the current token.
+
+    When a refresh can't complete (a transient failure, or another holder still
+    refreshing), a token that hasn't expired yet is returned rather than
+    ``None``, even inside the margin; the next call tries again.
     """
 
     def is_fresh(conn: DatabricksConnection) -> bool:
@@ -68,6 +79,7 @@ async def resolve_databricks_token(
         refresh=refresh,
         persist=persist,
         provider="Databricks",
+        wait_s=lease_wait_s,
     )
     if resolved is None:
         return None
@@ -76,7 +88,8 @@ async def resolve_databricks_token(
         return None
     if resolved.minted is not None:
         return resolved.minted.access_token, connection.workspace_host
-    if connection.access_token and is_fresh(connection):
+    expires_at = connection.token_expires_at
+    if expires_at is None or expires_at > now_epoch():
         return connection.access_token, connection.workspace_host
     return None
 
@@ -87,6 +100,7 @@ async def resolve_databricks_credential(
     store: DatabricksConnectionStore,
     client: DatabricksAppClient,
     refresh_margin_s: int = _REFRESH_MARGIN_S,
+    lease_wait_s: float = LEASE_TTL_S,
 ) -> dict[str, object] | None:
     """Resolve the Databricks broker payload for *user_id*, or ``None``.
 
@@ -98,7 +112,11 @@ async def resolve_databricks_credential(
     :func:`omnigent.server.github_identity.resolve_github_credential`.
     """
     resolved = await resolve_databricks_token(
-        user_id, store=store, client=client, refresh_margin_s=refresh_margin_s
+        user_id,
+        store=store,
+        client=client,
+        refresh_margin_s=refresh_margin_s,
+        lease_wait_s=lease_wait_s,
     )
     if resolved is None:
         return None
