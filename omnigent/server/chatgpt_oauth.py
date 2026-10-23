@@ -20,7 +20,7 @@ from typing import Any
 
 import httpx
 
-from omnigent.connections.refresh import RefreshNotRotated, RefreshRejected
+from omnigent.connections.refresh import RefreshNotRotated, RefreshRejected, provider_refusal_code
 
 _logger = logging.getLogger(__name__)
 
@@ -272,7 +272,9 @@ class ChatgptOAuthClient:
             raise ChatgptRefreshRejected(
                 f"ChatGPT refused the refresh token ({code or resp.status_code})"
             )
-        raise ChatgptRefreshFailed(f"ChatGPT token refresh failed ({resp.status_code})")
+        # Only an explicit refusal proves no tokens were issued.
+        failure = ChatgptRefreshFailed if provider_refusal_code(resp) else ChatgptOAuthError
+        raise failure(f"ChatGPT token refresh failed ({resp.status_code})")
 
     async def revoke(self, refresh_token: str) -> None:
         """Revoke the refresh chain upstream, which also kills its access tokens.

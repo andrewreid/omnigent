@@ -46,6 +46,31 @@ class RefreshNotRotated(Exception):
     Raised by provider clients; any other failure counts as an unknown outcome."""
 
 
+def oauth_error_code(payload: object) -> str | None:
+    """The ``error`` code of an OAuth error body that carries no tokens, else ``None``.
+
+    A body with both tokens and an error is ambiguous and yields ``None``.
+    """
+    if not isinstance(payload, dict) or "access_token" in payload:
+        return None
+    error = payload.get("error")
+    return error if isinstance(error, str) and error else None
+
+
+def provider_refusal_code(resp: httpx.Response) -> str | None:
+    """The ``error`` code when *resp* is the provider's explicit refusal, else ``None``.
+
+    Only a 4xx JSON error body counts: a 5xx or an unreadable body may come from
+    a proxy after the provider already issued tokens.
+    """
+    if not 400 <= resp.status_code < 500:
+        return None
+    try:
+        return oauth_error_code(resp.json())
+    except ValueError:
+        return None
+
+
 @dataclasses.dataclass(frozen=True)
 class Refreshed(Generic[EntityT, TokensT]):
     """What :func:`refresh_coordinated` resolved.

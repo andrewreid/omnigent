@@ -8,6 +8,7 @@ import hashlib
 import json
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import httpx
@@ -27,6 +28,7 @@ from omnigent.server.chatgpt_oauth import (
     ChatgptRefreshRejected,
     token_set_from_payload,
 )
+from omnigent.server.routes import connections_base
 from omnigent.server.routes.connections_chatgpt import create_connections_chatgpt_router
 from omnigent.server.routes.host_credentials import create_host_credentials_router
 
@@ -57,12 +59,14 @@ class FakeAuthService:
     def __init__(self) -> None:
         self.pending_polls = 1
         self.usercode_status = 200
-        self.refresh_error: tuple[int, dict] | None = None
+        self.refresh_error: tuple[int, dict | str] | None = None
         # A 200 whose body can't be parsed: the refresh may have rotated the chain.
         self.refresh_garbled = False
         self.refreshes: list[str] = []
         self.revoked: list[str] = []
         self.revoke_status = 200
+        # Runs as a revoke arrives (e.g. a slow refresh trying to land).
+        self.on_revoke: Callable[[], None] | None = None
         self.exchanges: list[dict] = []
         self.user_agents: set[str] = set()
         self.token_polls = 0
@@ -108,12 +112,16 @@ class FakeAuthService:
             self.refreshes.append(body["refresh_token"])
             if self.refresh_error is not None:
                 status, payload = self.refresh_error
+                if isinstance(payload, str):
+                    return httpx.Response(status, text=payload)
                 return httpx.Response(status, json=payload)
             if self.refresh_garbled:
                 return httpx.Response(200, content=b"<html>gateway page</html>")
             n = int(body["refresh_token"].split("-")[1]) + 1
             return httpx.Response(200, json=_tokens(n))
         if path == "/oauth/revoke":
+            if self.on_revoke is not None:
+                self.on_revoke()
             if self.revoke_status != 200:
                 return httpx.Response(self.revoke_status)
             self.revoked.append(json.loads(request.content)["token"])
@@ -469,6 +477,75 @@ def test_disconnect_waits_for_an_in_flight_refresh_and_revokes_its_result(
     assert auth.revoked == ["rt-2"]
 
 
+def test_refresh_landing_during_disconnect_keeps_the_connection_disabled(
+    client: TestClient, auth: FakeAuthService, store: ChatgptConnectionStore
+) -> None:
+    # The refresh commits right after disconnect flagged the connection; the
+    # revoke then fails, and nothing may be vended until a retry finishes.
+    _connect(client)
+    assert store.acquire_refresh_lease(_USER, holder="refresher", ttl_s=60)
+    assert store.mark_refresh_inflight(_USER, holder="refresher")
+    in_flight = store.refresh_in_flight
+
+    def commit_then_check(user_id: str) -> bool:
+        store.update_tokens(_USER, token_set_from_payload(_tokens(2)), lease_holder="refresher")
+        return in_flight(user_id)
+
+    store.refresh_in_flight = commit_then_check  # type: ignore[method-assign]
+    auth.revoke_status = 503
+
+    assert client.post("/v1/connections/chatgpt/disconnect").status_code == 502
+    vend = client.get(
+        "/v1/hosts/host1/credentials/chatgpt", headers={MANAGED_HOST_TOKEN_HEADER: "launch-tok"}
+    )
+    assert vend.json() == {"connected": False}
+    assert not store.acquire_refresh_lease(_USER, holder="next", ttl_s=60)
+
+    auth.revoke_status = 200
+    assert client.post("/v1/connections/chatgpt/disconnect").json()["revoked"] is True
+    assert auth.revoked == ["rt-2"]
+
+
+def test_refresh_outliving_its_lease_cannot_land_after_the_revoke(
+    client: TestClient, auth: FakeAuthService, store: ChatgptConnectionStore
+) -> None:
+    _connect(client)
+    assert store.acquire_refresh_lease(_USER, holder="slow", ttl_s=60)
+    assert store.mark_refresh_inflight(_USER, holder="slow")
+    store._store._update_metadata(  # the lease runs out before the answer arrives
+        "expire_lease", _USER, "chatgpt", "", lambda m: m.update(refresh_lease_until=0) or True
+    )
+    landed: list[bool] = []
+    auth.on_revoke = lambda: landed.append(
+        store.update_tokens(_USER, token_set_from_payload(_tokens(2)), lease_holder="slow")
+    )
+
+    resp = client.post("/v1/connections/chatgpt/disconnect").json()
+
+    assert resp == {"disconnected": True, "revoked": True}
+    assert auth.revoked == ["rt-1"]
+    assert landed == [False]
+
+
+def test_disconnect_asks_for_a_retry_while_a_refresh_still_holds_its_lease(
+    client: TestClient,
+    auth: FakeAuthService,
+    store: ChatgptConnectionStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(connections_base, "_DISCONNECT_REFRESH_WAIT_S", 0.3)
+    _connect(client)
+    assert store.acquire_refresh_lease(_USER, holder="refresher", ttl_s=60)
+    assert store.mark_refresh_inflight(_USER, holder="refresher")
+
+    busy = client.post("/v1/connections/chatgpt/disconnect")
+
+    assert busy.status_code == 503
+    assert "disconnect again" in busy.json()["detail"]
+    assert auth.revoked == []
+    assert store.needs_reconnect(_USER)
+
+
 def test_unreadable_sign_in_is_disconnected_but_reported_unrevoked(
     client: TestClient, auth: FakeAuthService, store: ChatgptConnectionStore
 ) -> None:
@@ -568,16 +645,29 @@ def test_unparseable_success_fails_closed_and_never_resends(store, api, auth) ->
     assert auth.refreshes == ["rt-1"]
 
 
-def test_transient_refresh_failure_keeps_a_still_valid_token(store, api, auth) -> None:
+def test_refused_refresh_keeps_a_still_valid_token(store, api, auth) -> None:
     _seed(store, ttl=3600)
-    auth.refresh_error = (503, {"error": "unavailable"})
+    auth.refresh_error = (429, {"error": "rate_limited"})
     assert _resolve(store, api) is not None
     assert not store.needs_reconnect(_USER)
 
 
+@pytest.mark.parametrize(
+    "error", [(502, "<html>bad gateway</html>"), (503, {"error": "unavailable"})]
+)
+def test_gateway_error_fails_closed_and_never_resends(store, api, auth, error) -> None:
+    # A proxy can answer 5xx after OpenAI already rotated the chain.
+    _seed(store, ttl=3600)
+    auth.refresh_error = error
+    assert _resolve(store, api) is not None
+    assert store.needs_reconnect(_USER)
+    assert _resolve(store, api) is None
+    assert auth.refreshes == ["rt-1"]
+
+
 def test_expired_token_with_failed_refresh_is_not_vended(store, api, auth) -> None:
     _seed(store, ttl=-10)
-    auth.refresh_error = (503, {"error": "unavailable"})
+    auth.refresh_error = (429, {"error": "rate_limited"})
     assert _resolve(store, api) is None
 
 
