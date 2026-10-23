@@ -196,6 +196,62 @@ def create_connection_router(
     return router
 
 
+class PasteSecretHooks(Protocol):
+    """The provider-specific half of a paste flow: the user pastes a secret
+    their own tool minted (e.g. ``claude setup-token``) instead of an OAuth
+    redirect. Status and disconnect are shared with the redirect flow."""
+
+    provider: str
+    store: Any
+
+    def status_fields(self, connection: Any | None) -> dict[str, Any]:
+        """Non-secret, provider-specific ``status`` fields (never tokens)."""
+
+    async def accept(self, user_id: str, secret: str) -> None:
+        """Validate and persist *secret* for *user_id*. Raise
+        :class:`ConnectionError` with a user-safe message on rejection."""
+
+
+async def _pasted_secret(request: Request) -> str:
+    """Read ``{"secret": "…"}`` without echoing it: FastAPI's validation error
+    would repeat the submitted value in its 422 body."""
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    secret = body.get("secret") if isinstance(body, dict) else None
+    if not isinstance(secret, str):
+        raise HTTPException(status_code=400, detail='Expected a JSON body {"secret": "…"}.')
+    return secret
+
+
+def create_paste_connection_router(
+    hooks: PasteSecretHooks,
+    *,
+    auth_provider: AuthProvider | None = None,
+) -> APIRouter:
+    """Build ``/connections/{provider}/{status,secret,disconnect}`` for *hooks*.
+
+    ``POST …/secret`` takes ``{"secret": "…"}``; ``400`` with the hook's message
+    on rejection. The secret is never echoed back or logged.
+    """
+    router = APIRouter()
+    _current_user = _mount_status_and_disconnect(router, hooks, auth_provider)
+
+    @router.post(f"/connections/{hooks.provider}/secret")
+    async def submit(request: Request) -> dict[str, object]:
+        """Store the caller's pasted secret, replacing any existing one."""
+        user_id = _current_user(request)
+        secret = await _pasted_secret(request)
+        try:
+            await hooks.accept(user_id, secret)
+        except ConnectionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"connected": True}
+
+    return router
+
+
 #: How long a disconnect waits for an in-flight refresh to finish: one lease TTL,
 #: plus slack for the lease's whole-second expiry.
 _DISCONNECT_REFRESH_WAIT_S = float(LEASE_TTL_S + 2)
@@ -221,7 +277,7 @@ async def _quiesce_refresh(
 
 def _mount_status_and_disconnect(
     router: APIRouter,
-    hooks: ConnectionHooks,
+    hooks: ConnectionHooks | PasteSecretHooks,
     auth_provider: AuthProvider | None,
 ) -> Callable[[Request], str]:
     """Mount the shared ``status`` / ``disconnect`` endpoints on *router*.
