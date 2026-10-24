@@ -671,11 +671,22 @@ async def _create_opt_in_session(
         )
 
 
+@pytest.mark.parametrize("use_molly_bundle", [False, True])
 async def test_spec_opt_in_hands_the_brain_harness_to_the_router(
     client: httpx.AsyncClient,
     db_uri: str,
+    use_molly_bundle: bool,
 ) -> None:
-    agent = await create_test_agent(client, name="spec-opt-in-agent", executor=OPT_IN_EXECUTOR)
+    from pathlib import Path
+
+    from omnigent.spec import load
+
+    executor = OPT_IN_EXECUTOR
+    if use_molly_bundle:
+        bundle = Path(__file__).resolve().parents[3] / "examples" / "molly"
+        spec = load(bundle, expand_env=False)
+        executor = {"type": spec.executor.type, "config": spec.executor.config}
+    agent = await create_test_agent(client, name="spec-opt-in-agent", executor=executor)
     created = await _create_opt_in_session(client, str(agent["id"]))
     assert created.status_code == 201, created.text
 
