@@ -15,6 +15,8 @@ from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
+from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+
 # ---------------------------------------------------------------------------
 # Type aliases for JSON-shaped executor boundaries
 # ---------------------------------------------------------------------------
@@ -560,6 +562,17 @@ def classify_tool_result(
                 status=ToolCallStatus.BLOCKED,
                 error=str(result.get("reason", "BLOCKED")),
             )
+        image_result = decode_mcp_image_result(result)
+        if image_result is not None:
+            if not image_result.is_error:
+                return ToolResultClassification(status=ToolCallStatus.SUCCESS, error="")
+            text = "\n".join(
+                str(block["text"]) for block in image_result.content if block["type"] == "text"
+            )
+            return ToolResultClassification(
+                status=ToolCallStatus.ERROR,
+                error=text or "MCP tool returned an error",
+            )
         for key in ("content", "result", "output", "text"):
             if key in result:
                 nested = classify_tool_result(
@@ -628,6 +641,14 @@ def classify_tool_result(
 # ---------------------------------------------------------------------------
 
 
+class InjectionDeliveryAmbiguous(Exception):
+    """A live message may already have reached the harness, so it must not be resent.
+
+    :meth:`Executor.enqueue_session_message` raises this when the harness's reply
+    to a submission it may have accepted was lost.
+    """
+
+
 class Executor:
     """Abstract interface for LLM backends and agent harnesses.
 
@@ -684,7 +705,10 @@ class Executor:
         return False
 
     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:  # noqa: ARG002 — default no-op; subclasses override to support live queueing
-        """Send a new user message to a live session without interrupting it, if supported."""
+        """Send a new user message to a live session without interrupting it, if supported.
+
+        :raises InjectionDeliveryAmbiguous: The harness may have accepted the message.
+        """
         return False
 
     def supports_live_message_queue(self) -> bool:
