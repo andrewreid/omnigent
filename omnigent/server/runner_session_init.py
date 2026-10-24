@@ -15,6 +15,8 @@ from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import Conversation
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory, ErrorCode, ErrorImpact
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+from omnigent.runtime import get_caps
+from omnigent.server.routing_backend import routing_available
 from omnigent.update_check import _read_build_info
 
 if TYPE_CHECKING:
@@ -265,6 +267,7 @@ class RunnerSessionInitializer:
                 suppress_recovery_turn=suppress_recovery_turn,
                 resume_interrupted_turn=resume_interrupted_turn,
                 recovery_id=recovery_id,
+                smart_routing_available=routing_available(get_caps()),
             )
 
             async def post_session_init() -> httpx.Response:

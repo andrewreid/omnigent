@@ -202,6 +202,7 @@ from omnigent.runner.subagent_work import (
     unregister_subagent_work_for_session,
     wrapper_label_from_labels,
 )
+from omnigent.runtime import set_remote_routing_available
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
     build_instructions,
@@ -2138,6 +2139,7 @@ def create_runner_app(
 
         global _server_version
         _server_version = envelope.server_version
+        set_remote_routing_available(envelope.smart_routing_available)
         snapshot = envelope.snapshot
         _session_snapshot_cache[session_id] = _SessionSnapshot(
             ok=True,
