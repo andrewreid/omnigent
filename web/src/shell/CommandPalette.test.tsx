@@ -247,7 +247,10 @@ describe("CommandPalette — sessions", () => {
   it("caps the session list to 5 while the query is empty, lifting it on type", () => {
     vi.useFakeTimers();
     try {
-      const many = Array.from({ length: 8 }, (_, i) => conv(`c${i}`, `Session ${i}`, "agent"));
+      const many = Array.from({ length: 8 }, (_, i) => ({
+        ...conv(`c${i}`, `Session ${i}`, "agent"),
+        updated_at: 100 - i,
+      }));
       setSessions(many);
       renderPalette();
 
@@ -271,6 +274,28 @@ describe("CommandPalette — sessions", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("orders the idle list by recency, not by cached page order", () => {
+    // A live update can bump a row on a later page without a refetch.
+    useConversations.mockReturnValue({
+      data: {
+        pages: [
+          {
+            data: Array.from({ length: 5 }, (_, i) => ({
+              ...conv(`c${i}`, `Session ${i}`),
+              updated_at: 100 - i,
+            })),
+          },
+          { data: [{ ...conv("bumped", "Just bumped"), updated_at: 500 }] },
+        ],
+      },
+      isFetching: false,
+    });
+    renderPalette();
+
+    expect(screen.getByText("Just bumped")).toBeTruthy();
+    expect(screen.queryByText("Session 4")).toBeNull();
   });
 
   it("dedupes sessions that appear on overlapping pages", () => {
