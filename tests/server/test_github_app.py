@@ -11,6 +11,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from omnigent.connections.refresh import RefreshNotRotated
 from omnigent.server.github_app import GitHubAppError
 from omnigent.server.github_app_client import GitHubAppClient
 from tests.server.github_app_fixtures import make_config
@@ -65,6 +66,26 @@ async def test_token_endpoint_non_200_raises() -> None:
 
     with pytest.raises(GitHubAppError):
         await _client(handler).exchange_code("c")
+
+
+@pytest.mark.asyncio
+async def test_gateway_error_on_refresh_is_not_a_refusal() -> None:
+    # A proxy can answer 502 after GitHub already rotated the refresh token.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text="<html>bad gateway</html>")
+
+    with pytest.raises(GitHubAppError) as raised:
+        await _client(handler).refresh_token("ghr_old")
+    assert not isinstance(raised.value, RefreshNotRotated)
+
+
+@pytest.mark.asyncio
+async def test_explicit_error_on_refresh_is_a_refusal() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "slow_down"})
+
+    with pytest.raises(RefreshNotRotated):
+        await _client(handler).refresh_token("ghr_old")
 
 
 @pytest.mark.asyncio

@@ -31,7 +31,9 @@ the trust boundary is the sandbox itself, not this endpoint. See
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 
@@ -41,18 +43,61 @@ from omnigent.stores.host_store import HostStore
 _logger = logging.getLogger(__name__)
 
 
+async def vend_provider_credential(
+    app: Any, provider: str, owner: str, *, rejected_digest: str | None = None
+) -> dict[str, object]:
+    """Resolve *owner*'s *provider* credential for a sandbox, or ``{"connected": false}``.
+
+    Shared by the host route (launch token) and the runner route (binding
+    token) so both vend identically. *rejected_digest* is the SHA-256 digest of
+    a token the provider refused; the resolver refreshes it if it is current.
+
+    :raises HTTPException: ``404`` for a provider with no broker resolver or
+        not configured on this server — nothing to vend.
+    """
+    resolver = _broker_resolvers().get(provider)
+    store = getattr(app.state, f"{provider}_store", None)
+    client = getattr(app.state, f"{provider}_client", None)
+    if resolver is None or store is None:
+        raise HTTPException(status_code=404, detail="unknown credential provider")
+    try:
+        # Only resolvers that can refresh a refused token take rejected_digest.
+        accepts = rejected_digest and _accepts_rejected_digest(resolver)
+        extra = {"rejected_digest": rejected_digest} if accepts else {}
+        payload = await resolver(owner, store=store, client=client, **extra)
+    except Exception:  # a provider resolver fault must degrade, not 500
+        _logger.warning("credential resolve failed for provider %r", provider, exc_info=True)
+        return {"connected": False}
+    if payload is None:
+        return {"connected": False}
+    return {"connected": True, "owner": owner, **payload}
+
+
+def _accepts_rejected_digest(resolver: Any) -> bool:
+    """Whether *resolver* takes the optional ``rejected_digest`` keyword."""
+    try:
+        params = inspect.signature(resolver).parameters
+    except (TypeError, ValueError):
+        return False
+    return "rejected_digest" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
+def _broker_resolvers() -> dict[str, Any]:
+    return {
+        provider.name: provider.credential_resolver
+        for provider in connection_providers()
+        if provider.credential_resolver is not None
+    }
+
+
 def create_host_credentials_router(host_store: HostStore) -> APIRouter:
     """Build the host-facing, provider-generic credential router.
 
     :param host_store: Resolves a launch token + host id to the session owner.
     :returns: A router exposing ``GET /hosts/{host_id}/credentials/{provider}``.
     """
-    resolvers = {
-        provider.name: provider.credential_resolver
-        for provider in connection_providers()
-        if provider.credential_resolver is not None
-    }
-
     router = APIRouter()
 
     @router.get("/hosts/{host_id}/credentials/{provider}")
@@ -81,20 +126,9 @@ def create_host_credentials_router(host_store: HostStore) -> APIRouter:
         if managed is None:
             raise HTTPException(status_code=401, detail="unauthenticated")
         # Resolve provider only after auth so the endpoint reveals nothing to an
-        # unauthenticated caller. A resolver with no configured store on this
-        # server (or an unknown provider) is a 404 — nothing to vend.
-        resolver = resolvers.get(provider)
-        store = getattr(request.app.state, f"{provider}_store", None)
-        client = getattr(request.app.state, f"{provider}_client", None)
-        if resolver is None or store is None:
-            raise HTTPException(status_code=404, detail="unknown credential provider")
-        try:
-            payload = await resolver(managed.user_id, store=store, client=client)
-        except Exception:  # a provider resolver fault must degrade, not 500
-            _logger.warning("credential resolve failed for provider %r", provider, exc_info=True)
-            return {"connected": False}
-        if payload is None:
-            return {"connected": False}
-        return {"connected": True, "owner": managed.user_id, **payload}
+        # unauthenticated caller. A provider with no resolver or no configured
+        # store on this server is a 404, and a resolver fault degrades to
+        # {"connected": false} (see vend_provider_credential).
+        return await vend_provider_credential(request.app, provider, managed.user_id)
 
     return router

@@ -13149,6 +13149,76 @@
         ]
       }
     },
+    "/v1/runners/{runner_id}/credentials/{provider}": {
+      "get": {
+        "description": "Vend the managed runner owner's *provider* credential to the runner.\n\nThe runner-side twin of `GET /hosts/{id}/credentials/{provider}`: the\ncodex harness runs in the runner, which holds its tunnel binding token\nbut not the host's launch token. Same gate as the owner-token mint\n(binding token bound to *runner_id*, owner from the managed launch\nrecord), and only while that managed host is live, so a binding token\nleft over after teardown resolves nothing. `401` otherwise;\n`{\"connected\": false}` when the owner hasn't linked it. `rejected`\nis the SHA-256 digest of a token the provider refused, which the broker\nrefreshes rather than handing back.",
+        "operationId": "runner_credential_v1_runners__runner_id__credentials__provider__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "runner_id",
+            "required": true,
+            "schema": {
+              "title": "Runner Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "rejected",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Rejected"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Runner Credential V1 Runners  Runner Id  Credentials  Provider  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Runner Credential",
+        "tags": [
+          "runners"
+        ]
+      }
+    },
     "/v1/runners/{runner_id}/status": {
       "get": {
         "description": "Return whether a runner currently has an open tunnel.\n\nWhen auth is active, a runner owned by a different user\nappears as offline to prevent enumeration.\n\n**Returns:** A JSON object with `runner_id` and `online`.",

@@ -191,11 +191,12 @@ in the agent bundle, not edited by this API. The runner refreshes selections on
 the next server-dispatched turn; a native client may still need a restart to
 refresh its own cached tool list.
 
-KMS-backed connections must fit within 4096 bytes after JSON serialization and
-UTF-8 encoding, including both access and refresh tokens. Oversized credentials
-are rejected before encryption; use the existing Vault Transit backend for larger
-grants. On MySQL/MariaDB, every cipher's final envelope must also fit the existing
-TEXT limit of 65,535 bytes, checked before writing. Other databases retain their
+KMS-backed connections up to 4096 bytes after JSON serialization and UTF-8
+encoding (access and refresh tokens together) use direct `kms:Encrypt`; larger
+ones are sealed with an envelope (a `kms:GenerateDataKey` data key wrapping
+AES-256-GCM), which needs that permission on the key. On MySQL/MariaDB, every
+cipher's final ciphertext, envelope included, must also fit the existing TEXT
+limit of 65,535 bytes, checked before writing. Other databases retain their
 existing capacity. Failed updates retain the previous grant.
 OAuth connection failures return to the UI as sign-in errors, with the storage-limit
 diagnosis in the server log. A refresh response that omits a refresh token or returns
