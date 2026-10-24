@@ -144,7 +144,11 @@ from omnigent.runner.native import (
 from omnigent.runner.native import orchestration as _native_runtime
 from omnigent.runner.native.interrupt import NativeInterruptRunner
 from omnigent.runner.native_controls import build_native_controls
-from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
+from omnigent.runner.policy_proxy import (
+    _evaluate_policy_via_omnigent,
+    drop_all_no_policies_hints,
+    drop_no_policies_hint,
+)
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
@@ -1217,6 +1221,10 @@ def create_runner_app(
     app.add_middleware(RunnerLogContextMiddleware)
     mcp_execution_registry = McpExecutionRegistry()
     app.state.mcp_execution_registry = mcp_execution_registry
+
+    def _server_tunnel_connected() -> bool:
+        dispatcher = getattr(app.state, "runner_event_dispatcher", None)
+        return dispatcher is not None and bool(dispatcher.is_connected)
 
     # Set as soon as SIGINT/SIGTERM is handled, so a required terminal that
     # dies with the runner's process group is not reported as a crash.
@@ -3460,6 +3468,7 @@ def create_runner_app(
         # generation and discard rather than repopulating entries for a dead
         # (or reborn) session.
         _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
+        drop_no_policies_hint(session_id)
 
         _session_spec_cache.pop(session_id, None)
         _session_root_spec_cache.pop(session_id, None)
@@ -4751,6 +4760,8 @@ def create_runner_app(
                 server_client,
                 publish_event=_publish_event,
                 execution_registry=mcp_execution_registry,
+                server_connected=_server_tunnel_connected,
+                local_executor=_execute_runner_tool,
             ).call_tool(relay_spec, name, arguments)
             try:
                 return cast(_JsonObject, _json.loads(result_str))
@@ -5224,6 +5235,7 @@ def create_runner_app(
                     conv,
                     server_client,
                     execution_registry=mcp_execution_registry,
+                    server_connected=_server_tunnel_connected,
                 )
                 try:
                     mcp_result = await _session_mcp_proxy.schemas_for(
@@ -5626,6 +5638,7 @@ def create_runner_app(
                 conv_id,
                 server_client,
                 execution_registry=mcp_execution_registry,
+                server_connected=_server_tunnel_connected,
             )
             if _eager_spec_error is None and _turn_spec is not None:
                 try:
@@ -6057,6 +6070,11 @@ def create_runner_app(
                                             server_client,
                                             publish_event=_publish_event,
                                             execution_registry=mcp_execution_registry,
+                                            server_connected=_server_tunnel_connected,
+                                            # This turn's MCP tools keep the server path.
+                                            local_executor=(
+                                                None if is_mcp else _execute_runner_tool
+                                            ),
                                         )
                                         _dispatch_tasks.append(
                                             _asyncio.create_task(
@@ -7074,6 +7092,10 @@ def create_runner_app(
                 )
             return Response(status_code=204)
 
+        if body_type == "policies_changed":
+            drop_no_policies_hint(conversation_id)
+            return Response(status_code=204)
+
         if body_type == "policy_blocked_notice":
             if _session_harness_name(conversation_id) == "opencode-native":
                 message = body.get("message") if isinstance(body, dict) else None
@@ -7486,6 +7508,8 @@ def create_runner_app(
         _session_harness_overrides.pop(session_id, None)
         # Bump so any in-flight fill discards its write rather than reinstating it.
         _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
+        # A new agent or bundle can bring its own guardrails.
+        drop_no_policies_hint(session_id)
         _session_snapshot_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
         _session_cursor_model_names.pop(session_id, None)
@@ -7639,7 +7663,13 @@ def create_runner_app(
             },
         )
 
-    register_mcp_routes(
+    @app.post("/v1/policies/changed")
+    async def server_policies_changed() -> Response:
+        """Forget every no-policies report after a server-wide policy change."""
+        drop_all_no_policies_hints()
+        return Response(status_code=204)
+
+    _execute_runner_tool = register_mcp_routes(
         app,
         _publish_event=_publish_event,
         _recover_undrained_subagent_results=_recover_undrained_subagent_results,
@@ -7665,6 +7695,8 @@ def create_runner_app(
 
     async def _catch_up_scan() -> None:
         recreated_prompts = pending_approvals.notify_server_reconnect()
+        # A new server may hold policies the old one's reports did not cover.
+        drop_all_no_policies_hints()
         if recreated_prompts:
             _logger.info(
                 "Recreating %d pending approval or elicitation request(s) after reconnect",

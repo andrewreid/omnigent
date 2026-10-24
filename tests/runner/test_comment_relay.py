@@ -572,17 +572,17 @@ async def test_claude_launch_starts_the_comment_relay(
 
 
 @pytest.mark.asyncio
-async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
+async def test_relay_executor_enforces_server_policy_in_omnigent_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Route relay tool execution through Omnigent ``/mcp`` for policy enforcement.
+    """Relay built-ins run locally but stay gated by Omnigent policy.
 
     Verifies that when the runner is configured with a server_client (AP mode),
     the ``_relay_tool_executor`` closure routes calls through
-    :class:`~omnigent.runner.proxy_mcp_manager.ProxyMcpManager` instead of
-    dispatching directly to comment/session-query handlers.  Policy enforcement
-    on these relay tools was previously bypassed; this test pins the fix.
+    :class:`~omnigent.runner.proxy_mcp_manager.ProxyMcpManager`, which checks
+    TOOL_CALL and TOOL_RESULT with ``/policies/evaluate`` around the local
+    built-in instead of round-tripping it through ``/mcp``.
     """
     import omnigent.harnesses.claude_native.bridge as _bridge_mod
 
@@ -617,26 +617,23 @@ async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
             timeout: float = 60.0,
             headers: dict[str, str] | None = None,
         ) -> httpx.Response:
-            """Record the request and return a valid MCP tools/call response.
+            """Record the request and allow it, rewriting the tool result.
 
-            :param url: Target URL, e.g. ``"/v1/sessions/conv_x/mcp"``.
-            :param json: JSON-RPC 2.0 request body.
+            :param url: Target URL, e.g. ``"/v1/sessions/conv_x/policies/evaluate"``.
+            :param json: Request body.
             :param timeout: Request timeout (unused).
-            :returns: 200 response with a fixed MCP result.
+            :returns: 200 policy verdict.
             """
             del timeout
             ap_mcp_posts.append({"url": url, "json": json})
             req = httpx.Request("POST", f"http://ap-server{url}")
-            return httpx.Response(
-                200,
-                json={
-                    "result": {
-                        "content": [{"type": "text", "text": '{"items": []}'}],
-                        "isError": False,
-                    }
-                },
-                request=req,
-            )
+            verdict: dict[str, Any] = {
+                "result": "POLICY_ACTION_ALLOW",
+                "_omnigent_return_ask": True,
+            }
+            if json.get("event", {}).get("type") == "PHASE_TOOL_RESULT":
+                verdict["data"] = '{"items": []}'
+            return httpx.Response(200, json=verdict, request=req)
 
     # Intercept start_tool_relay to capture the _relay_tool_executor callback
     # before it's wired into the HTTP relay server.
@@ -687,33 +684,20 @@ async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
         # Call the relay executor directly (simulates Claude Code invoking list_comments).
         result = await executor("list_comments", {"status": "pending"})
 
-        # In Omnigent mode the executor must have POSTed a tools/call JSON-RPC to the
-        # Omnigent server's /mcp endpoint, not called the direct comment handler.
-        mcp_call = next(
-            (
-                r
-                for r in ap_mcp_posts
-                if "/mcp" in r["url"] and r["json"].get("method") == "tools/call"
-            ),
-            None,
-        )
-        assert mcp_call is not None, (
-            "No tools/call request reached the Omnigent /mcp endpoint. "
-            "The relay executor is bypassing ProxyMcpManager and policy enforcement."
-        )
-        # Tool name and arguments must be forwarded verbatim.
-        assert mcp_call["json"]["params"]["name"] == "list_comments", (
-            "Wrong tool name forwarded; policy would be evaluated against the wrong tool."
-        )
-        assert mcp_call["json"]["params"]["arguments"] == {"status": "pending"}, (
-            "Arguments were not forwarded correctly to Omnigent /mcp."
-        )
-        # The request URL must be scoped to this session's /mcp endpoint.
-        assert session_id in mcp_call["url"], (
-            f"AP /mcp request URL {mcp_call['url']!r} does not contain session_id {session_id!r}."
-        )
-        # The Omnigent response's text content must be parsed back to a dict.
-        assert result == {"items": []}, f"Expected parsed Omnigent response dict, got {result!r}."
+        # Both phases are evaluated for this session; the built-in never
+        # round-trips through the server's /mcp endpoint.
+        assert not [r for r in ap_mcp_posts if r["url"].endswith("/mcp")]
+        evaluations = [r for r in ap_mcp_posts if r["url"].endswith("/policies/evaluate")]
+        assert [r["url"] for r in evaluations] == [
+            f"/v1/sessions/{session_id}/policies/evaluate"
+        ] * 2
+        call_event, result_event = (r["json"]["event"] for r in evaluations)
+        assert call_event["type"] == "PHASE_TOOL_CALL"
+        assert call_event["data"] == {"name": "list_comments", "arguments": {"status": "pending"}}
+        assert result_event["type"] == "PHASE_TOOL_RESULT"
+        assert result_event["request_data"]["name"] == "list_comments"
+        # The TOOL_RESULT rewrite is what the relay returns, parsed to a dict.
+        assert result == {"items": []}, f"Expected the policy-shaped result, got {result!r}."
     finally:
         shutil.rmtree(bridge_dir, ignore_errors=True)
 

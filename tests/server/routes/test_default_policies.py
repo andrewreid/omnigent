@@ -7,6 +7,7 @@ supply one, so these tests use the shared policy app with a route-only client.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import patch
@@ -30,6 +31,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+from tests.server.helpers import CapturingRunnerClient
 
 _REGISTERED_HANDLER = "omnigent.policies.builtins.safety.ask_on_os_tools"
 _TEST_USER_ID = "alice@example.com"
@@ -216,6 +218,31 @@ async def test_update_default_policy_toggle_enabled(policy_client: httpx.AsyncCl
     resp = await policy_client.patch(f"/v1/policies/{pid}", json={"enabled": False})
     assert resp.status_code == 200
     assert resp.json()["enabled"] is False
+
+
+async def test_default_policy_changes_notify_runners(
+    policy_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Create, update and delete each tell runners to re-check every session's policies."""
+    runner = CapturingRunnerClient()
+    monkeypatch.setattr("omnigent.runtime._globals._runner_client", runner)
+
+    async def _notices() -> int:
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if runner.posted:
+                urls = [entry["url"] for entry in runner.posted]
+                runner.posted.clear()
+                assert urls == ["/v1/policies/changed"]
+                return len(urls)
+        return 0
+
+    pid = (await policy_client.post("/v1/policies", json=_policy_payload())).json()["id"]
+    assert await _notices() == 1
+    await policy_client.patch(f"/v1/policies/{pid}", json={"enabled": False})
+    assert await _notices() == 1
+    await policy_client.delete(f"/v1/policies/{pid}")
+    assert await _notices() == 1
 
 
 # ── DELETE /v1/policies/{policy_id} ──────────────────────────────────

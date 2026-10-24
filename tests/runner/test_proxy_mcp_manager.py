@@ -10,12 +10,17 @@ Covers:
 - ``call_tool`` -32000 RPC error → JSON error string (soft error, not raised)
 - ``call_tool`` non-32000 RPC error → raises RuntimeError
 - ``call_tool`` network failure → raises RuntimeError
+- ``call_tool`` dropped request → prompt retry on a live tunnel, reconnect wait otherwise
+- runner built-ins: local execution, per-phase server policy, ASK fallback,
+  the no-policies hint, fail-closed checks, and exactly-once execution
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,7 +28,7 @@ import httpx
 import pytest
 
 from omnigent.runner import mcp_execution_registry as mcp_execution_registry_mod
-from omnigent.runner import pending_approvals
+from omnigent.runner import pending_approvals, policy_proxy
 from omnigent.runner.mcp_execution_registry import (
     MCP_OPERATION_ID_PARAM,
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
@@ -124,6 +129,105 @@ def _make_manager(transport: _StubTransport) -> ProxyMcpManager:
     """
     client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
     return ProxyMcpManager(session_id="conv_test", ap_client=client)
+
+
+def _input_required(elicitation_id: str, request_state: str, rpc_id: int) -> httpx.Response:
+    """Build a policy-ASK ``InputRequiredResult`` for one elicitation."""
+    return _json_resp(
+        {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "result": {
+                "resultType": "input_required",
+                "inputRequests": {
+                    elicitation_id: {
+                        "method": "elicitation/create",
+                        "params": {
+                            "message": "Approve shell command?",
+                            "requestedSchema": {
+                                "type": "object",
+                                "properties": {"approved": {"type": "boolean"}},
+                                "required": ["approved"],
+                            },
+                        },
+                    }
+                },
+                "requestState": request_state,
+            },
+        }
+    )
+
+
+async def _wait_until_registered(elicitation_id: str) -> None:
+    """Wait for ``call_tool`` to park on the given approval."""
+    for _ in range(1000):
+        if elicitation_id in pending_approvals._pending:
+            return
+        await asyncio.sleep(0.001)
+    raise AssertionError(f"approval {elicitation_id} was never registered")
+
+
+class _RetainedExecutionTransport(httpx.AsyncBaseTransport):
+    """Server stand-in that runs each tool step through the runner registry.
+
+    Each request consumes one scripted outcome: ``"input_required"`` answers
+    with a policy ASK; ``"refuse"`` fails to connect before reaching the
+    server; ``"status:<code>"`` answers that HTTP status without reaching it;
+    ``"late-status:<code>"``, ``"detached"``, ``"drop"`` and ``"ok"`` first
+    execute (or reattach to) the operation, then reply with that HTTP status,
+    a detached RPC error, a dropped connection, or the tool result.
+    """
+
+    def __init__(self, registry: McpExecutionRegistry, outcomes: list[str]) -> None:
+        self.calls: list[_Call] = []
+        self.external_invocations = 0
+        self._registry = registry
+        self._outcomes = list(outcomes)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        self.calls.append(_Call(url=str(request.url), body=body))
+        outcome = self._outcomes.pop(0)
+        if outcome == "input_required":
+            return _input_required("elicit_live", "live-state", body["id"])
+        if outcome == "refuse":
+            raise httpx.ConnectError("connection refused")
+        if outcome.startswith("status:"):
+            return httpx.Response(int(outcome.removeprefix("status:")))
+
+        async def _retained_work() -> McpExecutionResult:
+            self.external_invocations += 1
+            return McpExecutionResult(status_code=200, content={"result": {"output": "done"}})
+
+        await self._registry.execute(
+            session_id="conv_test",
+            operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+            step="initial",
+            params={"name": body["params"]["name"], "arguments": {}},
+            run=_retained_work,
+        )
+        if outcome == "drop":
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        if outcome.startswith("late-status:"):
+            return httpx.Response(int(outcome.removeprefix("late-status:")))
+        if outcome == "detached":
+            return _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "error": {
+                        "code": RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                        "message": "Runner MCP execution detached.",
+                    },
+                }
+            )
+        return _json_resp(
+            {
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": {"content": [{"type": "text", "text": "completed"}], "isError": False},
+            }
+        )
 
 
 # ── schemas_for ────────────────────────────────────────────────────────────
@@ -377,32 +481,6 @@ async def test_call_tool_recreates_approval_after_server_reconnect() -> None:
     """A reconnect discards stale requestState and repeats the original call."""
     old_elicitation = "elicit_old_server"
     new_elicitation = "elicit_new_server"
-
-    def _input_required(elicitation_id: str, request_state: str, rpc_id: int) -> httpx.Response:
-        return _json_resp(
-            {
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "result": {
-                    "resultType": "input_required",
-                    "inputRequests": {
-                        elicitation_id: {
-                            "method": "elicitation/create",
-                            "params": {
-                                "message": "Approve shell command?",
-                                "requestedSchema": {
-                                    "type": "object",
-                                    "properties": {"approved": {"type": "boolean"}},
-                                    "required": ["approved"],
-                                },
-                            },
-                        }
-                    },
-                    "requestState": request_state,
-                },
-            }
-        )
-
     transport = _StubTransport(
         [
             _input_required(old_elicitation, "old-state", 1),
@@ -424,14 +502,6 @@ async def test_call_tool_recreates_approval_after_server_reconnect() -> None:
     task = asyncio.create_task(
         manager.call_tool(_make_spec("github"), "sys_os_shell", {"command": "printf ok"})
     )
-
-    async def _wait_until_registered(elicitation_id: str) -> None:
-        for _ in range(1000):
-            if elicitation_id in pending_approvals._pending:
-                return
-            await asyncio.sleep(0.001)
-        raise AssertionError(f"approval {elicitation_id} was never registered")
-
     try:
         await _wait_until_registered(old_elicitation)
         assert pending_approvals.notify_server_reconnect() == 1
@@ -454,67 +524,27 @@ async def test_call_tool_recreates_approval_after_server_reconnect() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["detached", "drop"])
 async def test_call_tool_reattaches_expired_execution_after_server_disconnect(
     monkeypatch: pytest.MonkeyPatch,
+    failure: str,
 ) -> None:
-    """A reconnect wait pins completed work past its normal retention window."""
+    """A reconnect wait pins completed work past its normal retention window.
+
+    Covers both the server reporting a detached runner request and the POST
+    itself dropping while the tunnel is down.
+    """
     clock = 0.0
     monkeypatch.setattr(mcp_execution_registry_mod, "_COMPLETED_TTL_S", 1.0)
     monkeypatch.setattr(mcp_execution_registry_mod, "monotonic", lambda: clock)
     registry = McpExecutionRegistry()
-
-    class _DetachThenSucceedTransport(httpx.AsyncBaseTransport):
-        def __init__(self) -> None:
-            self.calls: list[_Call] = []
-            self.external_invocations = 0
-
-        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-            body = json.loads(request.content)
-            self.calls.append(_Call(url=str(request.url), body=body))
-            operation_id = body["params"][MCP_OPERATION_ID_PARAM]
-
-            async def _retained_work() -> McpExecutionResult:
-                self.external_invocations += 1
-                return McpExecutionResult(
-                    status_code=200,
-                    content={"result": {"output": "retained"}},
-                )
-
-            await registry.execute(
-                session_id="conv_test",
-                operation_id=operation_id,
-                step="initial",
-                params={"name": "github__deploy", "arguments": {}},
-                run=_retained_work,
-            )
-            if len(self.calls) == 1:
-                return _json_resp(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": body["id"],
-                        "error": {
-                            "code": RUNNER_MCP_EXECUTION_DETACHED_CODE,
-                            "message": "Runner MCP execution detached.",
-                        },
-                    }
-                )
-            return _json_resp(
-                {
-                    "jsonrpc": "2.0",
-                    "id": body["id"],
-                    "result": {
-                        "content": [{"type": "text", "text": "reattached"}],
-                        "isError": False,
-                    },
-                }
-            )
-
-    transport = _DetachThenSucceedTransport()
+    transport = _RetainedExecutionTransport(registry, [failure, "ok"])
     client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
     manager = ProxyMcpManager(
         session_id="conv_test",
         ap_client=client,
         execution_registry=registry,
+        server_connected=lambda: False,
     )
     pending_approvals.reset_for_tests()
     task = asyncio.create_task(manager.call_tool(None, "github__deploy", {}))
@@ -527,7 +557,7 @@ async def test_call_tool_reattaches_expired_execution_after_server_disconnect(
         clock = 2.0
         pending_approvals.notify_server_reconnect()
 
-        assert await task == "reattached"
+        assert await task == "completed"
     finally:
         if not task.done():
             task.cancel()
@@ -539,6 +569,226 @@ async def test_call_tool_reattaches_expired_execution_after_server_disconnect(
     first_params, retry_params = [call.body["params"] for call in transport.calls]
     assert retry_params == first_params
     assert first_params[MCP_OPERATION_ID_PARAM].startswith("mcpop_")
+
+
+@pytest.mark.asyncio
+async def test_call_tool_retries_dropped_request_promptly_on_live_tunnel() -> None:
+    """A dropped POST on a live tunnel reattaches within seconds, not after 120 s."""
+    registry = McpExecutionRegistry()
+    transport = _RetainedExecutionTransport(registry, ["drop", "ok"])
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+        server_connected=lambda: True,
+    )
+    pending_approvals.reset_for_tests()
+    try:
+        result = await asyncio.wait_for(
+            manager.call_tool(None, "sys_os_read", {}),
+            timeout=5.0,
+        )
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert result == "completed"
+    assert transport.external_invocations == 1
+    assert [call.body["id"] for call in transport.calls] == [1, 2]
+    first_params, retry_params = [call.body["params"] for call in transport.calls]
+    assert retry_params == first_params
+
+
+@pytest.mark.asyncio
+async def test_call_tool_live_tunnel_retry_keeps_parked_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parked approval outlasts the retry budget; its unsent resume POST retries."""
+    monkeypatch.setattr("omnigent.runner.proxy_mcp_manager._LIVE_TUNNEL_RETRY_DELAYS_S", (0.01,))
+    registry = McpExecutionRegistry()
+    transport = _RetainedExecutionTransport(registry, ["input_required", "refuse", "ok"])
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+        server_connected=lambda: True,
+    )
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(manager.call_tool(None, "sys_os_shell", {}))
+    try:
+        await _wait_until_registered("elicit_live")
+        await asyncio.sleep(0.1)
+        assert not task.done()
+        assert pending_approvals.resolve("elicit_live", approved=True)
+
+        assert await asyncio.wait_for(task, timeout=5.0) == "completed"
+    finally:
+        if not task.done():
+            task.cancel()
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert transport.external_invocations == 1
+    assert [call.body["id"] for call in transport.calls] == [1, 2, 3]
+    _ask_params, approved_params, retry_params = [call.body["params"] for call in transport.calls]
+    assert approved_params["requestState"] == "live-state"
+    assert retry_params == approved_params
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tunnel_connected", [True, False])
+@pytest.mark.parametrize("failure", ["drop", "status:503"])
+async def test_call_tool_does_not_resend_approval_dropped_after_send(
+    tunnel_connected: bool,
+    failure: str,
+) -> None:
+    """The server consumes an approval before executing, so a sent resume is not replayed.
+
+    Holds with the tunnel down too: a reconnected server cannot resume it either.
+    """
+    registry = McpExecutionRegistry()
+    transport = _RetainedExecutionTransport(registry, ["input_required", failure])
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+        server_connected=lambda: tunnel_connected,
+    )
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(manager.call_tool(None, "sys_os_shell", {}))
+    try:
+        await _wait_until_registered("elicit_live")
+        assert pending_approvals.resolve("elicit_live", approved=True)
+
+        with pytest.raises(RuntimeError, match=r"completion is unknown|503"):
+            await asyncio.wait_for(task, timeout=5.0)
+    finally:
+        if not task.done():
+            task.cancel()
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert transport.external_invocations == (1 if failure == "drop" else 0)
+    assert [call.body["id"] for call in transport.calls] == [1, 2]
+    assert not pending_approvals._server_reconnect_waiters
+
+
+def _registry_manager(
+    transport: httpx.AsyncBaseTransport,
+    registry: McpExecutionRegistry,
+) -> tuple[ProxyMcpManager, httpx.AsyncClient]:
+    """Build a manager with a retained-operation registry and a live tunnel."""
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+        server_connected=lambda: True,
+    )
+    return manager, client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["status:502", "status:503", "late-status:504"])
+async def test_call_tool_retries_gateway_status_on_same_operation(failure: str) -> None:
+    """A 502/503/504 is retried promptly on the same operation; the tool runs once."""
+    registry = McpExecutionRegistry()
+    transport = _RetainedExecutionTransport(registry, [failure, "ok"])
+    manager, client = _registry_manager(transport, registry)
+    pending_approvals.reset_for_tests()
+    try:
+        result = await asyncio.wait_for(manager.call_tool(None, "echo__echo", {}), timeout=5.0)
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert result == "completed"
+    assert transport.external_invocations == 1
+    assert [call.body["id"] for call in transport.calls] == [1, 2]
+    first_params, retry_params = [call.body["params"] for call in transport.calls]
+    assert retry_params == first_params
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 404, 500])
+async def test_call_tool_does_not_retry_other_http_errors(status: int) -> None:
+    """Only gateway statuses are retried; any other HTTP error fails at once."""
+    registry = McpExecutionRegistry()
+    transport = _RetainedExecutionTransport(registry, [f"status:{status}"])
+    manager, client = _registry_manager(transport, registry)
+    try:
+        with pytest.raises(RuntimeError, match=str(status)):
+            await manager.call_tool(None, "echo__echo", {})
+    finally:
+        await client.aclose()
+
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_call_tool_gateway_status_retries_are_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persistent 503 fails after the retry budget instead of waiting for a reconnect."""
+    monkeypatch.setattr(
+        "omnigent.runner.proxy_mcp_manager._LIVE_TUNNEL_RETRY_DELAYS_S", (0.01, 0.01)
+    )
+    registry = McpExecutionRegistry()
+    transport = _RetainedExecutionTransport(registry, ["status:503"] * 3)
+    manager, client = _registry_manager(transport, registry)
+    pending_approvals.reset_for_tests()
+    try:
+        with pytest.raises(RuntimeError, match="503"):
+            await asyncio.wait_for(manager.call_tool(None, "echo__echo", {}), timeout=5.0)
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert len(transport.calls) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["sys_advise_models", "mcp__omnigent__sys_advise_models"])
+@pytest.mark.parametrize("failure", ["drop", "late-status:504"])
+async def test_call_tool_does_not_replay_server_executed_tool(
+    tool_name: str,
+    failure: str,
+) -> None:
+    """The server runs these itself, outside the runner operation, so a sent call is not resent."""
+    registry = McpExecutionRegistry()
+    transport = _RetainedExecutionTransport(registry, [failure])
+    manager, client = _registry_manager(transport, registry)
+    pending_approvals.reset_for_tests()
+    try:
+        with pytest.raises(RuntimeError, match=r"completion is unknown|504"):
+            await asyncio.wait_for(manager.call_tool(None, tool_name, {}), timeout=5.0)
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_call_tool_retries_unsent_server_executed_tool() -> None:
+    """A server-executed tool whose request never connected is safe to resend."""
+    registry = McpExecutionRegistry()
+    transport = _RetainedExecutionTransport(registry, ["refuse", "ok"])
+    manager, client = _registry_manager(transport, registry)
+    pending_approvals.reset_for_tests()
+    try:
+        result = await asyncio.wait_for(
+            manager.call_tool(None, "sys_advise_models", {}), timeout=5.0
+        )
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert result == "completed"
+    assert len(transport.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -713,3 +963,536 @@ async def test_call_tool_uses_configured_read_timeout() -> None:
         "otherwise call_tool may regress to httpx's shorter default."
     )
     assert timeout["connect"] == 10.0, "Connect timeout stays short to fail fast on a dead server"
+
+
+# ── runner built-ins: local execution with server policy ───────────────────
+
+
+class _PolicyServer(httpx.AsyncBaseTransport):
+    """Stub Omnigent server for local built-in dispatch.
+
+    ``/policies/evaluate`` answers from a per-phase queue of responses (or
+    exceptions to raise); ``/mcp`` answers from ``mcp_responses``. Every
+    request is recorded in ``calls``.
+    """
+
+    def __init__(
+        self,
+        verdicts: dict[str, list[httpx.Response | Exception]] | None = None,
+        mcp_responses: list[httpx.Response] | None = None,
+    ) -> None:
+        self.verdicts = verdicts or {}
+        self.mcp_responses = list(mcp_responses or [])
+        self.calls: list[_Call] = []
+        self.evaluate_gate: asyncio.Event | None = None
+
+    def phases(self) -> list[str]:
+        """Return the evaluated phases in request order."""
+        return [
+            call.body["event"]["type"] for call in self.calls if "/policies/evaluate" in call.url
+        ]
+
+    def mcp_calls(self) -> list[_Call]:
+        """Return the requests that reached the session MCP endpoint."""
+        return [call for call in self.calls if call.url.endswith("/mcp")]
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        self.calls.append(_Call(url=str(request.url), body=body))
+        if request.url.path.endswith("/policies/evaluate"):
+            if self.evaluate_gate is not None:
+                await self.evaluate_gate.wait()
+            queued = self.verdicts[body["event"]["type"]].pop(0)
+            if isinstance(queued, Exception):
+                raise queued
+            return queued
+        return self.mcp_responses.pop(0)
+
+
+def _verdict(action: str, **fields: object) -> httpx.Response:
+    """Build a ``/policies/evaluate`` response, e.g. ``_verdict("DENY", reason="x")``."""
+    return _json_resp(
+        {"result": f"POLICY_ACTION_{action}", "_omnigent_return_ask": True, **fields}
+    )
+
+
+class _RecordingExecutor:
+    """Local executor stub that records each built-in execution."""
+
+    def __init__(self, output: str = "file contents") -> None:
+        self.output = output
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def __call__(self, session_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
+        self.calls.append((session_id, tool_name, arguments))
+        return self.output
+
+
+def _local_manager(
+    server: _PolicyServer,
+    executor: _RecordingExecutor,
+    *,
+    session_id: str | None = None,
+    execution_registry: McpExecutionRegistry | None = None,
+    server_connected: Callable[[], bool] | None = None,
+) -> ProxyMcpManager:
+    """Build a manager that runs built-ins through *executor*."""
+    client = httpx.AsyncClient(transport=server, base_url="http://ap-server")
+    return ProxyMcpManager(
+        session_id=session_id or f"conv_{uuid.uuid4().hex[:12]}",
+        ap_client=client,
+        execution_registry=execution_registry,
+        server_connected=server_connected,
+        local_executor=executor,
+    )
+
+
+def _mcp_text(text: str) -> httpx.Response:
+    """Build a session-MCP ``tools/call`` result carrying *text*."""
+    return _json_resp(
+        {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": text}]}}
+    )
+
+
+@pytest.mark.asyncio
+async def test_builtin_runs_locally_while_mcp_and_server_tools_use_mcp_endpoint() -> None:
+    """Built-ins skip ``/mcp`` but are still policy-checked; MCP tools keep ``/mcp``."""
+    server = _PolicyServer(
+        verdicts={
+            "PHASE_TOOL_CALL": [_verdict("ALLOW")],
+            "PHASE_TOOL_RESULT": [_verdict("ALLOW")],
+        },
+        mcp_responses=[_mcp_text("issues"), _mcp_text("advice")],
+    )
+    executor = _RecordingExecutor()
+    manager = _local_manager(server, executor)
+
+    assert await manager.call_tool(None, "sys_os_read", {"path": "a.txt"}) == "file contents"
+    assert executor.calls == [(manager._session_id, "sys_os_read", {"path": "a.txt"})]
+    assert server.phases() == ["PHASE_TOOL_CALL", "PHASE_TOOL_RESULT"]
+    assert server.mcp_calls() == []
+    result_event = server.calls[1].body["event"]
+    assert result_event["data"] == {"result": "file contents"}
+    assert result_event["request_data"] == {"name": "sys_os_read", "arguments": {"path": "a.txt"}}
+    assert server.calls[0].body["_omnigent_return_ask"] is True
+
+    assert await manager.call_tool(_make_spec("github"), "github__search", {}) == "issues"
+    assert await manager.call_tool(None, "sys_advise_models", {}) == "advice"
+    assert [call.body["params"]["name"] for call in server.mcp_calls()] == [
+        "github__search",
+        "sys_advise_models",
+    ]
+    assert len(executor.calls) == 1, "MCP and server-executed tools must not run locally"
+
+
+@pytest.mark.asyncio
+async def test_builtin_tool_call_deny_never_executes() -> None:
+    """A TOOL_CALL DENY returns the MCP endpoint's denial and skips the tool."""
+    server = _PolicyServer(verdicts={"PHASE_TOOL_CALL": [_verdict("DENY", reason="no reads")]})
+    executor = _RecordingExecutor()
+    manager = _local_manager(server, executor)
+
+    output = await manager.call_tool(None, "sys_os_read", {"path": "secret"})
+
+    assert json.loads(output) == {"error": "Denied by policy: no reads"}
+    assert executor.calls == []
+    assert server.phases() == ["PHASE_TOOL_CALL"]
+
+
+@pytest.mark.parametrize(
+    ("result_verdict", "expected"),
+    [
+        (_verdict("DENY", reason="secret"), "[Result suppressed by policy: secret]"),
+        (_verdict("ALLOW", data="[REDACTED]"), "[REDACTED]"),
+        (_verdict("ASK", data="[REVIEW]"), "[REVIEW]"),
+    ],
+    ids=["deny", "redact", "ask-transform"],
+)
+@pytest.mark.asyncio
+async def test_builtin_result_policy_shapes_output(
+    result_verdict: httpx.Response, expected: str
+) -> None:
+    """TOOL_RESULT verdicts replace the output exactly as the MCP endpoint does."""
+    server = _PolicyServer(
+        verdicts={
+            "PHASE_TOOL_CALL": [_verdict("ALLOW", data={"path": "safe.txt"})],
+            "PHASE_TOOL_RESULT": [result_verdict],
+        }
+    )
+    executor = _RecordingExecutor(output="api_key=hunter2")
+    manager = _local_manager(server, executor)
+
+    assert await manager.call_tool(None, "sys_os_read", {"path": "a.txt"}) == expected
+    # TOOL_CALL's transformed arguments are what ran and what TOOL_RESULT sees.
+    assert executor.calls[0][2] == {"path": "safe.txt"}
+    assert server.calls[1].body["event"]["request_data"]["arguments"] == {"path": "safe.txt"}
+
+
+@pytest.mark.asyncio
+async def test_builtin_ask_parks_and_resumes_through_mcp_endpoint() -> None:
+    """A TOOL_CALL ASK hands the call to the MCP endpoint's approval flow."""
+    elicitation_id = "elicit_builtin"
+    server = _PolicyServer(
+        verdicts={"PHASE_TOOL_CALL": [_verdict("ASK", reason="approve?")]},
+        mcp_responses=[
+            _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "resultType": "input_required",
+                        "inputRequests": {elicitation_id: {"params": {"requestedSchema": {}}}},
+                        "requestState": "state",
+                    },
+                }
+            ),
+            _mcp_text("approved output"),
+        ],
+    )
+    executor = _RecordingExecutor()
+    manager = _local_manager(server, executor, execution_registry=McpExecutionRegistry())
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(manager.call_tool(None, "sys_os_shell", {"command": "ls"}))
+    try:
+        for _ in range(1000):
+            if elicitation_id in pending_approvals._pending:
+                break
+            await asyncio.sleep(0.001)
+        assert pending_approvals.resolve(elicitation_id, approved=True)
+        assert await task == "approved output"
+    finally:
+        if not task.done():
+            task.cancel()
+        pending_approvals.reset_for_tests()
+
+    assert executor.calls == [], "the MCP endpoint executes approved calls"
+    first, retry = [call.body["params"] for call in server.mcp_calls()]
+    assert first["arguments"] == {"command": "ls"}
+    assert retry["inputResponses"][elicitation_id]["action"] == "accept"
+    assert retry[MCP_OPERATION_ID_PARAM] == first[MCP_OPERATION_ID_PARAM]
+
+
+@pytest.mark.asyncio
+async def test_builtin_no_policies_hint_skips_policy_round_trips() -> None:
+    """After the fast path reports no policies, built-ins make no policy calls."""
+    server = _PolicyServer(
+        verdicts={
+            "PHASE_TOOL_CALL": [
+                _verdict("ALLOW", no_policies_ttl_s=60),
+                _verdict("ASK", reason="approve policy"),
+                _verdict("ALLOW"),
+            ],
+            "PHASE_TOOL_RESULT": [_verdict("ALLOW")],
+        },
+        mcp_responses=[_mcp_text("denied by user")],
+    )
+    executor = _RecordingExecutor(output="")
+    manager = _local_manager(server, executor)
+    session_id = manager._session_id
+
+    for _ in range(3):
+        output = await manager.call_tool(None, "sys_os_read", {"path": "a.txt"})
+        # An empty output keeps the MCP endpoint's text-block shape.
+        assert json.loads(output) == {"content": [{"type": "text", "text": ""}]}
+    assert server.phases() == ["PHASE_TOOL_CALL"], "one fast-path call, then none"
+    assert len(executor.calls) == 3
+
+    # Policy and schedule changes always reach the engine.
+    await manager.call_tool(None, "sys_add_policy", {"name": "p"})
+    assert server.phases()[-1] == "PHASE_TOOL_CALL"
+
+    policy_proxy.drop_no_policies_hint(session_id)
+    await manager.call_tool(None, "sys_os_read", {"path": "a.txt"})
+    assert server.phases()[-2:] == ["PHASE_TOOL_CALL", "PHASE_TOOL_RESULT"]
+
+
+@pytest.mark.asyncio
+async def test_no_policies_hint_needs_honoured_allow_and_ends_on_reconnect() -> None:
+    """Only an echoed fast-path ALLOW arms the hint, and a server reconnect clears it."""
+    server = _PolicyServer(
+        verdicts={
+            "PHASE_TOOL_CALL": [
+                _verdict("UNSPECIFIED", no_policies_ttl_s=60),
+                _verdict("ALLOW", no_policies_ttl_s=60),
+                _verdict("ALLOW"),
+            ],
+            "PHASE_TOOL_RESULT": [_verdict("ALLOW")],
+        }
+    )
+    executor = _RecordingExecutor()
+    manager = _local_manager(server, executor)
+
+    assert "error" in json.loads(await manager.call_tool(None, "sys_os_read", {}))
+    assert not policy_proxy.no_policies_apply(manager._session_id)
+    await manager.call_tool(None, "sys_os_read", {})
+    assert policy_proxy.no_policies_apply(manager._session_id)
+
+    policy_proxy.drop_all_no_policies_hints()
+    await manager.call_tool(None, "sys_os_read", {})
+    assert server.phases() == ["PHASE_TOOL_CALL"] * 3 + ["PHASE_TOOL_RESULT"]
+
+
+@pytest.mark.asyncio
+async def test_no_policies_hint_holds_until_its_ttl_then_refreshes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skipped calls ride one report for the whole TTL; the next call after it re-checks."""
+    clock = 0.0
+    monkeypatch.setattr(policy_proxy, "monotonic", lambda: clock)
+    server = _PolicyServer(
+        verdicts={
+            "PHASE_TOOL_CALL": [
+                _verdict("ALLOW", no_policies_ttl_s=120),
+                _verdict("ALLOW", no_policies_ttl_s=120),
+            ],
+        }
+    )
+    executor = _RecordingExecutor()
+    manager = _local_manager(server, executor)
+
+    for clock in (0.0, 30.0, 60.0, 119.0):
+        await manager.call_tool(None, "sys_os_read", {})
+    assert server.phases() == ["PHASE_TOOL_CALL"]
+
+    clock = 121.0
+    await manager.call_tool(None, "sys_os_read", {})
+    clock = 200.0
+    await manager.call_tool(None, "sys_os_read", {})
+    assert server.phases() == ["PHASE_TOOL_CALL"] * 2, "expiry re-checks once and re-arms"
+    assert len(executor.calls) == 6
+
+
+@pytest.mark.asyncio
+async def test_deny_added_inside_the_skip_window_is_enforced() -> None:
+    """A pushed policy change ends the skip, so the new DENY applies to the next call."""
+    server = _PolicyServer(
+        verdicts={
+            "PHASE_TOOL_CALL": [
+                _verdict("ALLOW", no_policies_ttl_s=120),
+                _verdict("DENY", reason="reads blocked"),
+            ],
+        }
+    )
+    executor = _RecordingExecutor()
+    manager = _local_manager(server, executor)
+    await manager.call_tool(None, "sys_os_read", {})
+    await manager.call_tool(None, "sys_os_read", {})
+    assert len(executor.calls) == 2
+
+    # What the runner does on a session ``policies_changed`` push.
+    policy_proxy.drop_no_policies_hint(manager._session_id)
+
+    output = await manager.call_tool(None, "sys_os_read", {})
+    assert json.loads(output) == {"error": "Denied by policy: reads blocked"}
+    assert len(executor.calls) == 2
+
+
+def test_answer_requested_before_a_reconnect_does_not_arm_the_hint() -> None:
+    """A fast-path answer from the old server cannot re-arm a hint dropped on reconnect."""
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    epoch = policy_proxy.no_policies_hint_epoch(session_id)
+    policy_proxy.drop_all_no_policies_hints()
+    policy_proxy.note_no_policies(session_id, 120, epoch)
+    assert not policy_proxy.no_policies_apply(session_id)
+
+
+@pytest.mark.asyncio
+async def test_builtin_falls_back_to_mcp_endpoint_on_server_without_flag() -> None:
+    """A server that ignores ``_omnigent_return_ask`` keeps the MCP endpoint path."""
+    server = _PolicyServer(
+        verdicts={"PHASE_TOOL_CALL": [_json_resp({"result": "POLICY_ACTION_ALLOW"})]},
+        mcp_responses=[_mcp_text("via mcp")],
+    )
+    executor = _RecordingExecutor()
+    manager = _local_manager(server, executor)
+
+    assert await manager.call_tool(None, "sys_os_read", {"path": "secret.txt"}) == "via mcp"
+    assert executor.calls == []
+    assert server.mcp_calls()[0].body["params"]["arguments"] == {"path": "secret.txt"}
+
+
+@pytest.mark.asyncio
+async def test_policy_change_during_evaluation_does_not_arm_stale_hint() -> None:
+    """A fast-path answer computed before a policy change cannot skip later checks."""
+    server = _PolicyServer(
+        verdicts={
+            "PHASE_TOOL_CALL": [_verdict("ALLOW", no_policies_ttl_s=60)],
+            "PHASE_TOOL_RESULT": [_verdict("DENY", reason="new policy")],
+        }
+    )
+    server.evaluate_gate = asyncio.Event()
+    executor = _RecordingExecutor()
+    manager = _local_manager(server, executor)
+    task = asyncio.create_task(manager.call_tool(None, "sys_os_read", {"path": "a.txt"}))
+    for _ in range(1000):
+        if server.calls:
+            break
+        await asyncio.sleep(0.001)
+    policy_proxy.drop_no_policies_hint(manager._session_id)
+    server.evaluate_gate.set()
+
+    assert await task == "[Result suppressed by policy: new policy]"
+    assert not policy_proxy.no_policies_apply(manager._session_id)
+
+
+@pytest.mark.parametrize(
+    ("verdicts", "executions"),
+    [
+        ({"PHASE_TOOL_CALL": [_json_resp({"detail": "boom"}, status=500)]}, 0),
+        ({"PHASE_TOOL_CALL": [_json_resp({"unexpected": True})]}, 0),
+        ({"PHASE_TOOL_CALL": [_verdict("UNSPECIFIED")]}, 0),
+        (
+            {
+                "PHASE_TOOL_CALL": [_verdict("ALLOW")],
+                "PHASE_TOOL_RESULT": [_json_resp({"detail": "boom"}, status=500)],
+            },
+            1,
+        ),
+    ],
+    ids=["tool-call-500", "tool-call-malformed", "tool-call-no-agent", "tool-result-500"],
+)
+@pytest.mark.asyncio
+async def test_builtin_fails_closed_when_policy_unavailable(
+    verdicts: dict[str, list[httpx.Response | Exception]], executions: int
+) -> None:
+    """An unevaluable TOOL_CALL never runs the tool; an unevaluable result is withheld."""
+    executor = _RecordingExecutor(output="sensitive")
+    manager = _local_manager(_PolicyServer(verdicts=verdicts), executor)
+
+    output = await manager.call_tool(None, "sys_os_read", {"path": "a.txt"})
+
+    assert "error" in json.loads(output)
+    assert "sensitive" not in output
+    assert len(executor.calls) == executions
+
+
+@pytest.mark.asyncio
+async def test_builtin_policy_transport_loss_waits_for_server_and_runs_once() -> None:
+    """A lost server during TOOL_RESULT retries the check, never the tool."""
+    server = _PolicyServer(
+        verdicts={
+            "PHASE_TOOL_CALL": [_verdict("ALLOW")],
+            "PHASE_TOOL_RESULT": [httpx.ConnectError("tunnel dropped"), _verdict("ALLOW")],
+        }
+    )
+    executor = _RecordingExecutor()
+    manager = _local_manager(server, executor, execution_registry=McpExecutionRegistry())
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(manager.call_tool(None, "sys_os_read", {"path": "a.txt"}))
+    try:
+        for _ in range(1000):
+            if pending_approvals._server_reconnect_waiters:
+                break
+            await asyncio.sleep(0.001)
+        pending_approvals.notify_server_reconnect()
+        assert await task == "file contents"
+    finally:
+        if not task.done():
+            task.cancel()
+        pending_approvals.reset_for_tests()
+
+    assert len(executor.calls) == 1
+    assert server.phases() == ["PHASE_TOOL_CALL", "PHASE_TOOL_RESULT", "PHASE_TOOL_RESULT"]
+
+
+@pytest.mark.parametrize("dropped_phase", ["PHASE_TOOL_CALL", "PHASE_TOOL_RESULT"])
+@pytest.mark.asyncio
+async def test_builtin_policy_check_dropped_on_live_tunnel_retries_promptly(
+    dropped_phase: str,
+) -> None:
+    """A check dropped while the tunnel stays up is retried without a reconnect wait."""
+    verdicts: dict[str, list[httpx.Response | Exception]] = {
+        "PHASE_TOOL_CALL": [_verdict("ALLOW")],
+        "PHASE_TOOL_RESULT": [_verdict("ALLOW")],
+    }
+    verdicts[dropped_phase].insert(0, httpx.ReadError("request dropped"))
+    server = _PolicyServer(verdicts=verdicts)
+    executor = _RecordingExecutor()
+    manager = _local_manager(
+        server,
+        executor,
+        execution_registry=McpExecutionRegistry(),
+        server_connected=lambda: True,
+    )
+    pending_approvals.reset_for_tests()
+
+    output = await asyncio.wait_for(
+        manager.call_tool(None, "sys_os_read", {"path": "a.txt"}), timeout=5.0
+    )
+
+    assert output == "file contents"
+    assert len(executor.calls) == 1
+    assert server.phases().count(dropped_phase) == 2
+
+
+@pytest.mark.parametrize("status", [502, 503, 504])
+@pytest.mark.asyncio
+async def test_builtin_policy_check_retries_gateway_errors(status: int) -> None:
+    """A gateway 5xx from a check is retried within the budget, then fails closed."""
+    busy = [_json_resp({"detail": "busy"}, status=status) for _ in range(4)]
+    server = _PolicyServer(
+        verdicts={
+            "PHASE_TOOL_CALL": [busy[0], _verdict("ALLOW")],
+            "PHASE_TOOL_RESULT": busy,
+        }
+    )
+    executor = _RecordingExecutor(output="sensitive")
+    manager = _local_manager(
+        server,
+        executor,
+        execution_registry=McpExecutionRegistry(),
+        server_connected=lambda: True,
+    )
+    pending_approvals.reset_for_tests()
+
+    output = await asyncio.wait_for(manager.call_tool(None, "sys_os_read", {}), timeout=10.0)
+
+    assert len(executor.calls) == 1, "a retried check never re-runs the tool"
+    assert server.phases() == ["PHASE_TOOL_CALL"] * 2 + ["PHASE_TOOL_RESULT"] * 4
+    assert "sensitive" not in output and "error" in json.loads(output)
+
+
+@pytest.mark.asyncio
+async def test_builtin_result_check_keeps_its_own_live_tunnel_retries() -> None:
+    """Retries spent on TOOL_CALL do not push a dropped TOOL_RESULT into a reconnect wait."""
+    dropped = [httpx.ReadError("request dropped") for _ in range(3)]
+    server = _PolicyServer(
+        verdicts={
+            "PHASE_TOOL_CALL": [*dropped, _verdict("ALLOW")],
+            "PHASE_TOOL_RESULT": [httpx.ReadError("request dropped"), _verdict("ALLOW")],
+        }
+    )
+    executor = _RecordingExecutor()
+    manager = _local_manager(
+        server,
+        executor,
+        execution_registry=McpExecutionRegistry(),
+        server_connected=lambda: True,
+    )
+    pending_approvals.reset_for_tests()
+
+    output = await asyncio.wait_for(manager.call_tool(None, "sys_os_read", {}), timeout=10.0)
+
+    assert output == "file contents"
+    assert len(executor.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_builtin_cancelled_during_policy_check_never_executes() -> None:
+    """Cancelling a dispatch parked on its TOOL_CALL check does not run the tool."""
+    server = _PolicyServer(verdicts={"PHASE_TOOL_CALL": [_verdict("ALLOW")]})
+    server.evaluate_gate = asyncio.Event()
+    executor = _RecordingExecutor()
+    manager = _local_manager(server, executor)
+    task = asyncio.create_task(manager.call_tool(None, "sys_os_shell", {"command": "rm x"}))
+    for _ in range(1000):
+        if server.calls:
+            break
+        await asyncio.sleep(0.001)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    server.evaluate_gate.set()
+    await asyncio.sleep(0)
+
+    assert executor.calls == []
