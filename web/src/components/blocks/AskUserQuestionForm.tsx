@@ -1,33 +1,5 @@
-// Interactive form for Claude Code's built-in ``AskUserQuestion``
-// tool. Rendered inside the existing ``ApprovalCard`` when the
-// PermissionRequest carries a structured ``ask_user_question``
-// payload — see :file:`@/lib/askUserQuestion`.
-//
-// **Carousel** layout: only one question is visible at a time with
-// Prev / Next / Submit navigation. ``Question N of M`` indicator
-// keeps progress legible without stacking N fieldsets vertically.
-//
-// Each question section renders:
-//   - the question text in primary foreground color + an optional
-//     ``header`` badge in muted text
-//   - radio inputs (single-select) or checkboxes (multi-select)
-//     for the predefined options, with each option's description
-//     under the label in muted text
-//   - a "Type something" custom-input row at the bottom of the
-//     option list — same radio/checkbox prefix as the real
-//     options, so visually it's "one more option" whose value the
-//     user types. The radio/checkbox is part of the same group
-//     as the predefined options (single-select mutex; multi-select
-//     independent toggle).
-//   - <pre> blocks showing the ``preview`` of any currently-selected
-//     option that has one (single-select: 0 or 1; multi-select:
-//     one per selected option with a preview).
-//
-// Submit is gated on EVERY question having an answer (a predefined
-// option selected, or the custom row selected with non-empty text).
-// Selections are gathered into a flat ``{[question id or text]:
-// answer}`` map matching MCP's ``ElicitResult.content`` shape and
-// passed to ``onSubmit``.
+// Question carousel for structured elicitation, with single- or multi-select answers.
+// isOther controls custom input; submit requires an answer to every question.
 
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
 import { type ChangeEvent, useState } from "react";
@@ -214,18 +186,19 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
     (opt) => selectedLabels.includes(opt.label) && opt.preview,
   );
 
+  const allowCustomInput = current.isOther !== false;
   const customRowId = `${currentKey}__custom`;
   const customRowChecked = customSelected[currentKey] ?? false;
   const customRowValue = customInputs[currentKey] ?? "";
 
   return (
     <div className="flex flex-col gap-2 text-foreground" data-testid="ask-user-question-form">
-      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
         <span data-testid="ask-user-question-progress">
           Question {currentIndex + 1} of {questions.length}:
         </span>
         {current.header && (
-          <span className="text-muted-foreground text-xs rounded bg-muted px-1.5 py-0.5">
+          <span className="text-muted-foreground text-sm rounded bg-muted px-1.5 py-0.5">
             {current.header}
           </span>
         )}
@@ -236,7 +209,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
         className="flex flex-col gap-2 mb-2"
         data-testid="ask-user-question-section"
       >
-        <legend className="text-foreground text-sm font-medium flex items-center gap-2 mb-2">
+        <legend className="text-foreground text-ui font-medium flex items-center gap-2 mb-2">
           {current.question}
         </legend>
         <div className="flex flex-col gap-2">
@@ -249,7 +222,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
                 <label
                   key={opt.label}
                   htmlFor={inputId}
-                  className="flex items-start gap-2 cursor-pointer text-sm text-foreground"
+                  className="flex items-start gap-2 cursor-pointer text-ui text-foreground"
                 >
                   <input
                     type="checkbox"
@@ -261,7 +234,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
                   <span className="flex flex-col">
                     <span>{opt.label}</span>
                     {opt.description && (
-                      <span className="text-muted-foreground text-xs">{opt.description}</span>
+                      <span className="text-muted-foreground text-sm">{opt.description}</span>
                     )}
                   </span>
                 </label>
@@ -273,7 +246,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
               <label
                 key={opt.label}
                 htmlFor={inputId}
-                className="flex items-start gap-2 cursor-pointer text-sm text-foreground"
+                className="flex items-start gap-2 cursor-pointer text-ui text-foreground"
               >
                 <input
                   type="radio"
@@ -286,53 +259,55 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
                 <span className="flex flex-col">
                   <span>{opt.label}</span>
                   {opt.description && (
-                    <span className="text-muted-foreground text-xs">{opt.description}</span>
+                    <span className="text-muted-foreground text-sm">{opt.description}</span>
                   )}
                 </span>
               </label>
             );
           })}
-          {/* Custom-input row — visually "one more option" with a
-              matching radio/checkbox prefix, so the user picks
-              between predefined options and free-form input the
-              same way. */}
-          <label
-            htmlFor={customRowId}
-            className="flex items-start gap-2 cursor-pointer text-sm text-foreground"
-          >
-            <input
-              type={current.multiSelect ? "checkbox" : "radio"}
-              id={customRowId}
-              name={current.multiSelect ? undefined : currentKey}
-              checked={customRowChecked}
-              onChange={() =>
-                current.multiSelect
-                  ? handleCustomToggleMulti(currentKey)
-                  : handleCustomToggleSingle(currentKey)
-              }
-              className="mt-1"
-              data-testid="ask-user-question-custom-toggle"
-            />
-            {/* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
-                the textarea to fit its content, so typing past the
-                first line wraps and expands downward instead of
-                scrolling within a fixed single row. */}
-            <textarea
-              rows={1}
-              placeholder="Type something"
-              value={customRowValue}
-              onChange={(e) => handleCustomInput(currentKey, e)}
-              data-testid="ask-user-question-custom-input"
-              className="field-sizing-content flex-1 resize-none bg-transparent text-sm placeholder:text-muted-foreground focus:outline-none"
-            />
-          </label>
+          {allowCustomInput && (
+            /* Custom-input row — visually "one more option" with a
+               matching radio/checkbox prefix, so the user picks
+               between predefined options and free-form input the
+               same way. */
+            <label
+              htmlFor={customRowId}
+              className="flex items-start gap-2 cursor-pointer text-ui text-foreground"
+            >
+              <input
+                type={current.multiSelect ? "checkbox" : "radio"}
+                id={customRowId}
+                name={current.multiSelect ? undefined : currentKey}
+                checked={customRowChecked}
+                onChange={() =>
+                  current.multiSelect
+                    ? handleCustomToggleMulti(currentKey)
+                    : handleCustomToggleSingle(currentKey)
+                }
+                className="mt-1"
+                data-testid="ask-user-question-custom-toggle"
+              />
+              {/* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
+                  the textarea to fit its content, so typing past the
+                  first line wraps and expands downward instead of
+                  scrolling within a fixed single row. */}
+              <textarea
+                rows={1}
+                placeholder="Type something"
+                value={customRowValue}
+                onChange={(e) => handleCustomInput(currentKey, e)}
+                data-testid="ask-user-question-custom-input"
+                className="field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
+              />
+            </label>
+          )}
         </div>
         {previewsToShow.length > 0 && (
           <div className="flex flex-col gap-1" data-testid="ask-user-question-previews">
             {previewsToShow.map((opt) => (
               <pre
                 key={opt.label}
-                className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap"
+                className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap"
               >
                 {opt.preview}
               </pre>
@@ -348,6 +323,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
           onClick={() => setCurrentIndex((i) => i - 1)}
           disabled={isFirst}
           data-testid="ask-user-question-prev"
+          componentId="question.prev"
         >
           <ChevronLeftIcon className="mr-1 size-3.5" />
           Prev
@@ -358,6 +334,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
             variant="outline"
             onClick={() => setCurrentIndex((i) => i + 1)}
             data-testid="ask-user-question-next"
+            componentId="question.next"
           >
             Next
             <ChevronRightIcon className="ml-1 size-3.5" />
@@ -369,12 +346,19 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
             onClick={handleSubmit}
             disabled={!allAnswered}
             data-testid="ask-user-question-submit"
+            componentId="question.submit"
           >
             <CheckIcon className="mr-1 size-3.5" />
             Submit
           </Button>
         )}
-        <Button size="sm" variant="outline" onClick={onReject} className="ml-auto">
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={onReject}
+          className="ml-auto"
+          componentId="question.cancel"
+        >
           <XIcon className="mr-1 size-3.5" />
           Cancel
         </Button>

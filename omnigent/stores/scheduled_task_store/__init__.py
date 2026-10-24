@@ -7,6 +7,7 @@ table and its ``scheduled_task_runs`` history table.
 
 from __future__ import annotations
 
+import builtins
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -49,8 +50,11 @@ class ScheduledTaskStore(ABC):
         *,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
+        max_cost_usd: float | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
+        execution_target: str = "connected_host",
         state: str = "active",
     ) -> ScheduledTask:
         """
@@ -67,8 +71,13 @@ class ScheduledTaskStore(ABC):
         :param timezone: IANA timezone the trigger is evaluated in.
         :param model_override: Optional LLM model override.
         :param reasoning_effort: Optional reasoning-effort hint.
+        :param permission_mode: Optional native-harness permission mode
+            (Claude Code), e.g. ``"acceptEdits"``.
+        :param max_cost_usd: Optional per-firing cost budget in USD.
         :param workspace: Runner start path (source repo / working dir).
         :param host_id: The connected host to pin the run to.
+        :param execution_target: ``"connected_host"`` (default) or
+            ``"managed_sandbox"`` (a fresh server-provisioned sandbox per fire).
         :param state: Lifecycle state — ``active``/``paused``/``deleted``.
             Defaults to ``"active"``.
         :returns: The newly created :class:`ScheduledTask`.
@@ -89,7 +98,7 @@ class ScheduledTaskStore(ABC):
     @abstractmethod
     def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
         """
-        List all scheduled tasks ordered by ``created_at ASC, id ASC``.
+        List non-deleted scheduled tasks ordered by ``created_at ASC, id ASC``.
 
         :param owner_user_id: When given, return only tasks owned by this user.
         :returns: List of :class:`ScheduledTask` instances.
@@ -97,7 +106,7 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list_active(self) -> list[ScheduledTask]:
+    def list_active(self) -> builtins.list[ScheduledTask]:
         """
         List active scheduled tasks ordered by ``created_at ASC, id ASC``.
 
@@ -108,7 +117,7 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list_active_all_workspaces(self) -> list[ScheduledTask]:
+    def list_active_all_workspaces(self) -> builtins.list[ScheduledTask]:
         """
         List active scheduled tasks across every workspace.
 
@@ -127,11 +136,15 @@ class ScheduledTaskStore(ABC):
         name: str | None = None,
         prompt: str | None = None,
         rrule: str | None = None,
+        agent_id: str | None = None,
         timezone: str | None = None,
-        model_override: str | None = None,
-        reasoning_effort: str | None = None,
-        workspace: str | None = None,
+        model_override: str | None = _UNSET,
+        reasoning_effort: str | None = _UNSET,
+        permission_mode: str | None = _UNSET,
+        max_cost_usd: float | None = _UNSET,
+        workspace: str | None = _UNSET,
         host_id: str | None = _UNSET,
+        execution_target: str | None = None,
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
@@ -139,14 +152,22 @@ class ScheduledTaskStore(ABC):
         """
         Update mutable fields of a task.
 
-        Most parameters use ``None`` to mean "leave unchanged". For ``host_id``
-        and ``last_run_conversation_id``, the sentinel default means "not
-        provided / leave unchanged"; passing ``None`` explicitly sets the column
-        to NULL (e.g. to clear a host binding or to null out the last-run
-        conversation after it is deleted).
+        Most parameters use ``None`` to mean "leave unchanged". For the per-task
+        overrides (``model_override``, ``reasoning_effort``,
+        ``permission_mode``), ``host_id``, ``max_cost_usd``, and
+        ``last_run_conversation_id``, the sentinel default means "not provided /
+        leave unchanged"; passing ``None`` explicitly sets the column to NULL —
+        so resetting an override to the agent default actually clears it (e.g.
+        turning a set ``bypassPermissions`` back off), and clearing a host
+        binding or nulling out a deleted last-run conversation.
 
         Passing ``rrule`` updates the recurring trigger; ``None``
         leaves it unchanged.
+
+        Passing ``agent_id`` rebinds the task to a different agent, which
+        switches the harness its future firings run. The fire path reads
+        ``agent_id`` fresh on every firing and each firing owns its own
+        conversation, so past runs keep the agent they actually ran.
 
         Returns ``None`` if the task does not exist.
 
@@ -160,8 +181,11 @@ class ScheduledTaskStore(ABC):
         """
         Delete a scheduled task. Idempotent.
 
+        Unfinished claimed runs may retain the task in the deleted state until
+        cleanup or completion finishes. Such tasks cannot be edited or fired.
+
         :param scheduled_task_id: Opaque task identifier.
-        :returns: ``True`` if removed; ``False`` if not found.
+        :returns: ``True`` if newly deleted; ``False`` if missing or already deleted.
         """
         ...
 
@@ -206,7 +230,7 @@ class ScheduledTaskStore(ABC):
         *,
         limit: int = 100,
         after_id: str | None = None,
-    ) -> tuple[list[ScheduledTaskRun], str | None]:
+    ) -> tuple[builtins.list[ScheduledTaskRun], str | None]:
         """
         List one page of a task's runs ordered by ``scheduled_at DESC, id DESC``
         (most recent first).
@@ -280,7 +304,10 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list_running_runs_for_tasks(self, scheduled_task_ids: list[str]) -> list[ScheduledTaskRun]:
+    def list_running_runs_for_tasks(
+        self,
+        scheduled_task_ids: builtins.list[str],
+    ) -> builtins.list[ScheduledTaskRun]:
         """
         List ``running`` runs for the given tasks in the current workspace.
 
@@ -297,7 +324,10 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list_latest_run_status_for_tasks(self, scheduled_task_ids: list[str]) -> dict[str, str]:
+    def list_latest_run_status_for_tasks(
+        self,
+        scheduled_task_ids: builtins.list[str],
+    ) -> dict[str, str]:
         """
         Return each task's MOST RECENT run status in one windowed query.
 
