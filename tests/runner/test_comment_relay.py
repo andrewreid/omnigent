@@ -74,6 +74,14 @@ class _StubResourceRegistry:
         """
         self._tmp_path = tmp_path
 
+    def wake_session_terminal_watchers(self, session_id: str) -> None:
+        """
+        Accept the turn-start wake the runner sends to backed-off idle watchers.
+
+        :param session_id: Session whose watchers would be woken.
+        :returns: None.
+        """
+
     def set_terminal_activity_publisher(
         self,
         publisher: Callable[[str, str], None],

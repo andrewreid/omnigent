@@ -196,14 +196,21 @@ def test_poller_reports_idle_tracks_last_read_status(tmp_path: Path) -> None:
         config_dir=tmp_path,
     )
 
+    def rewrite(status: str, bump: int) -> None:
+        # A same-tick rewrite keeps the mtime on coarse filesystems; bump it so
+        # the poller re-reads.
+        path = _write_session_file(sessions, pid=1, session_id="s", status=status)
+        mtime = path.stat().st_mtime
+        os.utime(path, (mtime + bump, mtime + bump))
+
     # Nothing read yet: unknown is not idle.
     assert poller.reports_idle is False
     poller.tick()  # busy → running
     assert poller.reports_idle is False
-    _write_session_file(sessions, pid=1, session_id="s", status="idle")
+    rewrite("idle", 2)
     poller.tick()
     assert poller.reports_idle is True
-    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    rewrite("busy", 4)
     poller.tick()
     assert poller.reports_idle is False
 
