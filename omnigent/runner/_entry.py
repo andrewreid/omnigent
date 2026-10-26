@@ -382,8 +382,13 @@ class _RunnerDatabricksAuth(ThreadedAuth):
         # none recorded. Set once here; it persists across the retry yield.
         if self._server_url:
             from omnigent.cli_auth import databricks_request_headers
+            from omnigent.runner.session_requests import REQUEST_HOST_EXTENSION
 
-            request.headers.update(databricks_request_headers(self._server_url))
+            request.headers.update(
+                databricks_request_headers(
+                    self._server_url, host_id=request.extensions.get(REQUEST_HOST_EXTENSION)
+                )
+            )
         if self._factory is not None:
             token, declined = _call_factory_with_declined(self._factory)
             if not token:
@@ -1740,6 +1745,10 @@ def _handle_loop_exception(
     callback = getattr(handle, "_callback", None)
     while isinstance(callback, functools.partial):
         callback = callback.func
+    # Callback failures carry a Handle, but usually omit the receiver Future.
+    callback_future = getattr(callback, "__self__", None)
+    if future is None and isinstance(callback_future, asyncio.Future):
+        future = callback_future
     coroutine = future.get_coro() if isinstance(future, asyncio.Task) else None
     extra = debug_event(
         "runner_async_failure",
