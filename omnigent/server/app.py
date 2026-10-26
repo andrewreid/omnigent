@@ -88,6 +88,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
@@ -224,6 +225,8 @@ class ServerInfoResponse(BaseModel):
     dictation_available: bool
     # The archive PATCH accepts ``delete_worktree``; older servers reject it.
     archive_worktree_cleanup: bool = True
+    # GET /v1/sessions accepts ``search_scope``; older servers ignore it.
+    session_search_scope: bool = True
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.
     request_managed_sandbox_host_id: bool = True
@@ -946,7 +949,7 @@ def _ensure_default_agents(
     """
     Register all built-in agents that should always be available.
 
-    Called on every server lifespan startup. Each helper is
+    Called during server startup. Each helper is
     content-aware via :func:`_ensure_builtin_agent`: it creates the
     agent if missing and refreshes it in place when the packaged
     bundle changed, so a redeploy picks up a new spec instead of
@@ -1388,6 +1391,7 @@ def create_app(
     base_path: str | None = None,
     host_sharded: bool = False,
     *,
+    default_agents_seeded: bool = False,
     preference_store: PreferenceStore | None = None,
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
@@ -1408,6 +1412,8 @@ def create_app(
         file content).
     :param agent_cache: Cache for loaded agent specs and working
         directories.
+    :param default_agents_seeded: The CLI already refreshed built-ins before
+        registering explicit agent bundles; skip a second refresh at startup.
     :param runner_tunnel_tokens: Optional allow-list of binding
         tokens accepted by the runner WebSocket tunnel route, e.g.
         ``frozenset({"uA6Zz..."})``. ``None`` accepts any
@@ -1803,7 +1809,8 @@ def create_app(
         # SessionFilesystemRegistry moved to the runner. Both
         # warmup blocks deleted here.
 
-        _ensure_default_agents(agent_store, artifact_store, agent_cache)
+        if not default_agents_seeded:
+            _ensure_default_agents(agent_store, artifact_store, agent_cache)
 
         # Populate the policy registry (builtins + user-configured
         # modules) so GET /v1/policy-registry serves the catalog.
@@ -3362,6 +3369,7 @@ def create_app(
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
                 "archive_worktree_cleanup": True,
+                "session_search_scope": True,
                 "request_managed_sandbox_host_id": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
@@ -3716,7 +3724,11 @@ def create_app(
             pending.cancel()
 
     async def _mark_disconnected_runner_failed(
-        runner_id: str, reference_stamp: int | None, *, idle_shutdown: bool = False
+        runner_id: str,
+        reference_stamp: int | None,
+        *,
+        idle_shutdown: bool = False,
+        evidence: DisconnectEvidence | None = None,
     ) -> None:
         """Reconcile a dropped runner's sessions once the liveness lease expires.
 
@@ -3823,7 +3835,9 @@ def create_app(
             code="runner_disconnected",
             message="Runner disconnected unexpectedly.",
         )
+        hold_started = time.monotonic()
         hold = None if idle_shutdown else await _hold_for_offline_host(runner_id, affected)
+        hold_s = None if hold is None else time.monotonic() - hold_started
         if hold in ("runner_reconnected", "server_shutdown"):
             return
         if hold is not None:
@@ -3874,7 +3888,12 @@ def create_app(
                 runner_id,
                 len(affected),
             )
-        await _mark_runner_sessions_offline(affected, error, conversation_store)
+        await _mark_runner_sessions_offline(
+            affected,
+            error,
+            conversation_store,
+            disconnect_evidence=drop_attributes(evidence, hold_s=hold_s, hold_outcome=hold),
+        )
 
     async def _routing_host_id(convs: "list[Conversation]") -> str | None:
         """Return the host *convs*' shared runner runs on, or ``None`` when unknown."""
@@ -4083,6 +4102,7 @@ def create_app(
                 runner_id,
                 reference_stamp,
                 idle_shutdown=idle_shutdown,
+                evidence=DisconnectEvidence.from_session(connection),
             ),
             name=f"runner-disconnect-grace-{runner_id}",
         )
