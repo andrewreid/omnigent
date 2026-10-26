@@ -21,6 +21,10 @@ the header menu), and each place is a separate entry point.
   row pins it into that slot.
 - `rename`: from the row, the header menu, the header title, or Cmd/Ctrl+Alt+R
   on desktop; long titles are limited.
+- `search`: the sidebar's Search or ⌘K / Ctrl+K opens the command palette.
+  Sessions whose title matches list under **Sessions**, then sessions matching
+  only in chat content under **In messages** with a snippet; each group has its
+  own Show more.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
@@ -65,9 +69,13 @@ the header menu), and each place is a separate entry point.
   explanations. Their forms cannot submit.
 - `clone`: copy a session into a new workspace, including a typed `~` path.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
-  dialog with the command to run; the desktop app can reconnect a local host
-  itself or explicitly reconnect a remembered Arca host. States: reconnecting
-  (spinner), reconnect failed (retry), host offline.
+  dialog with the command to run; the desktop app reconnects a local host
+  itself, and starts an Arca host recognized by its saved ID or CLI-seeded name
+  from the same action (the desktop's Arca console still asks before running).
+  A failed attempt opens the dialog for retry; so does an Arca connect after
+  which the server still lists the session's host offline (usually because Arca
+  came back as a different host), with **Switch host** to move the session.
+  States: reconnecting (spinner), reconnect failed (retry), host offline.
 - `workspace-recovery`: a missing-workspace error offers **Continue in another
   directory…**. Choose an existing host directory, optionally with a new git
   worktree of it, to fork the conversation into a new session; the original
@@ -113,7 +121,7 @@ the header menu), and each place is a separate entry point.
 - `canvas-session-health`: an opened Canvas session receives host health and
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
-  (Default / Status / Created / Updated), Display (All / My / Shared / Archived), Ordering
+  (Default / Status / Harness / Created / Updated), Display (All / My / Shared / Archived), Ordering
   (Updated / Created) and Show (Updated / Environment / Repo / Branch) submenus,
   saved per device. Created ordering keeps sessions newest-created first as messages
   arrive;
@@ -126,6 +134,9 @@ the header menu), and each place is a separate entry point.
   when empty. Starting or running sessions enter Working immediately; idle must
   last 10 seconds before they leave it. Errors and approvals bypass that delay.
   This only affects grouping, and existing hover/rename holds still apply.
+  Harness groups sessions under alphabetically ordered harness names (such as
+  Claude Code, Codex, and Pi), including custom agents using the same harness.
+  Sessions without harness information appear under Unknown harness; pins stay separate.
   Created and Updated group by their respective date, independently of ordering,
   with the Created/Updated prefix only on the first date section, followed by
   headings such as “Yesterday” and “Earlier”. Environment metadata shows an icon
@@ -233,7 +244,7 @@ menu, then filter by project.
 
 **Sidebar filter menu:** with `sidebar_grouping_ui` on, the funnel on the
 Projects header holds Grouping, Display, Ordering and Show. In
-Status, Created or Updated grouping, Projects is hidden and the funnel sits in the same spot on the
+Status, Harness, Created or Updated grouping, Projects is hidden and the funnel sits in the same spot on the
 first group's header. The Select sessions button sits beside it and selects
 project, Shared and Sessions rows together; the Sessions header keeps only New
 session. Hovering a row opens
@@ -270,9 +281,13 @@ status and live session updates, including when the app is embedded.
 **Reconnect:** in a session whose agent stopped, use the reconnect affordance
 in the chat; the dialog shows the command for this situation (for example
 `omnigent host` when the host is offline, or the harness's `--resume` command
-when a local session is stranded). In the desktop app, reconnect acts directly
-for this machine; an Arca-hosted session offers an explicit **Reconnect Arca**
-action in the same dialog.
+when a local session is stranded). In the desktop app, **Reconnect host** acts
+directly for this machine or a recognized Arca host; Arca's connect console
+asks for confirmation before running, and a failed attempt opens the dialog,
+whose **Reconnect Arca** action retries. Success is reported only once the
+server lists the session's own host online; otherwise the dialog says the host
+is still offline and points to **Switch host** in case Arca came back as a
+different host.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
@@ -332,7 +347,11 @@ after stopping; this relaunches the parent and both use one runner. Sending to
 an existing side chat or choosing Resume after the parent's runner exited (for
 example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
-chat with its tab's close button; the parent and sibling chats keep running. A
+chat with its tab's close button; the parent and sibling chats keep running.
+While a side chat works, typing a follow-up turns Interrupt into Send, which
+queues or steers it as the main composer does; Escape still interrupts. Its queue
+strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.
+Closing the side chat discards its queued follow-ups. A
 chat-only side chat can also send messages from its direct `/c/<child_id>` URL
 without choosing a workspace. The side-chat composer opens the same `/` menu
 affordance as the main composer but with a narrower set — `/help` and the
@@ -645,7 +664,13 @@ plain `uv run pytest`, which starts a private server for the test.
   that stays usable after closing its side chat.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
-  `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`
+  `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`,
+  `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_reconnects_arca_from_current_chat`,
+  `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_arca_reconnect_failure_offers_retry`
+  drive the real SPA and server with an injected desktop bridge and offline host
+  responses. The Arca journeys cover a remembered host and a CLI-seeded host
+  with no saved ID; they check one-action start, progress, failure and retry,
+  not live SSH or the desktop's consent console.
 - **`message-recovery`, native binding races (own environment):**
   `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
   drives real servers, runners, and Claude/Codex CLIs with a mock model. It
@@ -774,6 +799,8 @@ plain `uv run pytest`, which starts a private server for the test.
   ordinary sessions still return to the new-session page in
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_stale_regular_creation_url_returns_to_new_session`.
 - **`view-options`:**
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_harness_grouping_persists_across_reload`
+  (desktop and narrow-browser navigation),
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_grouping_and_show_toggles_persist_across_reload`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`
