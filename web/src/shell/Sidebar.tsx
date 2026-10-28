@@ -218,6 +218,7 @@ import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
+import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
   type SessionFilter,
@@ -921,6 +922,7 @@ function SidebarImpl({
   // visually open so it isn't `inert`/`aria-hidden` mid-gesture.
   const dragging = dragProgress != null;
   const effectiveOpen = open || dragging || peek;
+  const nativeSidebarSurface = isIOSShell() || isAndroidShell();
 
   // The mobile drawer is a `fixed inset-0` overlay, so the iOS shell-lock
   // (useIOSViewportLock) — which only resizes flow content inside .app-shell —
@@ -1037,6 +1039,7 @@ function SidebarImpl({
           // shell, where it pushes the card below the traffic lights
           // (see the [data-electron-mac] rules in index.css).
           "conversations-sidebar flex flex-col bg-card md:select-none",
+          nativeSidebarSurface ? "omnigent-native-sidebar-surface" : "omnigent-sidebar-panel",
           // Mobile (default): a fixed drawer that slides in via translate-x
           // and stops short of the right edge, leaving a tappable strip of the
           // chat behind it. The floating-card treatment below is desktop-only.
@@ -1098,6 +1101,7 @@ function SidebarImpl({
         // don't see the empty-state contents while focus is elsewhere.
         aria-hidden={!effectiveOpen}
         data-collapsed={!effectiveOpen || undefined}
+        data-floating={peek ? "true" : "false"}
         // Match the keyboard-focus story: when closed, the sidebar's
         // children shouldn't receive tabs.
         inert={!effectiveOpen}
@@ -1348,8 +1352,9 @@ function SidebarImpl({
                 // underneath it and can't be tapped.
                 className={cn(
                   "relative flex-1 overflow-y-auto px-2 pt-4 pb-3 max-md:pb-16",
-                  // Reserve the gutter so toggling the thumb never reflows the list.
-                  "[scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-track]:bg-transparent",
+                  // Reserve the gutter even when the list fits, so neither the thumb
+                  // nor a section collapsing out of overflow reflows the rows.
+                  "[scrollbar-gutter:stable] [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-track]:bg-transparent",
                   isScrolling
                     ? "[scrollbar-color:var(--muted-foreground)_transparent] [&::-webkit-scrollbar-thumb]:bg-muted-foreground"
                     : "[scrollbar-color:transparent_transparent] [&::-webkit-scrollbar-thumb]:bg-transparent",
@@ -4513,7 +4518,7 @@ function LegacySessionTooltipContent({
       data-testid="session-tooltip-content"
       // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title,
       // then muted, small-icon metadata lines.
-      className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
+      className="menu-surface w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg p-2.5 text-popover-foreground whitespace-normal shadow-menu"
     >
       <p className="sidebar-compact-text line-clamp-3 font-medium">
         {conversation.title ?? conversation.id}
@@ -4578,7 +4583,7 @@ function SessionTooltipContent({
       data-testid="session-tooltip-content"
       // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title and a
       // muted "updated · harness · environment" line, then label/value rows.
-      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
+      className="menu-surface w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg p-2.5 text-popover-foreground whitespace-normal shadow-menu"
     >
       <p className="sidebar-compact-text line-clamp-3 font-medium">
         {conversation.title ?? conversation.id}

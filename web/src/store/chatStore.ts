@@ -86,6 +86,7 @@ import type {
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { randomUUID } from "@/lib/randomUUID";
+import { awaitReconnectDelay } from "@/lib/reconnectBackoff";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
@@ -143,7 +144,7 @@ import {
   resolveSessionHost,
   subscribeIdentity,
 } from "@/lib/identity";
-import { getOmnigentHostConfig, isDatabricksWorkspace } from "@/lib/host";
+import { isDatabricksWorkspace, isHostRoutingEnabled } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
 import { emitInteractionPhase, startTimedInteraction } from "@/lib/analyticsEmit";
@@ -1214,12 +1215,15 @@ export interface ChatActions {
    * while the agent is busy. The head is flushed automatically (FIFO, one per
    * turn) when the session next goes idle — see the `session_status` handler.
    * `conversationId` targets a live conversation beside the visible one (a side chat).
+   * `waitingForHost` holds it until `releaseHostHeldMessages`, for a send made
+   * while the session's host is offline.
    */
   enqueueMessage: (
     text: string,
     files?: File[],
     replyDraft?: StoredReplyDraft,
     conversationId?: string,
+    opts?: { waitingForHost?: boolean },
   ) => void;
   /** Let a conversation's messages held for an offline host flush again. */
   releaseHostHeldMessages: (conversationId: string) => void;
@@ -1860,13 +1864,6 @@ async function uploadFileBlocks(
 const FLASH_DURATION_MS = 1500;
 const WORKSPACE_INVALIDATION_DEBOUNCE_MS = 750;
 
-// Reconnect backoff for the session SSE stream. Databricks Apps' ingress
-// hard-caps a single HTTP/2 stream at ~5 min, so the client must re-subscribe
-// when it's dropped. Backoff applies only between consecutive failed opens
-// (see nextReconnectDelay); a drop after a healthy connection reconnects
-// instantly.
-const STREAM_RECONNECT_BASE_MS = 250;
-const STREAM_RECONNECT_MAX_MS = 5_000;
 export const ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS = 60_000;
 export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = 15_000;
 // After the stream reconnects, `reconcileActiveSessionStatus` runs once
@@ -2157,12 +2154,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   abortController: null,
   historyGeneration: 0,
 
-  enqueueMessage: (text, files, replyDraft, targetId) => {
+  enqueueMessage: (text, files, replyDraft, targetId, opts) => {
     const target = queueTarget(get, targetId);
     if (target === null) return;
     const { conversationId, boundAgentId, sessionHarness, startupPending } = target.state;
     if (conversationId === null) return;
-    if (startupPending && boundAgentId && !isCompactControl(sessionHarness, text, files)) {
+    const waitingForHost = opts?.waitingForHost === true;
+    if (
+      !waitingForHost &&
+      startupPending &&
+      boundAgentId &&
+      !isCompactControl(sessionHarness, text, files)
+    ) {
       void get().send(text, boundAgentId, files, {
         replyDraft,
         pinnedConversationId: conversationId,
@@ -2190,13 +2193,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
           ...(files && files.length > 0 ? { files } : {}),
           ...(replyDraft ? { replyDraft } : {}),
+          ...(waitingForHost ? { waitingForHost } : {}),
         },
       ],
     }));
     // A message queued while the agent is idle (a race where the send routed
     // to the queue but the turn had already ended) would otherwise wait for an
-    // idle edge that never comes — flush now.
-    get().maybeFlushQueuedHead(targetId);
+    // idle edge that never comes — flush now, unless it waits for the host.
+    if (!waitingForHost) get().maybeFlushQueuedHead(targetId);
   },
 
   dequeueMessage: (queueId) => {
@@ -2207,9 +2211,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
   releaseHostHeldMessages: (conversationId) => {
     setActive((s) => {
-      if (!s.queuedMessages.some((m) => m.conversationId === conversationId && m.waitingForHost)) {
-        return {};
-      }
+      if (!waitsForHost(s.queuedMessages, conversationId)) return {};
       return {
         queuedMessages: s.queuedMessages.map((m) =>
           m.conversationId === conversationId && m.waitingForHost
@@ -2254,6 +2256,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const target = s.queuedMessages.find((m) => m.queueId === queueId);
     const agentId = target?.agentId ?? s.boundAgentId;
     if (target === undefined || agentId === null) return;
+    if (waitsForHost(s.queuedMessages, target.conversationId)) return;
     if (target.command === "compact" && rejectBusyCompact(target.conversationId)) return;
     // Nothing can be steered past a first message still held for startup; it stays queued.
     const targetState = setterForState(target.conversationId);
@@ -2266,7 +2269,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   steerAllQueuedMessages: (conversationId) => {
     const s = get();
     const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
-    if (own.length === 0) return;
+    if (own.length === 0 || waitsForHost(own, conversationId)) return;
     const state = setterForState(conversationId);
     if (state !== null && holdsInitialDraft(state)) return;
     // When the first one will be held for startup, the rest stay queued behind it.
@@ -2364,7 +2367,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // so an undrained message from another conversation can sit at index 0; a
     // head-only guard would let it block this conversation's messages forever.
     const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
-    if (head === undefined || head.requiresRetry || head.waitingForHost) return;
+    if (head === undefined || head.requiresRetry) return;
+    if (waitsForHost(s.queuedMessages, s.conversationId)) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     target.write({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
     void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, queuedSendOptions(head));
@@ -2429,7 +2433,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const cooldownUntil = backgroundFlushCooldownUntil.get(conversationId);
       if (cooldownUntil !== undefined && cooldownUntil > now) continue;
       const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
-      if (head === undefined || head.requiresRetry || head.waitingForHost) continue;
+      if (head === undefined || head.requiresRetry) continue;
+      if (waitsForHost(get().queuedMessages, conversationId)) continue;
       const compactAgentId = head.agentId ?? local?.boundAgentId;
       if (head.command === "compact" && !compactAgentId) continue;
 
@@ -3847,6 +3852,11 @@ export function rejectBusyCompact(conversationId: string | null): boolean {
   return true;
 }
 
+/** Whether a conversation has a message waiting for its offline host; none of its queue sends early. */
+function waitsForHost(queuedMessages: QueuedMessage[], conversationId: string | null): boolean {
+  return queuedMessages.some((m) => m.conversationId === conversationId && m.waitingForHost);
+}
+
 /**
  * Queue a send the server refused because the session's host is offline. It
  * waits ahead of the conversation's other queued messages until
@@ -4775,12 +4785,13 @@ async function bindStream(
   // replica — NOT the one holding this session's runner tunnel. The live tail
   // then subscribes to the wrong replica's event bus and silently delivers
   // nothing (the server swallows the miss; there's no 503 to trigger the keyless
-  // retry). When sharded (a host fetcher is wired), resolve the session's host_id
-  // FIRST (one fast metadata GET that populates the map via sessionFromWire) so
-  // the stream keys correctly. Best-effort: a failed resolve falls through to the
+  // retry). The snapshot's launch stage also lives only on that replica. When
+  // requests route by host, resolve the session's host_id FIRST (one fast
+  // metadata GET that populates the map via sessionFromWire) so the stream and
+  // snapshot key correctly. Best-effort: a failed resolve falls through to the
   // unkeyed open (no worse than pre-fix). Re-apply after every resync, see
   // agentbricks/mas/.claude/skills/sync-omnigents/SKILL.md.
-  if (getOmnigentHostConfig().fetcher && getSessionHost(id) === null) {
+  if (isHostRoutingEnabled() && getSessionHost(id) === null) {
     try {
       // Prefer the registered resolver: it walks a hostless sub-agent child up
       // to its host-bound ancestor. Without one, the bare snapshot still seeds
@@ -5133,18 +5144,6 @@ function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
     // (`resolve` is idempotent; this closes any registration-ordering gap.)
     if (signal.aborted) onAbort();
   });
-}
-
-/**
- * Halved-to-full jittered exponential backoff between CONSECUTIVE failed
- * opens. Only called with `failedOpens >= 1` — a drop after a healthy
- * connection reconnects instantly (no delay), so the first attempt
- * (`failedOpens === 1`) backs off from the base, doubling per failure up
- * to the cap.
- */
-function nextReconnectDelay(failedOpens: number): number {
-  const base = Math.min(STREAM_RECONNECT_BASE_MS * 2 ** (failedOpens - 1), STREAM_RECONNECT_MAX_MS);
-  return base / 2 + Math.random() * (base / 2);
 }
 
 /**
@@ -6075,7 +6074,7 @@ export async function startStreamPump(
       // healthy connection (the benign ~5-min ingress recycle) leaves
       // failedOpens at 0, so it reconnects instantly with no delay.
       if (failedOpens > 0) {
-        await abortableDelay(nextReconnectDelay(failedOpens), controller.signal);
+        await awaitReconnectDelay(failedOpens, controller.signal);
         if (controller.signal.aborted || isConversationDisposed(id)) break;
       } else if (hasConnected && conversationRegistry.getActive()?.id !== id) {
         // Stagger a BACKGROUND conversation's reconnect. The ingress caps every

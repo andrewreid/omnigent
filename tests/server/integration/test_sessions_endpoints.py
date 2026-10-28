@@ -1428,8 +1428,10 @@ async def test_external_session_superseded_leaves_interrupted_entries_hidden(
 # ── POST /v1/sessions/{id}/events external_subagent_start ─────────
 
 
+@pytest.mark.parametrize("tool_use_id", ["toolu_016PwCnwmHv8h7kVpWLVd9YX", None])
 async def test_external_subagent_start_mints_child_session(
     client: httpx.AsyncClient,
+    tool_use_id: str | None,
 ) -> None:
     """
     Posting ``external_subagent_start`` to a claude-native parent
@@ -1456,7 +1458,7 @@ async def test_external_subagent_start_mints_child_session(
                 "subagent_id": "a5c7effac5a9a35ab",
                 "agent_type": "Explore",
                 "description": "Trace the auth flow",
-                "tool_use_id": "toolu_016PwCnwmHv8h7kVpWLVd9YX",
+                **({"tool_use_id": tool_use_id} if tool_use_id is not None else {}),
             },
         },
     )
@@ -1486,6 +1488,7 @@ async def test_external_subagent_start_mints_child_session(
     # Description is preserved on the row's labels for surfaces that
     # want it; the rail's row UI ignores ``session_name``.
     assert child["labels"]["omnigent.claude_native.description"] == "Trace the auth flow"
+    assert child["labels"].get("omnigent.claude_native.tool_use_id") == tool_use_id
 
 
 async def test_session_event_batch_is_ordered_and_idempotent(
@@ -2199,8 +2202,10 @@ async def test_external_subagent_start_falls_back_to_the_bare_agent_type(
     assert child["session_name"] == "a361e6a6aa05689cb"
 
 
+@pytest.mark.parametrize("tool_use_id", ["toolu_016PwCnwmHv8h7kVpWLVd9YX", None])
 async def test_external_subagent_start_is_idempotent_on_subagent_id(
     client: httpx.AsyncClient,
+    tool_use_id: str | None,
 ) -> None:
     """
     Two POSTs carrying the same ``subagent_id`` resolve to the same
@@ -2220,7 +2225,7 @@ async def test_external_subagent_start_is_idempotent_on_subagent_id(
             "subagent_id": "a5c7effac5a9a35ab",
             "agent_type": "Explore",
             "description": "Trace the auth flow",
-            "tool_use_id": "toolu_016PwCnwmHv8h7kVpWLVd9YX",
+            **({"tool_use_id": tool_use_id} if tool_use_id is not None else {}),
         },
     }
 
@@ -2373,31 +2378,38 @@ async def test_external_subagent_start_idempotency_pages_beyond_first_100(
 
 
 @pytest.mark.parametrize(
-    "missing_key",
-    ["subagent_id", "agent_type", "description", "tool_use_id"],
+    ("invalid_key", "invalid_value"),
+    [
+        ("subagent_id", None),
+        ("agent_type", None),
+        ("description", None),
+        ("tool_use_id", None),
+        ("tool_use_id", ""),
+        ("tool_use_id", 123),
+    ],
 )
-async def test_external_subagent_start_rejects_missing_required_keys(
+async def test_external_subagent_start_rejects_invalid_fields(
     client: httpx.AsyncClient,
-    missing_key: str,
+    invalid_key: str,
+    invalid_value: object,
 ) -> None:
-    """
-    A POST missing any of the four required ``data`` keys returns
-    400 — payload validation is at the route boundary so the handler
-    body always sees a complete record.
-    """
+    """Missing required fields and malformed optional tool IDs return 400."""
     agent = await create_test_agent(client)
     parent = await _create_session(
         client,
         agent["id"],
         labels={"omnigent.wrapper": "claude-code-native-ui"},
     )
-    data = {
+    data: dict[str, object] = {
         "subagent_id": "a5c7effac5a9a35ab",
         "agent_type": "Explore",
         "description": "Trace the auth flow",
         "tool_use_id": "toolu_016PwCnwmHv8h7kVpWLVd9YX",
     }
-    data.pop(missing_key)
+    if invalid_key == "tool_use_id":
+        data[invalid_key] = invalid_value
+    else:
+        data.pop(invalid_key)
     resp = await client.post(
         f"/v1/sessions/{parent['id']}/events",
         json={"type": "external_subagent_start", "data": data},
@@ -2405,7 +2417,7 @@ async def test_external_subagent_start_rejects_missing_required_keys(
     assert resp.status_code == 400
     # Error message must name the missing field so the forwarder's
     # logs point at the bug rather than reading "Invalid payload".
-    assert missing_key in resp.text
+    assert invalid_key in resp.text
 
 
 # ── POST /v1/sessions/{id}/events skill slash_command ─────
@@ -5207,6 +5219,64 @@ async def test_publish_status_keeps_failed_sticky_against_trailing_idle(
     assert [event["status"] for event in published] == ["failed", "running", "idle"]
     # The final idle (after running) is honored, so the cache is current.
     assert cache_after == "idle"
+
+
+@pytest.mark.parametrize("turn_completed", [True, None], ids=["confirmed", "quiescence"])
+async def test_confirmed_turn_completion_clears_earlier_native_failure(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    turn_completed: bool | None,
+) -> None:
+    """
+    A later turn's confirmed ``idle`` clears an earlier native turn failure.
+
+    claude-native's ``Stop`` hook marks a successful turn with
+    ``turn_completed``. When that turn's ``running`` edge never arrives, the
+    sticky ``failed`` from an earlier turn would otherwise outlive the
+    recovery and keep the sidebar error marker lit (OMNI-13314). A bare
+    quiescence ``idle`` must still leave the failure in place.
+    """
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+
+    failed_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "failed", "output": "API Error: 500", "response_id": "resp_1"},
+        },
+    )
+    assert failed_resp.status_code == 202, failed_resp.text
+    idle_data: dict[str, Any] = {"status": "idle", "response_id": "resp_2"}
+    if turn_completed is not None:
+        idle_data["turn_completed"] = turn_completed
+    idle_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_status", "data": idle_data},
+    )
+    assert idle_resp.status_code == 202, idle_resp.text
+
+    snapshot_resp = await client.get(f"/v1/sessions/{session_id}")
+    assert snapshot_resp.status_code == 200, snapshot_resp.text
+    snapshot = snapshot_resp.json()
+    statuses = [event["status"] for event in published if event.get("type") == "session.status"]
+    if turn_completed:
+        assert statuses == ["failed", "idle"]
+        assert snapshot["status"] != "failed"
+        assert snapshot["last_task_error"] is None
+    else:
+        assert statuses == ["failed"]
+        assert snapshot["status"] == "failed"
+        assert snapshot["last_task_error"] is not None
 
 
 async def test_publish_status_tracks_in_flight_response_id(
