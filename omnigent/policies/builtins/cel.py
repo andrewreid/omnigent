@@ -87,8 +87,8 @@ from omnigent.policies.schema import (
 
 _log = logging.getLogger(__name__)
 
-# Engines are rebuilt for every evaluation, so each distinct expression is
-# compiled once per process. A multi-KB expression's AST is up to ~1 MB.
+# Engines are rebuilt for every evaluation, so compiled programs are reused
+# across builds from a bounded cache. A multi-KB expression's AST is up to ~1 MB.
 _PROGRAM_CACHE_SIZE = 64
 
 
