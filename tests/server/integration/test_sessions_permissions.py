@@ -14,6 +14,7 @@ include ``X-Forwarded-Email`` headers to impersonate different users.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -3081,6 +3082,90 @@ async def test_list_child_sessions_blocks_cross_user(
     assert child.id in child_ids, (
         f"owner should see the seeded child {child.id!r}, got {child_ids}"
     )
+
+
+async def test_list_descendant_sessions_blocks_cross_user(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A user without READ cannot enumerate a subtree, from its root or mid-tree.
+
+    Sub-agents inherit access through their parent chain, so the single READ
+    check on ``GET /v1/sessions/{id}/descendants`` must deny a mid-tree node
+    exactly as it denies the root. Denials are the existence-hiding 404.
+
+    :param auth_client: Permission-enabled test client.
+    :param db_uri: Per-test SQLite database URI, used to seed the subtree.
+    """
+    agent = await create_test_agent(auth_client, user="user-a")
+    root_id = (await _create_session_as(auth_client, agent["id"], "user-a"))["id"]
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="researcher:mid", parent_conversation_id=root_id
+    )
+    grand = conv_store.create_conversation(
+        kind="sub_agent", title="researcher:leaf", parent_conversation_id=child.id
+    )
+
+    for target in (root_id, child.id):
+        denied = await auth_client.get(
+            f"/v1/sessions/{target}/descendants",
+            headers={"X-Forwarded-Email": "user-b"},
+        )
+        assert denied.status_code == 404, denied.text
+        assert grand.id not in denied.text
+
+    owned = await auth_client.get(
+        f"/v1/sessions/{root_id}/descendants",
+        headers={"X-Forwarded-Email": "user-a"},
+    )
+    assert owned.status_code == 200, owned.text
+    assert [row["id"] for row in owned.json()["data"]] == [child.id, grand.id]
+
+
+async def test_list_descendant_sessions_bound_to_authorized_tree(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The listing stays inside the tree of the row the READ check authorized.
+
+    Simulates a session recreated under another user's root between the check
+    and the read: the authorized row names user-a's tree while the stored row
+    now sits in a foreign tree. Its foreign descendants must not be returned.
+
+    :param auth_client: Permission-enabled test client.
+    :param db_uri: Per-test SQLite database URI, used to seed both trees.
+    :param monkeypatch: Swaps the access check to return the stale authorized row.
+    """
+    from omnigent.server.routes._auth_helpers import SessionAccess
+    from omnigent.server.routes.sessions import routes_items
+
+    agent = await create_test_agent(auth_client, user="user-a")
+    root_id = (await _create_session_as(auth_client, agent["id"], "user-a"))["id"]
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    foreign = conv_store.create_conversation(kind="default", title="someone else's")
+    recreated = conv_store.create_conversation(
+        kind="sub_agent", title="researcher:mid", parent_conversation_id=foreign.id
+    )
+    leaked = conv_store.create_conversation(
+        kind="sub_agent", title="researcher:secret", parent_conversation_id=recreated.id
+    )
+    authorized = dataclasses.replace(recreated, root_conversation_id=root_id)
+
+    async def _stale_access(*_args: Any, **_kwargs: Any) -> SessionAccess:
+        return SessionAccess(level=LEVEL_READ, conversation=authorized)
+
+    monkeypatch.setattr(routes_items, "_require_access_and_level", _stale_access)
+    resp = await auth_client.get(
+        f"/v1/sessions/{recreated.id}/descendants",
+        headers={"X-Forwarded-Email": "user-a"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"] == []
+    assert leaked.id not in resp.text
 
 
 async def test_list_child_sessions_allows_read_grant(

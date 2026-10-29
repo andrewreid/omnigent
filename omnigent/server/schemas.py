@@ -843,10 +843,9 @@ class ChildSessionSummary(BaseModel):
         e.g. ``"conv_child123"``.
     :param object: Fixed resource type, always
         ``"child_session"``.
-    :param parent_session_id: Parent conversation id (echo of the
-        route's ``session_id`` path parameter), e.g.
-        ``"conv_parent987"``. Stable join key for clients that
-        cache child rows across multiple parents.
+    :param parent_session_id: The child's direct parent conversation
+        id, e.g. ``"conv_parent987"``. Stable join key for clients
+        that cache child rows across multiple parents.
     :param title: Sub-agent title, ``"{agent_type}:{session_name}"``
         as written by :func:`omnigent.tools.builtins.spawn._spawn_one`,
         e.g. ``"researcher:auth"``. ``None`` only for legacy /
@@ -945,6 +944,24 @@ class ChildSessionSummary(BaseModel):
     pending_elicitations_count: int = 0
     routed_model: str | None = None
     routing_decision_id: str | None = None
+
+
+class DescendantSessionSummary(ChildSessionSummary):
+    """
+    A sub-agent anywhere beneath a session, from ``GET /v1/sessions/{id}/descendants``.
+
+    :param depth: Levels below the requested session; direct children are 1.
+    :param archived: Whether this session is archived. Archived rows are only
+        returned with ``include_archived=true``; their descendants are always
+        returned.
+
+    ``last_message_preview`` is ``None`` on every row when the request passes
+    ``include_previews=false``.
+    """
+
+    object: str = "descendant_session"
+    depth: int
+    archived: bool = False
 
 
 # ── Responses ───────────────────────────────────────────────────
@@ -3152,6 +3169,16 @@ class ChildSessionList(BaseModel):
 
     object: Literal["list"] = "list"
     data: list[ChildSessionSummary] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
+class DescendantSessionList(BaseModel):
+    """Paginated list of descendants; ``data`` is a page of ``DescendantSessionSummary``."""
+
+    object: Literal["list"] = "list"
+    data: list[DescendantSessionSummary] = Field(default_factory=list)
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False

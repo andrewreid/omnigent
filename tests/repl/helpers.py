@@ -6,6 +6,9 @@ don't get copy-pasted into every file.
 
 from __future__ import annotations
 
+from typing import Any
+
+from omnigent_client._sessions import SessionsNamespace
 from rich.console import Console
 
 
@@ -43,3 +46,64 @@ class CapturingHost:
             ``output()`` call so far.
         """
         return "".join(self.lines)
+
+
+class FakeSubagentSessions:
+    """
+    ``client.sessions`` stand-in serving a sub-agent tree from a parent→children map.
+
+    ``descendants`` mimics the server's subtree route (breadth-first, with
+    ``parent_session_id`` and ``depth``), and ``child_sessions_tree`` runs the
+    real SDK implementation on top of it, so the REPL→SDK path is exercised.
+    ``calls`` records every subtree request.
+    """
+
+    def __init__(self, by_parent: dict[str, list[dict[str, Any]]]) -> None:
+        self._by_parent = by_parent
+        self._descendants_route_missing_until = 0.0
+        self.calls: list[str] = []
+        self.include_previews: list[bool] = []
+
+    async def descendants(
+        self,
+        session_id: str,
+        *,
+        include_archived: bool = False,
+        max_depth: int | None = None,
+        limit: int = 100,
+        include_previews: bool = True,
+    ) -> list[dict[str, Any]]:
+        self.calls.append(session_id)
+        self.include_previews.append(include_previews)
+        rows: list[dict[str, Any]] = []
+        seen = {session_id}
+        frontier = [session_id]
+        depth = 0
+        while frontier and (max_depth is None or depth < max_depth):
+            depth += 1
+            next_frontier: list[str] = []
+            for parent_id in frontier:
+                for child in self._by_parent.get(parent_id, []):
+                    if child["id"] in seen:
+                        continue
+                    seen.add(child["id"])
+                    rows.append({**child, "parent_session_id": parent_id, "depth": depth})
+                    next_frontier.append(child["id"])
+            frontier = next_frontier
+        return rows
+
+    async def child_sessions_tree(
+        self,
+        session_id: str,
+        *,
+        max_depth: int = 3,
+        limit: int = 100,
+        include_previews: bool = True,
+    ) -> list[dict[str, Any]]:
+        return await SessionsNamespace.child_sessions_tree(
+            self,  # type: ignore[arg-type]
+            session_id,
+            max_depth=max_depth,
+            limit=limit,
+            include_previews=include_previews,
+        )

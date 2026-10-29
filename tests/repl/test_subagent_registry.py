@@ -22,8 +22,6 @@ import inspect
 from typing import Any
 
 import pytest
-from omnigent_client import PaginatedList
-from omnigent_client._sessions import SessionsNamespace
 from omnigent_ui_sdk.terminal._host import TerminalHost
 
 from omnigent.repl import _repl
@@ -32,6 +30,7 @@ from omnigent.server.schemas import (
     SessionChildSessionUpdatedEvent,
     SessionCreatedEvent,
 )
+from tests.repl.helpers import FakeSubagentSessions
 
 
 def _host() -> TerminalHost:
@@ -135,43 +134,14 @@ def test_child_terminal_status_settles_out_of_count() -> None:
     assert host.active_subagent_count() == 0
 
 
-class _FakeSessions:
-    """Minimal stand-in for ``client.sessions`` exposing ``child_sessions``.
-
-    The recursion + parent tagging now live in the SDK's
-    :meth:`SessionsNamespace.child_sessions_tree`, so the fake reuses that real
-    implementation (bound to this fake's ``child_sessions``) — the REPL→SDK
-    path is exercised end-to-end and ``calls`` still records each level fetched.
-    """
-
-    def __init__(self, by_parent: dict[str, list[dict[str, Any]]]) -> None:
-        self._by_parent = by_parent
-        self.calls: list[str] = []
-
-    async def child_sessions(
-        self, session_id: str, *, limit: int = 100, after: str | None = None
-    ) -> PaginatedList:
-        self.calls.append(session_id)
-        return PaginatedList(data=list(self._by_parent.get(session_id, [])), has_more=False)
-
-    async def child_sessions_tree(
-        self, session_id: str, *, max_depth: int = 3, limit: int = 100
-    ) -> list[dict[str, Any]]:
-        # Delegate to the real SDK recursion — it only depends on
-        # ``self.child_sessions`` — so we test the actual shared helper.
-        return await SessionsNamespace.child_sessions_tree(
-            self, session_id, max_depth=max_depth, limit=limit
-        )
-
-
 class _FakeClient:
     def __init__(self, by_parent: dict[str, list[dict[str, Any]]]) -> None:
-        self.sessions = _FakeSessions(by_parent)
+        self.sessions = FakeSubagentSessions(by_parent)
 
 
 @pytest.mark.asyncio
 async def test_refresh_subagent_tree_recurses_to_grandchildren() -> None:
-    """The recursive fetch assembles a 2-level tree with correct parents —
+    """The subtree fetch assembles a 2-level tree with correct parents —
     the mechanism that keeps grandchildren live (the SSE stream only carries
     the active session's direct children)."""
     client = _FakeClient(
@@ -203,14 +173,15 @@ async def test_refresh_subagent_tree_recurses_to_grandchildren() -> None:
         ("conv_grand", "conv_child", 2),
     ]
     assert host.active_subagent_count() == 2
-    # Both the root and the discovered child were queried (recursion).
-    assert "conv_main" in client.sessions.calls
-    assert "conv_child" in client.sessions.calls
+    # The whole tree came from one subtree request, not one per node, and the
+    # navigator skipped the message-preview read it never renders.
+    assert client.sessions.calls == ["conv_main"]
+    assert client.sessions.include_previews == [False]
 
 
 @pytest.mark.asyncio
 async def test_refresh_subagent_tree_respects_depth_cap() -> None:
-    """Descendants past ``max_depth`` are neither fetched nor surfaced."""
+    """Descendants past ``max_depth`` are not surfaced."""
     client = _FakeClient(
         {
             "conv_main": [{"id": "c1", "busy": True, "current_task_status": "in_progress"}],
@@ -221,8 +192,7 @@ async def test_refresh_subagent_tree_respects_depth_cap() -> None:
     host = _host()
     await _refresh_subagent_tree(client, host, "conv_main", max_depth=1)  # type: ignore[arg-type]
     ids = {n.session_id for n, _ in host.subagent_tree()}
-    assert ids == {"c1"}  # only depth-1 children fetched
-    assert "c1" not in client.sessions.calls  # never recursed into c1
+    assert ids == {"c1"}  # only depth-1 children surfaced
 
 
 def test_run_repl_wires_subagent_plumbing() -> None:
