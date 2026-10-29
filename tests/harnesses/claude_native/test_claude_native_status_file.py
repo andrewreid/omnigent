@@ -195,6 +195,36 @@ def test_poller_publishes_edges_only(tmp_path: Path) -> None:
     assert published == [RUNNING, IDLE]
 
 
+def test_poller_reports_idle_tracks_last_read_status(tmp_path: Path) -> None:
+    """``reports_idle`` mirrors the last read so backoff waits for a real idle."""
+    sessions = tmp_path / "sessions"
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: None,
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+
+    def rewrite(status: str, bump: int) -> None:
+        # A same-tick rewrite keeps the mtime on coarse filesystems; bump it so
+        # the poller re-reads.
+        path = _write_session_file(sessions, pid=1, session_id="s", status=status)
+        mtime = path.stat().st_mtime
+        os.utime(path, (mtime + bump, mtime + bump))
+
+    # Nothing read yet: unknown is not idle.
+    assert poller.reports_idle is False
+    poller.tick()  # busy → running
+    assert poller.reports_idle is False
+    rewrite("idle", 2)
+    poller.tick()
+    assert poller.reports_idle is True
+    rewrite("busy", 4)
+    poller.tick()
+    assert poller.reports_idle is False
+
+
 def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypatch) -> None:
     """A forwarded idle edge cannot be lost to a concurrent file poll."""
     path = _write_session_file(tmp_path / "sessions", pid=1, session_id="s", status="busy")

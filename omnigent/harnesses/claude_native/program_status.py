@@ -64,6 +64,19 @@ class ClaudeProgramStatusPoller:
         return not self._retired and (self._reader.status is not None or self._fallback.active)
 
     @property
+    def reports_idle(self) -> bool:
+        """Whether the current report maps to idle, so idle polling may back off.
+
+        Mirrors :meth:`tick`'s mapping; without an OSC report the file decides.
+        """
+        if self._retired:
+            return False
+        report = self._reader.status
+        if report is not None:
+            return report.state not in {"working", "blocked", "error"}
+        return self._fallback.reports_idle
+
+    @property
     def blocked_on(self) -> str | None:
         """Current blocking reason for native input delivery."""
         if self._retired:
