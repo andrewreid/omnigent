@@ -478,11 +478,15 @@ _ESCAPED_DENY = (
 
 def _string_tokens(expression: str) -> list[str]:
     """Return the string-literal token texts in the cached program's AST."""
-    return [
+    tokens = [
         str(tree.children[0])
         for tree in _compile(expression).ast.iter_subtrees()
         if tree.data == "literal" and tree.children[0].type == "STRING_LIT"
     ]
+    # Callers check every token with all()/any(), which pass vacuously if an
+    # AST-shape change in celpy leaves nothing to inspect.
+    assert tokens
+    return tokens
 
 
 def _assert_escaped_deny_decisions() -> None:
