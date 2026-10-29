@@ -12,7 +12,6 @@ pytest.importorskip("celpy", reason="cel-python not installed")
 
 import celpy
 
-from omnigent.policies.builtins import cel as cel_module
 from omnigent.policies.builtins.cel import _PROGRAM_CACHE_SIZE, _compile, cel_policy
 from omnigent.policies.function import FunctionPolicy, resolve_function_policy
 from omnigent.policies.types import EvaluationContext
@@ -436,98 +435,3 @@ def test_shared_program_evaluates_concurrently() -> None:
                 "result": "ALLOW",
                 "state_updates": [{"key": "last", "action": "set", "value": f"tool_{i}"}],
             }
-
-
-@pytest.mark.parametrize(
-    "literal",
-    [
-        r'"plain"',
-        r'""',
-        r'"tab\there\nnewline"',
-        r'"\x41\u00e9\101\U0001F600"',
-        r'"quote \" and backslash \\"',
-        r'"\"\"leading quotes"',
-        r'"(?i)\\bgh\\s+pr\\s+merge\\b"',
-        r'r"raw \n stays"',
-        '"""multi\nline \\t"""',
-        r'b"\x41"',
-        r'"\U00110000"',
-    ],
-)
-def test_string_literal_values_match_uncached_celpy(literal: str) -> None:
-    """Compiled literals evaluate to exactly what plain celpy produces, errors included."""
-
-    def outcome(program: object) -> object:
-        try:
-            return program.evaluate({})  # type: ignore[attr-defined]
-        except celpy.CELEvalError as exc:
-            return ("error", exc.args)
-
-    env = celpy.Environment()
-    expected = outcome(env.program(env.compile(literal)))
-    actual = outcome(_compile(literal))
-    assert actual == expected
-    assert type(actual) is type(expected)
-
-
-_ESCAPED_DENY = (
-    'event.data.name.matches("^sys\\\\.os_\\\\w+$")'
-    ' ? {"result": "DENY", "reason": "Tab\\there."} : {"result": "ALLOW"}'
-)
-
-
-def _string_tokens(expression: str) -> list[str]:
-    """Return the string-literal token texts in the cached program's AST."""
-    tokens = [
-        str(tree.children[0])
-        for tree in _compile(expression).ast.iter_subtrees()
-        if tree.data == "literal" and tree.children[0].type == "STRING_LIT"
-    ]
-    # Callers check every token with all()/any(), which pass vacuously if an
-    # AST-shape change in celpy leaves nothing to inspect.
-    assert tokens
-    return tokens
-
-
-def _assert_escaped_deny_decisions() -> None:
-    evaluate = cel_policy(expression=_ESCAPED_DENY)
-    assert evaluate({"type": "tool_call", "data": {"name": "sys.os_shell"}}) == {
-        "result": "DENY",
-        "reason": "Tab\there.",
-    }
-    assert evaluate({"type": "tool_call", "data": {"name": "sysXos_shell"}}) == {"result": "ALLOW"}
-
-
-def test_escaped_literals_are_predecoded(parse_calls: list[str]) -> None:
-    """Escaped literals are stored raw in the cached AST."""
-    _assert_escaped_deny_decisions()
-    assert all(text.startswith('r"') for text in _string_tokens(_ESCAPED_DENY))
-
-
-def test_predecode_skipped_without_celstr(
-    parse_calls: list[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Without the celpy internal, literals stay as parsed and decisions hold."""
-    monkeypatch.setattr(cel_module, "celstr", None)
-    _assert_escaped_deny_decisions()
-    assert not any(text.startswith('r"') for text in _string_tokens(_ESCAPED_DENY))
-
-
-def test_predecode_failure_leaves_ast_untouched(
-    parse_calls: list[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An unexpected error mid-rewrite keeps the parsed AST and decisions."""
-    real_celstr = cel_module.celstr
-    calls = 0
-
-    def flaky_celstr(token: object) -> object:
-        nonlocal calls
-        calls += 1
-        if calls > 3:
-            raise RuntimeError("unexpected celpy internals")
-        return real_celstr(token)
-
-    monkeypatch.setattr(cel_module, "celstr", flaky_celstr)
-    _assert_escaped_deny_decisions()
-    assert calls > 3
-    assert not any(text.startswith('r"') for text in _string_tokens(_ESCAPED_DENY))

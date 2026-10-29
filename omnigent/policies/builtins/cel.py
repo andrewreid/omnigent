@@ -66,7 +66,6 @@ from __future__ import annotations
 import functools
 import logging
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, cast
 
 try:
     import celpy
@@ -77,16 +76,6 @@ try:
     from celpy.evaluation import CELEvalError
 except ImportError:
     celpy = None  # type: ignore[assignment]
-
-# celpy internal used only by the optional literal predecode below.
-try:
-    from celpy.evaluation import celstr
-except ImportError:
-    celstr = None  # type: ignore[assignment]
-
-if TYPE_CHECKING:
-    from celpy import Expression
-    from lark import Token
 
 from omnigent.policies.schema import (
     PolicyCallable,
@@ -226,46 +215,7 @@ def _compile(expression: str) -> Runner:
     :raises CELParseError: If the expression has syntax errors.
     """
     env = Environment()
-    ast = env.compile(expression)
-    _predecode_string_literals(ast)
-    return env.program(ast)
-
-
-def _predecode_string_literals(ast: Expression) -> None:
-    """
-    Best-effort rewrite of escaped string literals as equivalent raw literals.
-
-    celpy decodes escapes in every string literal character by character
-    on each evaluation, which dominates regex-heavy policies. Raw literals
-    are sliced instead. Each rewrite is kept only if it decodes to the
-    identical value; literals that fail to decode keep their eval-time error.
-    This relies on celpy internals (``celstr`` and the parse-tree shape), so
-    anything unexpected leaves the AST untouched.
-
-    :param ast: Parse tree from ``celpy.Environment.compile``.
-    """
-    if celstr is None:
-        return
-    rewrites = []
-    try:
-        for tree in ast.iter_subtrees():
-            if tree.data != "literal" or len(tree.children) != 1:
-                continue
-            token = cast("Token", tree.children[0])
-            if token.type not in ("STRING_LIT", "MLSTRING_LIT") or token.value[:1] in "rR":
-                continue
-            try:
-                value = celstr(token)
-            except ValueError:
-                continue
-            raw = token.update(value=f'r"{value}"')
-            if celstr(raw) == value:
-                rewrites.append((tree, raw))
-    except Exception:  # noqa: BLE001 — unexpected celpy internals; evaluate the AST as parsed
-        _log.debug("CEL literal predecode skipped", exc_info=True)
-        return
-    for tree, raw in rewrites:
-        tree.children[0] = raw
+    return env.program(env.compile(expression))
 
 
 def _plain_cel_value(value: object) -> object:
