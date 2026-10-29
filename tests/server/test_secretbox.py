@@ -7,6 +7,9 @@ behaviour. Real KMS semantics are covered by the demo end-to-end verification.
 
 from __future__ import annotations
 
+import base64
+import json
+import os
 from typing import Any
 
 import pytest
@@ -51,6 +54,14 @@ class _FakeKmsClient:
                 "Decrypt",
             )
         return {"Plaintext": entry[2], "KeyId": entry[0]}
+
+    def generate_data_key(
+        self, *, KeyId: str, KeySpec: str, EncryptionContext: dict[str, str]
+    ) -> Any:
+        assert KeySpec == "AES_256"
+        key = os.urandom(32)
+        wrapped = self.encrypt(KeyId=KeyId, Plaintext=key, EncryptionContext=EncryptionContext)
+        return {"Plaintext": key, "CiphertextBlob": wrapped["CiphertextBlob"], "KeyId": KeyId}
 
 
 def _cipher() -> KmsSecretCipher:
@@ -133,3 +144,43 @@ def test_build_secret_cipher_from_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(CREDENTIAL_KMS_KEY_ENV_VAR, "arn:aws:kms:us-east-1:1:key/abc")
     cipher = build_secret_cipher()
     assert isinstance(cipher, KmsSecretCipher)
+
+
+# --- envelope for secrets over the KMS Encrypt limit -------------------------
+
+_BIG = "x" * 5000  # a full OAuth token set can exceed KMS Encrypt's 4096 bytes
+
+
+def test_small_secret_keeps_the_direct_kms_format() -> None:
+    sealed = _cipher().encrypt('{"access_token": "t"}', context=CTX_ALICE)
+    assert not sealed.startswith("kmsenv1:")
+
+
+def test_large_secret_round_trips_through_an_envelope() -> None:
+    box = _cipher()
+    sealed = box.encrypt(_BIG, context=CTX_ALICE)
+    assert sealed.startswith("kmsenv1:")
+    assert _BIG not in sealed
+    assert box.decrypt(sealed, context=CTX_ALICE) == _BIG
+
+
+def test_envelope_is_bound_to_its_row_identity() -> None:
+    box = _cipher()
+    sealed = box.encrypt(_BIG, context=CTX_ALICE)
+    assert box.decrypt(sealed, context=CTX_BOB) is None
+
+
+def test_tampered_envelope_reads_as_unreadable() -> None:
+    box = _cipher()
+    sealed = box.encrypt(_BIG, context=CTX_ALICE)
+    body = json.loads(base64.b64decode(sealed.removeprefix("kmsenv1:")))
+    data = bytearray(base64.b64decode(body["data"]))
+    data[0] ^= 0x01
+    body["data"] = base64.b64encode(bytes(data)).decode()
+    tampered = "kmsenv1:" + base64.b64encode(json.dumps(body).encode()).decode()
+
+    assert box.decrypt(tampered, context=CTX_ALICE) is None
+    assert box.decrypt("kmsenv1:not-base64!", context=CTX_ALICE) is None
+    body["nonce"] = ""
+    bad_nonce = "kmsenv1:" + base64.b64encode(json.dumps(body).encode()).decode()
+    assert box.decrypt(bad_nonce, context=CTX_ALICE) is None

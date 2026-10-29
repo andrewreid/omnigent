@@ -25,7 +25,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from ipaddress import ip_address
 from typing import cast
 
-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Request, Response, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 from omnigent.debug_logging import debug_event, set_current_user_id
@@ -236,6 +236,7 @@ def create_runner_tunnel_router(
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
     mint_managed_runner_token: Callable[[str, int], str | None] | None = None,
+    resolve_runner_credential_owner: Callable[[str], str | None] | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/runners/{id}/tunnel`` WS endpoint.
 
@@ -274,6 +275,10 @@ def create_runner_tunnel_router(
         runner-side analog of the host tunnel's ``resolve_launch_token``.
         ``None`` disables the lookup (an unauthenticated non-loopback
         peer is then rejected, the prior behavior).
+    :param resolve_runner_credential_owner: ``runner_id -> owner`` for vending
+        provider credentials: like *resolve_managed_runner_owner*, but only while
+        the runner's managed host is still live, so a leftover binding token
+        stops working at teardown. ``None`` disables the credential route.
     :param mint_managed_runner_token: Accounts-mode issuer that validates the
         saved runner authority and mints under the account lock.
     :returns: A FastAPI router with the tunnel endpoint.
@@ -422,6 +427,41 @@ def create_runner_tunnel_router(
             "token": bearer,
             "expires_at": int(time.time()) + _MANAGED_RUNNER_TOKEN_TTL_S,
         }
+
+    @router.get("/runners/{runner_id}/credentials/{provider}")
+    async def runner_credential(
+        request: Request,
+        response: Response,
+        runner_id: str,
+        provider: str,
+        rejected: str | None = None,
+    ) -> dict[str, object]:
+        """Vend the managed runner owner's *provider* credential to the runner.
+
+        The runner-side twin of ``GET /hosts/{id}/credentials/{provider}``: the
+        codex harness runs in the runner, which holds its tunnel binding token
+        but not the host's launch token. Same gate as the owner-token mint
+        (binding token bound to *runner_id*, owner from the managed launch
+        record), and only while that managed host is live, so a binding token
+        left over after teardown resolves nothing. ``401`` otherwise;
+        ``{"connected": false}`` when the owner hasn't linked it. ``rejected``
+        is the SHA-256 digest of a token the provider refused, which the broker
+        refreshes rather than handing back.
+        """
+        from omnigent.server.routes.host_credentials import vend_provider_credential
+
+        response.headers["Cache-Control"] = "no-store"
+        token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+        if not token or token_bound_runner_id(token) != runner_id:
+            raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
+        owner: str | None = None
+        if resolve_runner_credential_owner is not None:
+            owner = await asyncio.to_thread(resolve_runner_credential_owner, runner_id)
+        if owner is None:
+            raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
+        return await vend_provider_credential(
+            request.app, provider, owner, rejected_digest=rejected
+        )
 
     @router.websocket("/runners/{runner_id}/tunnel")
     async def tunnel(ws: WebSocket, runner_id: str) -> None:

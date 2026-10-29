@@ -1,0 +1,115 @@
+"""Per-user ChatGPT subscription connection store.
+
+A ChatGPT-typed :class:`~omnigent.connections.ConnectionStore` façade
+(``provider="chatgpt"``). The secret is the whole token set, refresh token
+included — it never leaves the server. Reuses the shared table and cipher, no
+new schema. See ``designs/SUBSCRIPTION_BROKER.md``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from typing import Any, ClassVar
+
+from omnigent.connections import ConnectionStore
+from omnigent.entities import ChatgptConnection, ProviderConnection
+from omnigent.server.chatgpt_oauth import ChatgptTokenSet
+
+
+class ChatgptConnectionStore(ConnectionStore[ChatgptConnection]):
+    """ChatGPT-typed façade over the shared credential store."""
+
+    _PROVIDER: ClassVar[str] = "chatgpt"
+
+    @staticmethod
+    def _to_entity(conn: ProviderConnection) -> ChatgptConnection:
+        secret = conn.secret or {}
+        meta = conn.metadata
+        with_secret = conn.secret is not None
+        return ChatgptConnection(
+            user_id=conn.user_id,
+            access_token=secret.get("access_token") if with_secret else None,
+            refresh_token=secret.get("refresh_token") if with_secret else None,
+            id_token=secret.get("id_token") if with_secret else None,
+            account_id=meta.get("account_id"),
+            access_expires_at=meta.get("access_expires_at"),
+            plan_type=meta.get("plan_type"),
+            email=meta.get("email"),
+            created_at=conn.created_at,
+            updated_at=conn.updated_at,
+            device_auth_digest=meta.get("device_auth_digest"),
+        )
+
+    @staticmethod
+    def _secret(tokens: ChatgptTokenSet) -> dict[str, Any]:
+        # The id token isn't stored: its identity claims are kept as metadata,
+        # and nothing downstream needs the token itself.
+        return {
+            "access_token": tokens.access_token,
+            "refresh_token": tokens.refresh_token,
+        }
+
+    @staticmethod
+    def _metadata(tokens: ChatgptTokenSet) -> dict[str, Any]:
+        # Plaintext: identity and expiry only, never token material.
+        return {
+            "account_id": tokens.account_id,
+            "access_expires_at": tokens.access_expires_at,
+            "plan_type": tokens.plan_type,
+            "email": tokens.email,
+        }
+
+    @staticmethod
+    def token_set(conn: ChatgptConnection) -> ChatgptTokenSet:
+        """The stored tokens as a :class:`ChatgptTokenSet` (for a refresh)."""
+        return ChatgptTokenSet(
+            access_token=conn.access_token or "",
+            refresh_token=conn.refresh_token,
+            id_token=conn.id_token,
+            access_expires_at=conn.access_expires_at,
+            account_id=conn.account_id,
+            plan_type=conn.plan_type,
+            email=conn.email,
+        )
+
+    @staticmethod
+    def device_auth_digest(device_auth_id: str) -> str:
+        """Non-reversible marker for the device-code login that saved a connection."""
+        return hashlib.sha256(device_auth_id.encode()).hexdigest()
+
+    def upsert(
+        self, user_id: str, tokens: ChatgptTokenSet, *, device_auth_id: str | None = None
+    ) -> ChatgptConnection:
+        """Create or replace a user's ChatGPT connection (idempotent on ``user_id``).
+
+        :param device_auth_id: The device-code login that minted *tokens*,
+            recorded as a digest so a repeated poll for it reports completion.
+        """
+        metadata = self._metadata(tokens)
+        if device_auth_id:
+            metadata["device_auth_digest"] = self.device_auth_digest(device_auth_id)
+        conn = self._store.upsert(
+            user_id, self._PROVIDER, secret=self._secret(tokens), metadata=metadata
+        )
+        return self._to_entity(conn)
+
+    def update_tokens(
+        self, user_id: str, tokens: ChatgptTokenSet, *, lease_holder: str | None = None
+    ) -> bool:
+        """Persist refreshed tokens. ``False`` if the row went or the lease was lost.
+
+        Keeps the device-login marker, so a sign-in poll retried after a
+        refresh still finds its completion.
+        """
+        metadata = self._metadata(tokens)
+        current = self._store.get(user_id, self._PROVIDER)
+        digest = current.metadata.get("device_auth_digest") if current is not None else None
+        if digest:
+            metadata["device_auth_digest"] = digest
+        return self._store.update_secret(
+            user_id,
+            self._PROVIDER,
+            secret=self._secret(tokens),
+            metadata=metadata,
+            lease_holder=lease_holder,
+        )

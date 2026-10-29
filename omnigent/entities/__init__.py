@@ -2,6 +2,8 @@
 
 from omnigent.entities.account import Account, AccountToken
 from omnigent.entities.agent import Agent, LoadedAgent
+from omnigent.entities.chatgpt_connection import ChatgptConnection
+from omnigent.entities.claude_connection import ClaudeConnection
 from omnigent.entities.comment import Comment, CommentsFingerprint
 from omnigent.entities.connection import ProviderConnection
 from omnigent.entities.conversation import (
@@ -51,6 +53,8 @@ __all__ = [
     "Account",
     "AccountToken",
     "Agent",
+    "ChatgptConnection",
+    "ClaudeConnection",
     "Comment",
     "CommentsFingerprint",
     "CompactionData",

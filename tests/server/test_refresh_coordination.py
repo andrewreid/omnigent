@@ -1,0 +1,570 @@
+"""Refresh coordination: the store's lease primitives and a real multi-process race.
+
+Providers rotate the refresh token on use, so two processes refreshing the same
+connection leave one holding a spent token (and a provider with reuse detection
+may revoke the whole chain). The race test runs 20 processes against one
+database and asserts the provider's token endpoint is hit exactly once.
+Runs on SQLite by default and on Postgres/MySQL when ``OMNIGENT_TEST_DB_URI``
+is set.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import fcntl
+import json
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import httpx
+import pytest
+
+from omnigent.connections.github import GithubConnectionStore
+from omnigent.db.utils import now_epoch
+from omnigent.server import github_identity
+from omnigent.server.databricks_app import token_set_from_payload as databricks_token_set
+from omnigent.server.github_app import (
+    GitHubRefreshRejected,
+    GitHubTokenRequestFailed,
+    GitHubTokenSet,
+)
+from omnigent.server.github_app import token_set_from_payload as github_token_set
+
+_USER = "alice@example.com"
+_PROVIDER = "github"
+_PROCS = 20
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+class SecretBox:  # test double for the KMS SecretCipher: key- and context-bound
+    def __init__(self, key: str) -> None:
+        self._key = key
+
+    def encrypt(self, plaintext: str, *, context) -> str:
+        return base64.b64encode(
+            json.dumps({"k": self._key, "c": dict(context), "p": plaintext}).encode()
+        ).decode("ascii")
+
+    def decrypt(self, ciphertext: str, *, context):
+        try:
+            d = json.loads(base64.b64decode(ciphertext.encode("ascii")))
+        except ValueError:
+            return None
+        return d["p"] if d["k"] == self._key and d["c"] == dict(context) else None
+
+
+def _store(db_uri: str) -> GithubConnectionStore:
+    return GithubConnectionStore(db_uri, SecretBox("enc-key"))
+
+
+def _tokens(access: str, expires_in: int) -> GitHubTokenSet:
+    return GitHubTokenSet(access, f"ghr_{access}", now_epoch() + expires_in, None, "repo")
+
+
+def _seed(db_uri: str, *, expires_in: int = 60) -> GithubConnectionStore:
+    store = _store(db_uri)
+    store.upsert(_USER, github_login="alice", github_user_id=7, tokens=_tokens("old", expires_in))
+    return store
+
+
+def _meta(store: GithubConnectionStore) -> dict:
+    conn = store._store.get(_USER, _PROVIDER)
+    assert conn is not None
+    return dict(conn.metadata)
+
+
+# --- store primitives -------------------------------------------------------
+
+
+def test_lease_is_exclusive_until_released(db_uri: str) -> None:
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)
+    assert not store.acquire_refresh_lease(_USER, holder="b", ttl_s=60)
+    assert store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)  # re-entrant
+    assert not store.release_refresh_lease(_USER, holder="b")
+    assert store.release_refresh_lease(_USER, holder="a")
+    assert store.acquire_refresh_lease(_USER, holder="b", ttl_s=60)
+
+
+def test_expired_lease_can_be_taken_over(db_uri: str) -> None:
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="crashed", ttl_s=0)
+    assert store.acquire_refresh_lease(_USER, holder="b", ttl_s=60)
+
+
+def test_commit_requires_the_lease_and_releases_it(db_uri: str) -> None:
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)
+    assert not store.update_tokens(_USER, _tokens("stolen", 3600), lease_holder="b")
+    assert store.get(_USER, with_tokens=True).access_token == "old"
+
+    assert store.update_tokens(_USER, _tokens("new", 3600), lease_holder="a")
+    assert store.get(_USER, with_tokens=True).access_token == "new"
+    meta = _meta(store)
+    assert "refresh_lease_holder" not in meta and "refresh_lease_until" not in meta
+    assert meta["github_login"] == "alice"  # provider metadata preserved
+
+
+def test_unleased_write_keeps_another_holders_lease(db_uri: str) -> None:
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)
+    assert store.update_tokens(_USER, _tokens("other", 3600))
+    assert _meta(store)["refresh_lease_holder"] == "a"
+
+
+def test_needs_reconnect_is_set_and_cleared_by_reconnect(db_uri: str) -> None:
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)
+    assert store.mark_needs_reconnect(_USER)
+    assert store.needs_reconnect(_USER)
+    assert "refresh_lease_holder" not in _meta(store)
+    store.upsert(_USER, github_login="alice", github_user_id=7, tokens=_tokens("fresh", 3600))
+    assert not store.needs_reconnect(_USER)
+
+
+def test_needs_reconnect_refuses_the_lease(db_uri: str) -> None:
+    store = _seed(db_uri)
+    assert store.mark_needs_reconnect(_USER)
+    assert not store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)
+
+
+def test_stale_rejection_cannot_flag_a_reconnected_login(db_uri: str) -> None:
+    # A refresh that outlives a reconnect gets rejected for the OLD chain; the
+    # reconnect's upsert dropped its lease, so its flag must not land.
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="old-refresh", ttl_s=60)
+    store.upsert(_USER, github_login="alice", github_user_id=7, tokens=_tokens("fresh", 3600))
+
+    assert not store.mark_needs_reconnect(_USER, holder="old-refresh")
+    assert not store.needs_reconnect(_USER)
+
+
+def _expire_lease(store: GithubConnectionStore) -> None:
+    store._store._update_metadata(
+        "test_expire_lease",
+        _USER,
+        _PROVIDER,
+        "",
+        lambda m: m.update(refresh_lease_until=0) or True,
+    )
+
+
+def test_abandoned_inflight_refresh_fails_closed_on_next_acquire(db_uri: str) -> None:
+    # The holder marked the refresh in flight, then died: the refresh token may
+    # already be spent, so the next acquirer flags a reconnect instead.
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="crashed", ttl_s=60)
+    assert store.mark_refresh_inflight(_USER, holder="crashed")
+    _expire_lease(store)
+
+    assert not store.acquire_refresh_lease(_USER, holder="next", ttl_s=60)
+    assert store.needs_reconnect(_USER)
+
+
+def test_released_lease_clears_the_inflight_marker(db_uri: str) -> None:
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)
+    assert store.mark_refresh_inflight(_USER, holder="a")
+    assert store.release_refresh_lease(_USER, holder="a")
+    assert store.acquire_refresh_lease(_USER, holder="b", ttl_s=60)
+    assert not store.needs_reconnect(_USER)
+
+
+def test_snapshot_under_lease_is_fenced(db_uri: str) -> None:
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)
+    assert store.get_under_lease(_USER, holder="a") is not None
+    assert store.get_under_lease(_USER, holder="b") is None
+    store.upsert(_USER, github_login="alice", github_user_id=7, tokens=_tokens("re", 3600))
+    assert store.get_under_lease(_USER, holder="a") is None  # reconnect dropped the lease
+    assert not store.mark_refresh_inflight(_USER, holder="a")
+
+
+def test_lost_answer_never_replays_the_refresh_token(db_uri: str) -> None:
+    store = _seed(db_uri)
+    client = _Client(exc=httpx.ReadTimeout("answer lost"))
+    assert _resolve(store, client) == "old"  # still valid for this call
+    assert _resolve(store, client) is None
+    assert client.calls == 1
+    assert store.needs_reconnect(_USER)
+
+
+def test_flag_landing_after_acquire_stops_the_refresh(db_uri: str) -> None:
+    store = _seed(db_uri)
+    client = _Client(result=_tokens("new", 3600))
+    acquire = store.acquire_refresh_lease
+
+    def acquire_then_flag(user_id: str, **kwargs) -> bool:
+        ok = acquire(user_id, **kwargs)
+        store.mark_needs_reconnect(user_id)  # e.g. a disconnect in between
+        return ok
+
+    store.acquire_refresh_lease = acquire_then_flag  # type: ignore[method-assign]
+    assert _resolve(store, client) is None
+    assert client.calls == 0
+
+
+def test_fence_lets_an_in_flight_refresh_commit_then_stops_refreshing(db_uri: str) -> None:
+    # Disconnect stops new refreshes but lets one already sent save its result.
+    store = _seed(db_uri)
+    gen = store.generation(_USER)
+    assert store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)
+    assert store.mark_refresh_inflight(_USER, holder="a")
+
+    assert store.fence_refresh(_USER, generation=gen) == "busy"
+    assert not store.acquire_refresh_lease(_USER, holder="b", ttl_s=60)
+    assert store.update_tokens(_USER, _tokens("new", 3600), lease_holder="a")
+    assert store.needs_reconnect(_USER)  # the refresh doesn't undo the disconnect
+    assert store.fence_refresh(_USER, generation=gen) == "ready"
+    assert store.get(_USER, with_tokens=True).access_token == "new"
+    assert store.fence_refresh(_USER, generation="another") == "replaced"
+
+
+def test_fence_drops_an_expired_lease_so_its_refresh_cannot_land(db_uri: str) -> None:
+    store = _seed(db_uri)
+    gen = store.generation(_USER)
+    assert store.acquire_refresh_lease(_USER, holder="slow", ttl_s=60)
+    assert store.mark_refresh_inflight(_USER, holder="slow")
+    _expire_lease(store)
+
+    assert store.fence_refresh(_USER, generation=gen) == "ready"
+    assert not store.update_tokens(_USER, _tokens("late", 3600), lease_holder="slow")
+    assert store.get(_USER, with_tokens=True).access_token == "old"
+
+
+def test_fence_waits_for_a_save_already_past_its_lease_check(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The fence takes the row lock, so a save that passed its lease check lands
+    # first and the fence sees it; it can't read the predecessor meanwhile.
+    from omnigent.stores.credential_store import sqlalchemy_store
+
+    store = _seed(db_uri)
+    gen = store.generation(_USER)
+    assert store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)
+    checked, resume = threading.Event(), threading.Event()
+    real_now, writer_calls = sqlalchemy_store.now_epoch, []
+
+    def now_pausing_the_writer() -> int:
+        if threading.current_thread().name == "writer":
+            writer_calls.append(1)
+            if len(writer_calls) == 2:  # the lease check inside the locked write
+                checked.set()
+                resume.wait(10)
+        return real_now()
+
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", now_pausing_the_writer)
+    saved: list[bool] = []
+    fenced: list[str] = []
+    writer = threading.Thread(
+        name="writer",
+        target=lambda: saved.append(
+            store.update_tokens(_USER, _tokens("new", 3600), lease_holder="a")
+        ),
+    )
+    writer.start()
+    assert checked.wait(10)
+    fence = threading.Thread(
+        target=lambda: fenced.append(store.fence_refresh(_USER, generation=gen))
+    )
+    fence.start()
+    fence.join(0.5)
+    assert fence.is_alive()  # blocked on the writer's row lock
+    resume.set()
+    writer.join(10)
+    fence.join(10)
+
+    assert saved == [True] and fenced == ["ready"]
+    assert store.get(_USER, with_tokens=True).access_token == "new"
+
+
+def test_update_without_metadata_keeps_the_flag_generation_and_lease(db_uri: str) -> None:
+    store = _seed(db_uri)
+    gen = store.generation(_USER)
+    store._store._update_metadata(
+        "seed",
+        _USER,
+        _PROVIDER,
+        "",
+        lambda m: (
+            m.update(
+                needs_reconnect=True,
+                refresh_lease_holder="other",
+                refresh_lease_until=now_epoch() + 60,
+            )
+            or True
+        ),
+    )
+    assert store._store.update_secret(_USER, _PROVIDER, secret={"access_token": "x"})
+    meta = _meta(store)
+    assert meta["needs_reconnect"] is True
+    assert meta["connection_generation"] == gen
+    assert meta["refresh_lease_holder"] == "other"
+
+
+def test_commit_after_the_lease_expired_is_refused(db_uri: str) -> None:
+    # Past its lease a refresh must not land: a disconnect may already have
+    # read, revoked and deleted what the lease protected.
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="slow", ttl_s=60)
+    assert store.mark_refresh_inflight(_USER, holder="slow")
+    _expire_lease(store)
+
+    assert not store.update_tokens(_USER, _tokens("late", 3600), lease_holder="slow")
+    assert store.get(_USER, with_tokens=True).access_token == "old"
+
+
+def test_generation_fences_delete_and_flag(db_uri: str) -> None:
+    store = _seed(db_uri)
+    old = store.generation(_USER)
+    store.upsert(_USER, github_login="alice", github_user_id=7, tokens=_tokens("re", 3600))
+    assert store.generation(_USER) != old
+    assert not store.mark_needs_reconnect(_USER, generation=old)
+    assert not store.delete(_USER, generation=old)
+    assert store.get(_USER) is not None
+    assert store.delete(_USER, generation=store.generation(_USER))
+
+
+def test_refresh_keeps_the_generation(db_uri: str) -> None:
+    store = _seed(db_uri)
+    gen = store.generation(_USER)
+    assert store.acquire_refresh_lease(_USER, holder="a", ttl_s=60)
+    assert store.update_tokens(_USER, _tokens("new", 3600), lease_holder="a")
+    assert store.generation(_USER) == gen
+
+
+@pytest.mark.parametrize(
+    ("exc", "safe"),
+    [
+        (httpx.ConnectError("refused"), True),
+        (httpx.ConnectTimeout("no route"), True),
+        (GitHubTokenRequestFailed("GitHub token exchange failed: slow_down"), True),
+        (httpx.ReadTimeout("answer lost"), False),
+        (httpx.RemoteProtocolError("connection dropped"), False),
+        (ValueError("Expecting value: line 1 column 1"), False),
+        (RuntimeError("unexpected"), False),
+    ],
+)
+def test_only_connect_failures_and_provider_errors_rule_out_rotation(exc, safe) -> None:
+    from omnigent.connections.refresh import _rotation_ruled_out
+
+    assert _rotation_ruled_out(exc) is safe
+
+
+@pytest.mark.parametrize(
+    ("response", "code"),
+    [
+        (httpx.Response(400, json={"error": "slow_down"}), "slow_down"),
+        (httpx.Response(429, json={"error": "rate_limited"}), "rate_limited"),
+        # A gateway error or an unreadable body may follow a refresh that rotated.
+        (httpx.Response(502, json={"error": "bad_gateway"}), None),
+        (httpx.Response(503, text="<html>unavailable</html>"), None),
+        (httpx.Response(400, text="<html>bad request</html>"), None),
+        (httpx.Response(400, json={"error": "x", "access_token": "a"}), None),
+        (httpx.Response(400, json={"error": "x", "refresh_token": "r2"}), None),
+        (httpx.Response(400, json={"error": None}), None),
+    ],
+)
+def test_only_an_explicit_provider_refusal_counts_as_not_rotated(response, code) -> None:
+    from omnigent.connections.refresh import provider_refusal_code
+
+    assert provider_refusal_code(response) == code
+
+
+@pytest.mark.parametrize("parse", [github_token_set, databricks_token_set])
+def test_a_token_response_with_an_error_field_is_not_a_refusal(parse) -> None:
+    from omnigent.connections.refresh import RefreshNotRotated
+
+    issued = {"access_token": "a", "refresh_token": "r2", "expires_in": 60}
+    assert parse({**issued, "error": None}).refresh_token == "r2"
+    for mixed in ({**issued, "error": "server_error"}, {"refresh_token": "r2", "error": "x"}):
+        with pytest.raises(Exception) as raised:
+            parse(mixed)
+        assert not isinstance(raised.value, RefreshNotRotated)  # tokens may have been issued
+
+
+# --- resolver against the real store ----------------------------------------
+
+
+class _Client:
+    def __init__(self, *, result=None, exc=None) -> None:
+        self.result, self.exc, self.calls = result, exc, 0
+
+    async def refresh_token(self, refresh_token: str) -> GitHubTokenSet:
+        self.calls += 1
+        if self.exc is not None:
+            raise self.exc
+        return self.result
+
+
+def _resolve(store, client) -> str | None:
+    return asyncio.run(github_identity.resolve_access_token(_USER, store=store, client=client))
+
+
+def test_rejected_refresh_marks_reconnect_and_is_not_retried(db_uri: str) -> None:
+    store = _seed(db_uri)
+    client = _Client(exc=GitHubRefreshRejected("bad_refresh_token"))
+    assert _resolve(store, client) is None
+    assert store.needs_reconnect(_USER)
+    assert _resolve(store, client) is None
+    assert client.calls == 1
+
+
+def test_refresh_the_store_refuses_is_never_vended(db_uri: str) -> None:
+    # A disconnect fenced the connection while the refresh was out: its result
+    # can't be stored, so it must not be handed out either.
+    store = _seed(db_uri)
+    gen = store.generation(_USER)
+
+    class FencedMidRefresh(_Client):
+        async def refresh_token(self, refresh_token: str) -> GitHubTokenSet:
+            _expire_lease(store)
+            assert store.fence_refresh(_USER, generation=gen) == "ready"
+            return await super().refresh_token(refresh_token)
+
+    client = FencedMidRefresh(result=_tokens("new", 3600))
+    assert _resolve(store, client) is None
+    assert client.calls == 1
+
+
+def test_refused_save_never_falls_back_to_a_disconnected_chain(db_uri: str) -> None:
+    # A reconnect lands right after the fallback read the fenced chain: what it
+    # read must still count as disconnected, never be vended.
+    store = _seed(db_uri)
+    gen = store.generation(_USER)
+    read = store._store.get
+    reconnect_after_next_read: list[bool] = []
+
+    def read_then_reconnect(*args, **kwargs):
+        conn = read(*args, **kwargs)
+        if reconnect_after_next_read and kwargs.get("with_secret"):
+            reconnect_after_next_read.clear()
+            store.upsert(_USER, github_login="alice", github_user_id=7, tokens=_tokens("re", 3600))
+        return conn
+
+    class FencedMidRefresh(_Client):
+        async def refresh_token(self, refresh_token: str) -> GitHubTokenSet:
+            _expire_lease(store)
+            assert store.fence_refresh(_USER, generation=gen) == "ready"
+            reconnect_after_next_read.append(True)
+            return await super().refresh_token(refresh_token)
+
+    store._store.get = read_then_reconnect  # type: ignore[method-assign]
+    assert _resolve(store, FencedMidRefresh(result=_tokens("new", 3600))) is None
+
+
+def test_refresh_persists_and_clears_the_lease(db_uri: str) -> None:
+    store = _seed(db_uri)
+    assert _resolve(store, _Client(result=_tokens("new", 28800))) == "new"
+    assert store.get(_USER, with_tokens=True).access_token == "new"
+    assert "refresh_lease_holder" not in _meta(store)
+
+
+# --- the race ---------------------------------------------------------------
+
+
+def race_worker_main(db_uri: str, workdir: str, index: int, bypass_lease: bool) -> None:
+    """One worker process: resolve concurrently with the others and print the token.
+
+    Run via :func:`_race` as a plain subprocess (not ``multiprocessing``, whose
+    resource-tracker child would outlive the test).
+    """
+
+    class _CountingClient:
+        async def refresh_token(self, refresh_token: str) -> GitHubTokenSet:
+            with open(Path(workdir) / "refresh-calls.log", "a+") as fh:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+                fh.write(f"{refresh_token}\n")
+            await asyncio.sleep(0.5)  # a slow provider widens the race window
+            return _tokens("new", 28800)
+
+    store = _store(db_uri)
+    if bypass_lease:  # control: every process believes it won the lease
+        store.acquire_refresh_lease = lambda *a, **k: True  # type: ignore[method-assign]
+        store.get_under_lease = lambda user_id, **k: store.get(user_id, with_tokens=True)  # type: ignore[method-assign]
+        store.mark_refresh_inflight = lambda *a, **k: True  # type: ignore[method-assign]
+    (Path(workdir) / f"ready-{index}").touch()
+    deadline = time.monotonic() + 60
+    while len(list(Path(workdir).glob("ready-*"))) < _PROCS and time.monotonic() < deadline:
+        time.sleep(0.01)
+    token = asyncio.run(
+        github_identity.resolve_access_token(_USER, store=store, client=_CountingClient())
+    )
+    print(json.dumps({"token": token}))
+
+
+def _race(db_uri: str, workdir: Path, *, bypass_lease: bool = False) -> tuple[list[str], list]:
+    """Run the resolver in ``_PROCS`` processes at once; return (upstream calls, tokens)."""
+    (workdir / "refresh-calls.log").touch()
+    code = (
+        "import sys; from tests.server.test_refresh_coordination import race_worker_main; "
+        "race_worker_main(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4] == '1')"
+    )
+    procs: list[subprocess.Popen[str]] = []
+    tokens = []
+    try:
+        for i in range(_PROCS):
+            procs.append(
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        code,
+                        db_uri,
+                        str(workdir),
+                        str(i),
+                        "1" if bypass_lease else "0",
+                    ],
+                    cwd=_REPO_ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            )
+        deadline = time.monotonic() + 120
+        for proc in procs:
+            out, err = proc.communicate(timeout=max(1.0, deadline - time.monotonic()))
+            lines = out.strip().splitlines()
+            tokens.append(
+                json.loads(lines[-1])["token"]
+                if proc.returncode == 0 and lines
+                else f"ERROR: {err[-300:]}"
+            )
+    finally:
+        # A timeout or failed launch must not leave workers running.
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+    return (workdir / "refresh-calls.log").read_text().splitlines(), tokens
+
+
+def test_concurrent_processes_refresh_exactly_once(db_uri: str, tmp_path: Path) -> None:
+    _seed(db_uri)
+    calls, results = _race(db_uri, tmp_path)
+    assert calls == ["ghr_old"], f"expected one upstream refresh, got {len(calls)}"
+    assert results == ["new"] * _PROCS, results
+    store = _store(db_uri)
+    assert store.get(_USER, with_tokens=True).access_token == "new"
+    assert "refresh_lease_holder" not in _meta(store)
+
+
+def test_without_the_lease_the_race_is_real(db_uri: str, tmp_path: Path) -> None:
+    # Control for the test above: with the lease bypassed, the same workload
+    # refreshes more than once — the hazard the lease exists to prevent.
+    _seed(db_uri)
+    calls, _ = _race(db_uri, tmp_path, bypass_lease=True)
+    assert len(calls) > 1, "race harness failed to produce concurrent refreshes"
+
+
+def test_race_leaves_no_lease_behind_after_crash_window(db_uri: str) -> None:
+    # A holder that died mid-refresh leaves an expired lease; the next resolve
+    # takes it over rather than waiting forever.
+    store = _seed(db_uri)
+    assert store.acquire_refresh_lease(_USER, holder="dead", ttl_s=0)
+    time.sleep(1.1)
+    assert _resolve(store, _Client(result=_tokens("new", 28800))) == "new"

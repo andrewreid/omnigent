@@ -23,6 +23,9 @@ export interface GithubConnectionStatus {
   scopes: string | null;
   /** Unix epoch seconds the account was connected, or null. */
   connected_at: number | null;
+  /** The provider rejected the stored refresh token; the user must reconnect.
+   *  Absent on older servers. */
+  needs_reconnect?: boolean;
   /** The App's install URL, or null when no slug is configured. */
   install_url: string | null;
 }
