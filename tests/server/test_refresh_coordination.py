@@ -565,6 +565,6 @@ def test_race_leaves_no_lease_behind_after_crash_window(db_uri: str) -> None:
     # A holder that died mid-refresh leaves an expired lease; the next resolve
     # takes it over rather than waiting forever.
     store = _seed(db_uri)
-    assert store.acquire_refresh_lease(_USER, holder="dead", ttl_s=0)
-    time.sleep(1.1)
+    assert store.acquire_refresh_lease(_USER, holder="dead", ttl_s=60)
+    _expire_lease(store)
     assert _resolve(store, _Client(result=_tokens("new", 28800))) == "new"
