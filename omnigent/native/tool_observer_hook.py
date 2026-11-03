@@ -39,6 +39,26 @@ def hook_settings(
     return {"type": "command", "command": command, "timeout": 3}
 
 
+def relay_hook_command(bridge_dir: Path, path: str, fallback: str, *, max_time: int) -> str:
+    """
+    Return a hook command that answers from the relay endpoint *path*.
+
+    The relay's response body is the hook's output. Until the relay writes
+    ``tool_relay.env``, without curl, or when curl fails, the same stdin is
+    replayed into *fallback*, the harness's Python hook, which owns the
+    direct-server path and any fail-closed shaping.
+    """
+    relay_env = shlex.quote(str(bridge_dir / "tool_relay.env"))
+    return (
+        "p=$(cat); "
+        f"if [ -r {relay_env} ] && command -v curl >/dev/null 2>&1; then . {relay_env}; "
+        "out=$(printf '%s' \"$p\" | "
+        + relay_curl(path, max_time=max_time, options="-sf")
+        + ") && { printf '%s' \"$out\"; exit 0; }; fi; "
+        f"printf '%s' \"$p\" | {fallback}"
+    )
+
+
 def relay_curl(path: str, *, max_time: int, options: str) -> str:
     """
     Return a curl command that posts stdin to the relay endpoint *path*.
