@@ -559,3 +559,26 @@ def test_policy_hooks_register_user_prompt_submit() -> None:
     prompt_hook = hooks["UserPromptSubmit"][0]["hooks"][0]
     # Same evaluate-policy command as the tool phases.
     assert prompt_hook["command"] == hooks["PreToolUse"][0]["hooks"][0]["command"]
+
+
+def test_policy_hook_answers_from_the_relay_and_stays_trusted() -> None:
+    """The policy hook curls the runner's relay; Python runs only as the fallback.
+
+    The command keeps the hook module in its text because the trust pass
+    matches on it: a hook without it stays untrusted and codex skips it.
+    """
+    from omnigent.harnesses.codex_native.app_server import _POLICY_HOOK_MODULE
+
+    settings = _codex_policy_hooks_settings(Path("/b"), "/venv/bin/python")
+    policy, observer = settings["hooks"]["PostToolUse"][0]["hooks"]
+    command = str(policy["command"])
+    assert '"$OMNIGENT_RELAY_URL/hook/codex/evaluate-policy"' in command
+    assert command.index("curl") < command.index(f"-I -m {_POLICY_HOOK_MODULE} evaluate-policy")
+    listed = {
+        "result": {
+            "data": [
+                {"cwd": _CWD, "hooks": [{"command": h["command"]} for h in (policy, observer)]}
+            ]
+        }
+    }
+    assert len(_our_policy_hooks_from_list(listed, _CWD)) == 2

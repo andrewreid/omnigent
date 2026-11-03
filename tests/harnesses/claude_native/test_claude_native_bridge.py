@@ -14621,6 +14621,30 @@ def _hook_relay(tmp_path, monkeypatch, client):
     return relay, bridge_dir
 
 
+def _bind_codex_session(bridge_dir: Path, session_id: str = "conv_hook_eval") -> None:
+    """Write the Codex bridge state that makes *session_id* the bridge's session."""
+    from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState, write_bridge_state
+
+    write_bridge_state(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id=session_id,
+            socket_path=str(bridge_dir / "app-server.sock"),
+            thread_id="thread_hook_eval",
+            codex_home=str(bridge_dir / "codex-home"),
+        ),
+    )
+
+
+_HOOK_EVALUATE_ROUTES = pytest.mark.parametrize(
+    ("route", "harness"),
+    [
+        ("/hook/claude/evaluate-policy", "claude-native"),
+        ("/hook/codex/evaluate-policy", "codex-native"),
+    ],
+)
+
+
 def _relay_request_raw(bridge_dir: Path, path: str, payload: dict[str, object]) -> str:
     """POST to the relay and return the raw response body text."""
     import urllib.request
@@ -14830,19 +14854,23 @@ async def test_policy_hook_command_answers_inside_no_policy_allow_window(
 
 
 @pytest.mark.asyncio
+@_HOOK_EVALUATE_ROUTES
 async def test_relay_answer_for_a_switched_bridge_opens_no_window(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str, harness: str
 ) -> None:
     """The relay evaluates its own session, so a bridge that moved on gets no window."""
     client = _ScriptedPolicyClient(_NO_POLICY_ALLOW)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
-        config_path = bridge_dir / claude_native_bridge._CONFIG_FILE
-        config = json.loads(config_path.read_text()) if config_path.exists() else {}
-        config_path.write_text(json.dumps({**config, "active_session_id": "conv_switched"}))
+        if harness == "codex-native":
+            _bind_codex_session(bridge_dir, "conv_switched")
+        else:
+            config_path = bridge_dir / claude_native_bridge._CONFIG_FILE
+            config = json.loads(config_path.read_text()) if config_path.exists() else {}
+            config_path.write_text(json.dumps({**config, "active_session_id": "conv_switched"}))
 
         body = await asyncio.to_thread(
-            _relay_request_raw, bridge_dir, "/hook/claude/evaluate-policy", _PRE_TOOL_USE_PAYLOAD
+            _relay_request_raw, bridge_dir, route, _PRE_TOOL_USE_PAYLOAD
         )
 
         assert body == ""
@@ -14934,39 +14962,64 @@ def test_active_session_switch_closes_allow_window(
 
 
 @pytest.mark.asyncio
+@_HOOK_EVALUATE_ROUTES
 async def test_hook_evaluate_endpoint_returns_deny_hook_output(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str, harness: str
 ) -> None:
     """A DENY verdict comes back as ready-made PreToolUse hook output."""
+    from omnigent.harnesses.codex_native.bridge import codex_home_for_bridge_dir
+
     client = _ScriptedPolicyClient({"result": "POLICY_ACTION_DENY", "reason": "blocked by test"})
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    _bind_codex_session(bridge_dir)
+    # Codex's live /model selection, which its cost gate evaluates against.
+    codex_home = codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "config.toml").write_text('model = "gpt-5.4"\n')
     try:
         body = await asyncio.to_thread(
-            _relay_request_raw,
-            bridge_dir,
-            "/hook/claude/evaluate-policy",
-            _PRE_TOOL_USE_PAYLOAD,
+            _relay_request_raw, bridge_dir, route, _PRE_TOOL_USE_PAYLOAD
         )
         output = json.loads(body)
         assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert "blocked by test" in output["hookSpecificOutput"]["permissionDecisionReason"]
+        context = client.bodies[0]["event"]["context"]
+        assert context["harness"] == harness
+        assert context.get("model") == ("gpt-5.4" if harness == "codex-native" else None)
     finally:
         relay.close()
 
 
 @pytest.mark.asyncio
-async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
+async def test_codex_hook_evaluate_without_bridge_state_has_no_opinion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Upstream failure asks for PreToolUse approval and stays open for PostToolUse."""
-    client = _ScriptedPolicyClient(None)
+    """As in the Codex Python hook, a bridge with no session state is not governed."""
+    client = _ScriptedPolicyClient({"result": "POLICY_ACTION_DENY", "reason": "blocked by test"})
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
         body = await asyncio.to_thread(
-            _relay_request_raw,
-            bridge_dir,
-            "/hook/claude/evaluate-policy",
-            _PRE_TOOL_USE_PAYLOAD,
+            _relay_request_raw, bridge_dir, "/hook/codex/evaluate-policy", _PRE_TOOL_USE_PAYLOAD
+        )
+        assert body == ""
+        assert client.calls == 0
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@_HOOK_EVALUATE_ROUTES
+async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str, harness: str
+) -> None:
+    """Upstream failure asks for PreToolUse approval and stays open for PostToolUse."""
+    del harness
+    client = _ScriptedPolicyClient(None)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    _bind_codex_session(bridge_dir)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw, bridge_dir, route, _PRE_TOOL_USE_PAYLOAD
         )
         output = json.loads(body)
         assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
@@ -14974,7 +15027,7 @@ async def test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream(
         post_body = await asyncio.to_thread(
             _relay_request_raw,
             bridge_dir,
-            "/hook/claude/evaluate-policy",
+            route,
             {**_PRE_TOOL_USE_PAYLOAD, "hook_event_name": "PostToolUse", "tool_output": "x"},
         )
         assert post_body == "", "PostToolUse must fail open (tool already ran)"
@@ -15163,6 +15216,25 @@ async def test_curl_evaluate_policy_command_round_trips(
         output = json.loads(result.stdout)
         assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert client.calls == calls_before + 2
+
+        # Codex's registered hook takes the same path on its own route. Its
+        # Python fallback names a missing interpreter, so only the relay can
+        # have produced the deny.
+        from omnigent.harnesses.codex_native.app_server import _codex_policy_hooks_settings
+
+        _bind_codex_session(bridge_dir)
+        codex_hooks = _codex_policy_hooks_settings(bridge_dir, str(tmp_path / "no-python"))
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["/bin/sh", "-c", codex_hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]],
+            input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        output = json.loads(result.stdout)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert client.bodies[-1]["event"]["context"]["harness"] == "codex-native"
     finally:
         relay.close()
 

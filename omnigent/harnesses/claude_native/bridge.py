@@ -2636,7 +2636,7 @@ def build_hook_settings(
         # publish live token deltas to the web UI.
         "MessageDisplay": [{"hooks": [message_display_hook]}],
     }
-    from omnigent.native.tool_observer_hook import hook_settings, relay_curl
+    from omnigent.native.tool_observer_hook import hook_settings, relay_hook_command
 
     observer_hook = hook_settings(
         bridge_dir,
@@ -2688,36 +2688,24 @@ def build_hook_settings(
         hooks["PermissionRequest"] = [{"hooks": [permission_hook]}]
 
         # Policy-gate native Claude Code tools, not just relay/MCP tools.
-        # The hook is a bare curl against the relay's evaluate-policy
-        # endpoint (which owns all transformation and verdict logic), so
-        # Claude's blocking tool-call path pays no interpreter spawn. The
-        # relay's coordinates are re-read from tool_relay.env on every
-        # event, so hooks survive runner restarts. Before the relay exists
-        # (it starts in the background at session create — a very early
-        # hook can beat it) or when curl fails, the same stdin is
-        # replayed into the Python hook, which owns the direct-server
-        # path and the phase-aware fail-closed contract — exactly the
-        # pre-curl behavior.
-        relay_env_quoted = shlex.quote(str(bridge_dir / _TOOL_RELAY_ENV_FILE))
-        evaluate_policy_python = _python_hook_command(
-            [
-                python,
-                "-I",
-                "-m",
-                "omnigent.harnesses.claude_native.hook",
-                "evaluate-policy",
-                "--bridge-dir",
-                str(bridge_dir),
-            ]
-        )
-        evaluate_policy_command = (
-            "p=$(cat); "
-            f"if [ -r {relay_env_quoted} ] && command -v curl >/dev/null 2>&1; then "
-            f". {relay_env_quoted}; "
-            "out=$(printf '%s' \"$p\" | "
-            + relay_curl("/hook/claude/evaluate-policy", max_time=86400, options="-sf")
-            + ") && { printf '%s' \"$out\"; exit 0; }; fi; "
-            f"printf '%s' \"$p\" | {evaluate_policy_python}"
+        # The relay's evaluate-policy endpoint owns all transformation and
+        # verdict logic, so Claude's blocking tool-call path pays no
+        # interpreter spawn; the Python hook is only the relay-less fallback.
+        evaluate_policy_command = relay_hook_command(
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _python_hook_command(
+                [
+                    python,
+                    "-I",
+                    "-m",
+                    "omnigent.harnesses.claude_native.hook",
+                    "evaluate-policy",
+                    "--bridge-dir",
+                    str(bridge_dir),
+                ]
+            ),
+            max_time=86400,
         )
         evaluate_policy_hook: _JsonObject = {
             "type": "command",
@@ -7944,6 +7932,13 @@ _POLICY_PROXY_ERROR_DETAIL_MAX = 400
 # waiting never stalls other relay traffic.
 _FILE_CHANGE_OBSERVER_TIMEOUT_S = 10.0
 
+# Policy hook routes served end to end by the relay, keyed to the harness
+# stamped on the evaluation context.
+_HOOK_EVALUATE_ROUTES = {
+    "/hook/claude/evaluate-policy": "claude-native",
+    "/hook/codex/evaluate-policy": "codex-native",
+}
+
 
 def _tool_relay_handler_factory(
     token: str,
@@ -7996,7 +7991,7 @@ def _tool_relay_handler_factory(
             if self.path not in (
                 "/tool",
                 "/policies/evaluate",
-                "/hook/claude/evaluate-policy",
+                *_HOOK_EVALUATE_ROUTES,
                 "/hook/pi/extension-ui",
                 "/hook/observe-tool",
                 "/hook/claude/event",
@@ -8027,8 +8022,8 @@ def _tool_relay_handler_factory(
                             future.result(timeout=_FILE_CHANGE_OBSERVER_TIMEOUT_S)
                 self._send_json({})
                 return
-            if self.path == "/hook/claude/evaluate-policy":
-                self._handle_hook_evaluate(payload)
+            if self.path in _HOOK_EVALUATE_ROUTES:
+                self._handle_hook_evaluate(payload, _HOOK_EVALUATE_ROUTES[self.path])
                 return
             if self.path == "/hook/claude/event":
                 self._handle_claude_hook(payload)
@@ -8119,15 +8114,18 @@ def _tool_relay_handler_factory(
             if raw:
                 self.wfile.write(raw)
 
-        def _handle_hook_evaluate(self, payload: _JsonObject) -> None:
-            """Serve one Claude policy hook event end to end.
+        def _handle_hook_evaluate(self, payload: _JsonObject, harness: str) -> None:
+            """Serve one native policy hook event end to end.
 
             The hook subprocess is a bare curl: this endpoint does the
             payload→EvaluationRequest transform, the upstream evaluate
             call, and the EvaluationResponse→hook-output transform, so the
             blocking hook path pays no interpreter spawn. Responses are
             always 200; enforcement failures are expressed as fail-closed
-            hook output.
+            hook output. Claude Code and Codex share the hook output shape.
+
+            :param payload: Hook stdin payload.
+            :param harness: ``"claude-native"`` or ``"codex-native"``.
             """
             # Heavy policy imports stay off this module's import path (hook
             # subprocesses import it); the relay runs inside the runner
@@ -8148,16 +8146,36 @@ def _tool_relay_handler_factory(
             if policy_client is None or session_id is None:
                 self._respond_hook_output(None)
                 return
+            # Read before the session identity, as the Python hooks do.
+            cache_generation = (
+                policy_allow_cache.generation(bridge_dir) if bridge_dir is not None else None
+            )
+            if harness == "codex-native":
+                from omnigent.harnesses.codex_native.bridge import (
+                    read_bridge_state,
+                    read_codex_config_model,
+                )
+
+                state = read_bridge_state(bridge_dir) if bridge_dir is not None else None
+                if bridge_dir is None or state is None:
+                    # As in the Python hook: no bridge state, no governed session.
+                    self._respond_hook_output(None)
+                    return
+                active_session: str | None = state.session_id
+                model = read_codex_config_model(bridge_dir)
+            else:
+                active_session = (
+                    read_active_session_id(bridge_dir) if bridge_dir is not None else None
+                )
+                model = read_claude_status_model(bridge_dir) if bridge_dir is not None else None
             eval_request = hook_payload_to_evaluation_request(hook_event, payload)
             if eval_request is None:
                 self._respond_hook_output(None)
                 return
             context = eval_request["event"]["context"]
-            context["harness"] = "claude-native"
-            if bridge_dir is not None:
-                status_model = read_claude_status_model(bridge_dir)
-                if status_model:
-                    context["model"] = status_model
+            context["harness"] = harness
+            if model:
+                context["model"] = model
             # Stable re-attach id: a retried long-poll reattaches to the
             # same parked ASK instead of raising a second approval card.
             request_body = {
@@ -8167,14 +8185,9 @@ def _tool_relay_handler_factory(
             import urllib.parse as _up
 
             url = f"/v1/sessions/{_up.quote(session_id, safe='')}/policies/evaluate"
-            cache_generation = (
-                policy_allow_cache.generation(bridge_dir) if bridge_dir is not None else None
-            )
             # This relay evaluates its own session; a bridge that has switched
             # sessions must not get a window from that answer.
-            relay_session_active = bridge_dir is not None and read_active_session_id(
-                bridge_dir
-            ) in (None, session_id)
+            relay_session_active = bridge_dir is not None and active_session in (None, session_id)
             requested_at = time.time()
             verdict: object = None
             last_error: str | None = None
