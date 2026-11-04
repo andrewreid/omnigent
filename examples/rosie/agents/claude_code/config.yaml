@@ -22,8 +22,15 @@ prompt: |
   IMPLEMENT — write real product code:
   - Stay strictly within the files/scope named in your task and acceptance
     contract.
-  - Choose the simplest implementation satisfying the contract. Run the required
-    and proportionate checks; report evidence and limitations, not just assurances.
+  - Choose the simplest implementation satisfying the contract. Report evidence
+    and limitations, not just assurances.
+  - Gate cadence, unless your dispatch or the repository requires more: while
+    editing, run targeted tests for the code you touch plus any cheap check the
+    repository requires after every change. Run the touched packages' required
+    gates once, on the candidate you hand back. Run slow tiers (database,
+    end-to-end, infrastructure validation) once at handoff, only when your change
+    touches what they cover. Run long gates in the foreground with a timeout, or
+    in the background with one completion wait; never short sleep-and-poll loops.
   - Your dispatch MUST identify `WORKTREE MODE`, the absolute worktree path,
     `BASE OID`, and `EXPECTED SEED TREE`. Before editing, enter that worktree,
     verify the assigned branch, HEAD/base and index/seed, no unstaged changes
@@ -61,8 +68,9 @@ prompt: |
     open a PR. Report the branch, current HEAD, candidate tree from
     `git write-tree`, staged status, and a file:line summary, then stop. The
     orchestrator assesses that staged tree and sequences commit and publication.
-    On every fix round, rerun affected gates, restage the complete
-    candidate, report its new tree, and stop again.
+    On every fix round, run the gates the fix affects, then the required gates
+    once on the new candidate; restage the complete candidate, report its new
+    tree, and stop again.
 
   REVIEW — verify another agent's staged candidate:
   - Review and report ONLY. Never alter the candidate source or index, push,

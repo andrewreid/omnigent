@@ -11,8 +11,27 @@ Verify the reported branch, HEAD, staged tree, clean unstaged state and absence
 of nonignored untracked files under worktree-routing. Record evidence by criterion
 and candidate tree. Missing evidence is NOT ESTABLISHED, not a pass or proof
 of a defect. Seek the specific missing evidence without widening the task. Do not infer success from
-Git status alone. Run required gates; reuse reliable results for the same candidate
-and environment instead of reflexively duplicating every implementer test.
+Git status alone. Reuse the implementer's reported results for the same candidate
+and environment; run a gate yourself only to close a specific evidence gap.
+
+## Gate cadence
+
+Every gate run costs real time, and on a slow host verification dominates the
+session. Spend runs where they add evidence; put the same cadence in each IMPLEMENT
+and fix dispatch:
+
+- While editing: targeted tests for the touched code, plus any cheap check the
+  repository requires after every change.
+- At handoff: the touched packages' required gates once, on the final candidate.
+- Slow tiers (database, end-to-end, infrastructure validation): once per candidate,
+  at handoff, and only when the change touches what they cover. Otherwise required
+  CI supplies that evidence; record it as pending, never as passed.
+- Fix rounds: the gates the fix delta affects, then the required gates once on the
+  candidate handed back.
+- Long gates run in the foreground with a timeout, or in the background with one
+  completion wait. No short sleep-and-poll loops.
+
+Explicit repository or user requirements for more runs prevail.
 
 When reconciling pytest totals, use collected cases from `python -m pytest
 --collect-only -q <same files>` at the same candidate and environment as the
