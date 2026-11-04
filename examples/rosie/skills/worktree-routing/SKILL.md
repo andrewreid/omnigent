@@ -76,27 +76,40 @@ Treat a missing or mismatched worktree, base, seed tree, candidate tree, or leas
 as a hard stop. Never repair a mismatch with `git reset`, `git clean`, checkout,
 or an inferred baseline.
 
+## State check
+
+One command, run from the worktree, prints everything the registry compares:
+
+```sh
+git branch --show-current && git rev-parse HEAD && git write-tree && { git diff --quiet && echo unstaged=none || echo unstaged=PRESENT; } && git ls-files --others --exclude-standard
+```
+
+Workers carry the same command. Rosie runs it at these points only: when
+recording a dispatch baseline, at acceptance of a reported candidate, and at the
+publish checkpoints (before commit, after commit, after push). Workers run it before
+editing and after staging; reviewers before and after review. Each run is a tool
+call on a slow host, so do not add checks between these points without a reason.
+If the runner root is a different checkout, record its HEAD and status once before
+dispatch and compare at acceptance; hash already-dirty paths only when it was
+already dirty.
+
 ## SHARED procedure
 
-1. Require no unstaged or nonignored untracked files. Existing staged work must
-   have known ownership and be explicitly accepted into this deliverable; otherwise
-   isolate or clarify ownership without changing it. Record the session worktree's
-   exact `base_oid`. Require HEAD to remain at that
-   commit until final release. Record `git write-tree` as both `initial_tree`
-   and the first `candidate_tree`.
-2. Record branch, HEAD, index and status baselines. If the runner root is a
-   different worktree, record its state too (hash existing dirty paths, or use a
-   clean orchestration checkout). Acquire the session writer lease for exactly one implementer conversation.
-   Do not dispatch another writer or direct-author prose while it is held.
+1. Run the state check: no unstaged or nonignored untracked files. Existing staged
+   work must have known ownership and be explicitly accepted into this deliverable;
+   otherwise isolate or clarify ownership without changing it. Record HEAD as
+   `base_oid` (it stays there until final release) and the tree as both
+   `initial_tree` and the first `candidate_tree`.
+2. Acquire the session writer lease for exactly one implementer conversation. Do
+   not dispatch another writer or direct-author prose while it is held.
 3. Load `dispatch`. Dispatch `WORKTREE MODE: SHARED`, the absolute session worktree, `base_oid`,
    and `EXPECTED SEED TREE: <candidate_tree>`. State that existing staged changes
    are accepted session work and must be preserved.
-4. The worker verifies `git write-tree` equals the seed before editing, changes
-   only its assigned scope, runs the gates, stages the complete cumulative
-   candidate, reports the new tree, and stops without committing.
-5. Verify HEAD and any separate runner-root baselines are unchanged, no unstaged or
-   nonignored untracked files remain, and the reported tree equals
-   `git write-tree`.
+4. The worker runs the state check before editing and after staging, changes only
+   its assigned scope, runs gates per verify's cadence, stages the complete
+   cumulative candidate, reports the new tree, and stops without committing.
+5. Run the state check once: HEAD unchanged, nothing unstaged or untracked, and the
+   tree equals the reported candidate. Compare the runner root if recorded.
 6. Freeze the lease for `verify`, recording the previous seed and new candidate.
    Run independent review only when selected by the contract/risk. No writer may
    run while verification reads its candidate.
@@ -122,9 +135,9 @@ visibility; that would create a second source of truth.
    `git read-tree --reset -u <seed_tree>` before dispatch; this is deterministic
    Git plumbing, not permission to resolve or author code.
 3. Each task receives contract-selected verification. Never commit or push a scratch branch.
-4. Before any materialization, require the recorded HEAD/index and no unstaged
-   changes or nonignored untracked files, with the exclusive lease held. A matching
-   index alone cannot establish that overwriting working files is safe.
+4. Before any materialization, run the state check with the exclusive lease held:
+   recorded HEAD and tree, nothing unstaged or untracked. A matching index alone
+   cannot establish that overwriting working files is safe.
    Promote accepted tasks into Rosie's worktree one at a time under its writer
    lease. If Rosie's current tree still equals the task seed, materialize the
    accepted task tree exactly with `git read-tree --reset -u <candidate_tree>`.

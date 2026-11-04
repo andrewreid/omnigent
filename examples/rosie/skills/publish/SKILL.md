@@ -13,8 +13,8 @@ release acceptance: assess the final integrated target and required interactions
 Do not repeat a full independent review solely because its phase label changed;
 record a fresh release assessment referencing evidence for the unchanged tree.
 
-Before authorizing a commit, freeze writers and require the recorded branch, HEAD,
-index tree, no unstaged changes and no nonignored untracked files. Acceptance and
+Before authorizing a commit, freeze writers and run worktree-routing's state check:
+recorded branch, HEAD and tree, nothing unstaged or untracked. Acceptance and
 required checks must match this candidate. On first publication HEAD equals the
 recorded base. For a fix-push it equals the recorded published PR head. Unexpected
 changes stop publication; preserve work rather than reset/clean it.

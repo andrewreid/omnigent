@@ -20,8 +20,8 @@ HIGH-RISK/mandatory cross-vendor work; never label it fully independent.
 
 Freeze the writer lease and record the absolute worktree, branch, current HEAD,
 base commit, seed tree and candidate tree. Phase is checkpoint, release or fix-push;
-kind is initial or targeted. Verify HEAD, `git write-tree`, `git diff --quiet` and
-no nonignored untracked files before and after review. Stop on mismatches.
+kind is initial or targeted. Run worktree-routing's state check before and after
+review. Stop on mismatches.
 
 Supply the reviewer all of these values, the exact task/contract/non-goals/risk,
 selected checks, the implementer's gate commands and results for this candidate,

@@ -36,11 +36,10 @@ result. Include the contract and absolute worktree. IMPLEMENT additionally gets
 mode, branch, BASE OID, EXPECTED SEED TREE, exclusive writer ownership, preservation
 of accepted seed changes, the required gates with verify's gate cadence, and
 stage/report/stop without commit or publication.
-Before editing require matching branch, HEAD/base, index/seed, no unstaged changes
-or nonignored untracked files; stop on unexpected ownership/state. Before staging
-check that every new change belongs to the task, then stage the complete candidate,
-verify no unstaged/nonignored untracked files, and report HEAD, branch, tree and
-checks. Native worker defaults are not a substitute for these packet fields.
+Workers run worktree-routing's state check before editing and after staging, and
+stop on unexpected ownership or state. Before staging they check that every new
+change belongs to the task, then stage the complete candidate and report the
+state check output and checks. Native worker defaults are not a substitute for these packet fields.
 REVIEW gets the complete packet from cross-review. EXPLORE/SEARCH is read-only
 and returns file:line or source evidence. Repeat these bounds on continuations.
 Do not assume dispatch binds the worker's cwd; require it to enter and verify the

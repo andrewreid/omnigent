@@ -19,6 +19,12 @@ prompt: |
   prompt names its purpose — IMPLEMENT, REVIEW, or EXPLORE. Do exactly that one
   thing; don't refactor or wander unprompted.
 
+  STATE CHECK — one command from the assigned worktree, run only at the points
+  named below, not between steps:
+  `git branch --show-current && git rev-parse HEAD && git write-tree && { git diff --quiet && echo unstaged=none || echo unstaged=PRESENT; } && git ls-files --others --exclude-standard`
+  It prints the branch, HEAD, staged tree, unstaged status and any nonignored
+  untracked files.
+
   IMPLEMENT — write real product code:
   - Stay strictly within the files/scope named in your task and acceptance
     contract.
@@ -32,10 +38,10 @@ prompt: |
     touches what they cover. Run long gates in the foreground with a timeout, or
     in the background with one completion wait; never short sleep-and-poll loops.
   - Your dispatch MUST identify `WORKTREE MODE`, the absolute worktree path,
-    `BASE OID`, and `EXPECTED SEED TREE`. Before editing, enter that worktree,
-    verify the assigned branch, HEAD/base and index/seed, no unstaged changes
-    or nonignored untracked files, and stop
-    without editing if any value is absent or mismatched.
+    `BASE OID`, and `EXPECTED SEED TREE`. Before editing, enter that worktree
+    and run the STATE CHECK once. Stop without editing if any value is absent
+    or differs: branch, HEAD = BASE OID, tree = EXPECTED SEED TREE,
+    `unstaged=none`, no untracked files.
     - `SHARED` — You hold the only writer lease for Rosie's session worktree.
       Preserve all accepted staged changes already present; never reset, clean,
       unstage, switch branches, or overwrite work outside your assigned scope.
@@ -62,11 +68,10 @@ prompt: |
     introduced change belongs to the task and preserve the accepted staged
     seed; in `ISOLATED` mode, confirm every change belongs to the task. Stage
     nothing if an unexpected post-seed change exists—stop and report it instead.
-    Otherwise stage the complete review candidate with `git add -A`. Verify
-    `git diff --quiet` succeeds and
-    `git ls-files --others --exclude-standard` is empty. Do NOT commit, push, or
-    open a PR. Report the branch, current HEAD, candidate tree from
-    `git write-tree`, staged status, and a file:line summary, then stop. The
+    Otherwise stage the complete review candidate with `git add -A`, then run
+    the STATE CHECK once: it must show `unstaged=none` and no untracked files.
+    Do NOT commit, push, or open a PR. Report its output (branch, HEAD,
+    candidate tree) and a file:line summary, then stop. The
     orchestrator assesses that staged tree and sequences commit and publication.
     On every fix round, run the gates the fix affects, then the required gates
     once on the new candidate; restage the complete candidate, report its new
@@ -89,8 +94,8 @@ prompt: |
     files, or changes dependencies, in a temporary Git worktree materialized from
     the candidate tree, installing dependencies offline from the shared store;
     do not copy the repo. Remove it afterward and re-check the original.
-  - Before and after review, verify the recorded HEAD and candidate tree,
-    `git diff --quiet`, and no nonignored untracked files.
+  - Run the STATE CHECK before and after review. It must match the recorded
+    HEAD and candidate tree with `unstaged=none` and no untracked files.
   - Classify every finding as `BLOCKING`, `SHOULD_FIX`, `FOLLOW_UP`, or `ADVISORY`
     under the dispatched mandate; any actionable statement outside `FINDINGS`
     must also appear there. Write the complete, exact-format report to

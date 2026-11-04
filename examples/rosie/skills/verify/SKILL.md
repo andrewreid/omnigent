@@ -7,8 +7,8 @@ user-invocable: false
 # Acceptance assessment
 
 Orchestrator only. Assess the complete deliverable against the scope contract.
-Verify the reported branch, HEAD, staged tree, clean unstaged state and absence
-of nonignored untracked files under worktree-routing. Record evidence by criterion
+Run worktree-routing's state check once and compare it with the reported branch,
+HEAD and staged tree. Record evidence by criterion
 and candidate tree. Missing evidence is NOT ESTABLISHED, not a pass or proof
 of a defect. Seek the specific missing evidence without widening the task. Do not infer success from
 Git status alone. Reuse the implementer's reported results for the same candidate

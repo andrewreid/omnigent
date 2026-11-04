@@ -33,16 +33,16 @@ record exactly one `publication_mode`:
    ```
 
    This deterministic tree materialization is orchestration plumbing. Rosie
-   never resolves source conflicts or authors code. Require HEAD to equal the
-   base, `git write-tree` to equal the seed, and no unstaged or nonignored
-   untracked files. Record in `.molly/registry.json`: publication mode, absolute
+   never resolves source conflicts or authors code. Run worktree-routing's state
+   check: HEAD equals the base, the tree equals the seed, nothing unstaged or
+   untracked. That output is the task's pre-dispatch baseline. Record in
+   `.molly/registry.json`: publication mode, absolute
    path, branch, base, seed, null candidate, and review phase (`release` for
    `separate`, `checkpoint` for `integrate`).
 
-2. Record pre-dispatch baselines for each task worktree and the runner root:
-   branch, HEAD, index tree, and `git status --porcelain`. Porcelain protects
-   only a clean path: if the runner root is legitimately dirty, also hash every
-   already-dirty path or orchestrate from a dedicated clean checkout.
+2. If the runner root is a different checkout, record its HEAD and status once;
+   hash already-dirty paths only when it was already dirty, or orchestrate from a
+   dedicated clean checkout.
 
 3. Load `dispatch`. Dispatch one implementation sub-agent per task. The input MUST include:
 
@@ -51,7 +51,7 @@ record exactly one `publication_mode`:
    - `WORKTREE MODE: ISOLATED`, `PUBLICATION MODE`, absolute worktree path,
      `BASE OID`, and `EXPECTED SEED TREE`;
    - the exact task, scope, acceptance contract, and required gates; and
-   - the instruction to stage the complete candidate, report `git write-tree`,
+   - the instruction to stage the complete candidate, report the state check output,
      and stop without committing, pushing, or opening a PR.
 
    Use a task-based title, never a vendor name. `sys_session_send` has no
@@ -62,13 +62,9 @@ record exactly one `publication_mode`:
 
 4. Collect results through the inbox. An empty, unclear, or merely announced
    result requires `sys_session_get_history`; it is not progress to relay. Before
-   accepting a candidate, verify:
-
-   - the task branch is the recorded branch and HEAD still equals `base_oid`;
-   - `git write-tree` equals the reported candidate and differs from the seed;
-   - `git diff --quiet` succeeds and no nonignored untracked files exist; and
-   - the runner-root branch, HEAD, index, status, and dirty-path hashes still
-     match their baselines.
+   accepting a candidate, run the state check once in the task worktree: recorded
+   branch, HEAD still `base_oid`, tree equal to the reported candidate and different
+   from the seed, nothing unstaged or untracked. Compare the runner root if recorded.
 
    A mismatch is a hard stop, not permission to reset or clean. Record the
    verified candidate tree.
