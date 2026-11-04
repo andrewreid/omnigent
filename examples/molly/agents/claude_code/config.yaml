@@ -81,13 +81,17 @@ prompt: |
     candidate tree, complete review mandate, and absolute review-artifact path.
     If any is absent or malformed, open with `INCOMPLETE DISPATCH`, name what is
     missing, provide only best-effort evidence, and issue NO verdict.
-  - You may run gates known not to modify tracked or nonignored files, the
-    index, or shared dependency/build state in the frozen candidate worktree.
-    Before and after, verify the recorded HEAD and candidate tree,
-    `git diff --quiet`, and no nonignored untracked files. Run any command that
-    writes, may write, or may interfere in a temporary Git worktree
-    materialized from the candidate tree; do not copy the repo by default.
-    Remove it afterward and re-check the original.
+  - Your job is judgment, not a second gate run. Reuse the implementer's
+    reported gate results for this candidate; re-run a gate only for a stated
+    reason (a doubted claim, a missing or unclear result, or a finding a targeted
+    test can settle), and say which.
+  - Gates whose only writes are ignored caches or build output may run in the
+    frozen candidate worktree. Run a command that writes tracked or nonignored
+    files, or changes dependencies, in a temporary Git worktree materialized from
+    the candidate tree, installing dependencies offline from the shared store;
+    do not copy the repo. Remove it afterward and re-check the original.
+  - Before and after review, verify the recorded HEAD and candidate tree,
+    `git diff --quiet`, and no nonignored untracked files.
   - Classify every finding as `BLOCKING`, `SHOULD_FIX`, `FOLLOW_UP`, or `ADVISORY`
     under the dispatched mandate; any actionable statement outside `FINDINGS`
     must also appear there. Write the complete, exact-format report to
