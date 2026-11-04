@@ -93,6 +93,20 @@ If the runner root is a different checkout, record its HEAD and status once befo
 dispatch and compare at acceptance; hash already-dirty paths only when it was
 already dirty.
 
+## Worktree setup
+
+A new worktree has no installed dependencies or generated code, and every worker
+that discovers this pays for it again. When Molly creates a worktree, after its
+seed is materialized and before the first dispatch, run the repository's
+documented setup command once (for example `scripts/prepare-worktree.sh`).
+Without one, run its offline frozen install (`pnpm install --offline
+--frozen-lockfile`, `uv sync --frozen --offline`) and any generation its gates
+need. Setup must leave the state check unchanged; if it adds nonignored files,
+stop and report. Set up Molly's own session worktree the same way, once, when it
+lacks dependencies. Dispatches state that the worktree is set up: workers
+reinstall or regenerate only when their change touches the lockfile or generator
+inputs.
+
 ## SHARED procedure
 
 1. Run the state check: no unstaged or nonignored untracked files. Existing staged

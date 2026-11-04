@@ -34,8 +34,8 @@ worker count, vendor or model selection.
 Every input states: do this work yourself; never delegate onward; report a concrete
 result. Include the contract and absolute worktree. IMPLEMENT additionally gets
 mode, branch, BASE OID, EXPECTED SEED TREE, exclusive writer ownership, preservation
-of accepted seed changes, the required gates with verify's gate cadence, and
-stage/report/stop without commit or publication.
+of accepted seed changes, whether worktree-routing's setup has run, the required
+gates with verify's gate cadence, and stage/report/stop without commit or publication.
 Workers run worktree-routing's state check before editing and after staging, and
 stop on unexpected ownership or state. Before staging they check that every new
 change belongs to the task, then stage the complete candidate and report the

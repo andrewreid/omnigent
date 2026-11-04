@@ -33,8 +33,8 @@ record exactly one `publication_mode`:
    ```
 
    This deterministic tree materialization is orchestration plumbing. Molly
-   never resolves source conflicts or authors code. Run worktree-routing's state
-   check: HEAD equals the base, the tree equals the seed, nothing unstaged or
+   never resolves source conflicts or authors code. Run worktree-routing's
+   worktree setup, then its state check: HEAD equals the base, the tree equals the seed, nothing unstaged or
    untracked. That output is the task's pre-dispatch baseline. Record in
    `.molly/registry.json`: publication mode, absolute
    path, branch, base, seed, null candidate, and review phase (`release` for
