@@ -24,13 +24,22 @@ kind is initial or targeted. Verify HEAD, `git write-tree`, `git diff --quiet` a
 no nonignored untracked files before and after review. Stop on mismatches.
 
 Supply the reviewer all of these values, the exact task/contract/non-goals/risk,
-selected checks, and an absolute write-once artifact path. Use an ignored path
+selected checks, the implementer's gate commands and results for this candidate,
+and an absolute write-once artifact path. Use an ignored path
 `.molly/reviews/<task>/<phase>-<tree>-<round>.md`, or external scratch when not ignored.
 The reviewer must do the review itself, never dispatch, and never edit the candidate
-or index. Commands known to be non-mutating may run in the frozen worktree;
-writing/uncertain/interfering gates require a temporary Git worktree materialized
-from the candidate. Remove that temporary worktree only after its processes finish,
-then recheck the original. The report is the sole permitted candidate-worktree write.
+or index.
+
+The reviewer's job is judgment, not a second gate run. It reuses the implementer's
+results for this candidate and re-runs a gate only for a stated reason: a doubted
+claim, a missing or unclear result, or a finding a targeted test can settle. Gates
+whose only writes are ignored caches or build output (test caches, incremental build
+info, `node_modules/.cache`) may run in the frozen worktree. A command that writes
+tracked or nonignored files, or changes dependencies, needs a temporary Git worktree
+materialized from the candidate, with dependencies installed offline from the shared
+store (for example `pnpm install --offline --frozen-lockfile`). Remove that temporary
+worktree only after its processes finish, then recheck the original. The report is
+the sole permitted candidate-worktree write.
 
 Initial mandate: evaluate the task delta (`seed -> candidate`) and relevant effects
 of the cumulative deliverable (`base -> candidate`) against the contract. Seek
