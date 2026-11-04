@@ -16,6 +16,11 @@ FACTORY_TOOLS = [
     "factory_get_status",
     "factory_ask_owner",
     "factory_submit_result",
+    "factory_submit_triage",
+    "factory_submit_epic_triage",
+    "factory_submit_plan",
+    "factory_submit_build_ready",
+    "factory_submit_blocked",
     "factory_list_issues",
     "factory_submit_ranking",
 ]
