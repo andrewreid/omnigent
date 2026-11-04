@@ -32,7 +32,9 @@ For unpublished work the worker's BASE OID is the original base; after publicati
 it is the recorded published HEAD (the parent of the next fix commit). Keep the
 original review base separately in the review target so cumulative scope is not lost. Require
 report digest/target verification before edits. The fixer chooses the implementation,
-runs affected checks, stages, reports every disposition and the new tree, then stops.
+runs checks per verify's gate cadence (affected gates, then required gates once; slow
+tiers only when the fix touches what they cover), stages, reports every disposition
+and the new tree, then stops.
 
 Recheck whether the defect is addressed across the identified affected paths,
 not merely whether the reported line changed. Check the fix delta and regressions to affected
