@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.harnesses.codex_native.app_server import _POLICY_HOOK_MODULE, _our_hooks_from_list
-from omnigent.native.tool_observer_hook import hook_settings, main
+from omnigent.native.tool_observer_hook import hook_settings, main, relay_hook_command
 
 _TOKEN = "relay-token"
 _PAYLOAD = json.dumps(
@@ -144,6 +144,31 @@ def _run(
         env=env,
         check=False,
     )
+
+
+@requires_curl
+def test_relay_hook_command_answers_from_the_relay_else_replays_stdin(
+    tmp_path: Path, relay: tuple[str, list[dict[str, object]]]
+) -> None:
+    """The relay's answer is the hook output; without one, stdin goes to the fallback."""
+    url, received = relay
+    command = relay_hook_command(
+        tmp_path, "/hook/codex/evaluate-policy", "sed s/^/fallback:/", max_time=5
+    )
+    assert _run(command).stdout.strip() == f"fallback:{_PAYLOAD}"
+
+    _write_relay_env(tmp_path, url)
+    answered = _run(command)
+    assert answered.returncode == 0, answered.stderr
+    assert answered.stdout == "{}"
+    assert [request["path"] for request in received] == ["/hook/codex/evaluate-policy"]
+
+    # A runner that went away leaves tool_relay.env behind: curl fails, Python answers.
+    with socket.socket() as unused:
+        unused.bind(("127.0.0.1", 0))
+        closed_port = unused.getsockname()[1]
+    _write_relay_env(tmp_path, f"http://127.0.0.1:{closed_port}")
+    assert _run(command).stdout.strip() == f"fallback:{_PAYLOAD}"
 
 
 @requires_curl

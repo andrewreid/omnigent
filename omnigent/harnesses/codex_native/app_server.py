@@ -3214,6 +3214,11 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
     """
     Build the shell command codex runs for the policy hook.
 
+    The hook POSTs its payload to the runner's tool relay through ``curl``
+    (:func:`omnigent.native.tool_observer_hook.relay_hook_command`), so
+    Codex's blocking tool-call path pays no interpreter start; the Python hook
+    runs only when no relay answers.
+
     Runs python in isolated mode (``-I``): codex executes hooks with the
     session's workspace as cwd, and ``-m`` would otherwise put that
     workspace first on ``sys.path``. A workspace holding a directory named
@@ -3226,9 +3231,9 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
         via ``--bridge-dir``.
     :param python_executable: Python executable to run, e.g.
         ``"/path/to/python"``. ``None`` uses :data:`sys.executable`.
-    :returns: The shell command, the Python hook behind the allow-cache guard
+    :returns: The shell command, the relay hook behind the allow-cache guard
         (:func:`omnigent.native.policy_allow_cache.guarded_hook_command`).
-        The Python part is shell-escaped, e.g. ``"/path/python -I -m
+        The Python fallback is shell-escaped, e.g. ``"/path/python -I -m
         omnigent.harnesses.codex_native.hook evaluate-policy --bridge-dir
         /home/u/.omnigent/codex-native/abc"``.
     """
@@ -3244,7 +3249,17 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
             str(bridge_dir),
         ]
     )
-    return policy_allow_cache.guarded_hook_command(bridge_dir, command)
+    from omnigent.native.tool_observer_hook import relay_hook_command
+
+    return policy_allow_cache.guarded_hook_command(
+        bridge_dir,
+        relay_hook_command(
+            bridge_dir,
+            "/hook/codex/evaluate-policy",
+            command,
+            max_time=_POLICY_HOOK_TIMEOUT_SECONDS,
+        ),
+    )
 
 
 def _turn_router_advertised(bridge_dir: Path) -> bool:
