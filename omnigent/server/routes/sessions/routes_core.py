@@ -59,6 +59,7 @@ from omnigent.runner.identity import (
 from omnigent.runner.routing import RunnerRouter, routing_host_id, routing_host_session
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
+    get_caps,
     pending_elicitations,
     user_session_stream,
 )
@@ -216,6 +217,7 @@ from omnigent.server.routes._sessions.orchestration import (
 )
 from omnigent.server.routes._sessions.update_ticks import ConversationCache, SessionUpdateTicks
 from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile
+from omnigent.server.routing_backend import routing_available
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
@@ -1288,6 +1290,7 @@ def register_core_routes(
                         conv,
                         server_version=VERSION,
                         suppress_recovery_turn=True,
+                        smart_routing_available=routing_available(get_caps()),
                     )
                 except Exception:
                     # Must not fail the create, but the degradation loses the
@@ -3395,6 +3398,7 @@ def register_core_routes(
                                 conv,
                                 server_version=VERSION,
                                 suppress_recovery_turn=conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1",
+                                smart_routing_available=routing_available(get_caps()),
                             ),
                             timeout=10.0,
                         )
