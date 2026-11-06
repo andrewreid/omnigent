@@ -3329,12 +3329,18 @@ async def test_continue_sends_while_an_earlier_turn_is_still_going(live_status: 
 
 
 @pytest.mark.asyncio
-async def test_continue_budget_is_per_fire_on_top_of_session_spend() -> None:
+async def test_continue_budget_is_per_fire_on_top_of_session_spend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The baseline is the spend the budget policy enforces, sub-agents included.
 
     The earlier run's cap is updated by the session's fixed id, without reading
-    the session's policies.
+    the session's policies, and the session's runner is told its policies changed.
     """
+    from omnigent.server.routes._sessions import orchestration
+
+    notified: list[str] = []
+    monkeypatch.setattr(orchestration, "_spawn_policies_changed_forward", notified.append)
     conv_store = _ExistingConversationStore(
         _continued_session(session_usage={"total_cost_usd": 1.0}),
         _FakeConversation(
@@ -3364,6 +3370,7 @@ async def test_continue_budget_is_per_fire_on_top_of_session_spend() -> None:
     [cap] = policy_store.created
     assert cap["policy_id"] == fire_mod._cost_budget_policy_id("task_1", "conv_prev")
     assert cap["factory_params"] == {"max_cost_usd": 5.25}
+    assert notified == ["conv_prev"]
 
 
 def _seeded_budget(policy_store: Any, policy_id: str) -> None:

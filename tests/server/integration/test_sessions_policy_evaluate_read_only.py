@@ -218,6 +218,14 @@ async def test_read_only_caller_gets_verdict_but_no_label_mutation(
         "LEVEL_READ caller must not mutate session labels via policy evaluate"
     )
 
+    # Tool dispatch must record policy writes, so it needs edit access.
+    resp = await auth_client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json={**_tool_call_request("Read"), "_omnigent_return_ask": True},
+        headers={"X-Forwarded-Email": READER},
+    )
+    assert resp.status_code == 403, resp.text
+
 
 async def test_edit_caller_persists_labels_as_before(
     auth_client: httpx.AsyncClient,
