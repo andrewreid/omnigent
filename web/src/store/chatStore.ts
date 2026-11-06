@@ -111,6 +111,7 @@ import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSe
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import {
+  ARCHIVED_AT_LABEL_KEY,
   filtersFromConversationQueryKey,
   insertNewRowsIntoPages,
   markRecentlyCreated,
@@ -9348,7 +9349,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Child status delta pushed to the parent stream — patch the
       // child-sessions cache in place (no refetch). Also covers the
       // snapshot-on-connect frames, which reuse this event shape.
-      applyChildSessionUpdated(event.conversationId, event.childSessionId, event.child);
+      applyChildSessionUpdated(event.conversationId, event.childSessionId, event.child, {
+        // A deeper sub-agent's row reaches every ancestor's stream; only the
+        // stream's own children may seed a cold list, since one relayed row
+        // would hide its siblings.
+        seedColdCache:
+          streamConversationId === undefined || streamConversationId === event.conversationId,
+      });
       // A claude-native child's turn-complete delta carries busy=false but no
       // last_message_preview (its reply lives in the tmux pane, not the
       // runner's in-process history). Refetch the parent's child list so the
@@ -9535,17 +9542,44 @@ function applyTerminalDeleted(sessionId: string, resourceId: string): void {
  * cache (parent not viewed since reload) is a no-op — the eventual
  * ``useChildSessions`` mount pulls a fresh list.
  */
+/** Children seen archived; partial deltas about them must not re-add their row. */
+const archivedChildSessionIds = new Set<string>();
+
 function applyChildSessionUpdated(
   parentId: string,
   childId: string,
   child: Record<string, unknown>,
+  { seedColdCache }: { seedColdCache: boolean },
 ): void {
   if (queryClient === null) return;
   const key = childSessionsQueryKey(parentId);
+  const cached = queryClient.getQueryData<ChildSessionInfo[]>(key);
+  // Archived children leave `child_sessions`, so they leave the cached list
+  // until a full row (one with labels) shows them unarchived.
+  const labels = child.labels;
+  if (labels && typeof labels === "object") {
+    if (ARCHIVED_AT_LABEL_KEY in labels) {
+      archivedChildSessionIds.add(childId);
+      if (cached?.some((c) => c.id === childId)) {
+        queryClient.setQueryData<ChildSessionInfo[]>(
+          key,
+          cached.filter((c) => c.id !== childId),
+        );
+      }
+      return;
+    }
+    archivedChildSessionIds.delete(childId);
+  }
+  if (archivedChildSessionIds.has(childId)) {
+    // A refetched list that has the child back is authoritative.
+    if (!cached?.some((c) => c.id === childId)) return;
+    archivedChildSessionIds.delete(childId);
+  }
   // Initialize a cold cache rather than skipping: snapshot-on-connect
   // sends full child rows over the stream, so seeding here lets child
   // status/preview update live even when no useChildSessions is mounted.
-  const current = queryClient.getQueryData<ChildSessionInfo[]>(key) ?? [];
+  if (cached === undefined && !seedColdCache) return;
+  const current = cached ?? [];
 
   // Build a patch from only the fields PRESENT in the payload (undefined
   // = "not in this delta, leave as-is"); explicit null is a real value.

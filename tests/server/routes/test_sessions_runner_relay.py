@@ -344,6 +344,57 @@ async def test_subagent_activity_waits_for_final_idle_after_buffered_turns(
     assert items[-1].data.resource["status"] == outcome
 
 
+@pytest.mark.asyncio
+async def test_relayed_child_spawn_and_deltas_reach_further_ancestors(db_uri: str) -> None:
+    """A child's runner reports its own sub-agent's spawn and deltas to the
+    child's stream only; the root's stream must carry them too, still naming
+    the child as their parent."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    store = SqlAlchemyConversationStore(db_uri)
+    root = store.create_conversation()
+    child = store.create_conversation(parent_conversation_id=root.id, title="planner:auth")
+    grandchild = store.create_conversation(
+        parent_conversation_id=child.id, title="researcher:auth"
+    )
+    release = asyncio.Event()
+    release.set()
+    child_events = [
+        {
+            "type": "session.created",
+            "conversation_id": child.id,
+            "child_session_id": grandchild.id,
+        },
+        {
+            "type": "session.child_session.updated",
+            "conversation_id": child.id,
+            "child_session_id": grandchild.id,
+            "child": {"id": grandchild.id, "busy": False, "current_task_status": "launching"},
+        },
+    ]
+    collector = await start_session_stream_collector(root.id)
+    try:
+        await _relay_runner_stream_once(
+            child.id,
+            _ScriptedRunnerClient(release, child_events),
+            store,  # type: ignore[arg-type]
+        )
+        received = []
+        while len(received) < 2:
+            event = await asyncio.wait_for(collector.queue.get(), timeout=5.0)
+            if event.get("type") in ("session.created", "session.child_session.updated"):
+                received.append(event)
+        assert [(e["type"], e["conversation_id"]) for e in received] == [
+            ("session.created", child.id),
+            ("session.child_session.updated", child.id),
+        ]
+        assert received[1]["child"]["current_task_status"] == "launching"
+    finally:
+        await collector.stop()
+        session_stream.close(root.id)
+
+
 @pytest.mark.parametrize(
     ("harness", "wrapper", "native"),
     [

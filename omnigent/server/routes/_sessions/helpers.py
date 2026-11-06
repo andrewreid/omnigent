@@ -1677,6 +1677,26 @@ def _ancestor_session_ids(
     return ancestors
 
 
+def _publish_to_further_ancestors(
+    conv_store: ConversationStore,
+    parent_id: str,
+    event: dict[str, Any],
+) -> None:
+    """
+    Publish a sub-agent event, already sent to *parent_id*, to its ancestors too.
+
+    Lets a stream hear its whole subtree. The event keeps naming the
+    sub-agent's own parent, so a client attaches it under that parent.
+
+    :param conv_store: Store used to discover ancestor sessions.
+    :param parent_id: The sub-agent's parent, e.g. ``"conv_parent123"``.
+    :param event: The event published to the parent, e.g. a
+        ``session.child_session.updated`` dict.
+    """
+    for ancestor_id in _ancestor_session_ids(conv_store, parent_id):
+        session_stream.publish(ancestor_id, event)
+
+
 # Ancestor mirrors run on worker threads and can finish out of order; this
 # keeps a late mirror from overwriting a newer state of the same card.
 _ancestor_elicitation_mirror_lock = threading.Lock()
@@ -3820,11 +3840,12 @@ async def _publish_session_created(
     harness: str | None,
 ) -> None:
     """
-    Emit ``session.created`` on the parent's stream for a child session.
+    Emit ``session.created`` on the parent's and further ancestors' streams.
 
     Clients watching the parent (e.g. the web Subagents rail tab)
     invalidate their ``child_sessions`` cache and re-fetch on this
-    event.
+    event; the ancestors' copies let a stream list a new deeper sub-agent
+    before its first status edge.
 
     :param parent_id: Parent conversation id, e.g. ``"conv_parent987"``.
     :param child_session_id: The minted (or adopted) child id, e.g.
@@ -3842,7 +3863,9 @@ async def _publish_session_created(
         agent_id=agent_id,
         parent_session_id=parent_id,
     )
-    session_stream.publish(parent_id, event.model_dump())
+    payload = event.model_dump()
+    session_stream.publish(parent_id, payload)
+    await asyncio.to_thread(_publish_to_further_ancestors, conversation_store, parent_id, payload)
     # Native-harness sub-agents are minted outside the general create path's
     # ``session_created`` logger, so emit the join key here. Log the child
     # explicitly without rebinding the parent relay's request scope.
@@ -4928,9 +4951,9 @@ def _require_permission_mode_forward(
     return settled if isinstance(settled, str) and settled else mode
 
 
-def _publish_child_status_to_parent(session_id: str, status: str) -> None:
+def _publish_child_summary_to_ancestors(session_id: str, status: str | None = None) -> None:
     """
-    Mirror a status transition onto the session's parent stream.
+    Mirror a sub-agent's status transition or row change onto its parent's stream.
 
     A sub-agent's ``busy`` / ``current_task_status`` on the parent's Agents
     rail comes from ``session.child_session.updated`` events. The runner
@@ -4939,16 +4962,20 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
     its parent, changes status without the parent's stream ever hearing of
     it. The server sees every transition in ``_session_status_cache``, so
     it republishes the child's current summary to the parent from here; a
-    top-level session (no parent) publishes nothing.
+    top-level session (no parent) publishes nothing. A deeper sub-agent's
+    event is also published to every further ancestor, still naming its own
+    parent as ``conversation_id``, so a stream sees its whole subtree.
 
     The store reads run on the ordered live-state worker so a ``running``
     → ``idle`` pair can never fan out reversed, and the event-loop caller
     only pays a queue put.
 
-    :param session_id: Session whose cached status just changed,
+    :param session_id: Sub-agent whose status or row changed,
         e.g. ``"conv_child123"``.
-    :param status: The new status, e.g. ``"running"``. Captured here rather
-        than re-read on the worker so each edge fans out its own value.
+    :param status: The new status of a status edge, e.g. ``"running"``.
+        Captured here rather than re-read on the worker so each edge fans out
+        its own value. ``None`` for a row change such as a close, which
+        republishes the current status.
     """
     store = session_live_state.conversation_store()
     if store is None:
@@ -4972,7 +4999,10 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
             child_session_id=conv.id,
             child=summary.model_dump(mode="json"),
         )
-        session_stream.publish(parent_id, event.model_dump())
+        payload = event.model_dump()
+        session_stream.publish(parent_id, payload)
+        if parent_id != conv.root_conversation_id:
+            _publish_to_further_ancestors(store, parent_id, payload)
 
     session_live_state.submit("child_status_fanout", _fan_out)
 
@@ -5128,7 +5158,7 @@ def _publish_status(
     _session_status_cache[session_id] = status
     _set_blocked_on(session_id, blocked_on)
     if previous_status != status:
-        _publish_child_status_to_parent(session_id, status)
+        _publish_child_summary_to_ancestors(session_id, status)
     if status == "idle" and previous_status in ("running", "waiting") and persist_live_status:
         # A turn can open or merge a PR while nobody watches; refresh what the server
         # stores. Stops and archives publish idle without persisting it, and skip this.

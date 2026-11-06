@@ -5081,7 +5081,9 @@ class SessionChildSessionUpdatedEvent(_SSEEventBase):
     :class:`ChildSessionSummary` so the web patches its cache directly.
 
     :param type: Always ``"session.child_session.updated"``.
-    :param conversation_id: The PARENT (carrier) session id.
+    :param conversation_id: The child's PARENT session id. A deeper
+        sub-agent's status edge is also published on every further ancestor's
+        stream, still carrying its own parent here.
     :param child_session_id: The child session id, e.g.
         ``"conv_child_abc123"``.
     :param child: A PARTIAL :class:`ChildSessionSummary` — the

@@ -162,6 +162,7 @@ from omnigent.server.routes._sessions.helpers import (
     _pin_claude_permission_launch_args,
     _presentation_labels_for_agent,
     _prune_session_read_state,
+    _publish_child_summary_to_ancestors,
     _publish_codex_approval_mode,
     _publish_collaboration_mode,
     _publish_permission_mode,
@@ -3874,6 +3875,12 @@ def register_core_routes(
             await asyncio.to_thread(
                 conversation_store.delete_label, session_id, pinned_label_key(user_id)
             )
+        # A sub-agent's title, labels and archive state are part of its row on
+        # the parent's stream, e.g. a close by its orchestrator.
+        if updated.parent_conversation_id is not None and (
+            body.title is not None or labels_to_set or body.archived is not None
+        ):
+            _publish_child_summary_to_ancestors(session_id)
         if requested_codex_collaboration_mode is not None:
             _publish_collaboration_mode(
                 session_id,

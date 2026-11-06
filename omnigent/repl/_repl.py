@@ -244,24 +244,29 @@ _LIST_ITEMS_MAX_RESTARTS = 3
 _OVERVIEW_FULL_REFRESH_SECONDS = 30.0
 
 # Turn-completion backstop: the stream normally ends a turn, so the snapshot is
-# checked after the first second and then less often.
+# checked after the first second and then less often until the stream shows it
+# is live, then only on reconnect and at the slow live-stream interval.
 _TURN_BACKSTOP_FIRST_SECONDS = 1.0
 _TURN_BACKSTOP_MAX_SECONDS = 5.0
+_TURN_BACKSTOP_LIVE_SECONDS = 30.0
 
 # Sub-agent tree (state badge + ``↓`` menu). The depth cap mirrors web's
 # ``MAX_TREE_DEPTH`` so the CLI tree matches the web Agents rail; the poll
-# cadence refreshes deeper levels (the SSE stream only carries the active
-# session's direct children) while sub-agents are active.
+# cadence refreshes the tree while the user is inside a sub-agent, whose stream
+# doesn't carry the rest of the tree.
 _MAX_SUBAGENT_TREE_DEPTH = 3
 _SUBAGENT_POLL_SECONDS = 2.0
 # The poll doubles its wait after each fetch that changed nothing (or failed),
-# up to this cap, and snaps back to _SUBAGENT_POLL_SECONDS on any change, any
-# child-session event, or user input.
+# up to this cap, and snaps back to _SUBAGENT_POLL_SECONDS on any change or
+# wake.
 _SUBAGENT_POLL_MAX_SECONDS = 10.0
 # Fetches skip the children of subtrees that have settled. While the poll runs
 # (see _should_discover_subagents), a periodic full walk still catches a
 # settled grandchild that resumed without an event the REPL can see.
 _SUBAGENT_FULL_SWEEP_SECONDS = 60.0
+# While the root's stream pushes the tree, a fetch with nothing waking it is
+# only a safety net against a missed event.
+_SUBAGENT_SAFETY_POLL_SECONDS = 60.0
 
 
 def _load_startup_theme() -> TerminalTheme:
@@ -1490,6 +1495,16 @@ class _SessionsChatReplAdapter:
         self._stream_task: asyncio.Task[None] | None = None
         # Set once the current stream subscription registers or its attempt ends.
         self._stream_ready = asyncio.Event()
+        # Called whenever a stream subscription delivers its first event, so the
+        # REPL can resync state the stream may have missed while disconnected.
+        self._on_stream_connected: Callable[[], None] | None = None
+        # Set when the subscription drops or reconnects, so an in-flight turn
+        # re-checks the snapshot for a terminal status it may have missed and
+        # falls back to frequent checks while the stream is down.
+        self._stream_resync = asyncio.Event()
+        # Whether the stream has delivered an event since the turn started (or
+        # since it last reconnected); until then the turn backstop checks often.
+        self._turn_stream_live = False
         self._recover_task: asyncio.Task[None] | None = None
         self._recover_lock = asyncio.Lock()
         self._bind_lock = asyncio.Lock()
@@ -2370,8 +2385,10 @@ class _SessionsChatReplAdapter:
         _dbg = bool(os.environ.get("OMNIGENT_SESSIONS_ADAPTER_DEBUG"))
         backoff = 0.5
         max_backoff = 5.0
+        subscriptions = 0
         assert self._session_id is not None
         while True:
+            connected = False
             try:
                 if _dbg:
                     print(
@@ -2381,6 +2398,11 @@ class _SessionsChatReplAdapter:
                     )
                 async for event in self._client.sessions.stream(self._session_id):
                     self._stream_ready.set()
+                    self._turn_stream_live = True
+                    if not connected:
+                        connected = True
+                        subscriptions += 1
+                        self._note_stream_connected(reconnected=subscriptions > 1)
                     if isinstance(event, _StatusEv) and event.status in (
                         "idle",
                         "waiting",
@@ -2393,6 +2415,7 @@ class _SessionsChatReplAdapter:
                         self._on_event(event)
                 # Clean close (server sent [DONE]). Reopen.
                 self._stream_ready.set()
+                self._note_stream_dropped()
                 await asyncio.sleep(backoff)
                 backoff = 0.5
             except asyncio.CancelledError:
@@ -2400,6 +2423,7 @@ class _SessionsChatReplAdapter:
             except Exception as exc:  # noqa: BLE001 — reconnect on any error
                 # A failed attempt will not register; don't hold up the post.
                 self._stream_ready.set()
+                self._note_stream_dropped()
                 # Recoverable transport errors (peer closed mid-chunk,
                 # read timeout, transient network error) are normal
                 # background noise — the session continues server-side
@@ -2443,33 +2467,63 @@ class _SessionsChatReplAdapter:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
 
+    def _note_stream_dropped(self) -> None:
+        """Record that the subscription ended, so events may be missed until it returns."""
+        self._turn_stream_live = False
+        self._stream_resync.set()
+
+    def _note_stream_connected(self, *, reconnected: bool) -> None:
+        """Record that a stream subscription delivered its first event.
+
+        :param reconnected: Whether an earlier subscription of this pump was
+            lost, so events published in between were never delivered.
+        """
+        if reconnected:
+            self._stream_resync.set()
+        if self._on_stream_connected is not None:
+            self._on_stream_connected()
+
+    async def _turn_done_or_resync(self) -> None:
+        """Return once the turn ends or a reconnected stream asks for a resync."""
+        waiters = (
+            asyncio.ensure_future(self._turn_done.wait()),
+            asyncio.ensure_future(self._stream_resync.wait()),
+        )
+        try:
+            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
+
     async def _wait_for_turn_done(self, session_id: str) -> None:
         """Wait for the in-flight turn, checking the snapshot as a backstop.
 
-        The stream pump sets ``_turn_done`` on the terminal status event. If the
-        subscription missed it, the snapshot's status settles the turn: checked
-        after the first second, then with a growing interval, since a missed
-        event is caught by the early checks and later ones only cost requests.
+        The stream pump sets ``_turn_done`` on the terminal status event. Until
+        the stream delivers an event for this turn, the subscription may not be
+        live, so the snapshot is checked after the first second and then with a
+        growing interval. Once events arrive, the snapshot is checked right after
+        a reconnect and otherwise only every ``_TURN_BACKSTOP_LIVE_SECONDS``.
 
         :param session_id: Session whose turn is in flight.
         """
         interval = _TURN_BACKSTOP_FIRST_SECONDS
         while not self._turn_done.is_set():
-            try:
-                # Event.wait() is cancellation-safe (its finally block removes
-                # the waiter from Event._waiters), so no asyncio.shield() is
-                # needed — shield leaks orphaned Tasks on each timeout iteration.
-                await asyncio.wait_for(self._turn_done.wait(), timeout=interval)
-            except TimeoutError:
-                snap = await self._client.sessions.get(
-                    session_id,
-                    include_items=False,
-                    include_liveness=False,
-                    include_usage=False,
-                )
-                if snap.status in ("idle", "failed"):
-                    self._turn_done.set()
-                interval = min(interval * 2, _TURN_BACKSTOP_MAX_SECONDS)
+            timeout = _TURN_BACKSTOP_LIVE_SECONDS if self._turn_stream_live else interval
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._turn_done_or_resync(), timeout=timeout)
+            if self._turn_done.is_set():
+                return
+            self._stream_resync.clear()
+            snap = await self._client.sessions.get(
+                session_id,
+                include_items=False,
+                include_liveness=False,
+                include_usage=False,
+            )
+            if snap.status in ("idle", "failed"):
+                self._turn_done.set()
+            interval = min(interval * 2, _TURN_BACKSTOP_MAX_SECONDS)
 
     async def send(
         self,
@@ -2540,6 +2594,8 @@ class _SessionsChatReplAdapter:
         # and tool rendering inline rather than as history items.
         self._is_streaming = True
         self._turn_done = asyncio.Event()
+        self._turn_stream_live = False
+        self._stream_resync.clear()
         self._pending_local_user_sends += 1
 
         try:
@@ -2624,6 +2680,8 @@ class _SessionsChatReplAdapter:
 
         self._is_streaming = True
         self._turn_done = asyncio.Event()
+        self._turn_stream_live = False
+        self._stream_resync.clear()
         command_key = (skill_name, arguments)
         self._pending_local_skill_slash_commands.append(command_key)
 
@@ -3611,12 +3669,37 @@ async def run_repl(
         _background_event_tasks.add(_refresh_task)
         _refresh_task.add_done_callback(_background_event_tasks.discard)
 
-    # Wakes the sub-agent poll early and resets its backoff. Set by child-session
-    # stream events and by user input; ``subagent_force_expand`` collects parents
-    # whose children an event says changed, so the next fetch re-reads them even
-    # if their subtree had settled.
+    # Requests a sub-agent tree fetch now and resets the backoff. Set when the
+    # stream (re)connects, on user input, and by a child-session event the tree
+    # can't place; ``subagent_force_expand`` collects parents whose children
+    # such an event says changed, so the fetch re-reads them even if their
+    # subtree had settled.
     subagent_poll_wake = asyncio.Event()
     subagent_force_expand: set[str] = set()
+    # Set with the wake when the tree may have missed something (a stream
+    # reconnect, an event it can't place): the next fetch is a full walk and
+    # runs even when no sub-agent is active.
+    subagent_resync: list[bool] = [False]
+    # Carriers a resync was already requested for: one deeper than the tree
+    # shows is never placed, and must not drive a full walk per event.
+    unplaced_carriers: set[str] = set()
+    # Counts pushed child-session events, so a tree fetch they overlapped (and
+    # whose snapshot may predate them) is followed by a corrective fetch.
+    subagent_pushes: list[int] = [0]
+
+    def _request_subagent_resync() -> None:
+        subagent_resync[0] = True
+        subagent_poll_wake.set()
+
+    # The session the tree is rooted at — the originally-launched "main"
+    # session. It tracks the live top-level session id while the user is at
+    # the top and freezes once they dive into a sub-agent, so the whole
+    # hierarchy + the way back to main stay correct even if the main session
+    # id changes (e.g. a runner rebind reassigns it). The adapter's
+    # ``_readonly_view`` flag (set atomically by ``view_session`` and cleared
+    # on switch / clear / new) is the single source of truth for "are we
+    # observing a sub-agent below the root".
+    subagent_root: list[str | None] = [None]
 
     def _render_session_event(event: object) -> None:
         """Push-based renderer for all session stream events.
@@ -3808,17 +3891,27 @@ async def run_repl(
         # ``session.created`` / ``session.child_session.updated``. Apply them
         # to the host registry (state badge + ↓ menu) before the generic
         # translation below, which has no branch for them and would drop them.
+        tree_root_id = subagent_root[0] or session.session_id
         if _apply_child_session_event(
             event,
             active_conversation_id=session.session_id,
             host=host,
+            tree_root_id=tree_root_id,
+            request_resync=_request_subagent_resync,
         ):
-            # A relayed event about a deeper level names its parent as the
-            # carrier: re-read that parent's children on the woken fetch.
+            subagent_pushes[0] += 1
+            # A deeper level's event names its parent as the carrier. One whose
+            # parent isn't in the tree yet can't be placed: re-read that
+            # parent's children instead.
             carrier = getattr(event, "conversation_id", None)
-            if isinstance(carrier, str) and carrier != session.session_id:
+            if (
+                isinstance(carrier, str)
+                and carrier not in unplaced_carriers
+                and _subagent_carrier_depth(host, carrier, tree_root_id=tree_root_id) is None
+            ):
+                unplaced_carriers.add(carrier)
                 subagent_force_expand.add(carrier)
-            subagent_poll_wake.set()
+                _request_subagent_resync()
             if tape_entry is not None:
                 _event_tape.update_translation(tape_entry, event)  # type: ignore[union-attr]
                 _maybe_log_tape_entry(tape_entry)
@@ -4179,6 +4272,7 @@ async def run_repl(
             return
 
     session._on_event = _render_session_event
+    session._on_stream_connected = _request_subagent_resync
 
     def _maybe_log_tape_entry(entry: TapeEntry) -> None:
         """Write a tape entry to the JSONL log if the handle is open.
@@ -4539,18 +4633,8 @@ async def run_repl(
     # of the terminal (the host owns the list UI); Enter switches into the
     # selected agent's live session via the ``on_subagent_select`` callback
     # wired below, Esc closes. The tree is fed live by
-    # ``_apply_child_session_event`` (direct children) plus the recursive
-    # ``_refresh_subagent_tree`` poll (deeper levels).
-
-    # The session the tree is rooted at — the originally-launched "main"
-    # session. It tracks the live top-level session id while the user is at
-    # the top and freezes once they dive into a sub-agent, so the whole
-    # hierarchy + the way back to main stay correct even if the main session
-    # id changes (e.g. a runner rebind reassigns it). The adapter's
-    # ``_readonly_view`` flag (set atomically by ``view_session`` and cleared
-    # on switch / clear / new) is the single source of truth for "are we
-    # observing a sub-agent below the root".
-    subagent_root: list[str | None] = [None]
+    # ``_apply_child_session_event`` (pushed rows at every level) plus the
+    # ``_refresh_subagent_tree`` fetch.
 
     # The root the selector tree was last discovered for. Lets the poll run a
     # one-shot discovery whenever the root CHANGES (resume / ``/switch`` into a
@@ -4599,22 +4683,21 @@ async def run_repl(
         )
 
     async def _subagent_poll_loop() -> None:
-        # Periodically re-fetch the tree so nested (grandchild) levels + live
-        # statuses stay current — the SSE stream only carries the active
-        # session's direct children. The root-sync runs every tick (cheap, no
-        # I/O) so the root stays accurate. The tree re-fetch fires while there
-        # is live work to track — an active sub-agent, or a child the user has
-        # dived into (whose own stream can't refresh its row) — OR when the root
-        # just changed (the discovery poll that repopulates the selector after a
-        # resume / ``/switch`` into a session that already has children, which
-        # would otherwise never poll: no SSE, no nodes yet). It deliberately
-        # goes quiet once everything settles at the top level: a finished
-        # sub-agent's status no longer changes, so polling retained-but-terminal
-        # nodes forever is pure waste; a child that later resumes re-arms the
-        # poll via the active stream's ``session.child_session.updated``.
+        # Fetch the tree when the stream can't keep it current. At the root,
+        # the root's stream pushes ``session.child_session.updated`` for every
+        # level (the server relays deeper edges to each ancestor), so fetches
+        # run only for discovery (the root just changed: a resume / ``/switch``
+        # into a session that already has children), on a resync (stream
+        # reconnect, an event the tree can't place; these run even when
+        # nothing is active), on user input, and as a
+        # ``_SUBAGENT_SAFETY_POLL_SECONDS`` safety net while sub-agents are
+        # active. While the user has dived into a child, the stream is the
+        # child's own, which never carries the child's own row, its siblings
+        # or the root, so the tree is polled with a backoff as before. The
+        # root-sync runs every tick (cheap, no I/O) so the root stays accurate.
         #
-        # Each fetch skips settled subtrees, and the wait between fetches backs
-        # off while nothing changes; see _SUBAGENT_POLL_MAX_SECONDS.
+        # Each fetch skips settled subtrees, and a polled wait backs off while
+        # nothing changes; see _SUBAGENT_POLL_MAX_SECONDS.
         delay = _SUBAGENT_POLL_SECONDS
         # Keyed by full_sweep: a full walk returns rows a partial fetch skips, so
         # only fetches of the same kind are comparable.
@@ -4623,13 +4706,15 @@ async def run_repl(
         last_fetch = 0.0
         loop = asyncio.get_running_loop()
         while True:
+            observing_subagent = getattr(session, "_readonly_view", False) or getattr(
+                session, "_interactive_child", False
+            )
+            resync = subagent_resync[0]
+            subagent_resync[0] = False
             try:
                 _sync_subagent_root()
                 root_id = subagent_root[0]
-                observing_subagent = getattr(session, "_readonly_view", False) or getattr(
-                    session, "_interactive_child", False
-                )
-                if _should_discover_subagents(
+                if (resync and root_id is not None) or _should_discover_subagents(
                     root_id,
                     has_active_subagents=host.has_active_subagents(),
                     observing_subagent=observing_subagent,
@@ -4639,9 +4724,13 @@ async def run_repl(
                     last_fetch = loop.time()
                     full_sweep = (
                         root_changed
+                        or resync
                         or loop.time() - last_full_sweep >= _SUBAGENT_FULL_SWEEP_SECONDS
                     )
+                    pushes_before = subagent_pushes[0]
                     fingerprint = await _refresh_subagents(expand_all=full_sweep)
+                    if subagent_pushes[0] != pushes_before:
+                        _request_subagent_resync()
                     polled_root[0] = root_id
                     if full_sweep and fingerprint is not None:
                         last_full_sweep = loop.time()
@@ -4661,7 +4750,10 @@ async def run_repl(
             except Exception:  # noqa: BLE001 — best-effort background poll; never crash the REPL
                 delay = _next_subagent_poll_delay(delay, changed=False)
             try:
-                await asyncio.wait_for(subagent_poll_wake.wait(), timeout=delay)
+                await asyncio.wait_for(
+                    subagent_poll_wake.wait(),
+                    timeout=_subagent_wait_seconds(delay, observing_subagent=observing_subagent),
+                )
             except TimeoutError:
                 pass
             else:
@@ -6832,6 +6924,18 @@ def _next_subagent_poll_delay(delay: float, *, changed: bool) -> float:
     return min(delay * 2, _SUBAGENT_POLL_MAX_SECONDS)
 
 
+def _subagent_wait_seconds(delay: float, *, observing_subagent: bool) -> float:
+    """Return how long the tree loop sleeps unless something wakes it.
+
+    :param delay: The current polling backoff, used while observing a child.
+    :param observing_subagent: Whether the user is inside a sub-agent, whose
+        stream doesn't carry the rest of the tree.
+    :returns: *delay* while observing; otherwise the safety-net interval, since
+        the root's stream pushes every level.
+    """
+    return delay if observing_subagent else _SUBAGENT_SAFETY_POLL_SECONDS
+
+
 def _should_discover_subagents(
     root_id: str | None,
     *,
@@ -6880,20 +6984,29 @@ def _apply_child_session_event(
     *,
     active_conversation_id: str | None,
     host: TerminalHost,
+    tree_root_id: str | None = None,
+    request_resync: Callable[[], None] | None = None,
 ) -> bool:
     """Apply a child-session SSE event to the host's sub-agent registry.
 
     Handles ``session.created`` (register a launching child) and
-    ``session.child_session.updated`` (merge the partial summary), but only
-    when the event's carrier ``conversation_id`` is the active session — so a
-    relayed grandchild event riding an ancestor stream doesn't get attached
-    to the wrong parent. Deeper tree levels are populated by the recursive
-    ``child_sessions`` poll (:func:`_refresh_subagent_tree`), not these events.
+    ``session.child_session.updated`` (merge the partial summary) under the
+    event's carrier ``conversation_id`` when the carrier is placed in the tree
+    above the depth cap (:func:`_subagent_carrier_depth`). The server relays
+    deeper levels' events to every ancestor's stream naming their own parent
+    as the carrier, so they attach where they belong; an event whose carrier
+    isn't in the tree is left for a tree fetch. An archived child is removed,
+    as ``child_sessions`` stops listing it.
 
     :param event: The decoded SSE event from the stream pump.
     :param active_conversation_id: The session the REPL is currently
-        streaming, used both as the filter and as the new child's parent.
+        streaming, e.g. ``"conv_main"``.
     :param host: The :class:`TerminalHost` whose registry is mutated.
+    :param tree_root_id: The root the selector tree is shown from, which stays
+        put while the user is inside a sub-agent; defaults to the active
+        session.
+    :param request_resync: Called when the tree needs a full fetch, e.g. an
+        unarchived child whose subtree was dropped.
     :returns: ``True`` if *event* was a child-session event (so the caller
         stops dispatching it), ``False`` otherwise.
     """
@@ -6903,24 +7016,51 @@ def _apply_child_session_event(
     from omnigent.server.schemas import (
         SessionCreatedEvent as _ChildCreated,
     )
+    from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY
 
-    if isinstance(event, _ChildCreated):
-        if event.conversation_id == active_conversation_id:
-            host.upsert_subagent(
-                event.child_session_id,
-                parent_id=active_conversation_id,
-                child={"current_task_status": "launching"},
-            )
+    if not isinstance(event, _ChildCreated | _ChildUpdated):
+        return False
+    carrier = event.conversation_id
+    depth = _subagent_carrier_depth(
+        host, carrier, tree_root_id=tree_root_id or active_conversation_id
+    )
+    if depth is None or depth >= _MAX_SUBAGENT_TREE_DEPTH:
         return True
-    if isinstance(event, _ChildUpdated):
-        if event.conversation_id == active_conversation_id:
-            host.upsert_subagent(
-                event.child_session_id,
-                parent_id=active_conversation_id,
-                child=event.child,
-            )
+    labels = event.child.get("labels") if isinstance(event, _ChildUpdated) else None
+    if isinstance(labels, dict):
+        # Archived sub-agents leave ``child_sessions``, so they leave the tree;
+        # a row with labels but no archive stamp has been unarchived.
+        if ARCHIVED_AT_LABEL_KEY in labels:
+            host.archive_subagent(event.child_session_id)
+            return True
+        if host.unarchive_subagent(event.child_session_id) and request_resync is not None:
+            request_resync()
+    if host.is_subagent_archived(event.child_session_id):
         return True
-    return False
+    child = (
+        {"current_task_status": "launching"} if isinstance(event, _ChildCreated) else event.child
+    )
+    host.upsert_subagent(event.child_session_id, parent_id=carrier, child=child)
+    return True
+
+
+def _subagent_carrier_depth(
+    host: TerminalHost,
+    carrier: str,
+    *,
+    tree_root_id: str | None,
+) -> int | None:
+    """Return how deep a child-session event's carrier sits in the selector tree.
+
+    :param host: The :class:`TerminalHost` holding the tree.
+    :param carrier: The event's ``conversation_id`` (the child's parent).
+    :param tree_root_id: The root the tree is shown from, or ``None``.
+    :returns: ``0`` for the root, ``1`` for its child, and so on; ``None``
+        when the carrier isn't placed in the tree.
+    """
+    if tree_root_id is None:
+        return None
+    return host.subagent_depth(carrier, tree_root_id)
 
 
 async def _refresh_subagent_tree(
