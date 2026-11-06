@@ -11390,6 +11390,115 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       expect(cached?.[0].busy).toBe(true);
     });
 
+    it("leaves a cold cache alone for a deeper sub-agent's relayed row", () => {
+      // The root's stream also carries grandchildren's rows; seeding the
+      // child's empty list with one of them would hide its siblings.
+      handleSessionEvent(
+        {
+          type: "session_child_session_updated",
+          conversationId: "conv_parent",
+          childSessionId: "conv_child1",
+          child: child(),
+        },
+        "conv_root",
+      );
+      expect(client.getQueryData(childSessionsQueryKey("conv_parent"))).toBeUndefined();
+
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), []);
+      handleSessionEvent(
+        {
+          type: "session_child_session_updated",
+          conversationId: "conv_parent",
+          childSessionId: "conv_child1",
+          child: child(),
+        },
+        "conv_root",
+      );
+      expect(
+        client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent")),
+      ).toHaveLength(1);
+    });
+
+    it("drops an archived child from the cached list", () => {
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), []);
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: child(),
+      });
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: child({ labels: { "omnigent.archived_at": "1762400000" } }),
+      });
+      expect(client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"))).toEqual(
+        [],
+      );
+
+      // A late partial delta keeps it out; a full row without the stamp
+      // (an unarchive) brings it back.
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: { id: "conv_child1", busy: false },
+      });
+      expect(client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"))).toEqual(
+        [],
+      );
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: child({ labels: { "omnigent.archived_at": "1762400000" } }),
+      });
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child1",
+        child: child({ labels: {} }),
+      });
+      expect(
+        client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent")),
+      ).toHaveLength(1);
+    });
+
+    it("applies partial deltas again once a refetched list has the child back", () => {
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child2",
+        child: child({ id: "conv_child2", labels: { "omnigent.archived_at": "1762400000" } }),
+      });
+      // Unarchived while unwatched; the REST refetch lists it again.
+      client.setQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"), [
+        {
+          id: "conv_child2",
+          title: "researcher:auth",
+          task_summary: null,
+          tool: "researcher",
+          session_name: "auth",
+          labels: {},
+          current_task_status: "completed",
+          last_task_error: null,
+          busy: false,
+          last_message_preview: null,
+          pending_elicitations_count: 0,
+        },
+      ]);
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_child2",
+        child: { id: "conv_child2", busy: true },
+      });
+      expect(
+        client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_parent"))?.[0].busy,
+      ).toBe(true);
+    });
+
     it("refetches the parent's child list when a child goes idle without a preview", () => {
       // claude-native turn-complete deltas carry busy=false but no preview
       // (the reply lives in the tmux pane). Refetch so the server-computed

@@ -338,6 +338,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_sandbox_status,
     _publish_status,
     _publish_terminal_pending,
+    _publish_to_further_ancestors,
     _query_host_runner_status,
     _read_state_entry,
     _record_daily_cost,
@@ -9486,6 +9487,15 @@ async def _relay_runner_stream_once(
                             await record_subagent_activity(
                                 child_id, "delegated", conversation_store, parent_id=session_id
                             )
+                    if evt_type in ("session.created", "session.child_session.updated"):
+                        # The runner reports a child's spawn and deltas to its
+                        # parent only; ancestors' streams carry the subtree too.
+                        await asyncio.to_thread(
+                            _publish_to_further_ancestors,
+                            conversation_store,
+                            session_id,
+                            event,
+                        )
 
                     # Stopped turn: drop its trailing response.* output (no
                     # forward, no persist) but keep text_acc — the pre-stop
