@@ -340,6 +340,29 @@ def test_error_report_leaves_the_failed_edge_to_the_stop_failure_hook(
     )
 
 
+def test_reports_idle_follows_osc_state_then_the_file(tmp_path: Path) -> None:
+    """Idle backoff needs an idle OSC report; without one the status file decides."""
+    path = tmp_path / "program-status.json"
+    fallback = SessionStatusPoller(
+        on_status=lambda _status, _reason: None,
+        pane_pid_getter=lambda: None,
+        session_id_getter=lambda: None,
+        config_dir=tmp_path,
+    )
+    poller = ClaudeProgramStatusPoller(
+        ProgramStatusReader(path), fallback, lambda _status, _reason: None
+    )
+    # No OSC report and nothing read from the file: unknown is not idle.
+    assert poller.reports_idle is False
+
+    for state, idle in (("working", False), ("blocked", False), ("error", False), ("idle", True)):
+        path.write_text(json.dumps({"relay_pid": os.getpid(), "status": {"state": state}}))
+        assert poller.reports_idle is idle, state
+
+    poller.retire()
+    assert poller.reports_idle is False
+
+
 @pytest.mark.parametrize(
     ("operation", "transition"),
     [("tick", "resync"), ("tick", "retire"), ("active", "retire"), ("blocked_on", "retire")],
