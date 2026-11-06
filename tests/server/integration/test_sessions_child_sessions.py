@@ -809,6 +809,165 @@ async def test_child_status_edge_fans_out_to_parent_stream(
         session_stream.close(session["id"])
 
 
+async def test_deeper_status_edge_reaches_every_ancestor_stream(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A deeper sub-agent's status edge is relayed to every ancestor's stream.
+
+    A stream otherwise only hears its direct children, so a client watching
+    a session (the REPL rooted there, the web session page) had to poll for
+    deeper levels. The relay keeps the sub-agent's own parent as
+    ``conversation_id`` so a client attaches it under that parent.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    from omnigent.runtime import session_stream
+    from tests.server.helpers import start_session_stream_collector
+
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    parent_id = session["id"]
+    chain: list[Conversation] = []
+    for title in ("planner:auth", "researcher:auth", "reader:auth"):
+        chain.append(
+            _seed_child(
+                conv_store=conv_store,
+                parent_id=chain[-1].id if chain else parent_id,
+                title=title,
+                agent_id=session["agent_id"],
+            )
+        )
+    child, grandchild, great_grandchild = chain
+    collectors = {sid: await start_session_stream_collector(sid) for sid in (parent_id, child.id)}
+    try:
+        sessions_module._publish_status(great_grandchild.id, "running")
+        # Fan-out is ordered, so the grandchild's own edge marks the end of
+        # whatever the great-grandchild's edge published.
+        sessions_module._publish_status(grandchild.id, "running")
+
+        for collector in collectors.values():
+            updates: list[dict[str, Any]] = []
+            while not updates or updates[-1]["child_session_id"] != grandchild.id:
+                event = await asyncio.wait_for(collector.queue.get(), timeout=5.0)
+                if event.get("type") == "session.child_session.updated":
+                    updates.append(event)
+            assert [(u["conversation_id"], u["child_session_id"]) for u in updates] == [
+                (grandchild.id, great_grandchild.id),
+                (child.id, grandchild.id),
+            ]
+            assert updates[0]["child"]["busy"] is True
+    finally:
+        for collector in collectors.values():
+            await collector.stop()
+        for conv in chain:
+            sessions_module._session_status_cache.pop(conv.id, None)
+        for sid in collectors:
+            session_stream.close(sid)
+
+
+async def test_deeper_spawn_reaches_every_ancestor_stream(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A grandchild's ``session.created`` also reaches the root's stream.
+
+    Its first status edge can come long after the spawn (a slow launch), and
+    until then only the parent's stream knew the grandchild existed.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes._sessions.helpers import _publish_session_created
+    from tests.server.helpers import start_session_stream_collector
+
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="planner:auth",
+        agent_id=session["agent_id"],
+    )
+    grandchild = _seed_child(
+        conv_store=conv_store,
+        parent_id=child.id,
+        title="researcher:auth",
+        agent_id=session["agent_id"],
+    )
+    collector = await start_session_stream_collector(session["id"])
+    try:
+        await _publish_session_created(
+            child.id,
+            grandchild.id,
+            session["agent_id"],
+            conv_store,
+            harness=None,
+        )
+
+        while True:
+            event = await asyncio.wait_for(collector.queue.get(), timeout=5.0)
+            if event.get("type") == "session.created":
+                break
+        assert event["conversation_id"] == child.id
+        assert event["child_session_id"] == grandchild.id
+    finally:
+        await collector.stop()
+        session_stream.close(session["id"])
+
+
+async def test_closing_a_child_republishes_its_row_to_the_parent_stream(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Closing a sub-agent (labels, archive) pushes its row to the parent.
+
+    A close changes no status, so without this a client watching the parent
+    keeps listing the closed child as chattable until it refetches the list.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY
+    from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+    from tests.server.helpers import start_session_stream_collector
+
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="researcher:auth",
+        agent_id=session["agent_id"],
+    )
+    collector = await start_session_stream_collector(session["id"])
+    try:
+        resp = await client.patch(
+            f"/v1/sessions/{child.id}",
+            json={"labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}, "archived": True},
+        )
+        assert resp.status_code == 200, resp.text
+
+        while True:
+            event = await asyncio.wait_for(collector.queue.get(), timeout=5.0)
+            if event.get("type") == "session.child_session.updated":
+                break
+        assert event["conversation_id"] == session["id"]
+        assert event["child_session_id"] == child.id
+        assert event["child"]["labels"][CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
+        # The archive stamp tells clients the child left ``child_sessions``.
+        assert ARCHIVED_AT_LABEL_KEY in event["child"]["labels"]
+    finally:
+        await collector.stop()
+        session_stream.close(session["id"])
+
+
 async def test_child_sessions_truncates_long_message_preview(
     client: httpx.AsyncClient,
     db_uri: str,
