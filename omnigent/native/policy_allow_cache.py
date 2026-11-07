@@ -6,10 +6,13 @@ policies. When the operator enables it, the server's no-policy ALLOW carries
 :data:`ALLOW_CACHE_FIELD`: how many seconds that answer stays valid. The hook
 that receives it records the expiry in the session's bridge directory, and the
 hook command's shell guard (:func:`guarded_hook_command`) answers later events
-itself until then, without starting Python or calling the server.
+itself until then, without starting Python or calling the server. Any
+evaluate response may instead carry :data:`TOOL_RESULT_ALLOW_CACHE_FIELD`
+when no policy acts on tool results; that window answers only
+``PostToolUse``.
 
-The cache file holds ``"<expiry> <generation> <mutations>"``, where the
-generation is a random token. A hook reads it before the session identity and
+The cache file holds ``"<expiry> <generation> <mutations> <result expiry>"``,
+where the generation is a random token. A hook reads it before the session identity and
 its request (:func:`generation`), and :func:`record` stores the answer only if
 the token is unchanged and no policy mutation is running. A session switch, a
 policy mutation and any answer without a window each pick a new token, so an
@@ -45,6 +48,11 @@ _logger = logging.getLogger(__name__)
 #: asking again. Absent unless the operator enabled the allow cache.
 ALLOW_CACHE_FIELD = "allow_cache_seconds"
 
+#: Field on any evaluate response: how many seconds the caller may answer the
+#: session's tool-result hooks ALLOW without asking, because no policy acts on
+#: tool results. A separate field, so hooks that predate it ignore it.
+TOOL_RESULT_ALLOW_CACHE_FIELD = "tool_result_allow_cache_seconds"
+
 #: Upper bound on an allow window, whatever the server or operator says, so a
 #: bad setting cannot leave a session's policy changes unenforced for long.
 MAX_ALLOW_CACHE_SECONDS = 300.0
@@ -57,14 +65,18 @@ _LOCK_TIMEOUT_S = 5.0
 # POSIX shell run before the hook command; see guarded_hook_command. Only the
 # first 2 KB is matched: patterns over a large payload are quadratic in dash.
 # Without an open window the hook runs on its own stdin, so the shell reads
-# nothing and starts no extra process; an expiry of 0 skips even `date`.
+# nothing and starts no extra process; expiries of 0 skip even `date`. The
+# tool-result window, alone, answers only PostToolUse.
 # outer succeeds when its argument, the text before a key, is just "{" once
 # its strings are dropped and the objects and arrays it closes are removed,
 # innermost first. Dropping strings first keeps brackets inside them from
 # closing anything; text with a backslash escape defers, since an escaped
 # quote would end a string early.
-_GUARD_SCRIPT = r"""if [ ! -e @REVOKED@ ] && [ -r @CACHE@ ] && read -r allow_until _ < @CACHE@ &&
-  [ "$allow_until" -gt 0 ] 2>/dev/null && [ "$(date +%s)" -lt "$allow_until" ]; then
+_GUARD_SCRIPT = r"""if [ ! -e @REVOKED@ ] && [ -r @CACHE@ ] &&
+  read -r allow_until _ _ result_until _ < @CACHE@ &&
+  { [ "$allow_until" -gt 0 ] || [ "$result_until" -gt 0 ]; } 2>/dev/null && now=$(date +%s) &&
+  { [ "$now" -lt "$allow_until" ] || [ "$now" -lt "$result_until" ]; } 2>/dev/null; then
+  if [ "$now" -lt "$allow_until" ] 2>/dev/null; then window=all; else window=results; fi
   payload=$(cat)
   outer() {
     rest=$1
@@ -88,9 +100,10 @@ _GUARD_SCRIPT = r"""if [ ! -e @REVOKED@ ] && [ -r @CACHE@ ] && read -r allow_unt
   tool=${head#*'"tool_name":'}
   outer "${head%%'"hook_event_name":'*}" || event=
   outer "${head%%'"tool_name":'*}" || tool=
-  case ${event# } in
-    '"UserPromptSubmit"'*) exit 0 ;;
-    '"PreToolUse"'*|'"PostToolUse"'*) case ${tool# } in '"'[!'"']*) exit 0 ;; esac ;;
+  case $window${event# } in
+    all'"UserPromptSubmit"'*) exit 0 ;;
+    all'"PreToolUse"'*|all'"PostToolUse"'*|results'"PostToolUse"'*)
+      case ${tool# } in '"'[!'"']*) exit 0 ;; esac ;;
   esac
   printf '%s' "$payload" | { @COMMAND@; }
   exit
@@ -98,19 +111,21 @@ fi
 { @COMMAND@; }"""
 
 
-def allow_cache_seconds(response: object) -> float | None:
+def allow_cache_seconds(response: object, field: str = ALLOW_CACHE_FIELD) -> float | None:
     """
     Return the allow window an evaluate response grants, if any.
 
     :param response: Parsed ``EvaluationResponse`` body, e.g.
         ``{"result": "POLICY_ACTION_ALLOW", "allow_cache_seconds": 42.5}``.
+    :param field: The window's field, :data:`ALLOW_CACHE_FIELD` or
+        :data:`TOOL_RESULT_ALLOW_CACHE_FIELD`.
     :returns: The window in seconds, capped at
         :data:`MAX_ALLOW_CACHE_SECONDS`, or ``None`` unless the response is
         an ALLOW with a finite positive window.
     """
     if not isinstance(response, dict) or response.get("result") != "POLICY_ACTION_ALLOW":
         return None
-    seconds = response.get(ALLOW_CACHE_FIELD)
+    seconds = response.get(field)
     if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
         return None
     if not math.isfinite(seconds) or seconds <= 0:
@@ -136,10 +151,10 @@ def generation(bridge_dir: Path) -> str | None:
         return current
     try:
         with _locked(bridge_dir):
-            _, current, mutations = _read_state(bridge_dir)
+            _, current, mutations, _ = _read_state(bridge_dir)
             if current is None or _revoked(bridge_dir):
                 current = _new_generation()
-                _write_state(bridge_dir, 0, current, mutations)
+                _write_state(bridge_dir, 0, current, mutations, 0)
                 _clear_revocation(bridge_dir)
     except OSError:
         _logger.warning("Could not create the policy allow cache", exc_info=True)
@@ -154,13 +169,15 @@ def record(
     requested_at: float,
 ) -> None:
     """
-    Open or close the allow window from one evaluate response.
+    Open or close the allow windows from one evaluate response.
 
     A response that grants a window opens it until *requested_at* plus the
     window, unless the generation moved since *generation_before* or a policy
-    mutation is running. Any other response closes it under a new generation:
-    the server either evaluated policies or did not vouch for the answer, and
-    an older no-policy answer still in flight must not reopen it.
+    mutation is running. Any other response closes the full window under a
+    new generation: the server either evaluated policies or did not vouch for
+    the answer, and an older no-policy answer still in flight must not reopen
+    it. It sets the tool-result window from its own field the same way,
+    except that a stale answer granting it leaves an open one as it is.
 
     :param bridge_dir: The session's native bridge directory.
     :param generation_before: :func:`generation` read before the request.
@@ -170,19 +187,25 @@ def record(
     :returns: None. Failures are logged and leave hooks asking the server.
     """
     seconds = allow_cache_seconds(response)
+    result_seconds = allow_cache_seconds(response, TOOL_RESULT_ALLOW_CACHE_FIELD)
     try:
         with _locked(bridge_dir):
-            _, current, mutations = _read_state(bridge_dir)
+            _, current, mutations, result_expiry = _read_state(bridge_dir)
+            settled = not mutations and not _revoked(bridge_dir)
+            fresh = settled and current is not None and current == generation_before
+            if result_seconds is None or not settled:
+                result_expiry = 0
+            elif fresh:
+                result_expiry = int(requested_at + result_seconds)
+            # A stale answer that also vouches for tool results keeps, but
+            # never extends, a window a concurrent answer opened.
             if seconds is None:
-                _write_state(bridge_dir, 0, _new_generation(), mutations)
+                _write_state(bridge_dir, 0, _new_generation(), mutations, result_expiry)
                 _clear_revocation(bridge_dir)
-            elif (
-                current is not None
-                and current == generation_before
-                and not mutations
-                and not _revoked(bridge_dir)
-            ):
-                _write_state(bridge_dir, int(requested_at + seconds), current, mutations)
+            elif fresh:
+                _write_state(
+                    bridge_dir, int(requested_at + seconds), current, mutations, result_expiry
+                )
     except OSError:
         _logger.warning("Could not update the policy allow cache", exc_info=True)
 
@@ -250,7 +273,7 @@ def _reset_generation(bridge_dir: Path, *, mutation_delta: int) -> None:
     try:
         with _locked(bridge_dir):
             mutations = max(_read_state(bridge_dir)[2] + mutation_delta, 0)
-            _write_state(bridge_dir, 0, _new_generation(), mutations)
+            _write_state(bridge_dir, 0, _new_generation(), mutations, 0)
             _clear_revocation(bridge_dir)
     except OSError:
         _logger.warning("Could not invalidate the policy allow cache", exc_info=True)
@@ -321,19 +344,21 @@ def _locked(bridge_dir: Path) -> Iterator[None]:
         os.close(fd)
 
 
-def _read_state(bridge_dir: Path) -> tuple[int, str | None, int]:
-    """Return ``(expiry, generation, mutations)``; ``(0, None, 0)`` if unreadable."""
+def _read_state(bridge_dir: Path) -> tuple[int, str | None, int, int]:
+    """Return ``(expiry, generation, mutations, result expiry)``, or ``(0, None, 0, 0)``."""
     try:
         text = (bridge_dir / _CACHE_FILENAME).read_text(encoding="utf-8")
-        expiry, current, mutations = text.split()
-        return int(expiry), current, int(mutations)
+        expiry, current, mutations, result_expiry = text.split()
+        return int(expiry), current, int(mutations), int(result_expiry)
     except (OSError, ValueError):
-        return 0, None, 0
+        return 0, None, 0, 0
 
 
-def _write_state(bridge_dir: Path, expiry: int, current: str, mutations: int) -> None:
+def _write_state(
+    bridge_dir: Path, expiry: int, current: str, mutations: int, result_expiry: int
+) -> None:
     """Replace the cache file atomically so the shell guard never reads a partial line."""
     path = bridge_dir / _CACHE_FILENAME
     tmp_path = path.with_name(f".{_CACHE_FILENAME}.{os.getpid()}.tmp")
-    tmp_path.write_text(f"{expiry} {current} {mutations}\n", encoding="utf-8")
+    tmp_path.write_text(f"{expiry} {current} {mutations} {result_expiry}\n", encoding="utf-8")
     os.replace(tmp_path, path)

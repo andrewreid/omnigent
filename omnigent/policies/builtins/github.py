@@ -84,7 +84,7 @@ from omnigent.policies.builtins._shell import (
     split_command_segments,
     unwrap_shell_command,
 )
-from omnigent.policies.schema import PolicyEvent, PolicyResponse
+from omnigent.policies.schema import PolicyEvent, PolicyResponse, acts_on
 
 # ── Shared constants ──────────────────────────────────────────────────────────
 
@@ -1308,6 +1308,7 @@ def github_policy(
             )
         return None
 
+    @acts_on("tool_call")
     def _evaluate(event: PolicyEvent) -> PolicyResponse | None:
         """
         Evaluate one policy event against the GitHub access rules.

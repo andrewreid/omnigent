@@ -33,6 +33,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.policies.schema import acts_on
 from omnigent.runtime import get_caps, session_stream
 from omnigent.runtime.caps import RuntimeCaps
 from omnigent.server.routes import sessions as sessions_routes
@@ -67,6 +68,12 @@ def _deny_bash_tool(event: dict[str, Any]) -> dict[str, Any]:
             "reason": "Bash is blocked by admin policy.",
         }
     return {"result": "ALLOW"}
+
+
+@acts_on("tool_call")
+def _deny_bash_tool_call_only(event: dict[str, Any]) -> dict[str, Any]:
+    """:func:`_deny_bash_tool`, declared to act only on tool calls."""
+    return _deny_bash_tool(event)
 
 
 def _deny_bash_tool_result(event: dict[str, Any]) -> dict[str, Any]:
@@ -335,6 +342,87 @@ async def test_engine_allow_never_carries_cache_window(
     body = resp.json()
     assert body["result"] == "POLICY_ACTION_ALLOW"
     assert "allow_cache_seconds" not in body
+
+
+def _tool_result_window(body: dict[str, Any]) -> float | None:
+    """Return the tool-result allow window an ALLOW body grants, checking its bounds."""
+    assert body["result"] == "POLICY_ACTION_ALLOW"
+    assert "allow_cache_seconds" not in body
+    window = body.get("tool_result_allow_cache_seconds")
+    assert window is None or 0 < window <= 30.0
+    return window
+
+
+@pytest.mark.parametrize(
+    ("handler", "skips_tool_results"),
+    [("_deny_bash_tool_call_only", True), ("_deny_bash_tool", False)],
+    ids=["declared_tool_call_only", "undeclared"],
+)
+async def test_tool_result_window_only_when_no_policy_acts_on_results(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    handler: str,
+    skips_tool_results: bool,
+) -> None:
+    """Every evaluation says whether native hooks may skip tool results.
+
+    An undeclared function policy may act on any phase, so it keeps them.
+    """
+    policy = FunctionPolicySpec(
+        name=f"admin_{handler}", on=None, function=FunctionRef(path=f"{__name__}.{handler}")
+    )
+    _patch_allow_cache(monkeypatch, lambda: 30.0, default_policies=[policy])
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    for request in (_tool_call_request("Read"), _tool_result_request("normal output")):
+        resp = await client.post(f"/v1/sessions/{session_id}/policies/evaluate", json=request)
+        assert resp.status_code == 200
+        assert (_tool_result_window(resp.json()) is not None) is skips_tool_results
+
+
+async def test_policy_added_mid_session_closes_tool_result_window(
+    policy_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stored policy that acts on tool results is evaluated on the next result.
+
+    A type-guarded tool-call CEL policy keeps the window; one reading tool
+    results closes it, and its verdict applies.
+    """
+    _patch_allow_cache(monkeypatch, lambda: 30.0)
+    agent = await create_test_agent(policy_client)
+    session_id = await _create_session(policy_client, agent["id"])
+    evaluate_url = f"/v1/sessions/{session_id}/policies/evaluate"
+
+    async def add_cel_policy(name: str, expression: str) -> None:
+        resp = await policy_client.post(
+            f"/v1/sessions/{session_id}/policies",
+            json={
+                "name": name,
+                "type": "python",
+                "handler": "omnigent.policies.builtins.cel.cel_policy",
+                "factory_params": {"expression": expression, "reason": "blocked"},
+            },
+        )
+        assert resp.status_code in (200, 201), resp.text
+
+    await add_cel_policy(
+        "deny_shell",
+        'event.type == "tool_call" && event.data.name == "Bash" ? {"result": "DENY"} : null',
+    )
+    resp = await policy_client.post(evaluate_url, json=_tool_result_request("SECRET"))
+    assert _tool_result_window(resp.json()) is not None
+
+    await add_cel_policy(
+        "deny_secret_output",
+        'event.type == "tool_result" && event.data.result.contains("SECRET")'
+        ' ? {"result": "DENY"} : null',
+    )
+    resp = await policy_client.post(evaluate_url, json=_tool_result_request("SECRET"))
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_DENY"
+    assert "tool_result_allow_cache_seconds" not in body
 
 
 async def test_tool_call_deny_with_default_policy(

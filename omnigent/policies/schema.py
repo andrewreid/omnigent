@@ -36,8 +36,10 @@ Factory form (with ``factory_params``)::
 
 from __future__ import annotations
 
-from collections.abc import Awaitable
-from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, cast
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, TypeVar, cast
+
+from omnigent.spec.types import Phase
 
 if TYPE_CHECKING:
     from omnigent.policies.types import PolicyLLMClient
@@ -415,6 +417,48 @@ class PolicyCallableWithConfig(Protocol):
         raise NotImplementedError
 
 
+# ── Phase declarations ───────────────────────────────────────────────────────
+
+_ACTS_ON_ATTR = "__omnigent_policy_phases__"
+
+_CallableT = TypeVar("_CallableT", bound=Callable[..., object])
+
+
+def acts_on(*event_types: str) -> Callable[[_CallableT], _CallableT]:
+    """Declare the only event types a policy callable can act on.
+
+    The engine skips the callable on every other event type, and a native
+    hook may answer those events without asking the server. A callable
+    without a declaration is dispatched on every event.
+
+    Example::
+
+        @acts_on("tool_call")
+        def my_policy(event: PolicyEvent) -> PolicyResponse | None: ...
+
+    :param event_types: ``event["type"]`` values, e.g. ``"tool_call"``.
+    :returns: A decorator that records the declaration on the callable.
+    :raises ValueError: If a value is not a known event type.
+    """
+    phases = frozenset(Phase(event_type) for event_type in event_types)
+
+    def declare(fn: _CallableT) -> _CallableT:
+        setattr(fn, _ACTS_ON_ATTR, phases)
+        return fn
+
+    return declare
+
+
+def declared_phases(fn: object) -> frozenset[Phase] | None:
+    """Return the phases a callable declared with :func:`acts_on`.
+
+    :param fn: A policy callable or factory.
+    :returns: The declared phases, or ``None`` when undeclared.
+    """
+    phases = getattr(fn, _ACTS_ON_ATTR, None)
+    return phases if isinstance(phases, frozenset) else None
+
+
 # ── REQUEST-phase data helpers ───────────────────────────────────────────────
 
 
@@ -478,6 +522,8 @@ __all__ = [
     "StateUpdateEntry",
     "UsageContext",
     "UserDailyCostContext",
+    "acts_on",
+    "declared_phases",
     "request_attachments",
     "request_user_text",
 ]

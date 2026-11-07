@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import time
 import weakref
 from collections.abc import Callable
 from typing import Any, NamedTuple
@@ -25,7 +26,11 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
-from omnigent.native.policy_allow_cache import ALLOW_CACHE_FIELD, MAX_ALLOW_CACHE_SECONDS
+from omnigent.native.policy_allow_cache import (
+    ALLOW_CACHE_FIELD,
+    MAX_ALLOW_CACHE_SECONDS,
+    TOOL_RESULT_ALLOW_CACHE_FIELD,
+)
 from omnigent.pi_extension_ui import timeout_seconds, to_elicitation_params, to_ui_response
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
@@ -181,9 +186,8 @@ def _no_policy_allow_body(
     """Build the ALLOW body for an evaluation where no policies apply.
 
     When the operator enables the allow cache, the body says how long the
-    session's native hooks may reuse this answer instead of asking again: the
-    configured window, capped, minus the age of the policy lists behind the
-    answer. A policy change therefore reaches native hooks within the window.
+    session's native hooks may reuse this answer instead of asking again (see
+    :func:`_allow_window_seconds`).
 
     :param caps: The server's runtime caps.
     :param session_id: The evaluated session, e.g. ``"conv_abc123"``.
@@ -192,22 +196,51 @@ def _no_policy_allow_body(
         ``{"result": "POLICY_ACTION_ALLOW", "allow_cache_seconds": 42.5}``.
     """
     body: dict[str, object] = {"result": "POLICY_ACTION_ALLOW"}
+    seconds = _allow_window_seconds(caps, policy_specs_cache_age(session_id, policy_store))
+    if seconds is not None:
+        body[ALLOW_CACHE_FIELD] = seconds
+    return body
+
+
+def _tool_result_allow_seconds(caps: RuntimeCaps, engine: PolicyEngine) -> float | None:
+    """Return how long native hooks may skip tool-result evaluations.
+
+    Only when no policy in the session's engine can act on a tool result,
+    so a ``PostToolUse`` hook would always get a bare ALLOW. The window
+    counts from the oldest stored policy list the engine was built from.
+
+    :param caps: The server's runtime caps.
+    :param engine: The session's freshly built policy engine.
+    :returns: The window in seconds, or ``None`` for no window.
+    """
+    if engine.policies_read_at is None or engine.acts_on(Phase.TOOL_RESULT):
+        return None
+    return _allow_window_seconds(caps, time.monotonic() - engine.policies_read_at)
+
+
+def _allow_window_seconds(caps: RuntimeCaps, policy_age_s: float) -> float | None:
+    """Return how long a native hook may reuse an answer, if the operator allows it.
+
+    The configured window, capped, minus the age of the policy lists behind
+    the answer, so a policy change reaches native hooks within the window.
+
+    :param caps: The server's runtime caps.
+    :param policy_age_s: Age in seconds of the oldest policy list the answer read.
+    :returns: A positive window in seconds, e.g. ``42.5``, or ``None``.
+    """
     resolver = caps.native_hook_allow_cache_seconds
     if resolver is None:
-        return body
+        return None
     try:
         seconds = float(resolver())
     except Exception:  # A broken resolver must not fail the gate.
         _logger.warning("native hook allow-cache resolver failed; not caching", exc_info=True)
-        return body
+        return None
     if not math.isfinite(seconds):
         _logger.warning("native hook allow-cache window %r is not finite; not caching", seconds)
-        return body
-    seconds = min(seconds, MAX_ALLOW_CACHE_SECONDS)
-    seconds -= policy_specs_cache_age(session_id, policy_store)
-    if seconds > 0:
-        body[ALLOW_CACHE_FIELD] = seconds
-    return body
+        return None
+    seconds = min(seconds, MAX_ALLOW_CACHE_SECONDS) - policy_age_s
+    return seconds if seconds > 0 else None
 
 
 def _create_route_decision_id(
@@ -1188,6 +1221,12 @@ def register_hooks_routes(
             resp_body["reason"] = result.reason
         if result.data is not None:
             resp_body["data"] = result.data
+        # Any ALLOW may tell native hooks to skip tool-result evaluations for
+        # a while; an answer without the hint closes that window.
+        if result.action == PolicyAction.ALLOW:
+            tool_result_seconds = _tool_result_allow_seconds(_caps, engine)
+            if tool_result_seconds is not None:
+                resp_body[TOOL_RESULT_ALLOW_CACHE_FIELD] = tool_result_seconds
         # Tag the audit envelope with the decision so a DENY/ASK is debuggable
         # (a deny returns HTTP 200, so status alone can't tell you the verdict).
         add_audit_attrs(
