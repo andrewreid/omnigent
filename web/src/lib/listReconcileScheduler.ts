@@ -26,9 +26,15 @@ export const RECONCILE_ROUND_TIMEOUT_MS = 60_000;
 /** Longest the lists go without a round while frames keep arriving; the Mine poll's interval. */
 export const RECONCILE_WHILE_ACTIVE_MS = 60_000;
 
+/**
+ * What a round re-reads: every list, or only search results (a title change
+ * can move a row into or out of a search, but no other list depends on it).
+ */
+export type ReconcileScope = "all" | "search";
+
 export interface ListReconcileScheduler {
   /** Ask for a reconcile; coalesced with any pending or running one. */
-  schedule: () => void;
+  schedule: (scope?: ReconcileScope) => void;
   /** Record a frame; asks for a reconcile if none started in RECONCILE_WHILE_ACTIVE_MS. */
   noteActivity: () => void;
   /** Drop a pending reconcile and stop scheduling new ones. */
@@ -36,17 +42,20 @@ export interface ListReconcileScheduler {
 }
 
 /**
- * @param run - Runs one reconcile round; resolves once its refetches settle.
+ * @param run - Runs one reconcile round over the requested scope; resolves once
+ *   its refetches settle.
  * @param now - Clock, injectable for tests.
  */
 export function createListReconcileScheduler(
-  run: () => Promise<unknown>,
+  run: (scope: ReconcileScope) => Promise<unknown>,
   now: () => number = Date.now,
 ): ListReconcileScheduler {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let running = false;
   let pending = false;
   let disposed = false;
+  // Every request since the last round started, widest scope wins.
+  let requested: ReconcileScope | null = null;
   let lastEnd = Number.NEGATIVE_INFINITY;
   let lastDuration = 0;
   // The lists were just loaded when the stream starts, so that counts as a round.
@@ -55,11 +64,14 @@ export function createListReconcileScheduler(
   const fire = async (): Promise<void> => {
     running = true;
     const started = now();
-    lastStart = started;
+    const scope = requested ?? "all";
+    requested = null;
+    // Only a round over every list stands in for the lists' own polls.
+    if (scope === "all") lastStart = started;
     let roundTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
-        run(),
+        run(scope),
         new Promise<void>((resolve) => {
           roundTimer = setTimeout(resolve, RECONCILE_ROUND_TIMEOUT_MS);
         }),
@@ -73,13 +85,14 @@ export function createListReconcileScheduler(
       running = false;
       if (pending && !disposed) {
         pending = false;
-        schedule();
+        schedule(requested ?? "all");
       }
     }
   };
 
-  const schedule = (): void => {
+  const schedule = (scope: ReconcileScope = "all"): void => {
     if (disposed) return;
+    requested = requested === "all" || scope === "all" ? "all" : "search";
     if (running) {
       pending = true;
       return;

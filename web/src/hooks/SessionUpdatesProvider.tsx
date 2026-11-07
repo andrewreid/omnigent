@@ -63,15 +63,21 @@ const DEBOUNCE_MS = 250;
  * @param items - Wire items from a snapshot/changed frame.
  * @param activeId - The open session, which is never inserted when it is
  *   another user's.
- * @returns Top-level ids not found in any cached page and whether any
- *   patched row needs a server refetch to preserve filtered-query membership.
+ * @param viewerId - The signed-in user, for Mine/Shared placement.
+ * @param isNewSession - Whether an id is one this tab has not listed. A watched
+ *   row absent from a list belongs to another list or has just left this one,
+ *   so it is never reported missing and joins a list only inside its window.
+ * @returns New top-level ids not found in any cached page, whether any patched
+ *   row needs a server refetch to preserve filtered-query membership, and
+ *   whether a title changed.
  */
 function applyItemsToCache(
   queryClient: QueryClient,
   items: SessionListWireItem[],
   activeId: string | undefined,
-  viewerId?: string | null,
-): { missingIds: string[]; needsRefetch: boolean } {
+  viewerId: string | null,
+  isNewSession: (id: string) => boolean,
+): { missingIds: string[]; needsRefetch: boolean; titleChanged: boolean } {
   // Frames are full rows with explicit nulls; convert null → undefined so a
   // cleared field overlays the cache in the same shape GET /v1/sessions
   // produces (absent), without tripping the permission_level === null sentinel.
@@ -99,19 +105,18 @@ function applyItemsToCache(
       ) === "shared");
   const foundAnywhere = new Set<string>();
   let needsRefetch = false;
+  let titleChanged = false;
   const entries = queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["conversations"],
   });
   for (const [key, data] of entries) {
     if (key[4] === "archived") continue;
     const filters = filtersFromConversationQueryKey(key);
-    const {
-      data: merged,
-      found,
-      needsRefetch: queryNeedsRefetch,
-    } = mergeItemsIntoPages(data, itemsById, filters);
+    const merge = mergeItemsIntoPages(data, itemsById, filters);
+    const { data: merged, found } = merge;
     for (const id of found) foundAnywhere.add(id);
-    if (queryNeedsRefetch) needsRefetch = true;
+    if (merge.needsRefetch) needsRefetch = true;
+    if (merge.titleChanged) titleChanged = true;
     // Surface a brand-new watched session (a create here or elsewhere, a share)
     // at the top now, instead of after the debounced refetch (which lags the
     // search index). An unfiled row is fully placed → mark it found so it skips
@@ -124,6 +129,7 @@ function applyItemsToCache(
       filters,
       skipInsert,
       viewerId,
+      (id) => !isNewSession(id),
     );
     for (const row of inserted) {
       if (row.project_id == null && !row.labels?.[PROJECT_LABEL_KEY]) foundAnywhere.add(row.id);
@@ -143,13 +149,11 @@ function applyItemsToCache(
     queryKey: ["project-sessions"],
   });
   for (const [key, data] of projectEntries) {
-    const {
-      data: next,
-      found,
-      needsRefetch: queryNeedsRefetch,
-    } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key));
+    const merge = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key));
+    const { data: next, found } = merge;
     for (const id of found) foundAnywhere.add(id);
-    if (queryNeedsRefetch) needsRefetch = true;
+    if (merge.needsRefetch) needsRefetch = true;
+    if (merge.titleChanged) titleChanged = true;
     if (next !== data) queryClient.setQueryData(key, next);
   }
   queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (previous) => {
@@ -186,9 +190,13 @@ function applyItemsToCache(
     // Sub-agent children are watched for their tree views, but no session list
     // ever holds them, so their absence is not a sign of a new session.
     missingIds: [...itemsById.values()]
-      .filter((item) => item.parent_session_id == null && !foundAnywhere.has(item.id))
+      .filter(
+        (item) =>
+          item.parent_session_id == null && !foundAnywhere.has(item.id) && isNewSession(item.id),
+      )
       .map((item) => item.id),
     needsRefetch,
+    titleChanged,
   };
 }
 
@@ -255,6 +263,10 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
 
+  // The ids last sent as the watch-set. The server streams changes only for
+  // these; any other id in a frame is a session this tab has not listed yet.
+  const watchedRef = useRef<ReadonlySet<string>>(new Set());
+
   // Recompute the watch-set from the cache and push it to the socket.
   // setWatched no-ops when the id-set is unchanged, so in-place field
   // patches (and navigation between already-watched sessions) don't bounce
@@ -295,7 +307,9 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
         }
       }
     }
-    sessionUpdatesSocket.setWatched(ids.filter((id) => !isTempConvId(id)));
+    const watched = ids.filter((id) => !isTempConvId(id));
+    watchedRef.current = new Set(watched);
+    sessionUpdatesSocket.setWatched(watched);
   }, [queryClient]);
 
   // Navigating to an off-sidebar child changes the open session without
@@ -353,12 +367,16 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     // Reconcile the session lists against the server when a frame shows a
     // change no local patch can place. Paced so a busy stream can't stack
     // refetch rounds against a slow server.
-    const reconciler = createListReconcileScheduler(() =>
-      Promise.all([
-        queryClient.invalidateQueries({
-          queryKey: ["conversations"],
-          predicate: (query) => query.meta?.snapshot !== true,
-        }),
+    const reconciler = createListReconcileScheduler((scope) => {
+      // A search-only round re-reads the lists with a search query.
+      const conversations = queryClient.invalidateQueries({
+        queryKey: ["conversations"],
+        predicate: (query) =>
+          query.meta?.snapshot !== true && (scope === "all" || query.queryKey[1] !== ""),
+      });
+      if (scope === "search") return conversations;
+      return Promise.all([
+        conversations,
         // Converge each project folder's own list too (new/archived/relabeled
         // members the local field-patch can't place).
         queryClient.invalidateQueries({ queryKey: ["project-sessions"] }),
@@ -366,8 +384,8 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
         // project from the Archived view's picker; only local mutations
         // invalidate this scan otherwise.
         queryClient.invalidateQueries({ queryKey: ["archived-project-names"] }),
-      ]),
-    );
+      ]);
+    });
     const scheduleInvalidate = () => reconciler.schedule();
 
     // See commentsFingerprintsRef: invalidate `["comments", id]` (prefix —
@@ -468,11 +486,15 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           for (const parentId of parentIds) {
             void queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(parentId) });
           }
-          const { missingIds, needsRefetch } = applyItemsToCache(
+          // A snapshot restates the watch-set, so it never carries a new session.
+          const isNewSession = (id: string) =>
+            frame.type === "changed" && !watchedRef.current.has(id);
+          const { missingIds, needsRefetch, titleChanged } = applyItemsToCache(
             queryClient,
             frame.items,
             activeIdRef.current,
             getCurrentUserId(),
+            isNewSession,
           );
           // A watched id absent from every page is a new session whose sort
           // position we can't place locally. Membership-affecting deltas
@@ -503,7 +525,11 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           }
           if (sidebarMissingIds.length > 0 || needsRefetch || activePermissionChanged) {
             scheduleInvalidate();
-          } else reconciler.noteActivity();
+          } else {
+            // A renamed row may now match, or stop matching, a search.
+            if (titleChanged) reconciler.schedule("search");
+            reconciler.noteActivity();
+          }
           return;
         }
       }
