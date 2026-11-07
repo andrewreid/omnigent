@@ -61,7 +61,7 @@ from omnigent.policies.builtins._shell import (
     split_command_segments,
     unwrap_shell_command,
 )
-from omnigent.policies.schema import PolicyEvent, PolicyResponse
+from omnigent.policies.schema import PolicyEvent, PolicyResponse, acts_on
 
 # Shell built-ins that change the process / shell working directory.
 _CD_COMMANDS: frozenset[str] = frozenset({"cd", "chdir", "pushd", "popd"})
@@ -408,6 +408,7 @@ def block_working_dir_changes(
                 worst = _worse(worst, _gate(op))
         return worst
 
+    @acts_on("tool_call")
     def _evaluate(event: PolicyEvent) -> PolicyResponse | None:
         """
         Evaluate one policy event against the dir/worktree rules.

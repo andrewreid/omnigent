@@ -15,6 +15,7 @@ from filelock import FileLock
 from omnigent.native import policy_allow_cache
 
 _NO_POLICY_ALLOW = {"result": "POLICY_ACTION_ALLOW", "allow_cache_seconds": 60.0}
+_TOOL_RESULT_ALLOW = {"result": "POLICY_ACTION_ALLOW", "tool_result_allow_cache_seconds": 30.0}
 
 
 def _window_expiry(bridge_dir: Path) -> int:
@@ -22,12 +23,12 @@ def _window_expiry(bridge_dir: Path) -> int:
     return policy_allow_cache._read_state(bridge_dir)[0]
 
 
-def _answered_in_shell(bridge_dir: Path) -> bool:
+def _answered_in_shell(bridge_dir: Path, event: str = "PreToolUse") -> bool:
     """Run the guard on a valid tool event and report whether it skipped the hook."""
     received = bridge_dir / "received"
     received.unlink(missing_ok=True)
     command = policy_allow_cache.guarded_hook_command(bridge_dir, f"cat > {received}")
-    payload = json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Bash"})
+    payload = json.dumps({"hook_event_name": event, "tool_name": "Bash"})
     subprocess.run(["/bin/sh", "-c", command], input=payload, text=True, check=True, timeout=30)
     return not received.exists()
 
@@ -168,8 +169,17 @@ def test_failed_invalidation_cannot_be_undone_by_a_stale_answer(
     assert _answered_in_shell(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("response", "state_field", "event"),
+    [(_NO_POLICY_ALLOW, 0, "PreToolUse"), (_TOOL_RESULT_ALLOW, 3, "PostToolUse")],
+    ids=["full_window", "tool_result_window"],
+)
 def test_invalidation_that_times_out_holds_against_the_writer_holding_the_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response: dict[str, object],
+    state_field: int,
+    event: str,
 ) -> None:
     """A writer inside record() when invalidation times out cannot restore its window.
 
@@ -188,7 +198,7 @@ def test_invalidation_that_times_out_holds_against_the_writer_holding_the_lock(
 
     monkeypatch.setattr(policy_allow_cache, "_write_state", write_after_release)
     writer = threading.Thread(
-        target=policy_allow_cache.record, args=(tmp_path, held, _NO_POLICY_ALLOW, time.time())
+        target=policy_allow_cache.record, args=(tmp_path, held, response, time.time())
     )
     writer.start()
     assert inside.wait(10)
@@ -198,10 +208,10 @@ def test_invalidation_that_times_out_holds_against_the_writer_holding_the_lock(
     release.set()
     writer.join(10)
 
-    assert _window_expiry(tmp_path) > 0, "the writer finished its write"
-    assert not _answered_in_shell(tmp_path)
+    assert policy_allow_cache._read_state(tmp_path)[state_field] > 0, "the writer finished"
+    assert not _answered_in_shell(tmp_path, event)
     policy_allow_cache.generation(tmp_path)
-    assert _window_expiry(tmp_path) == 0
+    assert policy_allow_cache._read_state(tmp_path)[state_field] == 0
 
 
 def test_unreadable_cache_file_matches_no_held_generation(tmp_path: Path) -> None:
@@ -420,3 +430,68 @@ def test_guarded_hook_command_answers_only_open_windows_and_valid_events(
         assert not received.exists()
     else:
         assert received.read_text() == payload
+
+
+def _result_window_expiry(bridge_dir: Path) -> int:
+    """Return the recorded tool-result expiry; ``0`` means that window is closed."""
+    return policy_allow_cache._read_state(bridge_dir)[3]
+
+
+def test_tool_result_window_follows_every_answer(tmp_path: Path) -> None:
+    """Any answer may open the tool-result window; one without it closes the window.
+
+    The window never opens the full one, and a stale answer cannot reopen it.
+    """
+    generation = policy_allow_cache.generation(tmp_path)
+    policy_allow_cache.record(tmp_path, generation, _TOOL_RESULT_ALLOW, requested_at=1000.9)
+    assert (_window_expiry(tmp_path), _result_window_expiry(tmp_path)) == (0, 1030)
+
+    stale = generation
+    fresh = policy_allow_cache.generation(tmp_path)
+    policy_allow_cache.record(tmp_path, fresh, {"result": "POLICY_ACTION_ALLOW"}, time.time())
+    assert _result_window_expiry(tmp_path) == 0
+    policy_allow_cache.record(tmp_path, stale, _TOOL_RESULT_ALLOW, time.time())
+    assert _result_window_expiry(tmp_path) == 0
+
+    held = policy_allow_cache.generation(tmp_path)
+    with policy_allow_cache.policy_mutation(tmp_path):
+        policy_allow_cache.record(tmp_path, held, _TOOL_RESULT_ALLOW, time.time())
+    assert _result_window_expiry(tmp_path) == 0
+
+    # Parallel hooks hold one generation; the later answer keeps the window.
+    shared = policy_allow_cache.generation(tmp_path)
+    policy_allow_cache.record(tmp_path, shared, _TOOL_RESULT_ALLOW, requested_at=2000.0)
+    policy_allow_cache.record(tmp_path, shared, _TOOL_RESULT_ALLOW, requested_at=2005.0)
+    assert _result_window_expiry(tmp_path) == 2030
+    policy_allow_cache.invalidate(tmp_path)
+    assert _result_window_expiry(tmp_path) == 0
+    policy_allow_cache.record(tmp_path, shared, _TOOL_RESULT_ALLOW, time.time())
+    assert _result_window_expiry(tmp_path) == 0
+
+
+@pytest.mark.parametrize(
+    ("event", "remaining_s", "answered_in_shell"),
+    [
+        ("PostToolUse", 60, True),
+        ("PreToolUse", 60, False),
+        ("UserPromptSubmit", 60, False),
+        ("PostToolUse", -1, False),
+    ],
+    ids=["result", "call", "prompt", "expired"],
+)
+def test_tool_result_window_answers_only_tool_results(
+    tmp_path: Path, event: str, remaining_s: int, answered_in_shell: bool
+) -> None:
+    """Tool calls and prompts still reach the hook while only results are vouched for."""
+    (tmp_path / "policy_allow_until").write_text(f"0 g 0 {int(time.time()) + remaining_s}\n")
+    received = tmp_path / "received"
+    command = policy_allow_cache.guarded_hook_command(tmp_path, f"cat > {received}")
+    payload = _compact({"hook_event_name": event, "tool_name": "Bash", "prompt": '"PostToolUse"'})
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", command], input=payload, capture_output=True, text=True, timeout=30
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert received.exists() is not answered_in_shell

@@ -18,6 +18,7 @@ from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
     PolicyResponse,
+    acts_on,
     request_attachments,
     request_user_text,
 )
@@ -126,6 +127,7 @@ def max_tool_calls_per_session(limit: int = 100) -> PolicyCallable:
     :returns: A policy callable that DENYs after the limit.
     """
 
+    @acts_on("tool_call")
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate the session-wide rate limit.
 
@@ -197,6 +199,7 @@ def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
     window = max(1, window)
     threshold = max(1, threshold)
 
+    @acts_on("tool_call")
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate whether the current tool call is a repeated loop.
 
@@ -252,6 +255,7 @@ def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
 # ── OS tool approval ────────────────────────────────────────────────────────
 
 
+@acts_on("tool_call")
 def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     """ASK for user approval before any file or shell tool call.
 
@@ -356,6 +360,7 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
 # ── Policy tool approval ───────────────────────────────────────────────────
 
 
+@acts_on("tool_call")
 def ask_on_add_policy(event: PolicyEvent) -> PolicyResponse:
     """ASK for user approval before ``sys_add_policy`` executes.
 
@@ -523,6 +528,7 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
     )
 
 
+@acts_on("tool_call")
 def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
     """ASK for user approval before an agent creates or updates a scheduled task.
 
@@ -643,6 +649,7 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
         # A namespaced block entry blocks the bare alias of its skill.
         return lowered in blocked_bare_lower
 
+    @acts_on("tool_call", "request")
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate whether the skill load should be blocked.
 
@@ -778,6 +785,7 @@ def enforce_sandbox(
     if env_passthrough is not None:
         override["env_passthrough"] = env_passthrough
 
+    @acts_on("tool_call")
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate whether the agent start should have sandbox forced.
 

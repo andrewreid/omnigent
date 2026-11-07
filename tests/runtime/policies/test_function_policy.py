@@ -1418,3 +1418,130 @@ async def test_engine_conversation_title_none_when_untitled(
     engine = _build_engine(conversation_store, [policy])
     await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="hi"))
     assert captured["conversation_title"] is None
+
+
+# ── Declared phases ──
+
+
+_PHASED_MODULE = """
+from omnigent.policies.schema import acts_on
+
+calls = []
+
+
+@acts_on("tool_call")
+def tool_call_only(event):
+    calls.append(event["type"])
+    update = {"key": "seen", "action": "increment", "value": 1}
+    return {"result": "ALLOW", "state_updates": [update]}
+
+
+def undeclared(event):
+    calls.append(event["type"])
+    return None
+
+
+def request_factory():
+    @acts_on("request")
+    def evaluate(event):
+        return None
+
+    return evaluate
+"""
+
+
+def _self_selecting(path: str, arguments: dict[str, Any] | None = None) -> FunctionPolicySpec:
+    """Build a stored-policy-style spec (``on=None``) for *path*."""
+    return FunctionPolicySpec(
+        name=path.rsplit(".", 1)[-1], on=None, function=FunctionRef(path, arguments)
+    )
+
+
+@pytest.mark.asyncio
+async def test_engine_dispatches_declared_policy_only_on_its_phases(
+    tmp_path: Path, conversation_store: SqlAlchemyConversationStore
+) -> None:
+    """A declaration is enforced, so the fast path can trust it.
+
+    The tool-call-only callable writes state when it runs; on a tool result
+    it must not run at all, and the engine reports no tool-result policy.
+    """
+    _install_module(tmp_path, "phased", _PHASED_MODULE)
+    declared = resolve_function_policy(_self_selecting("test_fn_policy_pkg.phased.tool_call_only"))
+    engine = _build_engine(conversation_store, [declared])
+    module = sys.modules["test_fn_policy_pkg.phased"]
+
+    assert not engine.acts_on(Phase.TOOL_RESULT)
+    result = await engine.evaluate(
+        EvaluationContext(phase=Phase.TOOL_RESULT, content={"result": "ok"}, tool_name="Bash")
+    )
+    assert result.action == PolicyAction.ALLOW
+    assert result.state_updates is None
+    assert module.calls == []
+
+    assert engine.acts_on(Phase.TOOL_CALL)
+    await engine.evaluate(
+        EvaluationContext(phase=Phase.TOOL_CALL, content={"name": "Bash"}, tool_name="Bash")
+    )
+    assert module.calls == ["tool_call"]
+
+
+@pytest.mark.parametrize(
+    ("spec", "acts_on_tool_result"),
+    [
+        (_self_selecting("test_fn_policy_pkg.phased.undeclared"), True),
+        (_self_selecting("test_fn_policy_pkg.phased.request_factory", {}), False),
+        (
+            FunctionPolicySpec(
+                name="selector",
+                on=[PhaseSelector(phase=Phase.TOOL_RESULT, tool_name="Bash")],
+                function=FunctionRef("test_fn_policy_pkg.phased.tool_call_only"),
+            ),
+            True,
+        ),
+    ],
+    ids=["undeclared_acts_everywhere", "factory_evaluator_declares", "selector_wins"],
+)
+def test_policy_phases_default_to_every_phase(
+    tmp_path: Path, spec: FunctionPolicySpec, acts_on_tool_result: bool
+) -> None:
+    """Only a declaration narrows a self-selecting policy; ``on:`` selectors still rule."""
+    _install_module(tmp_path, "phased", _PHASED_MODULE)
+
+    assert resolve_function_policy(spec).acts_on(Phase.TOOL_RESULT) is acts_on_tool_result
+
+
+@pytest.mark.parametrize(
+    ("path", "arguments"),
+    [
+        ("omnigent.policies.builtins.safety.ask_on_add_policy", None),
+        ("omnigent.policies.builtins.safety.ask_on_scheduled_task_change", None),
+        ("omnigent.policies.builtins.safety.ask_on_os_tools", None),
+        ("omnigent.policies.builtins.safety.max_tool_calls_per_session", {}),
+        ("omnigent.policies.builtins.safety.detect_loop", {}),
+        ("omnigent.policies.builtins.safety.block_skills", {"blocked": ["x"]}),
+        ("omnigent.policies.builtins.safety.enforce_sandbox", {}),
+        ("omnigent.policies.builtins.cost.cost_budget", {"max_cost_usd": 1.0}),
+        ("omnigent.policies.builtins.cost.user_daily_cost_budget", {"max_cost_usd": 1.0}),
+        ("omnigent.policies.builtins.cost.subagent_cost_budget", {"max_cost_usd": 1.0}),
+        (
+            "omnigent.policies.builtins.cost.user_period_cost_budget",
+            {"period": "month", "max_cost_usd": 1.0},
+        ),
+        ("omnigent.policies.builtins.github.github_policy", {}),
+        ("omnigent.policies.builtins.working_dir.block_working_dir_changes", {}),
+        ("omnigent.policies.builtins.orchestration.blast_radius", {}),
+        ("omnigent.policies.builtins.orchestration.spawn_bounds", {}),
+        ("omnigent.policies.builtins.orchestration.headless_subagent_purpose_guard", {}),
+        ("omnigent.policies.builtins.orchestration.worktree_guard", {}),
+        ("omnigent.policies.builtins.orchestration.read_only_os", {}),
+    ],
+)
+def test_builtin_gates_declare_they_ignore_tool_results(
+    path: str, arguments: dict[str, Any] | None
+) -> None:
+    """These builtins only gate calls and prompts, so they never cost a tool-result hook."""
+    policy = resolve_function_policy(_self_selecting(path, arguments))
+
+    assert policy.declared_phases is not None
+    assert not policy.acts_on(Phase.TOOL_RESULT)

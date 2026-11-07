@@ -78,6 +78,7 @@ from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
     PolicyResponse,
+    acts_on,
 )
 
 _ALLOW: PolicyResponse = {"result": "ALLOW"}
@@ -473,6 +474,7 @@ def cost_budget(
             )
     cfg = _resolve_expensive_models(expensive_models)
 
+    @acts_on("request", "tool_call")
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate the session cost budget for a request or tool call.
 
@@ -680,6 +682,7 @@ def user_daily_cost_budget(
             )
     cfg = _resolve_expensive_models(expensive_models)
 
+    @acts_on("request", "tool_call")
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate the per-user daily cost budget for a request or tool call.
 
@@ -869,6 +872,7 @@ def subagent_cost_budget(
             )
     cfg = _resolve_expensive_models(expensive_models)
 
+    @acts_on("request", "tool_call")
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate the subagent subtree cost budget for a request or tool call.
 
@@ -1131,6 +1135,7 @@ def user_period_cost_budget(
             return owner if isinstance(owner, str) and owner else None
         return None
 
+    @acts_on("request", "tool_call")
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate the per-user period cost budget for a request or tool call.
 

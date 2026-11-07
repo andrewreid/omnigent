@@ -612,7 +612,9 @@ def build_policy_engine(
     """
     guardrails = spec.guardrails
     agent_policy_specs: list[PolicySpec] = list(guardrails.policies or []) if guardrails else []
-    session_policy_specs = _load_session_policy_specs(conversation_id, policy_store)
+    session_policy_specs, policies_read_at = _load_session_policy_entry(
+        conversation_id, policy_store
+    )
     if conversation is not None and conversation.id != conversation_id:
         # A misrouted preload would mix one session's labels, state, usage
         # and model into another session's authorization decision — fail
@@ -644,7 +646,8 @@ def build_policy_engine(
     )
     tree = verified.rows
     root_conversation_id = verified.root_conversation_id
-    db_default_policy_specs = _load_default_policy_specs(policy_store)
+    db_default_policy_specs, default_read_at = _load_default_policy_entry(policy_store)
+    policies_read_at = min(policies_read_at, default_read_at)
     admin_policy_specs: list[PolicySpec] = db_default_policy_specs + list(default_policies or [])
     all_policy_specs = session_policy_specs + agent_policy_specs + admin_policy_specs
 
@@ -759,7 +762,10 @@ def build_policy_engine(
     # VERIFIED root, after the refresh: reading them from the caller's
     # suggested root inherited another tree's guardrails.
     if root_conversation_id != conversation_id:
-        root_policy_specs = _load_session_policy_specs(root_conversation_id, policy_store)
+        root_policy_specs, root_read_at = _load_session_policy_entry(
+            root_conversation_id, policy_store
+        )
+        policies_read_at = min(policies_read_at, root_read_at)
         # Keep the root copy of an exact duplicate so attaching the same
         # policy to a child cannot reorder the authoritative root pipeline.
         child_policy_specs = [p for p in session_policy_specs if p not in root_policy_specs]
@@ -908,6 +914,7 @@ def build_policy_engine(
         conversation_store=conversation_store,
         root_conversation_id=root_conversation_id,
         llm_client=llm_client,
+        policies_read_at=policies_read_at,
     )
 
 
@@ -1715,6 +1722,13 @@ def ancestor_ids_from_tree(
 def _load_default_policy_specs(
     policy_store: PolicyStore | None,
 ) -> list[PolicySpec]:
+    """Return :func:`_load_default_policy_entry`'s specs."""
+    return _load_default_policy_entry(policy_store)[0]
+
+
+def _load_default_policy_entry(
+    policy_store: PolicyStore | None,
+) -> _CachedPolicySpecs:
     """
     Load enabled server-wide default policies from the store.
 
@@ -1730,15 +1744,16 @@ def _load_default_policy_specs(
     mutation to make changes visible before the TTL expires.
 
     :param policy_store: The policy store. ``None`` returns an empty list.
-    :returns: List of :class:`FunctionPolicySpec` for enabled default
-        policies, in ``created_at ASC`` order.
+    :returns: ``(specs, read_at)``: :class:`FunctionPolicySpec` for enabled
+        default policies, in ``created_at ASC`` order, and the
+        ``time.monotonic()`` their store read started.
     :raises OmnigentError: If an enabled policy has an unsupported type.
     """
     if policy_store is None:
-        return []
+        return [], time.monotonic()
     cached = _DEFAULT_POLICY_SPECS_CACHE.get(_DEFAULT_POLICY_SPECS_KEY)
     if cached is not None:
-        return cached[0]
+        return cached
     loaded_at = time.monotonic()
     specs: list[PolicySpec] = []
     for policy in policy_store.list_defaults():
@@ -1761,7 +1776,7 @@ def _load_default_policy_specs(
             continue
         specs.append(_stored_policy_to_spec(policy))
     _DEFAULT_POLICY_SPECS_CACHE[_DEFAULT_POLICY_SPECS_KEY] = (specs, loaded_at)
-    return specs
+    return specs, loaded_at
 
 
 def invalidate_default_policy_specs_cache() -> None:
@@ -1797,6 +1812,14 @@ def _load_session_policy_specs(
     conversation_id: str,
     policy_store: PolicyStore | None,
 ) -> list[PolicySpec]:
+    """Return :func:`_load_session_policy_entry`'s specs."""
+    return _load_session_policy_entry(conversation_id, policy_store)[0]
+
+
+def _load_session_policy_entry(
+    conversation_id: str,
+    policy_store: PolicyStore | None,
+) -> _CachedPolicySpecs:
     """
     Load enabled session policies from the store and convert
     them to :class:`FunctionPolicySpec` instances.
@@ -1820,16 +1843,17 @@ def _load_session_policy_specs(
         e.g. ``"conv_abc123"``.
     :param policy_store: The session-scoped policy store.
         ``None`` returns an empty list.
-    :returns: List of :class:`FunctionPolicySpec` for enabled
-        session policies, in ``created_at ASC`` order.
+    :returns: ``(specs, read_at)``: :class:`FunctionPolicySpec` for
+        enabled session policies, in ``created_at ASC`` order, and the
+        ``time.monotonic()`` their store read started.
     :raises OmnigentError: If an enabled policy has an unsupported
         ``type`` (e.g. ``type="url"``).
     """
     if policy_store is None:
-        return []
+        return [], time.monotonic()
     cached = _SESSION_POLICY_SPECS_CACHE.get(conversation_id)
     if cached is not None:
-        return cached[0]
+        return cached
     loaded_at = time.monotonic()
     stored = policy_store.list_for_session(conversation_id)
     specs: list[PolicySpec] = []
@@ -1838,7 +1862,7 @@ def _load_session_policy_specs(
             continue
         specs.append(_stored_policy_to_spec(policy))
     _SESSION_POLICY_SPECS_CACHE[conversation_id] = (specs, loaded_at)
-    return specs
+    return specs, loaded_at
 
 
 def policy_specs_cache_age(

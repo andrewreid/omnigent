@@ -89,9 +89,11 @@ from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
     PolicyResponse,
+    acts_on,
     is_reserved_state_key,
     request_user_text,
 )
+from omnigent.spec.types import Phase
 
 _log = logging.getLogger(__name__)
 
@@ -213,7 +215,8 @@ def cel_policy(
             out["state_updates"] = state_updates  # type: ignore[typeddict-item]
         return out
 
-    return evaluate
+    phases = _phases_with_effect(expression)
+    return evaluate if phases is None else acts_on(*phases)(evaluate)
 
 
 @functools.lru_cache(maxsize=_PROGRAM_CACHE_SIZE)
@@ -231,6 +234,140 @@ def _compile(expression: str) -> Runner:
     """
     env = Environment()
     return env.program(env.compile(expression))
+
+
+# Parser rules that wrap a single child; the phase analysis looks through them.
+_WRAPPER_RULES = frozenset(
+    {
+        "expr",
+        "conditionalor",
+        "conditionaland",
+        "relation",
+        "addition",
+        "multiplication",
+        "unary",
+        "member",
+        "primary",
+        "paren_expr",
+    }
+)
+
+# A value the phase analysis cannot know without the rest of the event.
+_UNKNOWN = object()
+
+
+@functools.lru_cache(maxsize=_PROGRAM_CACHE_SIZE)
+def _phases_with_effect(expression: str) -> frozenset[Phase] | None:
+    """
+    Return the phases on which an expression might return a decision.
+
+    An expression abstains on a phase when, with ``event.type`` fixed to that
+    phase, it is known to yield something other than a map, such as the
+    ``null`` branch of ``event.type == "tool_call" && ... ? {...} : null``.
+    Anything the analysis cannot follow counts as a possible decision.
+
+    :param expression: A CEL source that :func:`_compile` accepts.
+    :returns: The phases left, or ``None`` when no phase can be ruled out.
+    """
+    ast = _compile(expression).ast
+    phases = frozenset(phase for phase in Phase if _static_value(ast, phase.value) is _UNKNOWN)
+    return None if phases == frozenset(Phase) else phases
+
+
+def _static_value(node: object, event_type: str) -> object:
+    """
+    Evaluate the part of a CEL parse tree that depends only on ``event.type``.
+
+    :param node: A ``lark`` tree node or token from the CEL parser.
+    :param event_type: The value of ``event.type``, e.g. ``"tool_result"``.
+    :returns: A ``str``, ``bool``, ``None`` (CEL ``null``) or ``list`` the node
+        evaluates to whatever the rest of the event holds, else ``_UNKNOWN``.
+        A node that may raise is ``_UNKNOWN`` unless every outcome is known.
+    """
+    while (
+        getattr(node, "data", None) in _WRAPPER_RULES and len(getattr(node, "children", ())) == 1
+    ):
+        node = node.children[0]  # type: ignore[attr-defined]
+    kind = getattr(node, "data", None)
+    children: list[object] = list(getattr(node, "children", ()))
+    if kind == "literal" and len(children) == 1:
+        return _literal_value(children[0])
+    if kind == "member_dot" and len(children) == 2:
+        target = children[0]
+        while getattr(target, "data", None) in _WRAPPER_RULES and len(target.children) == 1:  # type: ignore[attr-defined]
+            target = target.children[0]  # type: ignore[attr-defined]
+        is_event = getattr(target, "data", None) == "ident" and [
+            str(child)
+            for child in target.children  # type: ignore[attr-defined]
+        ] == ["event"]
+        return event_type if is_event and str(children[1]) == "type" else _UNKNOWN
+    if kind == "expr" and len(children) == 3:
+        condition = _static_value(children[0], event_type)
+        if isinstance(condition, bool):
+            return _static_value(children[1] if condition else children[2], event_type)
+        branches = (_static_value(children[1], event_type), _static_value(children[2], event_type))
+        # A condition that errs or is not a bool makes the whole expression err.
+        return None if _UNKNOWN not in branches else _UNKNOWN
+    if kind in ("conditionalor", "conditionaland") and len(children) == 2:
+        # CEL's && and || are commutative over errors: false && x is false.
+        absorbing = kind == "conditionalor"
+        operands = [_static_value(child, event_type) for child in children]
+        if any(operand is absorbing for operand in operands):
+            return absorbing
+        if all(operand is (not absorbing) for operand in operands):
+            return not absorbing
+        return _UNKNOWN
+    if kind == "unary" and len(children) >= 2:
+        operators = children[:-1]
+        if not all(getattr(op, "data", None) == "unary_not" for op in operators):
+            return _UNKNOWN
+        operand = _static_value(children[-1], event_type)
+        if not isinstance(operand, bool):
+            return _UNKNOWN
+        return operand if len(operators) % 2 == 0 else not operand
+    if kind == "relation" and len(children) == 2:
+        operator = children[0]
+        operator_kind = getattr(operator, "data", None)
+        if len(getattr(operator, "children", ())) != 1:
+            return _UNKNOWN
+        left = _static_value(operator.children[0], event_type)  # type: ignore[attr-defined]
+        right = _static_value(children[1], event_type)
+        if operator_kind == "relation_in" and isinstance(left, str) and isinstance(right, list):
+            return left in right
+        if isinstance(left, str) and isinstance(right, str):
+            if operator_kind == "relation_eq":
+                return left == right
+            if operator_kind == "relation_ne":
+                return left != right
+        return _UNKNOWN
+    if kind == "list_lit":
+        items = [
+            _static_value(item, event_type)
+            for exprlist in children
+            for item in getattr(exprlist, "children", ())
+        ]
+        return items if all(isinstance(item, str) for item in items) else _UNKNOWN
+    return _UNKNOWN
+
+
+def _literal_value(token: object) -> object:
+    """
+    Return a plain ``null``, ``bool`` or escape-free string literal's value.
+
+    :param token: The literal's ``lark`` token, e.g. ``'"tool_call"'``.
+    :returns: The value, or ``_UNKNOWN`` for other literals.
+    """
+    kind = getattr(token, "type", None)
+    text = str(token)
+    if kind == "NULL_LIT":
+        return None
+    if kind == "BOOL_LIT":
+        return text == "true"
+    if kind == "STRING_LIT" and len(text) >= 2 and text[0] in "\"'" and text[-1] == text[0]:
+        body = text[1:-1]
+        if text[0] not in body and "\\" not in body:
+            return body
+    return _UNKNOWN
 
 
 @functools.lru_cache(maxsize=_PROGRAM_CACHE_SIZE)

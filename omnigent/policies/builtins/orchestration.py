@@ -17,6 +17,7 @@ from typing import Any, TypeAlias
 
 from omnigent.policies.builtins._shell import SHELL_TOOLS
 from omnigent.policies.builtins.safety import NATIVE_WRITE_TOOLS
+from omnigent.policies.schema import acts_on
 
 # Heterogeneous JSON-shaped maps — the V0 policy event + decision payloads.
 _Json: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
@@ -381,6 +382,7 @@ def blast_radius(
             f"blast_radius: risky_action must be 'ASK' or 'DENY', got {risky_action!r}"
         )
 
+    @acts_on("tool_call")
     def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
         """
         Classify a ``sys_os_shell`` command by blast radius.
@@ -449,6 +451,7 @@ def spawn_bounds(
     counted = set(dispatch_tools)
     state = {"count": 0}
 
+    @acts_on("request", "tool_call")
     def _evaluate(event: _Json) -> _Json:
         """
         Count and bound worker dispatches in the current turn.
@@ -535,6 +538,7 @@ def headless_subagent_purpose_guard(
     """
     allowed = set(allowed_purposes)
 
+    @acts_on("tool_call")
     def _evaluate(event: _Json) -> _Json:
         """
         Deny unmarked or disallowed sub-agent dispatches.
@@ -588,6 +592,7 @@ def worktree_guard(
     # branch is needed below.
     _write_tools = NATIVE_WRITE_TOOLS | {"sys_os_write", "sys_os_edit", "write", "edit"}
 
+    @acts_on("tool_call")
     def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
         """
         Reject worker file writes that escape the worktree subtree.
@@ -670,6 +675,7 @@ def read_only_os(
     # worktree_guard gates, so the two write policies stay in lockstep.
     write_tools = NATIVE_WRITE_TOOLS | {"sys_os_write", "sys_os_edit", "write", "edit"}
 
+    @acts_on("tool_call")
     def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
         """
         Deny any file-mutating tool call.
