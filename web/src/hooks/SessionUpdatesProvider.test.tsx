@@ -991,6 +991,68 @@ describe("SessionUpdatesProvider list invalidation", () => {
     }
   });
 
+  it("re-reads only search results after a rename", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      const searchKey = ["conversations", "alp", false];
+      client.setQueryData(searchKey, client.getQueryData(["conversations", "", false]));
+      seedProjectFolder(client, "alpha", ["conv_b"]);
+      renderProvider(client, ["/"]);
+      const handler = frameHandler();
+
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_a"), title: "Renamed" }] }));
+      act(() => vi.advanceTimersByTime(300)); // past the debounce
+
+      expect(client.getQueryState(searchKey)?.isInvalidated).toBe(true);
+      expect(client.getQueryState(["conversations", "", false])?.isInvalidated).toBe(false);
+      expect(
+        client.getQueryState(["project-sessions", "alpha", "updated_at", false])?.isInvalidated,
+      ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("places a watched folder row in Mine only once it sorts inside Mine's window", () => {
+    // Folder rows are watched alongside Mine's; one older than Mine's loaded
+    // window belongs to an unloaded page, not to Mine's top.
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      const mineKey = ["conversations", "", false, null, "mine"];
+      const mineRows = [conv("conv_a"), conv("conv_b")].map((row, index) => ({
+        ...row,
+        updated_at: 10 - index,
+      }));
+      client.setQueryData<ConversationsInfiniteData>(mineKey, {
+        pages: [{ data: mineRows, first_id: "conv_a", last_id: "conv_b", has_more: true }],
+        pageParams: [undefined],
+      });
+      seedProjectFolder(client, "alpha", ["conv_old"]);
+      renderProvider(client, ["/"]);
+      expect(lastWatched()).toEqual(["conv_a", "conv_b", "conv_old"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+      const mineIds = () =>
+        client.getQueryData<ConversationsInfiniteData>(mineKey)!.pages[0].data.map((row) => row.id);
+      const old = { ...conv("conv_old"), updated_at: 1 };
+
+      act(() => handler({ type: "snapshot", items: [...mineRows, old] }));
+      act(() => vi.advanceTimersByTime(5_000));
+      expect(mineIds()).toEqual(["conv_a", "conv_b"]);
+
+      act(() => handler({ type: "changed", items: [{ ...old, updated_at: 20 }] }));
+      act(() => vi.advanceTimersByTime(5_000));
+      expect(mineIds()).toEqual(["conv_old", "conv_a", "conv_b"]);
+      expect(listInvalidations(invalidate)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      clearRecentlyCreated();
+    }
+  });
+
   it("still reconciles the lists when a watched top-level session is missing from them", () => {
     vi.useFakeTimers();
     try {

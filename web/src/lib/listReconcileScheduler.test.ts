@@ -170,6 +170,33 @@ describe("createListReconcileScheduler", () => {
     expect(run).toHaveBeenCalledTimes(1);
   });
 
+  it("runs the widest scope requested and leaves search rounds out of the activity minute", async () => {
+    const { run, finish } = controllableRun();
+    const scheduler = createListReconcileScheduler(run);
+
+    scheduler.schedule("search");
+    await vi.advanceTimersByTimeAsync(RECONCILE_DEBOUNCE_MS);
+    expect(run).toHaveBeenLastCalledWith("search");
+    // A list-wide request mid-round widens the trailing round.
+    scheduler.schedule("search");
+    scheduler.schedule("all");
+    finish();
+    await vi.advanceTimersByTimeAsync(RECONCILE_MIN_GAP_MS);
+    expect(run).toHaveBeenLastCalledWith("all");
+    finish();
+
+    // A search round doesn't stand in for the lists' own polls.
+    await vi.advanceTimersByTimeAsync(RECONCILE_WHILE_ACTIVE_MS / 2);
+    scheduler.schedule("search");
+    await vi.advanceTimersByTimeAsync(RECONCILE_DEBOUNCE_MS);
+    finish();
+    await vi.advanceTimersByTimeAsync(RECONCILE_WHILE_ACTIVE_MS / 2);
+    scheduler.noteActivity();
+    await vi.advanceTimersByTimeAsync(RECONCILE_DEBOUNCE_MS);
+    expect(run).toHaveBeenCalledTimes(4);
+    expect(run).toHaveBeenLastCalledWith("all");
+  });
+
   it("never runs a round requested before disposal", async () => {
     const run = vi.fn(async () => {});
     const scheduler = createListReconcileScheduler(run);

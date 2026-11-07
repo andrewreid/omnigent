@@ -10,7 +10,7 @@
 // the chat store's `session.title` handler (a terminal-side `/rename`).
 
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
-import { scopeBoundaryRow } from "@/lib/sidebarData";
+import { compareSessionRows, type ScopeCacheData, scopeBoundaryRow } from "@/lib/sidebarData";
 import type { Conversation, ConversationsPage, SessionSortBy } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
 
@@ -128,7 +128,8 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
     const current = row[key];
     if (key === "labels" || key === "pull_request" || key === "family") {
       if (JSON.stringify(current) !== JSON.stringify(value)) changed.add(key);
-    } else if (current !== value) {
+    } else if (current !== value && (current != null || value != null)) {
+      // A cleared field reads the same whether the row holds null or nothing.
       changed.add(key);
     }
   }
@@ -223,11 +224,10 @@ function violatesKnownMembership(conv: Conversation, filters: ConversationListFi
 /**
  * Decide whether a field change needs server-side list reconciliation.
  *
- * The server owns pagination, search matches over title and item content,
- * and archive filtering. Push frames update visible row fields immediately;
- * this tells the provider when to follow with a list refetch so filtered
- * query membership converges. Title changes reconcile every list variant
- * because a row absent from a search query may now match it.
+ * The server owns pagination and archive filtering. Push frames update
+ * visible row fields immediately; this tells the provider when to follow with
+ * a list refetch so filtered query membership converges. A title change only
+ * matters to search lists, which {@link mergeItemsIntoPages} reports apart.
  *
  * An `updated_at` change doesn't need one: every list view sorts its loaded
  * rows itself, and a bump only moves a row up, so it stays inside the loaded
@@ -239,7 +239,6 @@ function violatesKnownMembership(conv: Conversation, filters: ConversationListFi
  */
 function changedFieldsNeedRefetch(changed: Set<string>): boolean {
   if (changed.has("archived")) return true;
-  if (changed.has("title")) return true;
   // A labels change can move a row between project-filtered variants and the
   // project folders (["project-sessions", …]). A session relabeled INTO the
   // selected project isn't in that filtered cache yet, so no local patch can
@@ -290,23 +289,32 @@ export function findCachedListRow(queryClient: QueryClient, id: string): Convers
  *   query.
  * @param itemsById - Wire items keyed by conversation id.
  * @param filters - Canonical filters for this conversations query.
- * @returns The possibly updated data, ids found in it, and whether this
- *   query needs a server refetch after the local patch.
+ * @returns The possibly updated data, ids found in it, whether this query
+ *   needs a server refetch after the local patch, and whether a title changed
+ *   (which only search lists need to re-read).
  */
 export function mergeItemsIntoPages(
   data: ConversationsInfiniteData | undefined,
   itemsById: Map<string, SessionListWireItem>,
   filters: ConversationListFilters,
-): { data: ConversationsInfiniteData | undefined; found: Set<string>; needsRefetch: boolean } {
+): {
+  data: ConversationsInfiniteData | undefined;
+  found: Set<string>;
+  needsRefetch: boolean;
+  titleChanged: boolean;
+} {
   const found = new Set<string>();
-  if (!data) return { data, found, needsRefetch: false };
+  if (!data) return { data, found, needsRefetch: false, titleChanged: false };
   let anyPageChanged = false;
   let needsRefetch = false;
+  let titleChanged = false;
+  const sortKey = filters.sortBy ?? "updated_at";
   // The row the next page is fetched after, or the last loaded row when the
   // server filtered the cursor row out (the sidebar's same fallback). Moving it
-  // up leaves "load more" restarting near the top, so it reconciles.
+  // up leaves "load more" restarting near the top; see moveRowIdCursor.
   const tail = data.pages.at(-1);
-  const cursorId = tail?.has_more ? scopeBoundaryRow(tail.data, tail.last_id)?.id : null;
+  const cursorRow = tail?.has_more ? scopeBoundaryRow(tail.data, tail.last_id) : undefined;
+  let cursorMoved = false;
   const pages = data.pages.map((page) => {
     let rowChanged = false;
     const nextData: Conversation[] = [];
@@ -328,12 +336,9 @@ export function mergeItemsIntoPages(
         needsRefetch = true;
         continue;
       }
-      if (
-        changedFieldsNeedRefetch(changed) ||
-        (conv.id === cursorId && changed.has(filters.sortBy ?? "updated_at"))
-      ) {
-        needsRefetch = true;
-      }
+      if (changedFieldsNeedRefetch(changed)) needsRefetch = true;
+      if (changed.has("title")) titleChanged = true;
+      if (conv.id === cursorRow?.id && changed.has(sortKey)) cursorMoved = true;
       rowChanged = true;
       nextData.push(nextConv);
     }
@@ -341,8 +346,46 @@ export function mergeItemsIntoPages(
     anyPageChanged = true;
     return { ...page, data: nextData };
   });
-  if (!anyPageChanged) return { data, found, needsRefetch };
-  return { data: { ...data, pages }, found, needsRefetch };
+  if (!anyPageChanged) return { data, found, needsRefetch, titleChanged };
+  if (cursorMoved && cursorRow) {
+    const lastId = moveRowIdCursor(pages, cursorRow, sortKey);
+    if (lastId === null) needsRefetch = true;
+    else pages[pages.length - 1] = { ...pages[pages.length - 1], last_id: lastId };
+  }
+  return { data: { ...data, pages }, found, needsRefetch, titleChanged };
+}
+
+/**
+ * Re-anchor a row-id cursor whose row just sorted higher.
+ *
+ * The server pages after the cursor row's current position, so once that row
+ * moves up "load more" would restart near the top. Every row that sorted below
+ * it when the page was fetched is still unloaded, so the loaded row sorting
+ * nearest above its old position is an equivalent cursor: sort keys only grow,
+ * and at worst the next page repeats a few loaded rows, which the lists dedupe.
+ *
+ * @param pages - The query's pages with the move applied.
+ * @param cursorRow - The cursor row as fetched, before the move.
+ * @param sortKey - The list's sort field.
+ * @returns The new cursor id, or `null` when the cursor is not a loaded row's
+ *   id (opaque, or a row the server filtered out) or no loaded row sorts
+ *   strictly above the old position; the list must then be re-read.
+ */
+function moveRowIdCursor(
+  pages: ConversationsPage[],
+  cursorRow: Conversation,
+  sortKey: SessionSortBy,
+): string | null {
+  const tail = pages.at(-1);
+  if (!tail?.last_id || tail.last_id !== cursorRow.id) return null;
+  let nearest: Conversation | undefined;
+  for (const page of pages) {
+    for (const row of page.data) {
+      if (row.id === cursorRow.id || row[sortKey] <= cursorRow[sortKey]) continue;
+      if (!nearest || compareSessionRows(row, nearest, sortKey) > 0) nearest = row;
+    }
+  }
+  return nearest?.id ?? null;
 }
 
 // ── Recently-created keep-alive ───────────────────────────────────────
@@ -388,7 +431,9 @@ export function unmarkRecentlyCreated(id: string): void {
  * is its home. Skips: search lists (membership unknown), archived/wrong-project
  * rows, sub-agent children (`parent_session_id` — they live off the sidebar),
  * and ids the caller excludes via `skip` (e.g. an optimistic delete in flight).
- * `candidates` should already exclude rows the list holds.
+ * A row the tab already lists elsewhere (`isKnown`) joins only when it sorts
+ * inside this list's loaded window: below it, the row belongs to an unloaded
+ * page. `candidates` should already exclude rows the list holds.
  */
 export function insertNewRowsIntoPages(
   data: ConversationsInfiniteData | undefined,
@@ -396,6 +441,7 @@ export function insertNewRowsIntoPages(
   filters: ConversationListFilters,
   skip?: (id: string) => boolean,
   viewerId?: string | null,
+  isKnown?: (id: string) => boolean,
 ): { data: ConversationsInfiniteData | undefined; inserted: Conversation[] } {
   // Archived caches hold only archived rows; new sessions are never archived.
   if (!data || candidates.size === 0 || filters.searchQuery) return { data, inserted: [] };
@@ -422,12 +468,28 @@ export function insertNewRowsIntoPages(
     const ownedByViewer = conv.owner == null || conv.owner === viewerId;
     if (filters.visibility === "mine" && !ownedByViewer) continue;
     if (filters.visibility === "shared" && ownedByViewer) continue;
+    if (isKnown?.(id) && !sortsInsideLoadedWindow(data, conv, filters.sortBy)) continue;
     rows.push(conv);
   }
   if (rows.length === 0) return { data, inserted: [] };
   const [first, ...rest] = data.pages;
   const nextFirst = { ...first, data: [...rows, ...first.data], first_id: rows[0].id };
   return { data: { ...data, pages: [nextFirst, ...rest] }, inserted: rows };
+}
+
+/** Whether a row sorts above the point where a list's fetched pages stop. */
+function sortsInsideLoadedWindow(
+  data: ConversationsInfiniteData,
+  row: Conversation,
+  sortBy: SessionSortBy = "updated_at",
+): boolean {
+  const tail = data.pages.at(-1);
+  if (!tail?.has_more) return true;
+  const boundary =
+    (data as Partial<ScopeCacheData>).boundary ??
+    tail.page_boundary ??
+    scopeBoundaryRow(tail.data, tail.last_id);
+  return boundary !== undefined && compareSessionRows(row, boundary, sortBy) < 0;
 }
 
 // Only known legacy row-ID cursors can be repaired after removing their anchor.
