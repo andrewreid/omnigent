@@ -79,9 +79,11 @@ schema change.
 
 `KmsSecretCipher` is the implementation: `encrypt` is one `kms:Encrypt` call
 under the configured key with `context` as the KMS encryption context; the
-returned ciphertext blob is stored base64. Blobs are small (a token JSON
-object), well under the 4 KB `Encrypt` limit, so no envelope/data-key layer is
-needed. `decrypt` is `kms:Decrypt` with the same context.
+returned ciphertext blob is stored base64. A secret over the 4 KB `Encrypt`
+limit (e.g. a full OAuth token set) is instead sealed with AES-256-GCM under a
+`kms:GenerateDataKey` data key bound to the same context, stored with a
+`kmsenv1:` prefix. `decrypt` is `kms:Decrypt` with the same context (of the
+blob, or of the envelope's wrapped data key).
 
 `build_secret_cipher()` is the single seam where a deployment selects the
 backend; it reads the **store-level** key `OMNIGENT_CREDENTIAL_KMS_KEY_ID` (id,
@@ -132,8 +134,8 @@ hide a misconfiguration.
 
 On the demo/prod EKS cluster the server runs as the `omnigent-server`
 ServiceAccount, annotated with an IAM role (`eks.amazonaws.com/role-arn`) whose
-policy allows `kms:Encrypt`/`kms:Decrypt`/`kms:DescribeKey` on the one
-credential key. No AWS credentials sit in the pod; the KMS key ARN is passed as
+policy allows `kms:Encrypt`/`kms:Decrypt`/`kms:GenerateDataKey`/`kms:DescribeKey`
+on the one credential key (`GenerateDataKey` only for secrets over 4 KB). No AWS credentials sit in the pod; the KMS key ARN is passed as
 plain config (`OMNIGENT_CREDENTIAL_KMS_KEY_ID`), not a secret. The key + role +
 policy are provisioned in the infra repo (Pulumi, `cloud-infra/core`).
 
@@ -255,10 +257,8 @@ stamp instead of the MCP proxy.
 
 ### Open questions
 
-- **Envelope vs direct:** direct `Encrypt`/`Decrypt` is fine while blobs stay
-  under 4 KB. If a provider's secret grows, switch that cipher to envelope
-  (`GenerateDataKey` + local AES, wrapped key stored alongside) behind the same
-  port — a per-`(context, process)` KMS call instead of per vend.
+- **Envelope vs direct:** resolved: direct `Encrypt`/`Decrypt` up to 4 KB, a
+  `GenerateDataKey` envelope above it, behind the same port.
 - **Encryption-context IAM condition:** whether to constrain the server's key
   policy with a `kms:EncryptionContext:*` condition (tighter, but couples the
   policy to the identity shape) or keep it key-scoped (simpler).
