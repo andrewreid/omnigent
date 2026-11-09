@@ -184,6 +184,43 @@ def _collect_turn_events(
     return asyncio.run(run())
 
 
+@pytest.mark.asyncio
+async def test_side_command_attachment_is_undelivered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "/side explain this"},
+                        {"type": "input_image", "image_url": _PNG_DATA_URI},
+                    ],
+                }
+            ],
+            [],
+            "",
+        )
+    ]
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert "attachments" in error.message
+    assert error.undelivered is True
+    assert error.preserve_session is True
+    assert _FakeCodexNativeClient.requests == []
+    assert codex_native_executor.side_chat.peek_side_chat_requests(tmp_path) == []
+
+
 @pytest.fixture
 def draining_client(monkeypatch: pytest.MonkeyPatch):
     # The external RPC peer is scripted; the executor and bridge files stay real.
@@ -656,6 +693,53 @@ def test_persistent_draining_delivery_is_bounded_and_keeps_input_undelivered(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == active_turn_id
+
+
+@pytest.mark.parametrize(
+    ("rpc_code", "data", "retained"),
+    [
+        (-32600, {"type": "modelProviderMismatch", "currentModelProvider": "gateway"}, True),
+        (-32600, {"type": "modelProviderNotConfigured", "modelProvider": "previous"}, True),
+        (-32600, {"type": "modelProviderMismatch"}, False),
+        (-32600, {"type": "anotherError", "currentModelProvider": "gateway"}, False),
+        (-32603, {"type": "modelProviderMismatch", "currentModelProvider": "gateway"}, False),
+    ],
+    ids=["mismatch", "missing-provider", "missing-detail", "unrelated-type", "internal-error"],
+)
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["start", "steer"])
+def test_provider_refusal_retains_input_without_changing_routing(
+    draining_client,
+    tmp_path: Path,
+    rpc_code: int,
+    data: dict[str, str],
+    retained: bool,
+    active_turn_id: str | None,
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    before = read_bridge_state(tmp_path)
+    draining_client.delivery_errors = [
+        CodexAppServerResponseError(
+            {"code": rpc_code, "message": "The conversation provider is unavailable", "data": data}
+        )
+    ]
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "keep this input")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is retained
+    assert failure.preserve_session is retained
+    assert failure.retryable is False
+    assert failure.code == ("codex_provider_changed" if retained else None)
+    if retained:
+        assert failure.remediation is not None
+        assert "provider" in failure.remediation
+        assert "restart" in failure.remediation.lower()
+    assert draining_client.accepted_inputs == []
+    assert draining_client.connections == draining_client.closes == 1
+    assert [method for method, _ in draining_client.requests] == [
+        "turn/steer" if active_turn_id else "turn/start"
+    ]
+    assert read_bridge_state(tmp_path) == before
 
 
 @pytest.mark.parametrize(
@@ -1283,8 +1367,14 @@ def test_shell_input_wait_for_its_turn_is_bounded(
 
 
 @pytest.mark.parametrize("previous_turn", [None, "turn_finishing"])
+@pytest.mark.parametrize(
+    "replacement_field", [None, "codex_home", "socket_path", "thread_id", "session_id"]
+)
 def test_unobserved_shell_blocks_followup_after_executor_restart(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, previous_turn: str | None
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    previous_turn: str | None,
+    replacement_field: str | None,
 ) -> None:
     """An old turn finishing cannot erase a shell RPC awaiting its first item."""
     _FakeCodexNativeClient.requests = []
@@ -1333,6 +1423,27 @@ def test_unobserved_shell_blocks_followup_after_executor_restart(
         # A passive idle snapshot can precede queued shell startup; the fence cannot.
         idle_bridge = read_bridge_state(tmp_path)
         assert idle_bridge is not None and idle_bridge.active_turn_id is None
+        if replacement_field is not None:
+            replacement = replace(
+                idle_bridge,
+                **{
+                    replacement_field: str(tmp_path / f"replacement-{replacement_field}"),
+                    "active_turn_id": "replacement_turn",
+                    "pending_shell_command_id": None,
+                    "active_shell_turn_id": None,
+                },
+            )
+            write_bridge_state(tmp_path, replacement)
+            replacement_snapshot = read_bridge_state(tmp_path)
+            assert replacement_snapshot is not None
+            shell_started.set()
+            [error] = await asyncio.wait_for(pending, 2)
+            assert isinstance(error, ExecutorError)
+            assert error.undelivered is True
+            assert error.preserve_session is True
+            assert "session changed" in error.message
+            assert read_bridge_state(tmp_path) == replacement_snapshot
+            return
         update_active_turn_id(tmp_path, "turn_shell")
         shell_started.set()
         await asyncio.wait_for(shell_observed.wait(), 2)
@@ -1351,8 +1462,7 @@ def test_unobserved_shell_blocks_followup_after_executor_restart(
         method for method, params in _FakeCodexNativeClient.requests if params.get("input") != []
     ] == [
         "thread/shellCommand",
-        "turn/start",
-    ]
+    ] + (["turn/start"] if replacement_field is None else [])
 
 
 @pytest.mark.parametrize("ambiguous", [False, True], ids=["rejected", "connection-lost"])
@@ -2664,6 +2774,39 @@ def test_stale_active_turn_mismatch_steer_recovers_to_newer_turn(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == "turn_b"
+
+
+def test_steer_ack_does_not_restore_a_turn_completed_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A steer accepted just before its turn ended leaves the bridge idle."""
+
+    class _CompletingSteerClient(_FakeCodexNativeClient):
+        """Complete the steered turn before acknowledging the steer."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """Model the forwarder recording ``turn/completed`` ahead of the ack."""
+            type(self).requests.append((method, params))
+            assert method == "turn/steer", method
+            assert clear_active_turn_id_if_matches(tmp_path, "turn_a")
+            return {"result": {"turnId": "turn_a"}}
+
+    _CompletingSteerClient.requests = []
+    _CompletingSteerClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _CompletingSteerClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_a")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "follow up")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
 
 
 async def test_concurrent_steering_during_turn_start_is_not_dropped(
