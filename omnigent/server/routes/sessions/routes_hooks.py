@@ -104,6 +104,7 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.orchestration import (
     _hold_native_ask_gate,
+    _policy_evaluation_lock,
     _publish_and_wait_for_harness_elicitation,
     _spawn_gateway_backed,
     _spawn_native_blocked_notice_forward,
@@ -123,6 +124,12 @@ from omnigent.stores.policy_store import PolicyStore
 #: ``POLICY_NAME_VENDORS`` in ``web/src/lib/nativeCodingAgents.ts``, which resolves
 #: a card's glyph and name from the ``<vendor>_native_`` prefix.
 _NATIVE_POLICY_VENDORS: dict[str, str] = {"antigravity": "agy"}
+
+#: How long a ``/policies/evaluate`` caller may skip evaluation after the fast
+#: path reports that no policy applies to the session. Policy edits are pushed
+#: to the runner, which also drops the report when its tunnel drops; this is
+#: the backstop for a push that reached no runner (another server replica).
+_NO_POLICIES_HINT_TTL_S = 120.0
 
 
 # Serializes same-session policy-engine builds: each build seeds declared label initial
@@ -907,6 +914,22 @@ def register_hooks_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             hook_elicitation_id = raw_elicitation_id
+        # The runner's built-in tool dispatch owns its approval flow and tool
+        # result, so it takes ASK back unresolved and skips the deny signal.
+        return_ask = payload.get("_omnigent_return_ask") is True
+        if return_ask:
+            # Tool dispatch acts on the session and must record policy writes,
+            # so it needs the edit access the MCP endpoint requires.
+            await _require_access(
+                user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            )
+
+        def _verdict_response(body: dict[str, Any]) -> Response:
+            # Echo the flag so the runner can tell this server honoured it.
+            if return_ask:
+                body = {**body, "_omnigent_return_ask": True}
+            return Response(content=json.dumps(body), media_type="application/json")
+
         # Validation is driven from the per-phase schema above rather than
         # from a chain of conditionals: rules that live in branches get
         # applied to whichever phase happens to reach that branch. The three
@@ -1016,10 +1039,7 @@ def register_hooks_routes(
         agent = await asyncio.to_thread(agent_store.get, conv.agent_id) if conv.agent_id else None
         if agent is None:
             # No agent — no policies. Return unspecified (pass-through).
-            return Response(
-                content=json.dumps({"result": "POLICY_ACTION_UNSPECIFIED"}),
-                media_type="application/json",
-            )
+            return _verdict_response({"result": "POLICY_ACTION_UNSPECIFIED"})
 
         # Warm-cache loads are in-memory; the thread hop covers the cold path
         # that extracts the bundle from disk.
@@ -1053,14 +1073,15 @@ def register_hooks_routes(
             # fast-path skip a bundle whose only policies are child-declared.
             conversation=conv,
         ):
-            return Response(
-                content=json.dumps(
-                    _no_policy_allow_body(
-                        _caps, session_id, policy_store, conv.root_conversation_id
-                    )
-                ),
-                media_type="application/json",
+            allow_body = _no_policy_allow_body(
+                _caps, session_id, policy_store, conv.root_conversation_id
             )
+            if return_ask and conv.parent_conversation_id is None:
+                # Runner tool dispatch skips checks until a pushed policy change.
+                # Sub-agents inherit root policies whose changes are pushed only to
+                # the root's runner, so they keep evaluating.
+                allow_body["no_policies_ttl_s"] = _NO_POLICIES_HINT_TTL_S
+            return _verdict_response(allow_body)
 
         _host_conn = (
             _caps.policy_llm_connection_factory() if _caps.policy_llm_connection_factory else None
@@ -1096,25 +1117,43 @@ def register_hooks_routes(
                 host_connection=_host_conn,
             )
 
-        # The build makes several synchronous store reads.
-        engine = await _build_policy_engine_serialized(session_id, _build_engine, conv)
-        # Use the turn-initiating human's identity (persisted at forward time)
-        # so per-user policies gate on the correct actor even when the HTTP
-        # caller is the runner's service-account credential.  Falls back to
-        # user_id for direct API callers and native-terminal sessions (whose
-        # turns go via _dispatch_session_event_to_runner, which does not write
-        # this label).
-        # Read the actor from the engine's label snapshot, not from the row
-        # fetched at the top of this handler: the engine's labels come from a
-        # read taken after the agent/spec load, so a turn-actor label written
-        # in that window still gates on the right principal. (``agent_id``
-        # cannot be treated the same way — it selects the spec the engine is
-        # built from, so it is necessarily read first.)
-        turn_actor = engine.labels.get(_TURN_ACTOR_LABEL)
-        ctx = _build_evaluation_context(
-            phase, data, event, actor=_build_actor(turn_actor or user_id)
-        )
-        result = await engine.evaluate(ctx, read_only=is_read_only)
+        # Build and evaluate atomically against persisted policy state, as the
+        # other tool-policy sites do, so concurrent calls observe each other's
+        # state updates.
+        async with _policy_evaluation_lock(session_id):
+            # The build makes several synchronous store reads.
+            engine = await _build_policy_engine_serialized(session_id, _build_engine, conv)
+            # Use the turn-initiating human's identity (persisted at forward
+            # time) so per-user policies gate on the correct actor even when
+            # the HTTP caller is the runner's service-account credential.
+            # Falls back to user_id for direct API callers and native-terminal
+            # sessions (whose turns go via _dispatch_session_event_to_runner,
+            # which does not write this label).
+            # Read the actor from the engine's label snapshot, not from the row
+            # fetched at the top of this handler: the engine's labels come from
+            # a read taken after the agent/spec load, so a turn-actor label
+            # written in that window still gates on the right principal.
+            # (``agent_id`` cannot be treated the same way — it selects the
+            # spec the engine is built from, so it is necessarily read first.)
+            turn_actor = engine.labels.get(_TURN_ACTOR_LABEL)
+            ctx = _build_evaluation_context(
+                phase, data, event, actor=_build_actor(turn_actor or user_id)
+            )
+            result = await engine.evaluate(ctx, read_only=is_read_only)
+
+        if return_ask and result.action == PolicyAction.ASK:
+            # ASK withholds its writes until approval; the caller resolves it.
+            ask_body: dict[str, Any] = {"result": "POLICY_ACTION_ASK"}
+            if result.reason:
+                ask_body["reason"] = result.reason
+            if result.data is not None:
+                ask_body["data"] = result.data
+            add_audit_attrs(
+                policy_verdict="POLICY_ACTION_ASK",
+                policy_phase=phase.value,
+                policy_workspace_id=result.deciding_policy_workspace_id,
+            )
+            return _verdict_response(ask_body)
 
         # URL-based elicitation for blocking phases: on a TOOL_CALL or
         # LLM_REQUEST ASK, hold the gate server-side rather than
@@ -1285,7 +1324,7 @@ def register_hooks_routes(
         # signal so observers (web UI, capability bench) see the decision rather
         # than infer it from the blocked tool's absence. Observational, so it is
         # not gated on write access.
-        if result.action == PolicyAction.DENY and phase == Phase.TOOL_CALL:
+        if result.action == PolicyAction.DENY and phase == Phase.TOOL_CALL and not return_ask:
             _publish_policy_denied(session_id, result.reason or "Blocked by policy.", phase.value)
         # An LLM_RESPONSE DENY reaches the harness only after the assistant
         # text already streamed through the runner relay, whose terminal
@@ -1302,10 +1341,7 @@ def register_hooks_routes(
             _relay = _runner_relay_tasks.get(session_id)
             if _relay is not None and not _relay.task.done():
                 _llm_response_denied_turns[session_id] = result.reason or "Denied by policy"
-        return Response(
-            content=json.dumps(resp_body),
-            media_type="application/json",
-        )
+        return _verdict_response(resp_body)
 
     # ── POST /sessions/{session_id}/hooks/codex-elicitation-request ─
 

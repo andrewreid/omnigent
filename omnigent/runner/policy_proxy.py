@@ -8,7 +8,9 @@ harness as a ``policy_verdict`` event.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Awaitable, Callable
+from time import monotonic
 from typing import Any
 
 import httpcore
@@ -18,6 +20,60 @@ from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger("omnigent.runner.app")
+
+# Session id → monotonic deadline before which the server reported that no
+# policy applies to the session. The epochs count invalidations (per session,
+# and for all sessions on a server reconnect), so a verdict requested before a
+# policy change cannot re-arm a hint after it.
+_no_policies_deadlines: dict[str, float] = {}
+_no_policies_epochs: dict[str, int] = {}
+_no_policies_global_epoch = 0
+
+
+def no_policies_hint_epoch(session_id: str) -> tuple[int, int]:
+    """Return the invalidation epoch to pass to :func:`note_no_policies`."""
+    return _no_policies_global_epoch, _no_policies_epochs.get(session_id, 0)
+
+
+def note_no_policies(session_id: str, ttl_s: object, epoch: tuple[int, int]) -> None:
+    """
+    Record the server's report that no policy applies to *session_id*.
+
+    :param session_id: Session id, e.g. ``"conv_abc123"``.
+    :param ttl_s: The server's ``no_policies_ttl_s``; ignored unless a
+        positive finite number.
+    :param epoch: :func:`no_policies_hint_epoch` read before the request.
+    """
+    if isinstance(ttl_s, bool) or not isinstance(ttl_s, (int, float)):
+        return
+    if not math.isfinite(ttl_s) or ttl_s <= 0 or epoch != no_policies_hint_epoch(session_id):
+        return
+    _no_policies_deadlines[session_id] = monotonic() + ttl_s
+
+
+def no_policies_apply(session_id: str) -> bool:
+    """Return ``True`` while the server's no-policies report is fresh."""
+    deadline = _no_policies_deadlines.get(session_id)
+    if deadline is None:
+        return False
+    if monotonic() >= deadline:
+        _no_policies_deadlines.pop(session_id, None)
+        return False
+    return True
+
+
+def drop_no_policies_hint(session_id: str) -> None:
+    """Forget the no-policies report after a policy or agent change."""
+    _no_policies_epochs[session_id] = _no_policies_epochs.get(session_id, 0) + 1
+    _no_policies_deadlines.pop(session_id, None)
+
+
+def drop_all_no_policies_hints() -> None:
+    """Forget every no-policies report, e.g. when a new server connects."""
+    global _no_policies_global_epoch
+    _no_policies_global_epoch += 1
+    _no_policies_deadlines.clear()
+
 
 # Read budget for runner→server POSTs that can PARK behind a human-approval
 # ASK gate: policy evaluation (``_evaluate_policy_via_omnigent``) and sub-agent

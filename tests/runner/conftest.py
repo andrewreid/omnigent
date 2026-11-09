@@ -433,9 +433,10 @@ class _McpToolsListServerClient(NullServerClient):
     """Server client stub that handles MCP tools/list and tools/call requests.
 
     Returns a scripted tool schema for tools/list calls and records tools/call
-    invocations.  All other requests are handled by :class:`NullServerClient`
-    (empty 200).  Used in tests that exercise MCP schema injection and tool
-    dispatch through :class:`ProxyMcpManager`.
+    invocations. Policy evaluations are recorded and allowed. All other
+    requests are handled by :class:`NullServerClient` (empty 200). Used in
+    tests that exercise MCP schema injection and tool dispatch through
+    :class:`ProxyMcpManager`.
     """
 
     def __init__(self, tool_name: str) -> None:
@@ -445,6 +446,7 @@ class _McpToolsListServerClient(NullServerClient):
         """
         self._tool_name = tool_name
         self.call_tool_invocations: list[tuple[str, dict[str, Any]]] = []
+        self.policy_events: list[dict[str, Any]] = []
 
     async def post(self, url: str, **kwargs: Any) -> NullServerClient._Response:
         """Handle MCP endpoint requests and delegate others to null parent.
@@ -454,6 +456,14 @@ class _McpToolsListServerClient(NullServerClient):
         :param kwargs: Extra keyword arguments (forwarded for non-MCP calls).
         :returns: Stub 200 response with appropriate payload.
         """
+        if url.endswith("/policies/evaluate"):
+            self.policy_events.append(kwargs.get("json", {}).get("event", {}))
+
+            class _AllowResponse(NullServerClient._Response):
+                def json(self) -> dict[str, Any]:
+                    return {"result": "POLICY_ACTION_ALLOW", "_omnigent_return_ask": True}
+
+            return _AllowResponse()
         if url.endswith("/mcp"):
             body = kwargs.get("json", {})
             if isinstance(body, dict) and body.get("method") == "tools/list":
@@ -502,11 +512,15 @@ class _McpToolsListServerClient(NullServerClient):
 
 def _build_app_with_mcp_tool(
     tool_name: str = "jira_search_issues",
+    *,
+    dispatched_tool: str | None = None,
 ) -> tuple[FastAPI, _FakeMcpManager, _ScriptedHarnessClient, _McpToolsListServerClient]:
     """Wire a runner app with the fakes and one mcp tool name.
 
     :param tool_name: MCP tool name to advertise and dispatch, e.g.
         ``"jira_search_issues"``.
+    :param dispatched_tool: Tool the harness calls instead, e.g. a built-in
+        such as ``"sys_os_read"``; defaults to *tool_name*.
     :returns: ``(app, mcp_manager, harness_client, server_client)`` tuple.
         ``mcp_manager`` is the :class:`_FakeMcpManager` used for the runner's
         ``/mcp/execute`` endpoint (not inline turn dispatch).
@@ -527,7 +541,7 @@ def _build_app_with_mcp_tool(
                 "item": {
                     "type": "function_call",
                     "status": "action_required",
-                    "name": tool_name,
+                    "name": dispatched_tool or tool_name,
                     "call_id": "call_1",
                     "arguments": "{}",
                 },
