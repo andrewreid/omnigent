@@ -200,25 +200,25 @@ describe("mergeItemsIntoPages", () => {
     expect(needsRefetch).toBe(false);
   });
 
-  it("asks for a refetch when a searched row's title changes", () => {
+  it("reports a title change for search lists without reconciling membership", () => {
     const before = data([conv("a", { title: "alpha" })]);
     const items = new Map<string, SessionListWireItem>([["a", { id: "a", title: "beta" }]]);
 
-    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, {
-      searchQuery: "alp",
-      includeArchived: false,
-    });
+    const {
+      data: after,
+      needsRefetch,
+      titleChanged,
+    } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS);
 
-    // The local cache cannot know whether the server-side search still
-    // matches via title or item content, so it patches the row then
-    // reconciles with the filtered list endpoint.
+    // Only a search can gain or lose the row; the caller re-reads those.
     expect(after!.pages[0].data[0].title).toBe("beta");
-    expect(needsRefetch).toBe(true);
+    expect(titleChanged).toBe(true);
+    expect(needsRefetch).toBe(false);
   });
 
-  it("reconciles when the next page's cursor row moves", () => {
-    // Bumping the row "load more" fetches after would leave a stale cursor and
-    // lift the sidebar's completeness watermark above every other row.
+  it("re-anchors a row-id cursor whose row moves, reconciling only when it can't", () => {
+    // "Load more" fetches after the cursor row's current position, so a bumped
+    // cursor row moves to the nearest loaded row above where it was.
     const before: ConversationsInfiniteData = {
       pages: [
         {
@@ -230,15 +230,25 @@ describe("mergeItemsIntoPages", () => {
       ],
       pageParams: [undefined],
     };
-    const bump = (id: string) =>
+    const bump = (id: string, list = before) =>
       mergeItemsIntoPages(
-        before,
+        list,
         new Map<string, SessionListWireItem>([[id, { id, updated_at: 9 }]]),
         DEFAULT_FILTERS,
-      ).needsRefetch;
+      );
 
-    expect(bump("b")).toBe(true);
-    expect(bump("a")).toBe(false);
+    expect(bump("b")).toMatchObject({ needsRefetch: false });
+    expect(bump("b").data?.pages[0].last_id).toBe("a");
+    expect(bump("a")).toMatchObject({ needsRefetch: false });
+    expect(bump("a").data?.pages[0].last_id).toBe("b");
+    // No loaded row sorts above the old position: only the server can say.
+    const tied = {
+      ...before,
+      pages: [
+        { ...before.pages[0], data: [conv("a", { updated_at: 2 }), before.pages[0].data[1]] },
+      ],
+    };
+    expect(bump("b", tied).needsRefetch).toBe(true);
     // A cursor the server filtered out of the page (a side chat) falls back to
     // the last loaded row, as the sidebar's boundary does.
     const filtered = { ...before, pages: [{ ...before.pages[0], last_id: "side_chat" }] };
