@@ -916,3 +916,37 @@ def test_policy_specs_cache_age_tracks_the_older_store_read(db_uri: str) -> None
     assert _DEFAULT_POLICY_SPECS_KEY in _DEFAULT_POLICY_SPECS_CACHE
     _DEFAULT_POLICY_SPECS_CACHE.clear()
     _SESSION_POLICY_SPECS_CACHE.clear()
+
+
+def test_engine_records_read_time_of_oldest_policy_list_it_used(db_uri: str) -> None:
+    """A sub-agent's engine is as old as the oldest list behind it, its root's included.
+
+    The tool-result allow window counts from this, so a cached list that is
+    replaced while the request runs cannot make the engine's answer look newer.
+
+    :param db_uri: Per-test SQLite URI.
+    """
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    root_conv = conv_store.create_conversation()
+    child_conv = conv_store.create_conversation(
+        parent_conversation_id=root_conv.id, kind="sub_agent"
+    )
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    _SESSION_POLICY_SPECS_CACHE.clear()
+    for conversation_id in (root_conv.id, child_conv.id):
+        _load_session_policy_specs(conversation_id, policy_store)
+    _load_default_policy_specs(policy_store)
+    specs, read_at = _SESSION_POLICY_SPECS_CACHE[root_conv.id]
+    _SESSION_POLICY_SPECS_CACHE[root_conv.id] = (specs, read_at - 25.0)
+
+    engine = build_policy_engine(
+        spec=_make_minimal_spec(),
+        conversation_id=child_conv.id,
+        conversation_store=conv_store,
+        policy_store=policy_store,
+    )
+
+    assert engine.policies_read_at == read_at - 25.0
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    _SESSION_POLICY_SPECS_CACHE.clear()

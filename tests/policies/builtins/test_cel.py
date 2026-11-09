@@ -15,6 +15,7 @@ import celpy
 from omnigent.policies.builtins.cel import (
     _PROGRAM_CACHE_SIZE,
     _compile,
+    _phases_with_effect,
     _warn_non_decision,
     cel_policy,
 )
@@ -488,3 +489,75 @@ def test_shared_program_evaluates_concurrently() -> None:
                 "result": "ALLOW",
                 "state_updates": [{"key": "last", "action": "set", "value": f"tool_{i}"}],
             }
+
+
+# ── Phases an expression can act on ─────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("expression", "phases"),
+    [
+        (
+            'event.type == "tool_call" && event.data.name == "sys_os_shell"'
+            ' ? {"result": "DENY"} : null',
+            {Phase.TOOL_CALL},
+        ),
+        ("event.type == 'tool_call' ? {'result': 'DENY'} : null", {Phase.TOOL_CALL}),
+        (
+            'event.type in ["tool_call", "request"] ? {"result": "ASK"} : null',
+            {Phase.TOOL_CALL, Phase.REQUEST},
+        ),
+        ('event.type != "tool_call" ? null : {"result": "DENY"}', {Phase.TOOL_CALL}),
+        ('!(event.type != "tool_call") && event.x ? {"result": "ASK"} : null', {Phase.TOOL_CALL}),
+        ('event.data.x ? null : "not a decision"', set()),
+        ('event.target == "Bash" ? {"result": "DENY"} : null', None),
+        ('event.type == "tool_call" || event.x ? {"result": "ASK"} : null', None),
+        ('event.type == r"tool_call" ? {"result": "DENY"} : null', None),
+        ('[1].exists(event, event.type == "x") ? {"result": "DENY"} : null', None),
+        ('{"result": "ALLOW", "state_updates": []}', None),
+    ],
+    ids=[
+        "type_guarded",
+        "single_quotes",
+        "type_in_list",
+        "negated_guard",
+        "double_negation",
+        "never_a_map",
+        "unguarded_target",
+        "guard_or_unknown",
+        "raw_string_not_followed",
+        "macro_scope_not_followed",
+        "constant_map",
+    ],
+)
+def test_phases_with_effect_rules_out_only_proven_abstentions(
+    expression: str, phases: set[Phase] | None
+) -> None:
+    """A phase is dropped only when the expression cannot yield a map there.
+
+    Dropping a phase lets native hooks skip it, so anything the analysis
+    cannot follow keeps every phase.
+    """
+    result = _phases_with_effect(expression)
+
+    assert result == (None if phases is None else frozenset(phases))
+    if phases is not None:
+        evaluate = cel_policy(expression=expression)
+        for phase in set(Phase) - phases:
+            assert evaluate({"type": phase.value, "target": "Bash", "data": {}}) is None
+
+
+def test_cel_policy_declares_phases_to_the_engine() -> None:
+    spec = FunctionPolicySpec(
+        name="guarded",
+        on=None,
+        function=FunctionRef(
+            path="omnigent.policies.builtins.cel.cel_policy",
+            arguments={"expression": 'event.type == "tool_call" ? {"result": "DENY"} : null'},
+        ),
+    )
+
+    policy = resolve_function_policy(spec)
+
+    assert policy.declared_phases == frozenset({Phase.TOOL_CALL})
+    assert not policy.acts_on(Phase.TOOL_RESULT)

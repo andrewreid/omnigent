@@ -44,7 +44,7 @@ from typing import Protocol, cast
 from omnigent.policies.base import Policy
 from omnigent.policies.builtins.orchestration import spawn_bounds
 from omnigent.policies.builtins.safety import detect_loop, max_tool_calls_per_session
-from omnigent.policies.schema import PolicyEvent
+from omnigent.policies.schema import PolicyEvent, declared_phases
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.spec.types import (
     FunctionPolicySpec,
@@ -96,6 +96,7 @@ class FunctionPolicy(Policy):
         callable_obj: object,
         *,
         runtime_state_keys: frozenset[str] = frozenset(),
+        phases: frozenset[Phase] | None = None,
     ) -> None:
         """
         Wrap a resolved callable in the Policy contract.
@@ -103,8 +104,11 @@ class FunctionPolicy(Policy):
         :param spec: The spec declaration.
         :param callable_obj: The evaluator callable (already
             unwrapped from any factory).
+        :param phases: Phases the callable declared with
+            :func:`~omnigent.policies.schema.acts_on`; ``None`` means all.
         """
         self.spec = spec
+        self.declared_phases = phases
         self.runtime_state_keys = runtime_state_keys
         self._callable = cast(_DynamicCallable, callable_obj)
         self._is_async = inspect.iscoroutinefunction(self._callable)
@@ -317,6 +321,10 @@ def resolve_function_policy(spec: FunctionPolicySpec) -> FunctionPolicy:
             f"{func_ref.path!r} is not callable (got "
             f"{type(callable_obj).__name__})",
         )
+    # Read before any legacy wrapper hides the evaluator's own declaration.
+    phases = declared_phases(callable_obj)
+    if phases is None:
+        phases = declared_phases(target)
     # Deferred import avoids a circular init cycle:
     # function.py → _omnigent_legacy_shim → policies.types →
     # policies.__init__ → function.py (partially initialised).
@@ -339,7 +347,7 @@ def resolve_function_policy(spec: FunctionPolicySpec) -> FunctionPolicy:
         )
         if target is factory
     )
-    return FunctionPolicy(spec, callable_obj, runtime_state_keys=runtime_state_keys)
+    return FunctionPolicy(spec, callable_obj, runtime_state_keys=runtime_state_keys, phases=phases)
 
 
 def _resolve_dotted_path(path: str) -> object:

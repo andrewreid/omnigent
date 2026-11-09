@@ -25,6 +25,7 @@ from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     LabelDef,
+    Phase,
     PolicyAction,
     PolicySpec,
     StateUpdate,
@@ -108,6 +109,9 @@ class PolicyEngine:
         ``llm:`` config at engine build time. ``None`` when the
         server has no ``llm:`` config — function policies that
         need an LLM will see ``None`` in ``event["llm_client"]``.
+    :param policies_read_at: ``time.monotonic()`` of the oldest stored
+        policy list behind *policies*, e.g. ``8123.4``. ``None`` when
+        unknown.
     """
 
     def __init__(
@@ -131,8 +135,10 @@ class PolicyEngine:
         conversation_store: ConversationStore,
         root_conversation_id: str | None = None,
         llm_client: Any = None,
+        policies_read_at: float | None = None,
     ) -> None:
         self.policies = policies
+        self.policies_read_at = policies_read_at
         self.label_defs = label_defs
         self.ask_timeout = ask_timeout
         self._conversation_id = conversation_id
@@ -167,6 +173,16 @@ class PolicyEngine:
         self._model = initial_model
         self._store = conversation_store
         self._llm_client = llm_client
+
+    def acts_on(self, phase: Phase) -> bool:
+        """
+        Return whether any policy in this engine can act on *phase*.
+
+        :param phase: The evaluation phase, e.g. ``Phase.TOOL_RESULT``.
+        :returns: ``False`` when every evaluation of *phase* would ALLOW
+            without dispatching a policy or writing state.
+        """
+        return any(policy.acts_on(phase) for policy in self.policies)
 
     @property
     def labels(self) -> dict[str, str]:
@@ -377,7 +393,7 @@ class PolicyEngine:
         ctx = self._inject_conversation_title(ctx)
 
         for policy in self.policies:
-            if not self._should_fire(policy.spec, ctx):
+            if not self._should_fire(policy, ctx):
                 continue
             result = await _dispatch_policy(policy, ctx, context)
             # Filter set_labels through the spec's whitelist
@@ -491,7 +507,7 @@ class PolicyEngine:
 
     def _should_fire(
         self,
-        spec: PolicySpec,
+        policy: Policy,
         ctx: EvaluationContext,
     ) -> bool:
         """
@@ -501,17 +517,20 @@ class PolicyEngine:
         Two stages, short-circuited in order per §4 key
         semantics:
 
-        1. :class:`PhaseSelector` match — cheap, no label
-           reads.
+        1. Phase match (:meth:`Policy.acts_on`) and
+           :class:`PhaseSelector` match — cheap, no label reads.
         2. ``condition`` label-gate — AND across keys; list
            values = OR within the key.
 
-        :param spec: The policy's spec.
+        :param policy: The policy instance.
         :param ctx: The current evaluation context.
         :returns: ``True`` when the engine should dispatch to
             ``policy.evaluate``; ``False`` when the policy is
             skipped entirely for this context.
         """
+        spec = policy.spec
+        if not policy.acts_on(ctx.phase):
+            return False
         # on=None means the callable self-selects (type: function policies).
         if spec.on is not None and not any(sel.matches(ctx) for sel in spec.on):
             return False

@@ -25,7 +25,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 from omnigent.policies.types import EvaluationContext, PolicyResult
-from omnigent.spec.types import PolicySpec
+from omnigent.spec.types import Phase, PolicySpec
 
 
 class Policy(ABC):
@@ -44,6 +44,22 @@ class Policy(ABC):
     """
 
     spec: PolicySpec
+    #: Phases a self-selecting policy declared it acts on; ``None`` means all.
+    declared_phases: frozenset[Phase] | None = None
+
+    def acts_on(self, phase: Phase) -> bool:
+        """
+        Return whether this policy can act on *phase* at all.
+
+        Ignores tool names and label conditions, so ``True`` only means the
+        engine might dispatch it for some event of that phase.
+
+        :param phase: The evaluation phase, e.g. ``Phase.TOOL_RESULT``.
+        :returns: ``False`` when no event of *phase* can reach the policy.
+        """
+        if self.spec.on is not None:
+            return any(selector.phase == phase for selector in self.spec.on)
+        return self.declared_phases is None or phase in self.declared_phases
 
     @abstractmethod
     async def evaluate(
