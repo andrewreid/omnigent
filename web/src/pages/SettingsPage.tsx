@@ -2002,14 +2002,14 @@ function ChatgptIntegrationControl() {
         </div>
       </div>
       {device !== null && (
-        <div role="status" className="flex flex-col gap-2 rounded-md border px-3 py-3 text-sm">
+        <div role="status" className="flex flex-col gap-2 rounded-md border px-3 py-2 text-sm">
           <span>
             Open{" "}
             <a
               href={device.verification_url}
               target="_blank"
               rel="noopener noreferrer"
-              className="underline"
+              className="underline underline-offset-2"
             >
               {device.verification_url}
             </a>
