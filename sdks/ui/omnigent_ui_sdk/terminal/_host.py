@@ -933,6 +933,9 @@ class TerminalHost:
         # from each node's ``parent_id``. ``_subagent_root`` is the session
         # the tree is rooted at (the originally-launched "main" session).
         self._subagents: dict[str, _SubagentNode] = {}
+        # Archived sub-agents, kept out of the tree until a full row shows
+        # them unarchived; see :meth:`archive_subagent`.
+        self._archived_subagents: set[str] = set()
         self._subagent_root: str | None = None
         # Bumped every time the tree is cleared (``/switch`` / ``/new`` /
         # ``/clear`` start a fresh root). A background ``seed_subagent_tree``
@@ -3235,6 +3238,7 @@ class TerminalHost:
             if not isinstance(sid, str):
                 continue
             seen.add(sid)
+            self._archived_subagents.discard(sid)
             parent = row.get("parent_id")
             self.upsert_subagent(
                 sid,
@@ -3390,6 +3394,63 @@ class TerminalHost:
             node = self._subagents.get(node.parent_id)
         return out
 
+    def archive_subagent(self, session_id: str) -> None:
+        """Drop *session_id* and its known descendants from the tree for good.
+
+        A later partial delta about it is ignored (:meth:`is_subagent_archived`)
+        until :meth:`unarchive_subagent` or a tree snapshot lists it again.
+        Bumps :attr:`subagent_generation`, so a snapshot fetched before the
+        archive can't bring it back.
+
+        :param session_id: Archived node, e.g. ``"conv_child"``.
+        """
+        self._archived_subagents.add(session_id)
+        self._subagent_generation += 1
+        doomed = {
+            sid
+            for sid in self._subagents
+            if sid == session_id or session_id in self.subagent_ancestors(sid)
+        }
+        for sid in doomed:
+            del self._subagents[sid]
+        if doomed:
+            self._invalidate_prompt()
+
+    def unarchive_subagent(self, session_id: str) -> bool:
+        """Let *session_id* back into the tree after :meth:`archive_subagent`.
+
+        :returns: Whether it had been archived, so its subtree needs a refetch.
+        """
+        if session_id not in self._archived_subagents:
+            return False
+        self._archived_subagents.discard(session_id)
+        return True
+
+    def is_subagent_archived(self, session_id: str) -> bool:
+        """Whether *session_id* was archived and not seen unarchived since."""
+        return session_id in self._archived_subagents
+
+    def subagent_depth(self, session_id: str, root_id: str) -> int | None:
+        """Return how many levels *session_id* sits below *root_id* in the registry.
+
+        :param session_id: Node to place, e.g. ``"conv_child"``.
+        :param root_id: Tree root, e.g. ``"conv_main"``.
+        :returns: ``0`` when they are the same session, ``1`` for a direct
+            child, and so on; ``None`` when the known parents don't lead to
+            *root_id*.
+        """
+        depth = 0
+        current = session_id
+        seen: set[str] = set()
+        while current != root_id:
+            node = self._subagents.get(current)
+            if node is None or node.parent_id is None or current in seen:
+                return None
+            seen.add(current)
+            current = node.parent_id
+            depth += 1
+        return depth
+
     def has_any_subagents(self) -> bool:
         """True when ANY sub-agent node exists — active OR finished. Gates the
         ↓ selector + its toolbar hint, which stay available after children
@@ -3412,6 +3473,7 @@ class TerminalHost:
         :attr:`subagent_generation` so an in-flight tree fetch can't resurrect
         the cleared nodes (race guard)."""
         self._subagents.clear()
+        self._archived_subagents.clear()
         self._subagent_root = None
         self._subagent_generation += 1
         self._invalidate_prompt()

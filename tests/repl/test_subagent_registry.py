@@ -80,9 +80,9 @@ def test_child_updated_merges_summary_with_parent() -> None:
 
 
 def test_child_event_for_other_parent_is_ignored() -> None:
-    """An event whose carrier conversation_id isn't the active session is
-    consumed (handled) but must NOT mutate the registry — a relayed
-    grandchild event riding an ancestor stream can't pollute the tree."""
+    """An event whose carrier isn't the active session or a node in its tree
+    is consumed (handled) but must NOT mutate the registry — it can't be
+    placed, so it can't pollute the tree."""
     host = _host()
     event = SessionChildSessionUpdatedEvent(
         type="session.child_session.updated",
@@ -94,6 +94,166 @@ def test_child_event_for_other_parent_is_ignored() -> None:
     assert handled is True  # still a child event -> caller stops dispatch
     assert host.has_active_subagents() is False
     assert host.subagent_tree() == []
+
+
+def _grandchild_update(carrier: str, child_id: str) -> SessionChildSessionUpdatedEvent:
+    return SessionChildSessionUpdatedEvent(
+        type="session.child_session.updated",
+        conversation_id=carrier,
+        child_session_id=child_id,
+        child={"id": child_id, "busy": True, "current_task_status": "in_progress"},
+    )
+
+
+def test_relayed_deeper_event_attaches_under_its_known_parent() -> None:
+    """The server relays a deeper sub-agent's status edge to every ancestor's
+    stream with its own parent as carrier; the REPL places it there without a
+    fetch, down to the depth cap."""
+    host = _host()
+    host.upsert_subagent("conv_c1", parent_id="conv_main", child=_running("conv_c1"))
+
+    for carrier, child_id in (("conv_c1", "conv_g1"), ("conv_g1", "conv_gg1")):
+        handled = _apply_child_session_event(
+            _grandchild_update(carrier, child_id),
+            active_conversation_id="conv_main",
+            host=host,
+        )
+        assert handled is True
+    assert [(n.session_id, depth) for n, depth in host.subagent_tree()] == [
+        ("conv_c1", 1),
+        ("conv_g1", 2),
+        ("conv_gg1", 3),
+    ]
+
+    # A carrier already at the depth cap would put its child past the tree the
+    # REPL shows, so the event is consumed without a new row.
+    _apply_child_session_event(
+        _grandchild_update("conv_gg1", "conv_too_deep"),
+        active_conversation_id="conv_main",
+        host=host,
+    )
+    assert "conv_too_deep" not in {n.session_id for n, _ in host.subagent_tree()}
+
+
+def test_depth_cap_counts_from_the_tree_root_while_inside_a_child() -> None:
+    """Inside child A the stream is A's own, but the cap still counts from the
+    tree root: a node the root's view would never show must not slip in and
+    then stay stuck there."""
+    host = _host()
+    host.upsert_subagent("A", parent_id="R", child=_running("A"))
+    host.upsert_subagent("B", parent_id="A", child=_running("B"))
+
+    for carrier, child_id in (("B", "C"), ("C", "D")):
+        _apply_child_session_event(
+            _grandchild_update(carrier, child_id),
+            active_conversation_id="A",
+            host=host,
+            tree_root_id="R",
+        )
+
+    assert [(n.session_id, depth) for n, depth in host.subagent_tree()] == [
+        ("A", 1),
+        ("B", 2),
+        ("C", 3),
+    ]
+
+
+def test_relayed_spawn_lists_a_deeper_child_as_launching() -> None:
+    """A grandchild's ``session.created`` reaches the root stream too, so it is
+    listed under its parent before its first status edge."""
+    host = _host()
+    host.upsert_subagent("conv_c1", parent_id="conv_main", child=_running("conv_c1"))
+    event = SessionCreatedEvent(
+        type="session.created",
+        conversation_id="conv_c1",
+        child_session_id="conv_g1",
+        agent_id="ag_reviewer",
+        parent_session_id="conv_c1",
+    )
+
+    assert _apply_child_session_event(event, active_conversation_id="conv_main", host=host)
+    node, depth = host.subagent_tree()[1]
+    assert (node.session_id, node.parent_id, node.status, depth) == (
+        "conv_g1",
+        "conv_c1",
+        "launching",
+        2,
+    )
+
+
+def test_archived_child_leaves_the_tree_with_its_subtree() -> None:
+    """Archiving pushes the child's row with the archive stamp; it leaves
+    ``child_sessions``, so it and what was known below it leave the tree."""
+    host = _host()
+    host.upsert_subagent("conv_c1", parent_id="conv_main", child=_running("conv_c1"))
+    host.upsert_subagent("conv_g1", parent_id="conv_c1", child=_running("conv_g1"))
+    host.upsert_subagent("conv_c2", parent_id="conv_main", child=_running("conv_c2"))
+    event = SessionChildSessionUpdatedEvent(
+        type="session.child_session.updated",
+        conversation_id="conv_main",
+        child_session_id="conv_c1",
+        child={**_done("conv_c1"), "labels": {"omnigent.archived_at": "1762400000"}},
+    )
+
+    assert _apply_child_session_event(event, active_conversation_id="conv_main", host=host)
+    assert [n.session_id for n, _ in host.subagent_tree()] == ["conv_c2"]
+
+    # A late partial delta (e.g. the runner's final idle edge during the
+    # archive's undo window) must not bring it back; a full row without the
+    # stamp (an unarchive) does.
+    late = SessionChildSessionUpdatedEvent(
+        type="session.child_session.updated",
+        conversation_id="conv_main",
+        child_session_id="conv_c1",
+        child={"id": "conv_c1", "busy": False},
+    )
+    _apply_child_session_event(late, active_conversation_id="conv_main", host=host)
+    assert [n.session_id for n, _ in host.subagent_tree()] == ["conv_c2"]
+    unarchived = SessionChildSessionUpdatedEvent(
+        type="session.child_session.updated",
+        conversation_id="conv_main",
+        child_session_id="conv_c1",
+        child={**_done("conv_c1"), "labels": {}},
+    )
+    resyncs: list[None] = []
+    _apply_child_session_event(
+        unarchived,
+        active_conversation_id="conv_main",
+        host=host,
+        request_resync=lambda: resyncs.append(None),
+    )
+    assert "conv_c1" in {n.session_id for n, _ in host.subagent_tree()}
+    assert len(resyncs) == 1, "the subtree dropped on archive must be refetched"
+
+
+def test_a_snapshot_fetched_before_an_archive_is_dropped() -> None:
+    host = _host()
+    host.upsert_subagent("conv_c1", parent_id="conv_main", child=_running("conv_c1"))
+    generation = host.subagent_generation
+    host.archive_subagent("conv_c1")
+
+    host.seed_subagent_tree(
+        "conv_main",
+        [{**_running("conv_c1"), "parent_id": "conv_main"}],
+        generation=generation,
+    )
+
+    assert host.subagent_tree() == []
+    assert host.is_subagent_archived("conv_c1")
+
+
+def test_subagent_depth_follows_known_parents_to_the_root() -> None:
+    host = _host()
+    host.upsert_subagent("c1", parent_id="root")
+    host.upsert_subagent("g1", parent_id="c1")
+    host.upsert_subagent("orphan", parent_id="unknown")
+
+    assert host.subagent_depth("root", "root") == 0
+    assert host.subagent_depth("c1", "root") == 1
+    assert host.subagent_depth("g1", "root") == 2
+    assert host.subagent_depth("g1", "c1") == 1
+    assert host.subagent_depth("orphan", "root") is None
+    assert host.subagent_depth("missing", "root") is None
 
 
 def test_non_child_event_is_not_handled() -> None:
@@ -268,8 +428,23 @@ def test_run_repl_wires_subagent_plumbing() -> None:
         "the background tree poll (deeper levels) is no longer started"
     )
     assert src.count("subagent_poll_wake.set()") >= 2, (
-        "child-session events and user input must wake the tree poll, or a "
-        "backed-off poll lags a sub-agent that just resumed"
+        "user input must wake the tree fetch, or a backed-off poll lags a "
+        "sub-agent that just resumed"
+    )
+    assert "_request_subagent_resync()" in src and "(resync and root_id is not None)" in src, (
+        "an event the tree can't place must force a fetch even when nothing "
+        "is active, or the new sub-agent never appears"
+    )
+    assert "subagent_pushes[0] != pushes_before" in src, (
+        "a snapshot fetched while pushed events arrived may predate them and "
+        "must be followed by a corrective fetch"
+    )
+    assert "carrier not in unplaced_carriers" in src, (
+        "a carrier deeper than the tree shows would request a full walk on every event"
+    )
+    assert "session._on_stream_connected = _request_subagent_resync" in src, (
+        "a stream reconnect no longer resyncs the tree — events dropped while "
+        "disconnected would leave it stale until the safety-net fetch"
     )
     assert "_sync_subagent_root" in src and "_readonly_view" in src, (
         "the root-tracking dropped its read-only-view source of truth — the "
@@ -392,6 +567,16 @@ def test_poll_delay_backs_off_until_a_change() -> None:
 
     assert delays == [4.0, 8.0, 10.0, 10.0, 10.0]
     assert _repl._next_subagent_poll_delay(10.0, changed=True) == _repl._SUBAGENT_POLL_SECONDS
+
+
+def test_tree_waits_for_the_safety_net_unless_inside_a_subagent() -> None:
+    """At the root the stream pushes the tree, so only the safety net times
+    out; inside a sub-agent the backoff poll keeps the rest of the tree fresh."""
+    assert (
+        _repl._subagent_wait_seconds(4.0, observing_subagent=False)
+        == _repl._SUBAGENT_SAFETY_POLL_SECONDS
+    )
+    assert _repl._subagent_wait_seconds(4.0, observing_subagent=True) == 4.0
 
 
 def test_subtree_settled_needs_a_known_node_with_nothing_running_below() -> None:
