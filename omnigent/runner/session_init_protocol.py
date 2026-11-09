@@ -57,6 +57,9 @@ class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pyd
     # The relay lets a pane-inferred status only annotate a running turn; an older
     # server would let it reopen one a hook just closed.
     accepts_inferred_status: bool = False
+    # Whether the server can route. The runner holds no routing backends of
+    # its own, so this is how it learns to advertise ``sys_advise_models``.
+    smart_routing_available: bool = False
 
 
 def build_runner_session_init_payload(
@@ -66,6 +69,7 @@ def build_runner_session_init_payload(
     suppress_recovery_turn: bool = False,
     resume_interrupted_turn: bool = False,
     recovery_id: str | None = None,
+    smart_routing_available: bool = False,
 ) -> dict[str, object]:
     """Build the versioned initialization fields appended to the legacy body."""
     from omnigent.inference_config import snapshot_runtime_config
@@ -82,6 +86,7 @@ def build_runner_session_init_payload(
         resume_interrupted_turn=resume_interrupted_turn,
         recovery_id=(recovery_id or uuid4().hex) if resume_interrupted_turn else None,
         accepts_inferred_status=True,
+        smart_routing_available=smart_routing_available,
         snapshot=RunnerSessionInitSnapshot(
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,

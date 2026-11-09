@@ -77,6 +77,9 @@ async def test_initializer_shares_result_for_one_tunnel_generation(
     monkeypatch.setattr(
         "omnigent.server.runner_session_init._read_build_info", lambda: (123.0, "a" * 40)
     )
+    monkeypatch.setattr(
+        "omnigent.server.runner_session_init.routing_available", lambda _caps: True
+    )
     caplog.set_level(logging.INFO, logger="omnigent.server.runner_session_init")
     registry = _Registry()
     client = _Client()
@@ -103,6 +106,7 @@ async def test_initializer_shares_result_for_one_tunnel_generation(
     assert initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
     assert len(client.calls) == 1
     assert client.calls[0]["session_init"]["snapshot"]["workspace"] == "/tmp/workspace"
+    assert client.calls[0]["session_init"]["smart_routing_available"] is True
 
     cached = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
     assert cached is first_response
